@@ -1,6 +1,6 @@
 #!/bin/sh
 # Install pengepul. Usage:
-#   curl -fsSL https://raw.githubusercontent.com/gitshrl/pengepul/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/gitshrl/pengepul/main/scripts/install.sh | sh
 #
 # Override the install directory with PENGEPUL_BIN_DIR, and the version with
 # PENGEPUL_VERSION (defaults to the latest release).

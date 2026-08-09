@@ -15,7 +15,7 @@ What it does:
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/gitshrl/pengepul/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/gitshrl/pengepul/main/scripts/install.sh | sh
 ```
 
 Linux x86_64 and macOS on Apple silicon. `pengepul update` installs the most recent
