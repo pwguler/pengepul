@@ -2,8 +2,7 @@
 
 Run your own API relay for your AI subscriptions. Log in your Claude and ChatGPT/Codex
 accounts once, and pengepul serves every request from the pool, so your own harness runs
-on your subscription instead of a per-token API key. Reach it from your machine or across
-your network.
+on your subscription instead of a per-token API key.
 
 What it does:
 
@@ -118,6 +117,20 @@ curl -sS http://127.0.0.1:8317/v1/chat/completions \
   "messages": [{"role": "user", "content": "reply exactly: pong"}]}'
 ```
 
+## Commands
+
+| Command | Does |
+|---|---|
+| `pengepul serve` | start the relay (the default with no subcommand) |
+| `pengepul login` | authorize an account in a browser |
+| `pengepul status` | health of the running relay |
+| `pengepul accounts` | loaded accounts (`--reload` re-reads from disk) |
+| `pengepul update` | install the most recent release (`--check` only reports) |
+| `pengepul config path\|show\|api-key` | show the config path, contents, or a key |
+| `pengepul service install\|start\|stop\|restart\|status\|uninstall\|logs` | manage the user service |
+
+Run `pengepul <command> --help` for flags.
+
 ## Reference
 
 Routes: `POST /v1/messages`, `POST /v1/chat/completions`, `POST /v1/responses`,
@@ -127,7 +140,7 @@ needs the local API key, as either `Authorization: Bearer <key>` or `x-api-key: 
 
 The provider is chosen by model id: `gpt-5`, `gpt-5.*`, `gpt-5-*`, `o<N>` and `codex-*`
 route to Codex, `claude-*` to Anthropic. `opus`, `sonnet` and `haiku` are aliases; a
-missing `model` becomes `claude-sonnet-4-6`.
+request with no `model` is rejected with 400.
 
 pengepul writes `~/.pengepul/config.yaml` when it is missing, generating a fresh
 `sk-local-…` key. The keys you can set:
@@ -145,10 +158,6 @@ timeouts:
   count-tokens-ms: 30000
 debug: off # off | errors | verbose
 ```
-
-Unknown keys are a hard load error. `RUST_LOG` overrides the log level. Commands:
-`serve` · `login` · `status` · `accounts` · `update` · `config path|show|api-key` ·
-`service …`. Run `pengepul <cmd> --help` for flags.
 
 ### Behavior
 
