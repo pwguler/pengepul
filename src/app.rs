@@ -602,7 +602,10 @@ async fn count_tokens(State(state): State<AppState>, headers: HeaderMap, body: B
         Ok(body) => body,
         Err(error) => return error.into_response(),
     };
-    let model = resolve_model(body.get("model").and_then(Value::as_str));
+    let Some(model_id) = required_model(&body) else {
+        return AppError::simple(StatusCode::BAD_REQUEST, "model is required").into_response();
+    };
+    let model = resolve_model(Some(model_id));
     let provider = state.registry.for_model(&model);
     if matches!(
         provider.id.kind,
@@ -676,7 +679,10 @@ async fn route_provider_request(
     body: &Value,
     route: RequestRoute,
 ) -> Response {
-    let model = resolve_model(body.get("model").and_then(Value::as_str));
+    let Some(model_id) = required_model(body) else {
+        return AppError::simple(StatusCode::BAD_REQUEST, "model is required").into_response();
+    };
+    let model = resolve_model(Some(model_id));
     let provider = state.registry.for_model(&model);
     let client_wants_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let attempts = provider_account_count(state, provider.id.clone())
@@ -1927,6 +1933,15 @@ fn non_empty_array(value: Option<&Value>) -> bool {
     value
         .and_then(Value::as_array)
         .is_some_and(|value| !value.is_empty())
+}
+
+/// The request's `model`, if present and not blank. A request without one is rejected
+/// rather than defaulted to a model the caller did not ask for.
+fn required_model(body: &Value) -> Option<&str> {
+    body.get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
 }
 
 fn parse_body_limit(value: &str) -> BodyLimit {

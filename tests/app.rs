@@ -407,6 +407,46 @@ async fn app_auth_and_no_account_responses() {
     assert_eq!(body["error"]["provider"], "codex");
 }
 
+#[tokio::test]
+async fn request_without_model_is_rejected() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = create_app(config(tmp.path().to_path_buf()));
+
+    let (status, body) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .body(Body::from(
+                json!({"messages": [{"role": "user", "content": "hi"}]}).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 400, "missing model must be rejected, not defaulted");
+    assert_eq!(body["error"]["message"], "model is required");
+
+    let (status, body) = json_response(
+        app,
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages/count_tokens")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .body(Body::from(
+                json!({"messages": [{"role": "user", "content": "hi"}]}).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert_eq!(body["error"]["message"], "model is required");
+}
+
 fn opencode_token() -> TokenData {
     TokenData {
         access_token: "sk-opencode".to_string(),
