@@ -59,7 +59,7 @@ register a `pengepul` provider and select it with a `pengepul/`-prefixed model. 
         "apiKey": "<pengepul api-key>",
         "auth": "api-key",
         "models": [
-          { "id": "claude-opus-5", "api": "anthropic-messages", "contextWindow": 1000000, "maxTokens": 64000 }
+          { "id": "claude-opus-5", "name": "Claude Opus 5", "api": "anthropic-messages", "contextWindow": 1000000, "maxTokens": 64000 }
         ]
       }
     }
