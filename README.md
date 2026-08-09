@@ -151,9 +151,6 @@ timeouts:
 debug: off # off | errors | verbose
 ```
 
-Accounts are used strict round-robin, no session affinity. A request fails over across
-accounts, retrying once per account on upstream 401, 403, 429, 500 and 502-599, never on
-501. A failed account backs off 1s, 2s, 4s, 8s, … capped at 5 minutes; a dead refresh
-token locks it out for 24 hours until a fresh `pengepul login`. Tokens refresh before
-expiry, and a stream that ends without its completion sentinel counts as a failure even
-after the client received a 200.
+Requests round-robin across accounts with no session affinity, failing over once per
+account on upstream 401, 403, 429, 500 and 502-599. A failed account backs off up to 5
+minutes; a dead refresh token locks it out for 24 hours until a fresh `pengepul login`.
