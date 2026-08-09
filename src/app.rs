@@ -24,7 +24,7 @@ use crate::models::{
     FetchedModels, ModelCatalog, parse_anthropic, parse_codex, parse_opencode, upstream_model,
 };
 use crate::oauth::{refresh_anthropic_tokens, refresh_codex_tokens};
-use crate::providers::{ProviderRegistry, build_registry, strip_opencode_prefix};
+use crate::providers::strip_opencode_prefix;
 use crate::streaming::{
     AnthropicStreamState, ChatStreamState, ResponsesStreamState, anthropic_sse_to_chat,
     anthropic_sse_to_responses, drain_complete_sse_events, finish_sse_events,
@@ -58,7 +58,7 @@ pub struct UpstreamRequest {
     pub body: Value,
     pub request_headers: BTreeMap<String, String>,
     pub account: AvailableAccount,
-    pub config: Config,
+    pub config: Arc<Config>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,14 +84,13 @@ pub trait UpstreamClient: Send + Sync {
         &self,
         kind: ProviderKind,
         account: AvailableAccount,
-        config: Config,
+        config: Arc<Config>,
     ) -> ModelsFuture;
 }
 
 #[derive(Clone)]
 struct AppState {
     config: Arc<Config>,
-    registry: Arc<ProviderRegistry>,
     body_limit: BodyLimit,
     upstream: Arc<dyn UpstreamClient>,
     account_managers: Arc<AccountManagers>,
@@ -355,7 +354,7 @@ impl UpstreamClient for HttpUpstreamClient {
         &self,
         kind: ProviderKind,
         account: AvailableAccount,
-        config: Config,
+        config: Arc<Config>,
     ) -> ModelsFuture {
         let client = self.client.clone();
         let timeout = config.timeouts.count_tokens_ms;
@@ -392,6 +391,9 @@ impl UpstreamClient for HttpUpstreamClient {
                     Ok(FetchedModels::Direct(parse_codex(&body)))
                 }
                 ProviderKind::Opencode => {
+                    // The advertised opencode set is the union of both lists, so a partial
+                    // fetch would form a wrong union. Surface either failure and let the
+                    // refresh loop keep the last-good set rather than wipe half of it.
                     let headers = opencode_headers(&account.token.access_token, false);
                     let go = send_get(
                         client.clone(),
@@ -399,19 +401,18 @@ impl UpstreamClient for HttpUpstreamClient {
                         headers.clone(),
                         timeout,
                     )
-                    .await
-                    .map(|body| parse_opencode(&body))
-                    .unwrap_or_default();
+                    .await?;
                     let credits = send_get(
                         client,
                         format!("{OPENCODE_ZEN_BASE_URL}/models"),
                         headers,
                         timeout,
                     )
-                    .await
-                    .map(|body| parse_opencode(&body))
-                    .unwrap_or_default();
-                    Ok(FetchedModels::Opencode { go, credits })
+                    .await?;
+                    Ok(FetchedModels::Opencode {
+                        go: parse_opencode(&go),
+                        credits: parse_opencode(&credits),
+                    })
                 }
             }
         })
@@ -433,12 +434,10 @@ pub fn create_app_with_upstream(config: Config, upstream: Arc<dyn UpstreamClient
     if let Err(error) = crate::tokens::migrate_legacy_layout(&config.auth_dir) {
         tracing::warn!(?error, "legacy token layout migration failed");
     }
-    let registry = build_registry(&config.auth_dir);
     let body_limit = parse_body_limit(&config.body_limit);
     let account_managers = build_account_managers(&config);
     let state = AppState {
         config: Arc::new(config),
-        registry: Arc::new(registry),
         body_limit,
         upstream,
         account_managers: Arc::new(account_managers),
@@ -534,7 +533,7 @@ async fn refresh_model_catalog(state: &AppState) {
         };
         match state
             .upstream
-            .fetch_models(kind, account, (*state.config).clone())
+            .fetch_models(kind, account, state.config.clone())
             .await
         {
             Ok(FetchedModels::Direct(ids)) => {
@@ -743,24 +742,18 @@ async fn count_tokens(State(state): State<AppState>, headers: HeaderMap, body: B
         )
         .into_response();
     };
-    let provider = state.registry.get(&provider_id_for(kind));
+    let provider = provider_id_for(kind);
     let model = upstream_model(model_id).to_string();
-    if matches!(
-        provider.id.kind,
-        ProviderKind::Codex | ProviderKind::Opencode
-    ) {
+    if matches!(provider.kind, ProviderKind::Codex | ProviderKind::Opencode) {
         return AppError::provider(
             StatusCode::NOT_IMPLEMENTED,
-            format!(
-                "count_tokens is not supported for the {} provider",
-                provider.id
-            ),
+            format!("count_tokens is not supported for the {provider} provider"),
             "unsupported_endpoint_for_provider",
-            provider.id,
+            provider.clone(),
         )
         .into_response();
     }
-    let account = match next_provider_account(&state, provider.id.clone()).await {
+    let account = match next_provider_account(&state, provider.clone()).await {
         Ok(account) => account,
         Err(error) => return error.into_response(),
     };
@@ -771,35 +764,29 @@ async fn count_tokens(State(state): State<AppState>, headers: HeaderMap, body: B
             body,
             request_headers: headers_to_map(&headers),
             account: account.clone(),
-            config: (*state.config).clone(),
+            config: state.config.clone(),
         })
         .await
     {
         Ok(response) => {
             if response.status.is_success() {
-                record_provider_success(&state, provider.id.clone(), &account, None).await;
+                record_provider_success(&state, provider.clone(), &account, None).await;
             } else {
-                record_provider_failure(
-                    &state,
-                    provider.id.clone(),
-                    &account,
-                    response.status,
-                    None,
-                )
-                .await;
+                record_provider_failure(&state, provider.clone(), &account, response.status, None)
+                    .await;
             }
             (response.status, Json(response.body)).into_response()
         }
         Err(error) => {
             record_provider_failure(
                 &state,
-                provider.id.clone(),
+                provider.clone(),
                 &account,
                 StatusCode::BAD_GATEWAY,
                 Some(&error.to_string()),
             )
             .await;
-            upstream_error_response(provider.id, &error)
+            upstream_error_response(provider, &error)
         }
     }
 }
@@ -832,16 +819,14 @@ async fn route_provider_request(
         )
         .into_response();
     };
-    let provider = state.registry.get(&provider_id_for(kind));
+    let provider = provider_id_for(kind);
     let model = upstream_model(model_id).to_string();
     let client_wants_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let attempts = provider_account_count(state, provider.id.clone())
-        .await
-        .max(1);
+    let attempts = provider_account_count(state, provider.clone()).await.max(1);
     let mut last_response = None;
 
     for _ in 0..attempts {
-        let account = match next_provider_account(state, provider.id.clone()).await {
+        let account = match next_provider_account(state, provider.clone()).await {
             Ok(account) => account,
             Err(error) if error.error_type == Some("token_refresh_failed") => {
                 last_response = Some(error.into_response());
@@ -849,7 +834,7 @@ async fn route_provider_request(
             }
             Err(error) => return last_response.unwrap_or_else(|| error.into_response()),
         };
-        let response = match provider.id.kind {
+        let response = match provider.kind {
             ProviderKind::Codex => {
                 route_codex_request(
                     state,
@@ -896,9 +881,9 @@ async fn route_provider_request(
     last_response.unwrap_or_else(|| {
         AppError::provider(
             StatusCode::SERVICE_UNAVAILABLE,
-            format!("no available {} account", provider.id),
+            format!("no available {provider} account"),
             "no_account_for_provider",
-            provider.id,
+            provider,
         )
         .into_response()
     })
@@ -940,7 +925,7 @@ async fn route_codex_request(
                 body,
                 request_headers: headers_to_map(headers),
                 account: account.clone(),
-                config: (*state.config).clone(),
+                config: state.config.clone(),
             })
             .await
         {
@@ -968,7 +953,7 @@ async fn route_codex_request(
             body,
             request_headers: headers_to_map(headers),
             account: account.clone(),
-            config: (*state.config).clone(),
+            config: state.config.clone(),
         })
         .await
     {
@@ -1009,7 +994,7 @@ async fn route_anthropic_request(
                 body,
                 request_headers: headers_to_map(headers),
                 account: account.clone(),
-                config: (*state.config).clone(),
+                config: state.config.clone(),
             })
             .await
         {
@@ -1037,7 +1022,7 @@ async fn route_anthropic_request(
             body,
             request_headers: headers_to_map(headers),
             account: account.clone(),
-            config: (*state.config).clone(),
+            config: state.config.clone(),
         })
         .await
     {
@@ -1077,7 +1062,7 @@ async fn route_opencode_request(
                 body,
                 request_headers: headers_to_map(headers),
                 account: account.clone(),
-                config: (*state.config).clone(),
+                config: state.config.clone(),
             })
             .await
         {
@@ -1105,7 +1090,7 @@ async fn route_opencode_request(
             body,
             request_headers: headers_to_map(headers),
             account: account.clone(),
-            config: (*state.config).clone(),
+            config: state.config.clone(),
         })
         .await
     {
@@ -2150,12 +2135,11 @@ mod tests {
         AccountManagers, AppState, BodyLimit, ModelsFuture, RateLimitBucket, RequestRoute,
         StdRwLock, UpstreamClient, UpstreamFuture, UpstreamJsonResponse, UpstreamRequest,
         UpstreamSseFuture, build_upstream_request, decode_upstream_body, forward_refusal_event,
-        is_decoded_upstream_error, route_provider_request,
+        is_decoded_upstream_error, refresh_model_catalog, route_provider_request,
     };
     use crate::accounts::{AccountManager, RefreshPolicy};
     use crate::config::{CloakingConfig, Config, DebugMode, TimeoutConfig};
     use crate::models::{FetchedModels, ModelCatalog};
-    use crate::providers::build_registry;
     use crate::tokens::save_token;
     use crate::types::{AvailableAccount, ProviderId, ProviderKind, TokenData};
     use serde_json::{Value, json};
@@ -2256,6 +2240,7 @@ mod tests {
     #[derive(Default)]
     struct CapturingUpstream {
         calls: Mutex<Vec<String>>,
+        fetch_fails: std::sync::atomic::AtomicBool,
     }
 
     impl UpstreamClient for CapturingUpstream {
@@ -2332,9 +2317,15 @@ mod tests {
             &self,
             _kind: ProviderKind,
             _account: AvailableAccount,
-            _config: Config,
+            _config: Arc<Config>,
         ) -> ModelsFuture {
-            Box::pin(async { Ok(FetchedModels::Direct(Vec::new())) })
+            let fails = self.fetch_fails.load(std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async move {
+                if fails {
+                    anyhow::bail!("simulated model list fetch failure");
+                }
+                Ok(FetchedModels::Direct(Vec::new()))
+            })
         }
     }
 
@@ -2528,7 +2519,6 @@ mod tests {
     fn opencode_state(tmp: &std::path::Path, upstream: Arc<CapturingUpstream>) -> AppState {
         AppState {
             config: Arc::new(test_config(tmp.to_path_buf())),
-            registry: Arc::new(build_registry(tmp)),
             body_limit: BodyLimit::Unlimited,
             upstream,
             account_managers: Arc::new(AccountManagers {
@@ -2577,6 +2567,48 @@ mod tests {
             *upstream.calls.lock().expect("calls lock"),
             ["opencode-chat:glm-5.1"]
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_keeps_the_last_good_catalog_when_a_fetch_fails() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        save_token(tmp.path(), &opencode_token()).expect("save opencode token");
+        save_token(
+            tmp.path(),
+            &token(
+                "alice@example.com",
+                "anthropic-access",
+                "2030-01-01T00:00:00Z",
+            ),
+        )
+        .expect("save anthropic token");
+        let upstream = Arc::new(CapturingUpstream::default());
+        let state = opencode_state(tmp.path(), upstream.clone());
+
+        // Seed a known-good catalog, then force every upstream fetch to fail.
+        {
+            let mut catalog = state.catalog.write().expect("catalog lock");
+            catalog.set_direct(ProviderKind::Anthropic, vec!["claude-opus-5".into()]);
+            catalog.set_opencode(vec!["glm-5.2".into()], vec!["kimi-k3".into()]);
+        }
+        upstream
+            .fetch_fails
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        refresh_model_catalog(&state).await;
+
+        // A failed refresh keeps the last-good set instead of wiping it.
+        let advertised: Vec<String> = state
+            .catalog
+            .read()
+            .expect("catalog lock")
+            .advertised()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(advertised.contains(&"anthropic/claude-opus-5".to_string()));
+        assert!(advertised.contains(&"opencode/glm-5.2".to_string()));
+        assert!(advertised.contains(&"opencode/kimi-k3".to_string()));
     }
 
     #[tokio::test]

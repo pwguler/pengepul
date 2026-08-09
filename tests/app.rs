@@ -116,7 +116,7 @@ impl UpstreamClient for RetryUpstream {
         &self,
         _kind: ProviderKind,
         _account: AvailableAccount,
-        _config: Config,
+        _config: Arc<Config>,
     ) -> ModelsFuture {
         Box::pin(async { Ok(FetchedModels::Direct(Vec::new())) })
     }
@@ -283,7 +283,7 @@ impl UpstreamClient for FakeUpstream {
         &self,
         kind: ProviderKind,
         _account: AvailableAccount,
-        _config: Config,
+        _config: Arc<Config>,
     ) -> ModelsFuture {
         Box::pin(async move {
             Ok(match kind {

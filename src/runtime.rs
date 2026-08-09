@@ -13,7 +13,6 @@ use crate::oauth::{
     ANTHROPIC_REDIRECT_URI, CODEX_CALLBACK_PATH, CODEX_CALLBACK_PORT, exchange_anthropic_code,
     exchange_codex_code, generate_anthropic_auth_url, generate_codex_auth_url,
 };
-use crate::providers::ProviderRegistry;
 use crate::service::{ServiceOptions, run_command};
 use crate::tokens::save_token;
 use crate::types::{PkceCodes, ProviderId, ProviderKind, TokenData};
@@ -52,7 +51,7 @@ impl RealRuntime {
 }
 
 impl CliRuntime for RealRuntime {
-    fn run_server(&mut self, config: &Config, _registry: &ProviderRegistry) -> Result<()> {
+    fn run_server(&mut self, config: &Config) -> Result<()> {
         init_tracing(config.debug);
         let bind_addr = server_bind_addr(config);
         let config = config.clone();

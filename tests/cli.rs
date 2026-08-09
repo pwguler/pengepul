@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use pengepul::cli::{CliRuntime, RunOutcome, ServiceInstallRequest, run_with_env};
 use pengepul::config::Config;
-use pengepul::providers::ProviderRegistry;
 use pengepul::types::ProviderId;
 use serde_json::{Value, json};
 use tempfile::tempdir;
@@ -22,7 +21,6 @@ fn write_config(home: &Path, host: &str, port: u16) {
 struct FakeRuntime {
     server_host: Option<String>,
     server_port: Option<u16>,
-    server_provider_count: usize,
     health_url: Option<String>,
     accounts_url: Option<String>,
     accounts_api_key: Option<String>,
@@ -47,10 +45,9 @@ impl CliRuntime for FakeRuntime {
         Ok(std::path::PathBuf::from("/usr/local/bin/pengepul"))
     }
 
-    fn run_server(&mut self, config: &Config, registry: &ProviderRegistry) -> Result<()> {
+    fn run_server(&mut self, config: &Config) -> Result<()> {
         self.server_host = Some(config.host.clone());
         self.server_port = Some(config.port);
-        self.server_provider_count = registry.all().len();
         Ok(())
     }
 
@@ -148,7 +145,6 @@ fn default_command_starts_server() {
     assert_eq!(outcome.code, 0);
     assert_eq!(runtime.server_host.as_deref(), Some("0.0.0.0"));
     assert_eq!(runtime.server_port, Some(8318));
-    assert_eq!(runtime.server_provider_count, 3);
     assert!(outcome.stderr.is_empty());
 }
 

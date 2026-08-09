@@ -6,7 +6,6 @@ use clap::{CommandFactory, Parser, Subcommand};
 use serde_json::Value;
 
 use crate::config::{Config, load_config, selected_config_path};
-use crate::providers::{ProviderRegistry, build_registry};
 use crate::types::ProviderId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,7 +30,7 @@ pub trait CliRuntime {
     /// # Errors
     ///
     /// Returns an error if the server cannot be started.
-    fn run_server(&mut self, config: &Config, registry: &ProviderRegistry) -> Result<()>;
+    fn run_server(&mut self, config: &Config) -> Result<()>;
 
     /// Fetch local relay health.
     ///
@@ -353,8 +352,7 @@ fn serve(
     if let Some(port) = port {
         config.port = port;
     }
-    let registry = build_registry(&config.auth_dir);
-    runtime.run_server(&config, &registry)
+    runtime.run_server(&config)
 }
 
 fn status(

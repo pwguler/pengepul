@@ -7,7 +7,6 @@ use pengepul::oauth::{
     CODEX_CALLBACK_PATH, CODEX_CALLBACK_PORT, CODEX_CLIENT_ID, detect_exhausted_reason,
     generate_anthropic_auth_url, generate_codex_auth_url,
 };
-use pengepul::providers::build_registry;
 use pengepul::tokens::{load_all_tokens, save_token};
 use pengepul::translate::resolve_model;
 use pengepul::types::{PkceCodes, ProviderId, TokenData};
@@ -211,60 +210,6 @@ fn token_storage_round_trips_provider_files() {
             .map(|token| token.email)
             .collect::<Vec<_>>(),
         ["opencode-acct"]
-    );
-}
-
-#[test]
-fn registry_routes_anthropic_codex_and_opencode() {
-    let tmp = tempdir().expect("tempdir");
-    let registry = build_registry(tmp.path());
-
-    assert_eq!(
-        registry
-            .all()
-            .iter()
-            .map(|provider| provider.id.clone())
-            .collect::<Vec<_>>(),
-        [
-            "anthropic".parse().unwrap(),
-            "codex".parse().unwrap(),
-            "opencode".parse().unwrap()
-        ]
-    );
-    assert_eq!(
-        registry.for_model("claude-sonnet-4-6").id,
-        "anthropic".parse().unwrap()
-    );
-    assert_eq!(
-        registry.for_model("sonnet").id,
-        "anthropic".parse().unwrap()
-    );
-    assert_eq!(registry.for_model("gpt-5").id, "codex".parse().unwrap());
-    assert_eq!(
-        registry.for_model("gpt-5.4-mini").id,
-        "codex".parse().unwrap()
-    );
-    assert_eq!(registry.for_model("o4-mini").id, "codex".parse().unwrap());
-    assert_eq!(
-        registry.for_model("codex-mini-latest").id,
-        "codex".parse().unwrap()
-    );
-    assert_eq!(
-        registry.for_model("gpt-4o").id,
-        "anthropic".parse().unwrap()
-    );
-    assert_eq!(
-        registry.for_model("custom-model").id,
-        "anthropic".parse().unwrap()
-    );
-    assert_eq!(
-        registry.for_model("opencode/glm-5.1").id,
-        "opencode".parse().unwrap()
-    );
-    // a bare opencode model id (no routing prefix) must not hijack the default.
-    assert_eq!(
-        registry.for_model("glm-5.1").id,
-        "anthropic".parse().unwrap()
     );
 }
 
