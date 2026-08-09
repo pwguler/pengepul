@@ -6,7 +6,7 @@ use std::process::{Command, ExitStatus};
 use anyhow::{Context, Result, bail};
 
 pub const SYSTEMD_UNIT_NAME: &str = "pengepul.service";
-pub const LAUNCHD_LABEL: &str = "dev.gitshrl.pengepul";
+pub const LAUNCHD_LABEL: &str = "dev.pwguler.pengepul";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceOptions {

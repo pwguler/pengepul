@@ -157,7 +157,7 @@ fn install_launchd_service_writes_plist_and_bootstraps_when_started() {
             vec![
                 "launchctl".to_string(),
                 "bootout".to_string(),
-                "gui/501/dev.gitshrl.pengepul".to_string(),
+                format!("gui/501/{LAUNCHD_LABEL}"),
             ],
             vec![
                 "launchctl".to_string(),
@@ -168,7 +168,7 @@ fn install_launchd_service_writes_plist_and_bootstraps_when_started() {
             vec![
                 "launchctl".to_string(),
                 "kickstart".to_string(),
-                "gui/501/dev.gitshrl.pengepul".to_string(),
+                format!("gui/501/{LAUNCHD_LABEL}"),
             ],
         ]
     );
