@@ -96,8 +96,7 @@ impl ModelCatalog {
 /// provider prefixes are stripped; an unrelated id containing `/` is left intact.
 #[must_use]
 pub fn upstream_model(model: &str) -> &str {
-    provider_prefix(model)
-        .map_or(model, |kind| &model[kind.canonical_id().len() + 1..])
+    provider_prefix(model).map_or(model, |kind| &model[kind.canonical_id().len() + 1..])
 }
 
 /// The provider named by an explicit `<provider>/` prefix, if any.
