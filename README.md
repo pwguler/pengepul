@@ -110,18 +110,18 @@ curl -sS http://127.0.0.1:8317/v1/chat/completions \
 
 ## Commands
 
-| Command | Does |
-|---|---|
-| `pengepul serve` | start the relay (the default with no subcommand) |
-| `pengepul login` | authorize an account in a browser |
-| `pengepul status` | health of the running relay |
-| `pengepul accounts` | loaded accounts (`--reload` re-reads from disk) |
-| `pengepul update` | install the most recent release (`--check` only reports) |
-| `pengepul config path\|show\|api-key` | show the config path, contents, or a key |
-| `pengepul service install\|start\|stop\|restart\|status\|uninstall\|logs` | manage the user service (systemd on Linux, launchd on macOS) |
+```sh
+pengepul serve # start the relay (the default with no subcommand)
+pengepul login # authorize an account in a browser
+pengepul status # health of the running relay
+pengepul accounts # loaded accounts (--reload re-reads from disk)
+pengepul update # install the most recent release (--check only reports)
+pengepul config path|show|api-key # show the config path, contents, or a key
+pengepul service install|start|stop|restart|status|uninstall|logs # manage the user service (systemd on Linux, launchd on macOS)
+```
 
 Run `pengepul <command> --help` for flags. The service is user-scoped, so
-`systemctl status pengepul` will not find it — use `pengepul service status`, or add
+`systemctl status pengepul` will not find it; use `pengepul service status`, or add
 `--user`.
 
 ## Reference
