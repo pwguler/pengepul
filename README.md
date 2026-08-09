@@ -15,12 +15,12 @@ What it does:
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/gitshrl/pengepul/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/pwguler/pengepul/main/scripts/install.sh | sh
 ```
 
 Linux x86_64 and macOS on Apple silicon. `pengepul update` installs the most recent
 release (`--check` reports it without installing); both verify the published checksum.
-From source: `cargo install --git https://github.com/gitshrl/pengepul.git --locked`.
+From source: `cargo install --git https://github.com/pwguler/pengepul.git --locked`.
 
 ## Quickstart
 

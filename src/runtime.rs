@@ -724,7 +724,7 @@ fn command_output(command: &[&str]) -> Result<String> {
     }
 }
 
-const RELEASE_REPO: &str = "gitshrl/pengepul";
+const RELEASE_REPO: &str = "pwguler/pengepul";
 
 fn release_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()

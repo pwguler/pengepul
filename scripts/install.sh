@@ -1,12 +1,12 @@
 #!/bin/sh
 # Install pengepul. Usage:
-#   curl -fsSL https://raw.githubusercontent.com/gitshrl/pengepul/main/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/pwguler/pengepul/main/scripts/install.sh | sh
 #
 # Override the install directory with PENGEPUL_BIN_DIR, and the version with
 # PENGEPUL_VERSION (defaults to the latest release).
 set -eu
 
-REPO="gitshrl/pengepul"
+REPO="pwguler/pengepul"
 BIN_DIR="${PENGEPUL_BIN_DIR:-/usr/local/bin}"
 VERSION="${PENGEPUL_VERSION:-latest}"
 

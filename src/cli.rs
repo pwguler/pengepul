@@ -487,7 +487,7 @@ pub fn release_asset() -> Result<&'static str> {
         ("macos", "aarch64") => Ok("pengepul-macos-arm64.tar.gz"),
         (os, arch) => bail!(
             "no published build for {os} {arch}; install from source with \
-             cargo install --git https://github.com/gitshrl/pengepul.git --locked"
+             cargo install --git https://github.com/pwguler/pengepul.git --locked"
         ),
     }
 }
