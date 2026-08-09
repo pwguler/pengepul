@@ -269,11 +269,11 @@ fn registry_routes_anthropic_codex_and_opencode() {
 }
 
 #[test]
-fn resolve_model_aliases() {
+fn resolve_model_passes_ids_through_without_aliases() {
+    // Aliases were removed; a bare id is returned as-is, a missing one falls to the default.
     assert_eq!(resolve_model(None), "claude-sonnet-4-6");
-    assert_eq!(resolve_model(Some("opus")), "claude-opus-5");
-    assert_eq!(resolve_model(Some("sonnet")), "claude-sonnet-4-6");
-    assert_eq!(resolve_model(Some("haiku")), "claude-haiku-4-5-20251001");
+    assert_eq!(resolve_model(Some("opus")), "opus");
+    assert_eq!(resolve_model(Some("claude-opus-5")), "claude-opus-5");
     assert_eq!(resolve_model(Some("gpt-5.4")), "gpt-5.4");
 }
 

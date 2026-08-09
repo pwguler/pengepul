@@ -55,8 +55,10 @@ impl CliRuntime for RealRuntime {
     fn run_server(&mut self, config: &Config, _registry: &ProviderRegistry) -> Result<()> {
         init_tracing(config.debug);
         let bind_addr = server_bind_addr(config);
-        let app = create_app(config.clone());
+        let config = config.clone();
         self.runtime.block_on(async move {
+            // Inside the runtime, so create_app can spawn the model-catalog refresh task.
+            let app = create_app(config);
             let listener = tokio::net::TcpListener::bind(&bind_addr)
                 .await
                 .with_context(|| format!("failed to bind {bind_addr}"))?;

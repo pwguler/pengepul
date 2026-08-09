@@ -5,18 +5,22 @@
 //! ids anthropic and codex serve (`claude-opus-5`, `gpt-5.6-*`); the prefix disambiguates,
 //! the catalog supplies the list and the go-vs-credits base.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
 use crate::providers::OPENCODE_PREFIX;
 use crate::types::ProviderKind;
 
-/// Which opencode upstream serves a model. go is the subscription plan, credits the spillover.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OpencodeBase {
-    Go,
-    Credits,
+/// The models a single fetch returned, shaped per provider: anthropic and codex give one
+/// list, opencode gives its go and credits lists, which are advertised as one set.
+#[derive(Debug, Clone)]
+pub enum FetchedModels {
+    Direct(Vec<String>),
+    Opencode {
+        go: Vec<String>,
+        credits: Vec<String>,
+    },
 }
 
 /// A snapshot of the models each provider serves. Empty for a provider whose fetch has never
@@ -25,8 +29,8 @@ pub enum OpencodeBase {
 pub struct ModelCatalog {
     /// anthropic and codex model id -> its provider. Their id namespaces do not overlap.
     direct: BTreeMap<String, ProviderKind>,
-    /// opencode model id (unprefixed) -> the base that serves it.
-    opencode: BTreeMap<String, OpencodeBase>,
+    /// opencode model ids (unprefixed), the union of its go and credits lists.
+    opencode: BTreeSet<String>,
 }
 
 impl ModelCatalog {
@@ -38,16 +42,11 @@ impl ModelCatalog {
         }
     }
 
-    /// Replace the opencode entries. A model in both lists is served from go (subscription
-    /// first); a model only in credits is served from credits.
+    /// Replace the opencode entries with the union of its go and credits lists. opencode
+    /// itself spills a request from the subscription plan to credits, so pengepul advertises
+    /// both and does not track which base serves which id.
     pub fn set_opencode(&mut self, go_ids: Vec<String>, credits_ids: Vec<String>) {
-        self.opencode.clear();
-        for id in credits_ids {
-            self.opencode.insert(id, OpencodeBase::Credits);
-        }
-        for id in go_ids {
-            self.opencode.insert(id, OpencodeBase::Go);
-        }
+        self.opencode = go_ids.into_iter().chain(credits_ids).collect();
     }
 
     /// Resolve a request's model id to the provider that should serve it, or `None` when no
@@ -65,15 +64,6 @@ impl ModelCatalog {
         heuristic_provider(model)
     }
 
-    /// The opencode base for an unprefixed model id; go unless the catalog says credits-only.
-    #[must_use]
-    pub fn opencode_base(&self, model: &str) -> OpencodeBase {
-        self.opencode
-            .get(model)
-            .copied()
-            .unwrap_or(OpencodeBase::Go)
-    }
-
     /// The advertised catalog for `/v1/models`: every id carries its `<provider>/<model>`
     /// prefix so a client can address a provider unambiguously even when ids overlap.
     #[must_use]
@@ -85,7 +75,7 @@ impl ModelCatalog {
             .collect();
         out.extend(
             self.opencode
-                .keys()
+                .iter()
                 .map(|id| (format!("{OPENCODE_PREFIX}{id}"), ProviderKind::Opencode)),
         );
         out
@@ -158,7 +148,7 @@ fn ids_from(array: Option<&Value>, field: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ModelCatalog, OpencodeBase, parse_anthropic, parse_codex, parse_opencode};
+    use super::{ModelCatalog, parse_anthropic, parse_codex, parse_opencode};
     use crate::types::ProviderKind;
     use serde_json::json;
 
@@ -214,24 +204,11 @@ mod tests {
     }
 
     #[test]
-    fn opencode_base_prefers_go_when_in_both() {
-        let mut catalog = ModelCatalog::default();
-        catalog.set_opencode(
-            vec!["glm-5.2".into()],
-            vec!["glm-5.2".into(), "grok-4.5".into()],
-        );
-        assert_eq!(catalog.opencode_base("glm-5.2"), OpencodeBase::Go);
-        assert_eq!(catalog.opencode_base("grok-4.5"), OpencodeBase::Credits);
-        // unknown opencode id defaults to go
-        assert_eq!(catalog.opencode_base("mystery"), OpencodeBase::Go);
-    }
-
-    #[test]
     fn advertised_prefixes_every_id_with_its_provider() {
         let mut catalog = ModelCatalog::default();
         catalog.set_direct(ProviderKind::Anthropic, vec!["claude-opus-5".into()]);
         catalog.set_direct(ProviderKind::Codex, vec!["gpt-5.5".into()]);
-        catalog.set_opencode(vec!["glm-5.2".into()], vec![]);
+        catalog.set_opencode(vec!["glm-5.2".into()], vec!["grok-4.5".into()]);
         let advertised = catalog.advertised();
         assert!(advertised.contains(&(
             "anthropic/claude-opus-5".to_string(),

@@ -7,7 +7,7 @@ use serde_json::json;
 #[test]
 fn openai_chat_to_anthropic_translates_tools_and_system() {
     let out = openai_to_anthropic(&json!({
-        "model": "sonnet",
+        "model": "claude-sonnet-4-6",
         "messages": [
             {"role": "system", "content": "Be terse."},
             {"role": "user", "content": "weather?"},

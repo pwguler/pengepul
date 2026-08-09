@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
 use async_stream::try_stream;
@@ -20,10 +20,11 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::accounts::{AccountManager, RefreshFuture, RefreshPolicy, RefreshPolicyKind};
 use crate::config::Config;
 use crate::masquerade::{masquerade_request, restore_tool_use_names};
-use crate::oauth::{refresh_anthropic_tokens, refresh_codex_tokens};
-use crate::providers::{
-    OPENCODE_FREE_MODELS, OPENCODE_MODELS, ProviderRegistry, build_registry, strip_opencode_prefix,
+use crate::models::{
+    FetchedModels, ModelCatalog, parse_anthropic, parse_codex, parse_opencode, upstream_model,
 };
+use crate::oauth::{refresh_anthropic_tokens, refresh_codex_tokens};
+use crate::providers::{ProviderRegistry, build_registry, strip_opencode_prefix};
 use crate::streaming::{
     AnthropicStreamState, ChatStreamState, ResponsesStreamState, anthropic_sse_to_chat,
     anthropic_sse_to_responses, drain_complete_sse_events, finish_sse_events,
@@ -31,13 +32,14 @@ use crate::streaming::{
 };
 use crate::translate::{
     anthropic_to_openai, anthropic_to_responses, anthropic_to_responses_request,
-    chat_to_responses_request, openai_to_anthropic, resolve_model, responses_to_anthropic,
+    chat_to_responses_request, openai_to_anthropic, responses_to_anthropic,
     responses_to_anthropic_message, responses_to_chat_completion,
 };
 use crate::types::{AvailableAccount, ProviderId, ProviderKind, UsageData};
 use crate::upstream::{
-    ANTHROPIC_BASE_URL, CODEX_BASE_URL, CODEX_RESPONSES_PATH, anthropic_headers, apply_cloaking,
-    codex_headers, normalize_codex_responses_body, opencode_base_url, opencode_headers,
+    ANTHROPIC_BASE_URL, CODEX_BASE_URL, CODEX_DEFAULT_CLI_VERSION, CODEX_MODELS_PATH,
+    CODEX_RESPONSES_PATH, OPENCODE_BASE_URL, OPENCODE_ZEN_BASE_URL, anthropic_headers,
+    apply_cloaking, codex_headers, normalize_codex_responses_body, opencode_headers,
 };
 use crate::utils::now_iso;
 
@@ -49,6 +51,7 @@ pub type UpstreamFuture =
 pub type UpstreamSseStream = Pin<Box<dyn Stream<Item = anyhow::Result<Bytes>> + Send>>;
 pub type UpstreamSseFuture =
     Pin<Box<dyn Future<Output = anyhow::Result<UpstreamSseResponse>> + Send>>;
+pub type ModelsFuture = Pin<Box<dyn Future<Output = anyhow::Result<FetchedModels>> + Send>>;
 
 #[derive(Debug, Clone)]
 pub struct UpstreamRequest {
@@ -77,6 +80,12 @@ pub trait UpstreamClient: Send + Sync {
     fn codex_responses_stream(&self, request: UpstreamRequest) -> UpstreamSseFuture;
     fn opencode_chat(&self, request: UpstreamRequest) -> UpstreamFuture;
     fn opencode_chat_stream(&self, request: UpstreamRequest) -> UpstreamSseFuture;
+    fn fetch_models(
+        &self,
+        kind: ProviderKind,
+        account: AvailableAccount,
+        config: Config,
+    ) -> ModelsFuture;
 }
 
 #[derive(Clone)]
@@ -87,6 +96,7 @@ struct AppState {
     upstream: Arc<dyn UpstreamClient>,
     account_managers: Arc<AccountManagers>,
     rate_limit_buckets: Arc<StdMutex<BTreeMap<String, RateLimitBucket>>>,
+    catalog: Arc<StdRwLock<ModelCatalog>>,
 }
 
 struct AccountManagers {
@@ -316,10 +326,9 @@ impl UpstreamClient for HttpUpstreamClient {
     fn opencode_chat(&self, request: UpstreamRequest) -> UpstreamFuture {
         let client = self.client.clone();
         Box::pin(async move {
-            let base = opencode_base_url(body_model(&request.body));
             send_json(
                 client,
-                format!("{base}/chat/completions"),
+                format!("{OPENCODE_BASE_URL}/chat/completions"),
                 opencode_headers(&request.account.token.access_token, false),
                 request.body,
                 request.config.timeouts.messages_ms,
@@ -331,15 +340,80 @@ impl UpstreamClient for HttpUpstreamClient {
     fn opencode_chat_stream(&self, request: UpstreamRequest) -> UpstreamSseFuture {
         let client = self.client.clone();
         Box::pin(async move {
-            let base = opencode_base_url(body_model(&request.body));
             send_stream(
                 client,
-                format!("{base}/chat/completions"),
+                format!("{OPENCODE_BASE_URL}/chat/completions"),
                 opencode_headers(&request.account.token.access_token, true),
                 request.body,
                 request.config.timeouts.stream_messages_ms,
             )
             .await
+        })
+    }
+
+    fn fetch_models(
+        &self,
+        kind: ProviderKind,
+        account: AvailableAccount,
+        config: Config,
+    ) -> ModelsFuture {
+        let client = self.client.clone();
+        let timeout = config.timeouts.count_tokens_ms;
+        Box::pin(async move {
+            match kind {
+                ProviderKind::Anthropic => {
+                    let headers = BTreeMap::from([
+                        (
+                            "authorization".to_string(),
+                            format!("Bearer {}", account.token.access_token),
+                        ),
+                        ("anthropic-version".to_string(), "2023-06-01".to_string()),
+                        ("anthropic-beta".to_string(), "oauth-2025-04-20".to_string()),
+                    ]);
+                    let body = send_get(
+                        client,
+                        format!("{ANTHROPIC_BASE_URL}/v1/models"),
+                        headers,
+                        timeout,
+                    )
+                    .await?;
+                    Ok(FetchedModels::Direct(parse_anthropic(&body)))
+                }
+                ProviderKind::Codex => {
+                    let version = config
+                        .cloaking
+                        .codex
+                        .get("cli-version")
+                        .map_or(CODEX_DEFAULT_CLI_VERSION, String::as_str);
+                    let url =
+                        format!("{CODEX_BASE_URL}{CODEX_MODELS_PATH}?client_version={version}");
+                    let headers = codex_headers(&account, false, &config);
+                    let body = send_get(client, url, headers, timeout).await?;
+                    Ok(FetchedModels::Direct(parse_codex(&body)))
+                }
+                ProviderKind::Opencode => {
+                    let headers = opencode_headers(&account.token.access_token, false);
+                    let go = send_get(
+                        client.clone(),
+                        format!("{OPENCODE_BASE_URL}/models"),
+                        headers.clone(),
+                        timeout,
+                    )
+                    .await
+                    .map(|body| parse_opencode(&body))
+                    .unwrap_or_default();
+                    let credits = send_get(
+                        client,
+                        format!("{OPENCODE_ZEN_BASE_URL}/models"),
+                        headers,
+                        timeout,
+                    )
+                    .await
+                    .map(|body| parse_opencode(&body))
+                    .unwrap_or_default();
+                    Ok(FetchedModels::Opencode { go, credits })
+                }
+            }
         })
     }
 }
@@ -369,7 +443,14 @@ pub fn create_app_with_upstream(config: Config, upstream: Arc<dyn UpstreamClient
         upstream,
         account_managers: Arc::new(account_managers),
         rate_limit_buckets: Arc::new(StdMutex::new(BTreeMap::new())),
+        catalog: Arc::new(StdRwLock::new(ModelCatalog::default())),
     };
+
+    // Keep the model catalog fresh off the request path. Requires a Tokio runtime, which
+    // both `serve` (create_app runs inside block_on) and the tests (#[tokio::test]) provide.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::spawn(model_catalog_refresh_loop(state.clone()));
+    }
 
     Router::new()
         .route("/health", get(health))
@@ -430,6 +511,76 @@ fn build_account_managers(config: &Config) -> AccountManagers {
         anthropic: tokio::sync::Mutex::new(anthropic),
         codex: tokio::sync::Mutex::new(codex),
         opencode: tokio::sync::Mutex::new(opencode),
+    }
+}
+
+const MODEL_CATALOG_TTL: Duration = Duration::from_mins(15);
+
+async fn model_catalog_refresh_loop(state: AppState) {
+    loop {
+        refresh_model_catalog(&state).await;
+        tokio::time::sleep(MODEL_CATALOG_TTL).await;
+    }
+}
+
+async fn refresh_model_catalog(state: &AppState) {
+    for kind in [
+        ProviderKind::Anthropic,
+        ProviderKind::Codex,
+        ProviderKind::Opencode,
+    ] {
+        let Some(account) = catalog_account(state, kind).await else {
+            continue;
+        };
+        match state
+            .upstream
+            .fetch_models(kind, account, (*state.config).clone())
+            .await
+        {
+            Ok(FetchedModels::Direct(ids)) => {
+                state
+                    .catalog
+                    .write()
+                    .expect("catalog lock poisoned")
+                    .set_direct(kind, ids);
+            }
+            Ok(FetchedModels::Opencode { go, credits }) => {
+                state
+                    .catalog
+                    .write()
+                    .expect("catalog lock poisoned")
+                    .set_opencode(go, credits);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    provider = kind.canonical_id(),
+                    ?error,
+                    "model list fetch failed"
+                );
+            }
+        }
+    }
+}
+
+/// An account for a background model fetch: refresh its token if due, then hand it back. The
+/// manager lock drops before the caller fetches, so the request path is never blocked on the
+/// model-list I/O.
+async fn catalog_account(state: &AppState, kind: ProviderKind) -> Option<AvailableAccount> {
+    let mut manager = match kind {
+        ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
+        ProviderKind::Codex => state.account_managers.codex.lock().await,
+        ProviderKind::Opencode => state.account_managers.opencode.lock().await,
+    };
+    let email = manager.next_account()?.token.email;
+    let _ = manager.refresh_if_due(&email).await;
+    manager.account(&email)
+}
+
+fn provider_id_for(kind: ProviderKind) -> ProviderId {
+    match kind {
+        ProviderKind::Anthropic => ProviderId::anthropic(),
+        ProviderKind::Codex => ProviderId::codex(),
+        ProviderKind::Opencode => ProviderId::opencode(),
     }
 }
 
@@ -495,6 +646,10 @@ async fn admin_reload(State(state): State<AppState>, headers: HeaderMap) -> Resp
         }
     };
 
+    // Reloading accounts can add a provider that now has credentials to fetch models with.
+    let refresh_state = state.clone();
+    tokio::spawn(async move { refresh_model_catalog(&refresh_state).await });
+
     Json(json!({"reloaded": reloaded, "generated_at": now_iso()})).into_response()
 }
 
@@ -504,50 +659,21 @@ async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
     }
 
     let created = chrono::Utc::now().timestamp();
-    let has_anthropic = state
-        .account_managers
-        .anthropic
-        .lock()
-        .await
-        .account_count()
-        > 0;
-    let has_codex = state.account_managers.codex.lock().await.account_count() > 0;
-    let has_opencode = state.account_managers.opencode.lock().await.account_count() > 0;
-    let mut models = [
-        (ProviderKind::Anthropic, "claude-sonnet-4-6"),
-        (ProviderKind::Anthropic, "claude-sonnet-5"),
-        (ProviderKind::Anthropic, "claude-opus-4-8"),
-        (ProviderKind::Anthropic, "claude-opus-5"),
-        (ProviderKind::Anthropic, "claude-fable-5"),
-        (ProviderKind::Codex, "gpt-5.4"),
-    ]
-    .into_iter()
-    .filter(|(kind, _)| match kind {
-        ProviderKind::Anthropic => has_anthropic,
-        ProviderKind::Codex => has_codex,
-        // opencode has no entry in this seed list; its models are appended below.
-        ProviderKind::Opencode => false,
-    })
-    .map(|(kind, id)| {
-        json!({
-            "id": id,
-            "object": "model",
-            "created": created,
-            "owned_by": kind.canonical_id()
-        })
-    })
-    .collect::<Vec<_>>();
-    if has_opencode {
-        let ids = OPENCODE_MODELS.iter().chain(OPENCODE_FREE_MODELS.iter());
-        models.extend(ids.map(|id| {
+    let models = state
+        .catalog
+        .read()
+        .expect("catalog lock poisoned")
+        .advertised()
+        .into_iter()
+        .map(|(id, kind)| {
             json!({
-                "id": format!("opencode/{id}"),
+                "id": id,
                 "object": "model",
                 "created": created,
-                "owned_by": ProviderId::opencode().to_string()
+                "owned_by": kind.canonical_id()
             })
-        }));
-    }
+        })
+        .collect::<Vec<_>>();
 
     Json(json!({"object": "list", "data": models})).into_response()
 }
@@ -605,8 +731,20 @@ async fn count_tokens(State(state): State<AppState>, headers: HeaderMap, body: B
     let Some(model_id) = required_model(&body) else {
         return AppError::simple(StatusCode::BAD_REQUEST, "model is required").into_response();
     };
-    let model = resolve_model(Some(model_id));
-    let provider = state.registry.for_model(&model);
+    let Some(kind) = state
+        .catalog
+        .read()
+        .expect("catalog lock poisoned")
+        .resolve(model_id)
+    else {
+        return AppError::simple(
+            StatusCode::BAD_REQUEST,
+            format!("unknown model: {model_id}"),
+        )
+        .into_response();
+    };
+    let provider = state.registry.get(&provider_id_for(kind));
+    let model = upstream_model(model_id).to_string();
     if matches!(
         provider.id.kind,
         ProviderKind::Codex | ProviderKind::Opencode
@@ -682,8 +820,20 @@ async fn route_provider_request(
     let Some(model_id) = required_model(body) else {
         return AppError::simple(StatusCode::BAD_REQUEST, "model is required").into_response();
     };
-    let model = resolve_model(Some(model_id));
-    let provider = state.registry.for_model(&model);
+    let Some(kind) = state
+        .catalog
+        .read()
+        .expect("catalog lock poisoned")
+        .resolve(model_id)
+    else {
+        return AppError::simple(
+            StatusCode::BAD_REQUEST,
+            format!("unknown model: {model_id}"),
+        )
+        .into_response();
+    };
+    let provider = state.registry.get(&provider_id_for(kind));
+    let model = upstream_model(model_id).to_string();
     let client_wants_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let attempts = provider_account_count(state, provider.id.clone())
         .await
@@ -1779,12 +1929,6 @@ fn codex_request_body(body: &Value, model: &str, route: RequestRoute) -> Value {
 
 /// Build the opencode chat/completions body: passthrough with the routing prefix stripped
 /// from `model`. On streaming, inject `stream_options.include_usage` so usage reaches accounting.
-fn body_model(body: &Value) -> &str {
-    body.get("model")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-}
-
 fn opencode_request_body(body: &Value, model: &str, stream: bool) -> Value {
     let bare_model = strip_opencode_prefix(model);
     let mut next_body = body.clone();
@@ -1861,6 +2005,27 @@ async fn send_json(
         tracing::warn!(%url, model = %model, status = status.as_u16(), "upstream error response");
     }
     Ok(UpstreamJsonResponse { status, body })
+}
+
+async fn send_get(
+    client: reqwest::Client,
+    url: String,
+    headers: BTreeMap<String, String>,
+    timeout_ms: u64,
+) -> anyhow::Result<Value> {
+    let mut request = client
+        .get(&url)
+        .timeout(std::time::Duration::from_millis(timeout_ms));
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    let response = request.send().await?;
+    let status = response.status();
+    let bytes = response.bytes().await?;
+    if !status.is_success() {
+        anyhow::bail!("GET {url} returned {status}");
+    }
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 async fn send_stream(
@@ -1982,16 +2147,17 @@ mod tests {
     use http_body_util::BodyExt;
 
     use super::{
-        AccountManagers, AppState, BodyLimit, RateLimitBucket, RequestRoute, UpstreamClient,
-        UpstreamFuture, UpstreamJsonResponse, UpstreamRequest, UpstreamSseFuture,
-        build_upstream_request, decode_upstream_body, forward_refusal_event,
+        AccountManagers, AppState, BodyLimit, ModelsFuture, RateLimitBucket, RequestRoute,
+        StdRwLock, UpstreamClient, UpstreamFuture, UpstreamJsonResponse, UpstreamRequest,
+        UpstreamSseFuture, build_upstream_request, decode_upstream_body, forward_refusal_event,
         is_decoded_upstream_error, route_provider_request,
     };
     use crate::accounts::{AccountManager, RefreshPolicy};
     use crate::config::{CloakingConfig, Config, DebugMode, TimeoutConfig};
+    use crate::models::{FetchedModels, ModelCatalog};
     use crate::providers::build_registry;
     use crate::tokens::save_token;
-    use crate::types::{ProviderId, TokenData};
+    use crate::types::{AvailableAccount, ProviderId, ProviderKind, TokenData};
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
 
@@ -2161,6 +2327,15 @@ mod tests {
         fn opencode_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
             unreachable!("opencode stream not used in passthrough test")
         }
+
+        fn fetch_models(
+            &self,
+            _kind: ProviderKind,
+            _account: AvailableAccount,
+            _config: Config,
+        ) -> ModelsFuture {
+            Box::pin(async { Ok(FetchedModels::Direct(Vec::new())) })
+        }
     }
 
     fn token(email: &str, access_token: &str, expires_at: &str) -> TokenData {
@@ -2276,7 +2451,7 @@ mod tests {
             &state,
             &HeaderMap::new(),
             &json!({
-                "model": "sonnet",
+                "model": "claude-sonnet-4-6",
                 "messages": [{"role": "user", "content": "reply exactly: pong"}]
             }),
             RequestRoute::Messages,
@@ -2365,6 +2540,7 @@ mod tests {
                 String,
                 RateLimitBucket,
             >::new())),
+            catalog: Arc::new(StdRwLock::new(ModelCatalog::default())),
         }
     }
 

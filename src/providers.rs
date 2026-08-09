@@ -66,45 +66,10 @@ impl ProviderRegistry {
 /// Prefix that routes a model to the opencode provider, e.g. `opencode/glm-5.1`.
 pub const OPENCODE_PREFIX: &str = "opencode/";
 
-/// Model ids served by opencode (from the models.dev catalog), reported on `/v1/models`.
-pub const OPENCODE_MODELS: [&str; 15] = [
-    "glm-5.1",
-    "glm-5",
-    "kimi-k2.6",
-    "kimi-k2.5",
-    "deepseek-v4-pro",
-    "deepseek-v4-flash",
-    "minimax-m2.7",
-    "minimax-m2.5",
-    "qwen3.7-max",
-    "qwen3.6-plus",
-    "qwen3.5-plus",
-    "mimo-v2.5-pro",
-    "mimo-v2.5",
-    "mimo-v2-pro",
-    "mimo-v2-omni",
-];
-
-/// Free-tier model ids served by opencode zen, reported on `/v1/models`. Unlike the paid
-/// go-plan models these route to the credits endpoint (`/zen/v1`) rather than `/zen/go/v1`.
-pub const OPENCODE_FREE_MODELS: [&str; 5] = [
-    "deepseek-v4-flash-free",
-    "mimo-v2.5-free",
-    "qwen3.6-plus-free",
-    "minimax-m3-free",
-    "nemotron-3-super-free",
-];
-
 /// Strip the `opencode/` routing prefix to get the upstream model id.
 #[must_use]
 pub fn strip_opencode_prefix(model: &str) -> &str {
     model.strip_prefix(OPENCODE_PREFIX).unwrap_or(model)
-}
-
-/// True when `model` (with or without the `opencode/` prefix) is a free-tier zen model.
-#[must_use]
-pub fn is_opencode_free_model(model: &str) -> bool {
-    OPENCODE_FREE_MODELS.contains(&strip_opencode_prefix(model))
 }
 
 fn opencode_matches_model(model: &str) -> bool {
@@ -173,16 +138,5 @@ mod tests {
             "deepseek-v4-flash-free"
         );
         assert_eq!(strip_opencode_prefix("kimi-k2.6"), "kimi-k2.6");
-    }
-
-    #[test]
-    fn classifies_free_models_with_or_without_prefix() {
-        assert!(super::is_opencode_free_model("deepseek-v4-flash-free"));
-        assert!(super::is_opencode_free_model(
-            "opencode/nemotron-3-super-free"
-        ));
-        // the paid twin of a free model is not free.
-        assert!(!super::is_opencode_free_model("deepseek-v4-flash"));
-        assert!(!super::is_opencode_free_model("opencode/glm-5.1"));
     }
 }

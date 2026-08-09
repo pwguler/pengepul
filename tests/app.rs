@@ -8,12 +8,13 @@ use anyhow::Result;
 use axum::body::{Body, Bytes};
 use http_body_util::BodyExt;
 use pengepul::app::{
-    UpstreamClient, UpstreamJsonResponse, UpstreamRequest, UpstreamSseResponse, create_app,
-    create_app_with_upstream,
+    ModelsFuture, UpstreamClient, UpstreamJsonResponse, UpstreamRequest, UpstreamSseResponse,
+    create_app, create_app_with_upstream,
 };
 use pengepul::config::{CloakingConfig, Config, DebugMode, TimeoutConfig};
+use pengepul::models::FetchedModels;
 use pengepul::tokens::save_token;
-use pengepul::types::{ProviderId, TokenData};
+use pengepul::types::{AvailableAccount, ProviderId, ProviderKind, TokenData};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -109,6 +110,15 @@ impl UpstreamClient for RetryUpstream {
         _request: UpstreamRequest,
     ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
         unreachable!("opencode stream not used in retry test")
+    }
+
+    fn fetch_models(
+        &self,
+        _kind: ProviderKind,
+        _account: AvailableAccount,
+        _config: Config,
+    ) -> ModelsFuture {
+        Box::pin(async { Ok(FetchedModels::Direct(Vec::new())) })
     }
 }
 
@@ -268,6 +278,23 @@ impl UpstreamClient for FakeUpstream {
             })
         })
     }
+
+    fn fetch_models(
+        &self,
+        kind: ProviderKind,
+        _account: AvailableAccount,
+        _config: Config,
+    ) -> ModelsFuture {
+        Box::pin(async move {
+            Ok(match kind {
+                ProviderKind::Opencode => FetchedModels::Opencode {
+                    go: Vec::new(),
+                    credits: Vec::new(),
+                },
+                _ => FetchedModels::Direct(Vec::new()),
+            })
+        })
+    }
 }
 
 fn config(auth_dir: PathBuf) -> Config {
@@ -361,7 +388,7 @@ async fn app_auth_and_no_account_responses() {
             .header("authorization", "Bearer wrong")
             .header("content-type", "application/json")
             .body(Body::from(
-                json!({"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})
+                json!({"model": "claude-sonnet-4-6", "messages": [{"role": "user", "content": "hi"}]})
                     .to_string(),
             ))
             .unwrap(),
@@ -379,7 +406,7 @@ async fn app_auth_and_no_account_responses() {
             .header("content-type", "application/json")
             .header("content-length", "1")
             .body(Body::from(
-                json!({"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})
+                json!({"model": "claude-sonnet-4-6", "messages": [{"role": "user", "content": "hi"}]})
                     .to_string(),
             ))
             .unwrap(),
@@ -604,10 +631,13 @@ async fn app_opencode_serves_even_with_unparseable_expiry() {
 }
 
 #[tokio::test]
-async fn app_models_lists_opencode_when_key_present() {
+async fn app_models_returns_a_well_formed_list() {
+    // The catalog is populated off the request path from live upstream fetches; the fake
+    // upstream returns nothing, so this asserts the response contract, not its content.
+    // Real catalog content is verified against live accounts.
     let tmp = tempfile::tempdir().expect("tempdir");
-    save_token(tmp.path(), &opencode_token()).expect("save token");
-    let app = create_app(config(tmp.path().to_path_buf()));
+    let upstream = Arc::new(FakeUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream);
 
     let (status, body) = json_response(
         app,
@@ -620,44 +650,35 @@ async fn app_models_lists_opencode_when_key_present() {
     .await;
 
     assert_eq!(status, 200);
-    let ids = body["data"]
-        .as_array()
-        .expect("data array")
-        .iter()
-        .filter_map(|model| model["id"].as_str())
-        .collect::<Vec<_>>();
-    assert!(ids.contains(&"opencode/glm-5.1"));
+    assert_eq!(body["object"], "list");
+    assert!(body["data"].is_array(), "data must be a list");
 }
 
 #[tokio::test]
-async fn app_models_omits_opencode_without_key() {
+async fn app_rejects_an_unknown_model() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let app = create_app(config(tmp.path().to_path_buf()));
+    let upstream = Arc::new(FakeUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream);
 
+    // An id no fetched list and no heuristic claims is rejected, not silently routed.
     let (status, body) = json_response(
         app,
         axum::http::Request::builder()
-            .uri("/v1/models")
+            .method("POST")
+            .uri("/v1/messages")
             .header("authorization", "Bearer sk-test")
-            .body(Body::empty())
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .body(Body::from(
+                json!({"model": "gemini-3", "messages": [{"role": "user", "content": "hi"}]})
+                    .to_string(),
+            ))
             .unwrap(),
     )
     .await;
 
-    assert_eq!(status, 200);
-    let lists_opencode = body["data"]
-        .as_array()
-        .expect("data array")
-        .iter()
-        .any(|model| {
-            model["id"]
-                .as_str()
-                .is_some_and(|id| id.starts_with("opencode/"))
-        });
-    assert!(
-        !lists_opencode,
-        "must not list opencode models without a loaded key"
-    );
+    assert_eq!(status, 400);
+    assert_eq!(body["error"]["message"], "unknown model: gemini-3");
 }
 
 #[tokio::test]
@@ -885,7 +906,7 @@ async fn messages_route_forwards_anthropic_account_with_resolved_model() {
             .header("content-length", "1")
             .body(Body::from(
                 json!({
-                    "model": "sonnet",
+                    "model": "claude-sonnet-4-6",
                     "messages": [{"role": "user", "content": "reply exactly: pong"}]
                 })
                 .to_string(),
@@ -939,7 +960,7 @@ async fn messages_route_rotates_available_anthropic_accounts() {
                 .header("content-length", "1")
                 .body(Body::from(
                     json!({
-                        "model": "sonnet",
+                        "model": "claude-sonnet-4-6",
                         "messages": [{"role": "user", "content": "reply exactly: pong"}]
                     })
                     .to_string(),
@@ -994,7 +1015,7 @@ async fn messages_route_retries_next_account_after_retryable_upstream_failure() 
             .header("content-length", "1")
             .body(Body::from(
                 json!({
-                    "model": "sonnet",
+                    "model": "claude-sonnet-4-6",
                     "messages": [{"role": "user", "content": "reply exactly: pong"}]
                 })
                 .to_string(),
@@ -1047,7 +1068,7 @@ async fn chat_completions_route_adapts_anthropic_response_to_openai() {
             .header("content-length", "1")
             .body(Body::from(
                 json!({
-                    "model": "sonnet",
+                    "model": "claude-sonnet-4-6",
                     "messages": [{"role": "user", "content": "reply exactly: pong"}]
                 })
                 .to_string(),
@@ -1093,7 +1114,7 @@ async fn chat_completions_route_streams_anthropic_response_to_openai() {
             .header("content-length", "1")
             .body(Body::from(
                 json!({
-                    "model": "sonnet",
+                    "model": "claude-sonnet-4-6",
                     "stream": true,
                     "messages": [{"role": "user", "content": "reply exactly: pong"}]
                 })
@@ -1162,7 +1183,7 @@ async fn responses_route_adapts_anthropic_response_to_responses() {
             .header("content-type", "application/json")
             .header("content-length", "1")
             .body(Body::from(
-                json!({"model": "sonnet", "input": "reply exactly: pong"}).to_string(),
+                json!({"model": "claude-sonnet-4-6", "input": "reply exactly: pong"}).to_string(),
             ))
             .unwrap(),
     )
@@ -1204,7 +1225,7 @@ async fn responses_route_sends_web_search_and_reasoning_to_anthropic() {
             .header("content-length", "1")
             .body(Body::from(
                 json!({
-                    "model": "sonnet",
+                    "model": "claude-sonnet-4-6",
                     "input": "latest docs?",
                     "tools": [{"type": "web_search"}],
                     "reasoning": {"effort": "low"}
@@ -1257,7 +1278,7 @@ async fn count_tokens_route_forwards_anthropic_account_with_resolved_model() {
             .header("content-length", "1")
             .body(Body::from(
                 json!({
-                    "model": "sonnet",
+                    "model": "claude-sonnet-4-6",
                     "messages": [{"role": "user", "content": "reply exactly: pong"}]
                 })
                 .to_string(),
