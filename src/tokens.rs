@@ -61,22 +61,12 @@ pub fn load_all_tokens(auth_dir: &Path, provider: Option<&ProviderId>) -> Result
     let scan_dirs: Vec<PathBuf> = if let Some(provider) = provider {
         vec![auth_dir.join(provider.storage_dir())]
     } else {
-        // Scan every direct subdirectory; flat legacy files in auth_dir are handled by Task 6's
-        // migration (not by this read path).
-        let mut dirs = Vec::new();
-        for entry in fs::read_dir(auth_dir)
-            .with_context(|| format!("failed to read {}", auth_dir.display()))?
-        {
-            let entry =
-                entry.with_context(|| format!("failed to read entry in {}", auth_dir.display()))?;
-            let file_type = entry
-                .file_type()
-                .with_context(|| format!("failed to stat {}", entry.path().display()))?;
-            if file_type.is_dir() {
-                dirs.push(entry.path());
-            }
-        }
-        dirs
+        // Scan only the known provider subdirectories; anything else in auth_dir (a
+        // removed provider's directory, operator scratch) is not credentials.
+        ["anthropic", "codex"]
+            .iter()
+            .map(|name| auth_dir.join(name))
+            .collect()
     };
 
     let mut tokens = Vec::new();

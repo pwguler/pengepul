@@ -29,7 +29,6 @@ struct FakeRuntime {
     login_provider: Option<ProviderId>,
     latest_tag: Option<String>,
     installed: Option<(String, String)>,
-    login_key: Option<String>,
 }
 
 impl CliRuntime for FakeRuntime {
@@ -117,15 +116,9 @@ impl CliRuntime for FakeRuntime {
         Ok(())
     }
 
-    fn login(
-        &mut self,
-        _config: &Config,
-        provider: ProviderId,
-        key: Option<&str>,
-    ) -> Result<String> {
+    fn login(&mut self, _config: &Config, provider: ProviderId) -> Result<String> {
         let email = format!("{provider}@example.com");
         self.login_provider = Some(provider);
-        self.login_key = key.map(ToOwned::to_owned);
         Ok(email)
     }
 }

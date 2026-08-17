@@ -107,8 +107,7 @@ pub trait CliRuntime {
     /// # Errors
     ///
     /// Returns an error if OAuth authorization, token exchange, or token persistence fails.
-    fn login(&mut self, config: &Config, provider: ProviderId, key: Option<&str>)
-    -> Result<String>;
+    fn login(&mut self, config: &Config, provider: ProviderId) -> Result<String>;
 
     /// Resolve the tag of the newest published release.
     ///
@@ -537,7 +536,7 @@ fn login(
     let config = load_config(config_path, Some(home), cwd)?;
     let provider = provider.parse::<ProviderId>().map_err(anyhow::Error::msg)?;
     let provider_label = provider.clone();
-    let email = runtime.login(&config, provider, None)?;
+    let email = runtime.login(&config, provider)?;
     output.line(&format!("saved {provider_label} account token for {email}"));
     Ok(())
 }

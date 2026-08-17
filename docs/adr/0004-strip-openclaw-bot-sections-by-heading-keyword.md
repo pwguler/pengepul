@@ -40,7 +40,7 @@ deployment's naming.
 Tool renaming inside the prompt is confined to the `- <name>:` listing, so
 surrounding prose is never rewritten. The transform runs from
 `route_anthropic_request` on the Messages route only, which means an Anthropic
-model on `POST /v1/messages` — a Codex- or Opencode-backed model on the same URL
+model on `POST /v1/messages` — a Codex-backed model on the same URL
 is never masqueraded.
 
 ## Consequences

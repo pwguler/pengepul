@@ -17,7 +17,7 @@ _Avoid_: backend, endpoint, provider (when the vendor connection, not the partit
 ### Wire shapes
 
 **Dialect**:
-One of the two request and response shapes pengepul speaks — Anthropic Messages, OpenAI Chat Completions, OpenAI Responses.
+One of the three request and response shapes pengepul speaks — Anthropic Messages, OpenAI Chat Completions, OpenAI Responses.
 _Avoid_: format, api, protocol, schema
 
 **Inbound dialect**:

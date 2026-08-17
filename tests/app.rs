@@ -440,6 +440,86 @@ async fn removed_provider_model_ids_are_rejected_as_unknown() {
 }
 
 #[tokio::test]
+async fn app_models_returns_a_well_formed_list() {
+    // The catalog is populated off the request path from live upstream fetches; the fake
+    // upstream returns nothing, so this asserts the response contract, not its content.
+    // Real catalog content is verified against live accounts.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let upstream = Arc::new(FakeUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream);
+
+    let (status, body) = json_response(
+        app,
+        axum::http::Request::builder()
+            .uri("/v1/models")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert_eq!(body["object"], "list");
+    assert!(body["data"].is_array(), "data must be a list");
+}
+
+#[tokio::test]
+async fn app_rejects_an_unknown_model() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let upstream = Arc::new(FakeUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream);
+
+    // An id no fetched list and no heuristic claims is rejected, not silently routed.
+    let (status, body) = json_response(
+        app,
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .body(Body::from(
+                json!({"model": "gemini-3", "messages": [{"role": "user", "content": "hi"}]})
+                    .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, 400);
+    assert_eq!(body["error"]["message"], "unknown model: gemini-3");
+}
+
+#[tokio::test]
+async fn app_codex_count_tokens_is_unsupported() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = create_app(config(tmp.path().to_path_buf()));
+
+    // count_tokens is anthropic-only; a codex model answers 501 with the provider name.
+    let (status, body) = json_response(
+        app,
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages/count_tokens")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "256")
+            .body(Body::from(
+                json!({
+                    "model": "gpt-5.4",
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, 501);
+    assert_eq!(body["error"]["provider"], "codex");
+}
+
+#[tokio::test]
 async fn leftover_opencode_credentials_are_ignored_and_untouched() {
     let tmp = tempfile::tempdir().expect("tempdir");
     // Seed a leftover opencode token exactly as the removed provider wrote it.
@@ -458,6 +538,20 @@ async fn leftover_opencode_credentials_are_ignored_and_untouched() {
         .to_string(),
     )
     .expect("write leftover opencode token");
+    // Legacy flat-layout leftover, as the pre-migration layout wrote it.
+    std::fs::write(
+        tmp.path().join("opencode-legacy.json"),
+        serde_json::json!({
+            "access_token": "sk-opencode-legacy",
+            "refresh_token": "",
+            "email": "opencode-legacy",
+            "type": "opencode",
+            "expired": "9999-12-31T23:59:59Z",
+            "account_uuid": ""
+        })
+        .to_string(),
+    )
+    .expect("write legacy leftover opencode token");
 
     let upstream = Arc::new(FakeUpstream::default());
     let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream);
@@ -474,11 +568,13 @@ async fn leftover_opencode_credentials_are_ignored_and_untouched() {
     .await;
     assert_eq!(status, 200);
     assert!(accounts["providers"].get("opencode").is_none());
-    assert!(accounts["providers"].get("anthropic").is_some());
-    assert!(accounts["providers"].get("codex").is_some());
+    // The leftovers must not be loaded into either surviving provider either.
+    assert_eq!(accounts["providers"]["anthropic"]["account_count"], 0);
+    assert_eq!(accounts["providers"]["codex"]["account_count"], 0);
 
     // ...and the files are left on disk for the operator to remove by hand.
     assert!(opencode_dir.join("opencode-acct.json").exists());
+    assert!(tmp.path().join("opencode-legacy.json").exists());
 }
 
 #[tokio::test]

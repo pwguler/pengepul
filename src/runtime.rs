@@ -169,12 +169,7 @@ impl CliRuntime for RealRuntime {
         Ok(target)
     }
 
-    fn login(
-        &mut self,
-        config: &Config,
-        provider: ProviderId,
-        _key: Option<&str>,
-    ) -> Result<String> {
+    fn login(&mut self, config: &Config, provider: ProviderId) -> Result<String> {
         let state = random_urlsafe(32);
         let pkce = generate_pkce_codes();
         let auth_url = auth_url(&provider, &state, &pkce);
