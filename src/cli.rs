@@ -150,11 +150,8 @@ enum Command {
     Login {
         #[arg(long = "config")]
         command_config: Option<PathBuf>,
-        #[arg(long, default_value = "anthropic", value_parser = ["anthropic", "codex", "opencode"])]
+        #[arg(long, default_value = "anthropic", value_parser = ["anthropic", "codex"])]
         provider: String,
-        /// opencode API key (defaults to importing it from opencode's auth.json)
-        #[arg(long)]
-        key: Option<String>,
     },
     /// show local server status
     Status {
@@ -316,12 +313,10 @@ pub fn run_with_env(
         Some(Command::Login {
             command_config,
             provider,
-            key,
         }) => {
             login(
                 command_config.as_deref().or(parsed_args.config.as_deref()),
                 &provider,
-                key.as_deref(),
                 home,
                 cwd,
                 runtime,
@@ -534,7 +529,6 @@ fn update(check: bool, runtime: &mut impl CliRuntime, output: &mut Output) -> Re
 fn login(
     config_path: Option<&Path>,
     provider: &str,
-    key: Option<&str>,
     home: &Path,
     cwd: &Path,
     runtime: &mut impl CliRuntime,
@@ -543,7 +537,7 @@ fn login(
     let config = load_config(config_path, Some(home), cwd)?;
     let provider = provider.parse::<ProviderId>().map_err(anyhow::Error::msg)?;
     let provider_label = provider.clone();
-    let email = runtime.login(&config, provider, key)?;
+    let email = runtime.login(&config, provider, None)?;
     output.line(&format!("saved {provider_label} account token for {email}"));
     Ok(())
 }

@@ -7,7 +7,7 @@ pengepul pools several AI-vendor accounts behind one local API and spreads clien
 ### Providers
 
 **Provider**:
-One of the three upstream vendor families pengepul relays to — anthropic, codex, opencode — and the top-level axis by which accounts, credentials, models and admin output are partitioned.
+One of the two upstream vendor families pengepul relays to — anthropic, codex — and the top-level axis by which accounts, credentials, models and admin output are partitioned.
 _Avoid_: kind, provider id, backend, owned_by
 
 **Upstream**:
@@ -17,7 +17,7 @@ _Avoid_: backend, endpoint, provider (when the vendor connection, not the partit
 ### Wire shapes
 
 **Dialect**:
-One of the three request and response shapes pengepul speaks — Anthropic Messages, OpenAI Chat Completions, OpenAI Responses.
+One of the two request and response shapes pengepul speaks — Anthropic Messages, OpenAI Chat Completions, OpenAI Responses.
 _Avoid_: format, api, protocol, schema
 
 **Inbound dialect**:
@@ -70,16 +70,16 @@ _Avoid_: billing classifier, detector, filter
 
 ## Relationships
 
-- pengepul has exactly three **Providers**: anthropic, codex, opencode.
+- pengepul has exactly two **Providers**: anthropic, codex.
 - One **Provider** has zero or more **Accounts**; one **Account** belongs to exactly one **Provider**.
 - Within one **Provider** an **Account** is keyed by exactly one email, and emails are unique.
-- One **Account** holds exactly one credential: an access-token/refresh-token pair, or for **opencode** a single static key that is never subject to **Refresh**.
+- One **Account** holds exactly one credential: an access-token/refresh-token pair.
 - One **Account** has at most one **Cooldown** in effect, with one duration policy for ordinary failures and a longer one for **Reauth**.
 - One model id resolves to exactly one **Provider**.
 - One client request is served by one **Account** at a time, and **Failover** only moves it between **Accounts** of the same **Provider**.
-- **Cloaking** applies to requests bound for the anthropic and codex **Upstreams**; **opencode** uses plain bearer auth and is never cloaked. The **Local API key** applies to requests arriving from a client.
+- **Cloaking** applies to requests bound for both **Upstreams**. The **Local API key** applies to requests arriving from a client.
 - One pengepul endpoint accepts exactly one **Inbound dialect**; one **Provider** accepts exactly one **Dialect** upstream.
-- Any **Inbound dialect** may be served by anthropic or codex, and **Translation** is what closes the gap. **opencode** serves only OpenAI Chat Completions and answers 501 elsewhere, as does count_tokens for any provider but anthropic.
+- Any **Inbound dialect** may be served by anthropic or codex, and **Translation** is what closes the gap. count_tokens is anthropic-only and answers 501 for codex.
 
 ## Example dialogue
 
@@ -104,9 +104,9 @@ _Avoid_: billing classifier, detector, filter
 - "provider" names both the vendor and a configured entry for that vendor. Resolved: **Provider** means the vendor. Nothing operator-facing distinguishes a vendor from a configured entry for it, because there is exactly one entry per vendor.
 - "claude" appears as an alias for anthropic in stored credentials. Resolved: **anthropic** is the only spelling an operator uses or types.
 - "account", "credential" and "token" all name the same file under the auth directory across the README, the CLI and the source. Resolved: **Account** is the domain noun — the identity, its credential, and its record. Credential is the secret inside an account. Token is a wire artifact and never means the account.
-- Accounts are keyed by email, but **opencode** accounts have no mailbox and get a generated key instead. Resolved: read the field as the account key, not as an address.
+- Accounts are keyed by email. Resolved: read the field as the account key, not as an address.
 - "backoff", "lockout" and "unavailable" appear across the README, the CLI and the admin output for one mechanism. Resolved: there is one **Cooldown** with two duration policies. Say "failure cooldown" and "reauth cooldown" when the durations must be distinguished.
-- "API key" covers two unrelated secrets: the keys clients present to pengepul, and the **opencode** key pengepul presents upstream. Resolved: **Local API key** is what clients present; the opencode key is what pengepul presents upstream. They point in opposite directions on the wire.
+- "API key" covers two unrelated secrets: the keys clients present to pengepul, and the credentials pengepul presents upstream. Resolved: **Local API key** is what clients present; the upstream credential is what pengepul presents upstream. They point in opposite directions on the wire.
 - "cloaking" and "masquerade" are used interchangeably. Resolved: **Cloaking** is the domain term.
 - "refresh" names both the secret an account holds and the act of replacing its expiring access token. Resolved: **Refresh** is the act. The secret is the refresh token.
 - "round-robin with sticky windows" survives in `docs/`, contradicting the README. Resolved: **Rotation** has no stickiness. Selection resumes after the last-used account and advances on every request, with no client or session key anywhere.

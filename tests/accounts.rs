@@ -122,32 +122,32 @@ async fn exhausted_refresh_token_marks_account_for_reauth() {
 #[tokio::test]
 async fn failure_cooldown_doubles_from_one_second() {
     let tmp = tempdir().expect("tempdir");
-    let opencode_dir = tmp.path().join("opencode");
-    fs::create_dir_all(&opencode_dir).expect("opencode dir");
+    let codex_dir = tmp.path().join("codex");
+    fs::create_dir_all(&codex_dir).expect("codex dir");
     fs::write(
-        opencode_dir.join("key.json"),
+        codex_dir.join("key.json"),
         json!({
-            "access_token": "sk-opencode",
+            "access_token": "sk-codex",
             "refresh_token": "",
-            "email": "opencode-abc12345",
-            "type": "opencode",
+            "email": "codex-abc12345",
+            "type": "codex",
             "expired": "9999-12-31T23:59:59Z",
             "account_uuid": ""
         })
         .to_string(),
     )
-    .expect("write opencode token");
+    .expect("write codex token");
     let mut manager = AccountManager::new(
         tmp.path().to_path_buf(),
-        "opencode".parse().unwrap(),
-        |_refresh_token| Box::pin(async { anyhow::bail!("opencode never refreshes") }),
+        "codex".parse().unwrap(),
+        |_refresh_token| Box::pin(async { anyhow::bail!("unused refresh") }),
         RefreshPolicy::default(),
     );
     manager.load().expect("load accounts");
 
     // regardless of failure kind, consecutive failures back off 1s, 2s, 4s, …
     for expected in [1.0, 2.0, 4.0] {
-        manager.record_failure("opencode-abc12345", "auth", Some("Insufficient balance"));
+        manager.record_failure("codex-abc12345", "auth", Some("Insufficient balance"));
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")

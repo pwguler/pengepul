@@ -98,27 +98,13 @@ impl UpstreamClient for RetryUpstream {
         unreachable!("codex stream not used in retry test")
     }
 
-    fn opencode_chat(
-        &self,
-        _request: UpstreamRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
-        unreachable!("opencode not used in retry test")
-    }
-
-    fn opencode_chat_stream(
-        &self,
-        _request: UpstreamRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
-        unreachable!("opencode stream not used in retry test")
-    }
-
     fn fetch_models(
         &self,
         _kind: ProviderKind,
         _account: AvailableAccount,
         _config: Arc<Config>,
     ) -> ModelsFuture {
-        Box::pin(async { Ok(FetchedModels::Direct(Vec::new())) })
+        Box::pin(async { Ok(FetchedModels::new(Vec::new())) })
     }
 }
 
@@ -229,71 +215,13 @@ impl UpstreamClient for FakeUpstream {
         })
     }
 
-    fn opencode_chat(
-        &self,
-        request: UpstreamRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
-        let model = request
-            .body
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        self.calls.lock().expect("calls lock").push(request);
-        Box::pin(async move {
-            Ok(UpstreamJsonResponse {
-                status: axum::http::StatusCode::OK,
-                body: json!({
-                    "id": "chatcmpl_1",
-                    "object": "chat.completion",
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "message": {"role": "assistant", "content": "pong"},
-                        "finish_reason": "stop"
-                    }],
-                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
-                }),
-            })
-        })
-    }
-
-    fn opencode_chat_stream(
-        &self,
-        request: UpstreamRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
-        self.calls.lock().expect("calls lock").push(request);
-        Box::pin(async {
-            Ok(UpstreamSseResponse {
-                status: axum::http::StatusCode::OK,
-                body: Box::pin(futures_util::stream::iter([
-                    Ok(Bytes::from_static(
-                        b"data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"pong\"}}]}\n\n",
-                    )),
-                    Ok(Bytes::from_static(
-                        b"data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
-                    )),
-                    Ok(Bytes::from_static(b"data: [DONE]\n\n")),
-                ])),
-            })
-        })
-    }
-
     fn fetch_models(
         &self,
-        kind: ProviderKind,
+        _kind: ProviderKind,
         _account: AvailableAccount,
         _config: Arc<Config>,
     ) -> ModelsFuture {
-        Box::pin(async move {
-            Ok(match kind {
-                ProviderKind::Opencode => FetchedModels::Opencode {
-                    go: Vec::new(),
-                    credits: Vec::new(),
-                },
-                _ => FetchedModels::Direct(Vec::new()),
-            })
-        })
+        Box::pin(async move { Ok(FetchedModels::new(Vec::new())) })
     }
 }
 
@@ -474,269 +402,67 @@ async fn request_without_model_is_rejected() {
     assert_eq!(body["error"]["message"], "model is required");
 }
 
-fn opencode_token() -> TokenData {
-    TokenData {
-        access_token: "sk-opencode".to_string(),
-        refresh_token: String::new(),
-        email: "opencode-acct".to_string(),
-        expires_at: "9999-12-31T23:59:59Z".to_string(),
-        account_uuid: String::new(),
-        provider: ProviderId::opencode(),
-        id_token: None,
-        last_refresh_at: None,
-        plan_type: None,
+#[tokio::test]
+async fn removed_provider_model_ids_are_rejected_as_unknown() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let upstream = Arc::new(FakeUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    // A removed provider's prefixed model id is rejected by the generic unknown-model
+    // path and never reaches an upstream.
+    for uri in ["/v1/chat/completions", "/v1/messages", "/v1/responses"] {
+        let (status, body) = json_response(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("authorization", "Bearer sk-test")
+                .header("content-type", "application/json")
+                .header("content-length", "256")
+                .body(Body::from(
+                    json!({
+                        "model": "opencode/glm-5.1",
+                        "messages": [{"role": "user", "content": "hi"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(status, 400, "{uri}: expected 400, got {status}: {body}");
+        assert_eq!(body["error"]["message"], "unknown model: opencode/glm-5.1");
+        assert!(
+            upstream.calls().is_empty(),
+            "{uri}: upstream must not be called"
+        );
     }
 }
 
 #[tokio::test]
-async fn app_opencode_chat_passes_through_with_stripped_model() {
+async fn leftover_opencode_credentials_are_ignored_and_untouched() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    save_token(tmp.path(), &opencode_token()).expect("save token");
-    let upstream = Arc::new(FakeUpstream::default());
-    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
-
-    let (status, body) = json_response(
-        app,
-        axum::http::Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("authorization", "Bearer sk-test")
-            .header("content-type", "application/json")
-            .header("content-length", "256")
-            .body(Body::from(
-                json!({
-                    "model": "opencode/glm-5.1",
-                    "messages": [{"role": "user", "content": "hi"}]
-                })
-                .to_string(),
-            ))
-            .unwrap(),
+    // Seed a leftover opencode token exactly as the removed provider wrote it.
+    let opencode_dir = tmp.path().join("opencode");
+    std::fs::create_dir_all(&opencode_dir).expect("opencode dir");
+    std::fs::write(
+        opencode_dir.join("opencode-acct.json"),
+        serde_json::json!({
+            "access_token": "sk-opencode",
+            "refresh_token": "",
+            "email": "opencode-acct",
+            "type": "opencode",
+            "expired": "9999-12-31T23:59:59Z",
+            "account_uuid": ""
+        })
+        .to_string(),
     )
-    .await;
+    .expect("write leftover opencode token");
 
-    assert_eq!(status, 200);
-    assert_eq!(body["choices"][0]["message"]["content"], "pong");
-    let calls = upstream.calls();
-    assert_eq!(calls.len(), 1);
-    // the routing prefix is stripped before the upstream call.
-    assert_eq!(calls[0].body["model"], "glm-5.1");
-}
-
-#[tokio::test]
-async fn app_opencode_chat_streams_through() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    save_token(tmp.path(), &opencode_token()).expect("save token");
-    let upstream = Arc::new(FakeUpstream::default());
-    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
-
-    let (status, headers, body) = raw_response(
-        app,
-        axum::http::Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("authorization", "Bearer sk-test")
-            .header("content-type", "application/json")
-            .header("content-length", "256")
-            .body(Body::from(
-                json!({
-                    "model": "opencode/glm-5.1",
-                    "stream": true,
-                    "messages": [{"role": "user", "content": "hi"}]
-                })
-                .to_string(),
-            ))
-            .unwrap(),
-    )
-    .await;
-
-    assert_eq!(status, 200);
-    assert_eq!(
-        headers
-            .get("content-type")
-            .and_then(|value| value.to_str().ok()),
-        Some("text/event-stream; charset=utf-8")
-    );
-    assert!(body.contains("chat.completion.chunk"));
-    assert!(body.contains("\"content\":\"pong\""));
-    assert!(body.contains("data: [DONE]"));
-    let calls = upstream.calls();
-    // pengepul injects stream_options.include_usage so usage reaches accounting.
-    assert_eq!(calls[0].body["stream_options"]["include_usage"], true);
-    assert_eq!(calls[0].body["model"], "glm-5.1");
-}
-
-#[tokio::test]
-async fn app_opencode_rejects_non_chat_routes() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    save_token(tmp.path(), &opencode_token()).expect("save token");
-    let upstream = Arc::new(FakeUpstream::default());
-    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
-
-    let (status, body) = json_response(
-        app,
-        axum::http::Request::builder()
-            .method("POST")
-            .uri("/v1/messages")
-            .header("authorization", "Bearer sk-test")
-            .header("content-type", "application/json")
-            .header("content-length", "256")
-            .body(Body::from(
-                json!({
-                    "model": "opencode/glm-5.1",
-                    "messages": [{"role": "user", "content": "hi"}]
-                })
-                .to_string(),
-            ))
-            .unwrap(),
-    )
-    .await;
-
-    assert_eq!(status, 501);
-    assert_eq!(body["error"]["provider"], "opencode");
-    assert!(upstream.calls().is_empty());
-}
-
-#[tokio::test]
-async fn app_opencode_serves_even_with_unparseable_expiry() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut token = opencode_token();
-    token.expires_at = "not-a-real-timestamp".to_string();
-    save_token(tmp.path(), &token).expect("save token");
-    let upstream = Arc::new(FakeUpstream::default());
-    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
-
-    let (status, body) = json_response(
-        app,
-        axum::http::Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("authorization", "Bearer sk-test")
-            .header("content-type", "application/json")
-            .header("content-length", "256")
-            .body(Body::from(
-                json!({
-                    "model": "opencode/glm-5.1",
-                    "messages": [{"role": "user", "content": "hi"}]
-                })
-                .to_string(),
-            ))
-            .unwrap(),
-    )
-    .await;
-
-    // opencode keys never refresh, so a non-RFC3339 stored expiry must not wedge the
-    // account into a refresh-failure cooldown.
-    assert_eq!(status, 200, "expected 200, got {status}: {body}");
-    assert_eq!(body["choices"][0]["message"]["content"], "pong");
-}
-
-#[tokio::test]
-async fn app_models_returns_a_well_formed_list() {
-    // The catalog is populated off the request path from live upstream fetches; the fake
-    // upstream returns nothing, so this asserts the response contract, not its content.
-    // Real catalog content is verified against live accounts.
-    let tmp = tempfile::tempdir().expect("tempdir");
     let upstream = Arc::new(FakeUpstream::default());
     let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream);
 
-    let (status, body) = json_response(
-        app,
-        axum::http::Request::builder()
-            .uri("/v1/models")
-            .header("authorization", "Bearer sk-test")
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-
-    assert_eq!(status, 200);
-    assert_eq!(body["object"], "list");
-    assert!(body["data"].is_array(), "data must be a list");
-}
-
-#[tokio::test]
-async fn app_rejects_an_unknown_model() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let upstream = Arc::new(FakeUpstream::default());
-    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream);
-
-    // An id no fetched list and no heuristic claims is rejected, not silently routed.
-    let (status, body) = json_response(
-        app,
-        axum::http::Request::builder()
-            .method("POST")
-            .uri("/v1/messages")
-            .header("authorization", "Bearer sk-test")
-            .header("content-type", "application/json")
-            .header("content-length", "1")
-            .body(Body::from(
-                json!({"model": "gemini-3", "messages": [{"role": "user", "content": "hi"}]})
-                    .to_string(),
-            ))
-            .unwrap(),
-    )
-    .await;
-
-    assert_eq!(status, 400);
-    assert_eq!(body["error"]["message"], "unknown model: gemini-3");
-}
-
-#[tokio::test]
-async fn app_opencode_count_tokens_is_unsupported() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let app = create_app(config(tmp.path().to_path_buf()));
-
-    let (status, body) = json_response(
-        app,
-        axum::http::Request::builder()
-            .method("POST")
-            .uri("/v1/messages/count_tokens")
-            .header("authorization", "Bearer sk-test")
-            .header("content-type", "application/json")
-            .header("content-length", "256")
-            .body(Body::from(
-                json!({
-                    "model": "opencode/glm-5.1",
-                    "messages": [{"role": "user", "content": "hi"}]
-                })
-                .to_string(),
-            ))
-            .unwrap(),
-    )
-    .await;
-
-    assert_eq!(status, 501);
-    assert_eq!(body["error"]["provider"], "opencode");
-}
-
-#[tokio::test]
-async fn app_opencode_stream_records_usage_to_account_stats() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    save_token(tmp.path(), &opencode_token()).expect("save token");
-    let upstream = Arc::new(FakeUpstream::default());
-    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream);
-
-    let (status, _headers, _body) = raw_response(
-        app.clone(),
-        axum::http::Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("authorization", "Bearer sk-test")
-            .header("content-type", "application/json")
-            .header("content-length", "256")
-            .body(Body::from(
-                json!({
-                    "model": "opencode/glm-5.1",
-                    "stream": true,
-                    "messages": [{"role": "user", "content": "hi"}]
-                })
-                .to_string(),
-            ))
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(status, 200);
-
+    // The leftover credential is inert: no account, no provider in admin output.
     let (status, accounts) = json_response(
         app,
         axum::http::Request::builder()
@@ -747,10 +473,12 @@ async fn app_opencode_stream_records_usage_to_account_stats() {
     )
     .await;
     assert_eq!(status, 200);
-    let account = &accounts["providers"]["opencode"]["accounts"][0];
-    assert_eq!(account["totalSuccesses"], 1);
-    assert_eq!(account["totalInputTokens"], 1);
-    assert_eq!(account["totalOutputTokens"], 1);
+    assert!(accounts["providers"].get("opencode").is_none());
+    assert!(accounts["providers"].get("anthropic").is_some());
+    assert!(accounts["providers"].get("codex").is_some());
+
+    // ...and the files are left on disk for the operator to remove by hand.
+    assert!(opencode_dir.join("opencode-acct.json").exists());
 }
 
 #[tokio::test]

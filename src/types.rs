@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 pub enum ProviderKind {
     Anthropic,
     Codex,
-    Opencode,
 }
 
 impl ProviderKind {
@@ -18,7 +17,6 @@ impl ProviderKind {
         match self {
             Self::Anthropic => "anthropic",
             Self::Codex => "codex",
-            Self::Opencode => "opencode",
         }
     }
 }
@@ -36,7 +34,6 @@ impl FromStr for ProviderKind {
         match value {
             "anthropic" | "claude" => Ok(Self::Anthropic),
             "codex" => Ok(Self::Codex),
-            "opencode" => Ok(Self::Opencode),
             other => Err(format!("unknown provider kind: {other}")),
         }
     }
@@ -65,11 +62,6 @@ impl ProviderId {
     #[must_use]
     pub fn codex() -> Self {
         Self::new(ProviderKind::Codex, "codex")
-    }
-
-    #[must_use]
-    pub fn opencode() -> Self {
-        Self::new(ProviderKind::Opencode, "opencode")
     }
 
     /// Returns the per-id subdirectory name under `auth_dir`,
@@ -176,7 +168,6 @@ mod tests {
         assert_eq!(ProviderId::anthropic().kind, ProviderKind::Anthropic);
         assert_eq!(&*ProviderId::anthropic().id, "anthropic");
         assert_eq!(&*ProviderId::codex().id, "codex");
-        assert_eq!(&*ProviderId::opencode().id, "opencode");
     }
 
     #[test]
@@ -190,7 +181,6 @@ mod tests {
     fn provider_kind_canonical_ids_match_serde_repr() {
         assert_eq!(ProviderKind::Anthropic.canonical_id(), "anthropic");
         assert_eq!(ProviderKind::Codex.canonical_id(), "codex");
-        assert_eq!(ProviderKind::Opencode.canonical_id(), "opencode");
     }
 
     #[test]
@@ -204,20 +194,12 @@ mod tests {
             Ok(ProviderKind::Anthropic)
         );
         assert_eq!("codex".parse::<ProviderKind>(), Ok(ProviderKind::Codex));
-        assert_eq!(
-            "opencode".parse::<ProviderKind>(),
-            Ok(ProviderKind::Opencode)
-        );
         assert!("nope".parse::<ProviderKind>().is_err());
     }
 
     #[test]
     fn provider_kind_canonical_id_round_trips_through_from_str() {
-        for kind in [
-            ProviderKind::Anthropic,
-            ProviderKind::Codex,
-            ProviderKind::Opencode,
-        ] {
+        for kind in [ProviderKind::Anthropic, ProviderKind::Codex] {
             assert_eq!(kind.canonical_id().parse::<ProviderKind>(), Ok(kind));
         }
     }
