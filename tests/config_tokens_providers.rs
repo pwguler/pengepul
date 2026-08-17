@@ -158,21 +158,6 @@ fn token_storage_round_trips_provider_files() {
         },
     )
     .expect("save codex");
-    save_token(
-        tmp.path(),
-        &TokenData {
-            access_token: "opencode-key".to_string(),
-            refresh_token: String::new(),
-            email: "opencode-acct".to_string(),
-            expires_at: "9999-12-31T23:59:59Z".to_string(),
-            account_uuid: String::new(),
-            provider: "opencode".parse().unwrap(),
-            id_token: None,
-            last_refresh_at: None,
-            plan_type: None,
-        },
-    )
-    .expect("save opencode");
 
     let mut files = walk_json_files(tmp.path());
     files.sort();
@@ -181,12 +166,10 @@ fn token_storage_round_trips_provider_files() {
         [
             PathBuf::from("anthropic").join("alice@example.com.json"),
             PathBuf::from("codex").join("bob@example.com.json"),
-            PathBuf::from("opencode").join("opencode-acct.json"),
         ]
     );
     let anthropic: ProviderId = "anthropic".parse().unwrap();
     let codex: ProviderId = "codex".parse().unwrap();
-    let opencode: ProviderId = "opencode".parse().unwrap();
     assert_eq!(
         load_all_tokens(tmp.path(), Some(&anthropic))
             .expect("load anthropic")
@@ -202,14 +185,6 @@ fn token_storage_round_trips_provider_files() {
             .map(|token| token.email)
             .collect::<Vec<_>>(),
         ["bob@example.com"]
-    );
-    assert_eq!(
-        load_all_tokens(tmp.path(), Some(&opencode))
-            .expect("load opencode")
-            .into_iter()
-            .map(|token| token.email)
-            .collect::<Vec<_>>(),
-        ["opencode-acct"]
     );
 }
 

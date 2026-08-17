@@ -371,23 +371,36 @@ fn service_logs_defaults_to_recent_lines_without_follow() {
 }
 
 #[test]
-fn login_opencode_passes_key() {
+fn login_rejects_removed_provider_and_key_flag() {
     let tmp = tempdir().expect("tempdir");
     write_config(tmp.path(), "127.0.0.1", 8317);
     let mut runtime = FakeRuntime::default();
 
-    let outcome = run(
-        &["login", "--provider", "opencode", "--key", "sk-go"],
-        tmp.path(),
-        &mut runtime,
+    // The removed provider fails at argument parsing, before any runtime call.
+    assert!(
+        run_with_env(
+            &["login", "--provider", "opencode"],
+            tmp.path(),
+            tmp.path(),
+            &mut runtime,
+        )
+        .is_err(),
+        "removed provider must be rejected at parse time"
     );
+    assert!(runtime.login_provider.is_none());
 
-    assert_eq!(runtime.login_provider, Some(ProviderId::opencode()));
-    assert_eq!(runtime.login_key.as_deref(), Some("sk-go"));
-    assert_eq!(
-        outcome.stdout.trim(),
-        "saved opencode account token for opencode@example.com"
+    // The key flag that only existed for the removed provider is gone.
+    assert!(
+        run_with_env(
+            &["login", "--provider", "codex", "--key", "sk-go"],
+            tmp.path(),
+            tmp.path(),
+            &mut runtime,
+        )
+        .is_err(),
+        "removed key flag must be rejected at parse time"
     );
+    assert!(runtime.login_provider.is_none());
 }
 
 #[test]

@@ -5,7 +5,6 @@ pub mod config;
 pub mod masquerade;
 pub mod models;
 pub mod oauth;
-pub mod providers;
 pub mod runtime;
 pub mod service;
 pub mod streaming;

@@ -25,8 +25,6 @@ const REAUTH_COOLDOWN_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 pub enum RefreshPolicyKind {
     ExpiresLead,
     SinceLastRefresh,
-    /// Never refresh — for static credentials (e.g. opencode API keys) that cannot expire.
-    Never,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -389,7 +387,6 @@ impl AccountManager {
 
     fn should_refresh(&self, state: &AccountState) -> bool {
         match self.refresh_policy.kind {
-            RefreshPolicyKind::Never => false,
             RefreshPolicyKind::SinceLastRefresh => {
                 let Some(last_refresh_at) = &state.last_refresh_at else {
                     return true;

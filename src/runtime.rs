@@ -15,8 +15,8 @@ use crate::oauth::{
 };
 use crate::service::{ServiceOptions, run_command};
 use crate::tokens::save_token;
-use crate::types::{PkceCodes, ProviderId, ProviderKind, TokenData};
-use crate::utils::{generate_pkce_codes, random_urlsafe, sha256_hex};
+use crate::types::{PkceCodes, ProviderId, ProviderKind};
+use crate::utils::{generate_pkce_codes, random_urlsafe};
 
 /// Install the tracing subscriber for `serve`.
 ///
@@ -173,11 +173,8 @@ impl CliRuntime for RealRuntime {
         &mut self,
         config: &Config,
         provider: ProviderId,
-        key: Option<&str>,
+        _key: Option<&str>,
     ) -> Result<String> {
-        if provider.kind == ProviderKind::Opencode {
-            return save_opencode_login(config, key);
-        }
         let state = random_urlsafe(32);
         let pkce = generate_pkce_codes();
         let auth_url = auth_url(&provider, &state, &pkce);
@@ -192,9 +189,6 @@ impl CliRuntime for RealRuntime {
                 }
                 ProviderKind::Codex => {
                     exchange_codex_code(&callback.code, &callback.state, &state, &pkce).await
-                }
-                ProviderKind::Opencode => {
-                    unreachable!("opencode login is handled before the OAuth flow")
                 }
             }
         })?;
@@ -276,7 +270,6 @@ fn auth_url(provider: &ProviderId, state: &str, pkce: &PkceCodes) -> String {
     match provider.kind {
         ProviderKind::Anthropic => generate_anthropic_auth_url(state, pkce),
         ProviderKind::Codex => generate_codex_auth_url(state, pkce),
-        ProviderKind::Opencode => unreachable!("opencode has no OAuth authorize URL"),
     }
 }
 
@@ -288,85 +281,7 @@ fn callback_endpoint(provider: &ProviderId) -> Result<(u16, &'static str)> {
             Ok((port, "/callback"))
         }
         ProviderKind::Codex => Ok((CODEX_CALLBACK_PORT, CODEX_CALLBACK_PATH)),
-        ProviderKind::Opencode => bail!("opencode has no OAuth callback"),
     }
-}
-
-/// Resolve the opencode API key and persist it as a degenerate, refresh-less token.
-///
-/// The key comes from `--key` when provided, otherwise it is imported from opencode's own
-/// `auth.json`. The stored token has an empty refresh token and a far-future expiry so the
-/// account manager's refresh policy never fires.
-fn save_opencode_login(config: &Config, key: Option<&str>) -> Result<String> {
-    let key = match key {
-        Some(key) if !key.trim().is_empty() => key.trim().to_string(),
-        _ => import_opencode_key()
-            .context("no opencode key: pass --key or run `opencode auth login` first")?,
-    };
-    let email = format!("opencode-{}", &sha256_hex(&key)[..8]);
-    let token = TokenData {
-        access_token: key,
-        refresh_token: String::new(),
-        email: email.clone(),
-        expires_at: "9999-12-31T23:59:59Z".to_string(),
-        account_uuid: String::new(),
-        provider: ProviderId::opencode(),
-        id_token: None,
-        last_refresh_at: None,
-        plan_type: None,
-    };
-    save_token(&config.auth_dir, &token)?;
-    Ok(email)
-}
-
-fn import_opencode_key() -> Result<String> {
-    let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    import_opencode_key_from(&opencode_auth_json_paths(xdg_data_home, home))
-}
-
-/// Read the first opencode key found across `paths`, skipping unreadable/garbage files.
-fn import_opencode_key_from(paths: &[PathBuf]) -> Result<String> {
-    for path in paths {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<Value>(&text) else {
-            continue;
-        };
-        if let Some(key) = opencode_key_from_auth_json(&value) {
-            return Ok(key);
-        }
-    }
-    bail!("opencode key not found in opencode auth.json")
-}
-
-/// opencode stores credentials under `$XDG_DATA_HOME/opencode` (preferred) then
-/// `$HOME/.local/share/opencode`.
-fn opencode_auth_json_paths(xdg_data_home: Option<PathBuf>, home: Option<PathBuf>) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if let Some(data_home) = xdg_data_home {
-        paths.push(data_home.join("opencode/auth.json"));
-    }
-    if let Some(home) = home {
-        paths.push(home.join(".local/share/opencode/auth.json"));
-    }
-    paths
-}
-
-#[must_use]
-fn opencode_key_from_auth_json(value: &Value) -> Option<String> {
-    // opencode itself stores its credentials under the literal key "opencode-go" — keep this
-    // string as-is even though our provider is named "opencode".
-    let entry = value.get("opencode-go")?;
-    if entry.get("type").and_then(Value::as_str) != Some("api") {
-        return None;
-    }
-    entry
-        .get("key")
-        .and_then(Value::as_str)
-        .filter(|key| !key.is_empty())
-        .map(ToOwned::to_owned)
 }
 
 fn wait_for_callback(port: u16, callback_path: &str, timeout: Duration) -> Result<CallbackResult> {
@@ -845,12 +760,7 @@ fn unpack_over(
 }
 #[cfg(test)]
 mod tests {
-    use super::{
-        import_opencode_key_from, opencode_auth_json_paths, opencode_key_from_auth_json,
-        unpack_over, verify_checksum,
-    };
-    use serde_json::json;
-    use std::path::PathBuf;
+    use super::{unpack_over, verify_checksum};
 
     #[test]
     fn verify_checksum_matches_the_published_format() {
@@ -904,63 +814,5 @@ mod tests {
             .filter(|n| n.starts_with('.'))
             .collect();
         assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
-    }
-
-    #[test]
-    fn reads_opencode_api_key() {
-        // opencode's auth.json uses the literal key "opencode-go" — that's an external contract.
-        let auth = json!({
-            "zai-coding-plan": {"type": "api", "key": "zai"},
-            "opencode-go": {"type": "api", "key": "sk-go"}
-        });
-        assert_eq!(opencode_key_from_auth_json(&auth).as_deref(), Some("sk-go"));
-    }
-
-    #[test]
-    fn ignores_missing_non_api_or_empty_entries() {
-        assert_eq!(opencode_key_from_auth_json(&json!({})), None);
-        assert_eq!(
-            opencode_key_from_auth_json(&json!({"opencode-go": {"type": "oauth", "key": "x"}})),
-            None
-        );
-        assert_eq!(
-            opencode_key_from_auth_json(&json!({"opencode-go": {"type": "api", "key": ""}})),
-            None
-        );
-    }
-
-    #[test]
-    fn auth_json_paths_prefer_xdg_then_home() {
-        assert_eq!(
-            opencode_auth_json_paths(Some(PathBuf::from("/xdg")), Some(PathBuf::from("/home/u"))),
-            vec![
-                PathBuf::from("/xdg/opencode/auth.json"),
-                PathBuf::from("/home/u/.local/share/opencode/auth.json"),
-            ]
-        );
-        assert_eq!(
-            opencode_auth_json_paths(None, Some(PathBuf::from("/home/u"))),
-            vec![PathBuf::from("/home/u/.local/share/opencode/auth.json")]
-        );
-        assert_eq!(opencode_auth_json_paths(None, None), Vec::<PathBuf>::new());
-    }
-
-    #[test]
-    fn import_skips_unreadable_and_garbage_files() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let missing = dir.path().join("missing.json");
-        let garbage = dir.path().join("garbage.json");
-        std::fs::write(&garbage, "not json {").expect("write garbage");
-        let valid = dir.path().join("valid.json");
-        std::fs::write(
-            &valid,
-            json!({"opencode-go": {"type": "api", "key": "sk-go"}}).to_string(),
-        )
-        .expect("write valid");
-
-        let key = import_opencode_key_from(&[missing, garbage, valid]).expect("key");
-        assert_eq!(key, "sk-go");
-
-        assert!(import_opencode_key_from(&[]).is_err());
     }
 }

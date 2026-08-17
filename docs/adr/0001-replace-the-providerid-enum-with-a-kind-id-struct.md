@@ -10,8 +10,8 @@ translator reshapes the body, which parser reads usage off the stream — and it
 names a provider on the outside, as the directory under the auth dir holding
 that provider's tokens and as the string `/v1/models` reports in `owned_by`.
 
-For anthropic, codex and opencode those two jobs collapse onto one string, so a
-closed `enum ProviderId { Anthropic, Codex, Opencode }` carries both. It stops
+For anthropic and codex those two jobs collapse onto one string, so a
+closed `enum ProviderId { Anthropic, Codex }` carries both. It stops
 carrying both the moment behavior and naming stop being one-to-one.
 Taking pengepul to roughly thirty upstreams means fifteen or so
 OpenAI-compatible API-key services — groq, mistral, deepseek, openrouter and the

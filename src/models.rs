@@ -1,52 +1,40 @@
 //! The model catalog: which models each provider currently serves, fetched live from the
 //! upstreams and used as the source of truth for `/v1/models` and for routing.
-//!
-//! opencode stays prefix-addressed (`opencode/<id>`) because its credits list overlaps the
-//! ids anthropic and codex serve (`claude-opus-5`, `gpt-5.6-*`); the prefix disambiguates,
-//! the catalog supplies the list and the go-vs-credits base.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use crate::providers::OPENCODE_PREFIX;
 use crate::types::ProviderKind;
 
-/// The models a single fetch returned, shaped per provider: anthropic and codex give one
-/// list, opencode gives its go and credits lists, which are advertised as one set.
+/// The models a single fetch returned: anthropic and codex each give one list.
 #[derive(Debug, Clone)]
-pub enum FetchedModels {
-    Direct(Vec<String>),
-    Opencode {
-        go: Vec<String>,
-        credits: Vec<String>,
-    },
+pub struct FetchedModels {
+    pub ids: Vec<String>,
+}
+
+impl FetchedModels {
+    #[must_use]
+    pub fn new(ids: Vec<String>) -> Self {
+        Self { ids }
+    }
 }
 
 /// A snapshot of the models each provider serves. Empty for a provider whose fetch has never
 /// succeeded, so it advertises nothing and its ids fall back to the prefix heuristic.
 #[derive(Debug, Clone, Default)]
 pub struct ModelCatalog {
-    /// anthropic and codex model id -> its provider. Their id namespaces do not overlap.
+    /// model id -> the provider serving it. anthropic and codex id namespaces do not overlap.
     direct: BTreeMap<String, ProviderKind>,
-    /// opencode model ids (unprefixed), the union of its go and credits lists.
-    opencode: BTreeSet<String>,
 }
 
 impl ModelCatalog {
-    /// Replace the anthropic or codex entries with a freshly fetched list.
+    /// Replace a provider's entries with a freshly fetched list.
     pub fn set_direct(&mut self, kind: ProviderKind, ids: Vec<String>) {
         self.direct.retain(|_, existing| *existing != kind);
         for id in ids {
             self.direct.insert(id, kind);
         }
-    }
-
-    /// Replace the opencode entries with the union of its go and credits lists. opencode
-    /// itself spills a request from the subscription plan to credits, so pengepul advertises
-    /// both and does not track which base serves which id.
-    pub fn set_opencode(&mut self, go_ids: Vec<String>, credits_ids: Vec<String>) {
-        self.opencode = go_ids.into_iter().chain(credits_ids).collect();
     }
 
     /// Resolve a request's model id to the provider that should serve it, or `None` when no
@@ -68,17 +56,10 @@ impl ModelCatalog {
     /// prefix so a client can address a provider unambiguously even when ids overlap.
     #[must_use]
     pub fn advertised(&self) -> Vec<(String, ProviderKind)> {
-        let mut out: Vec<(String, ProviderKind)> = self
-            .direct
+        self.direct
             .iter()
             .map(|(id, kind)| (format!("{}/{id}", kind.canonical_id()), *kind))
-            .collect();
-        out.extend(
-            self.opencode
-                .iter()
-                .map(|id| (format!("{OPENCODE_PREFIX}{id}"), ProviderKind::Opencode)),
-        );
-        out
+            .collect()
     }
 }
 
@@ -95,7 +76,6 @@ fn provider_prefix(model: &str) -> Option<ProviderKind> {
     match prefix {
         "anthropic" => Some(ProviderKind::Anthropic),
         "codex" => Some(ProviderKind::Codex),
-        "opencode" => Some(ProviderKind::Opencode),
         _ => None,
     }
 }
@@ -127,12 +107,6 @@ pub fn parse_codex(body: &Value) -> Vec<String> {
     ids_from(body.get("models"), "slug")
 }
 
-/// Model ids from an opencode `/models` body (`{"data": [{"id": ...}]}`).
-#[must_use]
-pub fn parse_opencode(body: &Value) -> Vec<String> {
-    ids_from(body.get("data"), "id")
-}
-
 fn ids_from(array: Option<&Value>, field: &str) -> Vec<String> {
     array
         .and_then(Value::as_array)
@@ -148,7 +122,7 @@ fn ids_from(array: Option<&Value>, field: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ModelCatalog, parse_anthropic, parse_codex, parse_opencode};
+    use super::{ModelCatalog, parse_anthropic, parse_codex};
     use crate::types::ProviderKind;
     use serde_json::json;
 
@@ -162,10 +136,6 @@ mod tests {
             parse_codex(&json!({"models": [{"slug": "gpt-5.5"}, {"slug": "gpt-5.4"}]})),
             vec!["gpt-5.5", "gpt-5.4"]
         );
-        assert_eq!(
-            parse_opencode(&json!({"data": [{"id": "glm-5.2"}, {"id": "kimi-k3"}]})),
-            vec!["glm-5.2", "kimi-k3"]
-        );
     }
 
     #[test]
@@ -173,7 +143,6 @@ mod tests {
         let mut catalog = ModelCatalog::default();
         catalog.set_direct(ProviderKind::Anthropic, vec!["claude-opus-5".into()]);
         catalog.set_direct(ProviderKind::Codex, vec!["gpt-5.5".into()]);
-        catalog.set_opencode(vec!["glm-5.2".into()], vec!["claude-opus-5".into()]);
 
         // fetched lists win for bare ids
         assert_eq!(
@@ -181,11 +150,7 @@ mod tests {
             Some(ProviderKind::Anthropic)
         );
         assert_eq!(catalog.resolve("gpt-5.5"), Some(ProviderKind::Codex));
-        // an explicit <provider>/ prefix always wins, even for an overlapping id
-        assert_eq!(
-            catalog.resolve("opencode/claude-opus-5"),
-            Some(ProviderKind::Opencode)
-        );
+        // an explicit <provider>/ prefix always wins
         assert_eq!(
             catalog.resolve("anthropic/claude-opus-5"),
             Some(ProviderKind::Anthropic)
@@ -201,6 +166,8 @@ mod tests {
         // a dropped alias / unknown id is claimed by nobody
         assert_eq!(catalog.resolve("opus"), None);
         assert_eq!(catalog.resolve("gemini-3"), None);
+        // a removed provider's prefix is claimed by nobody
+        assert_eq!(catalog.resolve("opencode/glm-5.2"), None);
     }
 
     #[test]
@@ -208,14 +175,12 @@ mod tests {
         let mut catalog = ModelCatalog::default();
         catalog.set_direct(ProviderKind::Anthropic, vec!["claude-opus-5".into()]);
         catalog.set_direct(ProviderKind::Codex, vec!["gpt-5.5".into()]);
-        catalog.set_opencode(vec!["glm-5.2".into()], vec!["grok-4.5".into()]);
         let advertised = catalog.advertised();
         assert!(advertised.contains(&(
             "anthropic/claude-opus-5".to_string(),
             ProviderKind::Anthropic
         )));
         assert!(advertised.contains(&("codex/gpt-5.5".to_string(), ProviderKind::Codex)));
-        assert!(advertised.contains(&("opencode/glm-5.2".to_string(), ProviderKind::Opencode)));
     }
 
     #[test]
@@ -225,7 +190,6 @@ mod tests {
             "claude-opus-5"
         );
         assert_eq!(super::upstream_model("codex/gpt-5.5"), "gpt-5.5");
-        assert_eq!(super::upstream_model("opencode/glm-5.2"), "glm-5.2");
         // bare ids and unrelated slashes pass through untouched
         assert_eq!(super::upstream_model("claude-opus-5"), "claude-opus-5");
         assert_eq!(super::upstream_model("vendor/weird-id"), "vendor/weird-id");

@@ -120,8 +120,7 @@ pub fn load_all_tokens(auth_dir: &Path, provider: Option<&ProviderId>) -> Result
 /// moved. Safe to call on every startup — no-op once layout is current.
 ///
 /// Mapping: `claude-<rest>.json` → `anthropic/<rest>.json`,
-/// `codex-<rest>.json` → `codex/<rest>.json`,
-/// `opencode-<rest>.json` → `opencode/<rest>.json`.
+/// `codex-<rest>.json` → `codex/<rest>.json`.
 ///
 /// # Errors
 ///
@@ -130,11 +129,7 @@ pub fn migrate_legacy_layout(auth_dir: &Path) -> Result<usize> {
     if !auth_dir.exists() {
         return Ok(0);
     }
-    let mappings = [
-        ("claude-", "anthropic"),
-        ("codex-", "codex"),
-        ("opencode-", "opencode"),
-    ];
+    let mappings = [("claude-", "anthropic"), ("codex-", "codex")];
     let mut moved = 0;
     for entry in
         fs::read_dir(auth_dir).with_context(|| format!("failed to read {}", auth_dir.display()))?
@@ -187,7 +182,6 @@ fn token_to_storage(token: &TokenData) -> StoredToken {
         token_type: Some(match token.provider.kind {
             ProviderKind::Anthropic => "claude".to_string(),
             ProviderKind::Codex => "codex".to_string(),
-            ProviderKind::Opencode => "opencode".to_string(),
         }),
         expired: token.expires_at.clone(),
         account_uuid: Some(token.account_uuid.clone()),
@@ -200,7 +194,6 @@ fn token_to_storage(token: &TokenData) -> StoredToken {
 fn storage_to_token(stored: StoredToken) -> TokenData {
     let provider = match stored.token_type.as_deref() {
         Some("codex") => ProviderId::codex(),
-        Some("opencode") => ProviderId::opencode(),
         _ => ProviderId::anthropic(),
     };
     let plan_type = stored
@@ -315,15 +308,13 @@ mod tests {
         )
         .unwrap();
         std::fs::write(auth.join("codex-bob_at_y.com.json"), r#"{"access_token":"a","refresh_token":"r","expired":"2099-01-01T00:00:00Z","type":"codex"}"#).unwrap();
-        std::fs::write(auth.join("opencode-deadbeef.json"), r#"{"access_token":"a","refresh_token":"","expired":"9999-12-31T23:59:59Z","type":"opencode"}"#).unwrap();
         std::fs::write(auth.join("unrelated.txt"), "ignore me").unwrap();
 
         let moved = migrate_legacy_layout(auth).expect("migrate");
-        assert_eq!(moved, 3);
+        assert_eq!(moved, 2);
 
         assert!(auth.join("anthropic/alice_at_x.com.json").exists());
         assert!(auth.join("codex/bob_at_y.com.json").exists());
-        assert!(auth.join("opencode/deadbeef.json").exists());
         assert!(!auth.join("claude-alice_at_x.com.json").exists());
         assert!(auth.join("unrelated.txt").exists());
 
