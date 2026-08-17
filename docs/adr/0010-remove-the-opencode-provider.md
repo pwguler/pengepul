@@ -38,7 +38,7 @@ parsing. No opencode-specific rejection code exists anywhere.
   for those two, and an id nobody claims is rejected with 400.
 - ADR-0001 is amended to the two-variant enum. The superseded record of the
   old opencode-prefixed routing (previously ADR-0003) is retired with the
-  code it described, so the tree carries no reference to the removed provider.
+  code it described, so no ADR references the removed routing scheme.
 - A client still sending `opencode/...` gets a loud, honest 400 rather than a
   silent misroute — the same failure a genuinely unknown model gets.
 - Re-adding a static-key provider later means reviving the login/key path and

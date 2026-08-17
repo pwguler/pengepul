@@ -63,9 +63,9 @@ pub fn load_all_tokens(auth_dir: &Path, provider: Option<&ProviderId>) -> Result
     } else {
         // Scan only the known provider subdirectories; anything else in auth_dir (a
         // removed provider's directory, operator scratch) is not credentials.
-        ["anthropic", "codex"]
+        [ProviderKind::Anthropic, ProviderKind::Codex]
             .iter()
-            .map(|name| auth_dir.join(name))
+            .map(|kind| auth_dir.join(kind.canonical_id()))
             .collect()
     };
 
@@ -274,12 +274,26 @@ mod tests {
         save_token(dir.path(), &token(ProviderId::anthropic(), "alice@x.com"))
             .expect("save anthropic");
         save_token(dir.path(), &token(ProviderId::codex(), "bob@y.com")).expect("save codex");
+        // A removed provider's directory must never be read as credentials, even
+        // through the unfiltered load path. Seed a valid-shaped token with a
+        // distinctive email so a regression would show up in the result set.
+        let unknown_dir = dir.path().join("opencode");
+        std::fs::create_dir_all(&unknown_dir).expect("unknown dir");
+        std::fs::write(
+            unknown_dir.join("x.json"),
+            r#"{"access_token":"a","refresh_token":"r","email":"stray@x.com","expired":"2099-01-01T00:00:00Z"}"#,
+        )
+        .expect("unknown token");
 
         let all = load_all_tokens(dir.path(), None).expect("load");
         assert_eq!(all.len(), 2);
         let kinds: Vec<_> = all.iter().map(|t| t.provider.kind).collect();
         assert!(kinds.contains(&ProviderKind::Anthropic));
         assert!(kinds.contains(&ProviderKind::Codex));
+        assert!(
+            all.iter().all(|t| t.email != "stray@x.com"),
+            "unknown subdirectory must not be read as credentials"
+        );
 
         let just_anthropic =
             load_all_tokens(dir.path(), Some(&ProviderId::anthropic())).expect("load anthropic");
