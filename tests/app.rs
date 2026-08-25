@@ -2021,3 +2021,53 @@ async fn v1_models_advertises_fetched_configured_models_with_their_prefix() {
         "advertised ids: {ids:?}"
     );
 }
+
+#[tokio::test]
+async fn admin_reload_picks_up_a_newly_saved_key_for_a_configured_provider() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &groq_key_token()).expect("save first key");
+    let upstream = Arc::new(GenericUpstream::default());
+    let app = create_app_with_upstream(config_with_groq(tmp.path().to_path_buf()), upstream);
+
+    // A second key lands on disk while the relay is running.
+    save_token(
+        tmp.path(),
+        &TokenData {
+            access_token: "gsk-second".to_string(),
+            refresh_token: String::new(),
+            email: "key-87654321".to_string(),
+            expires_at: String::new(),
+            account_uuid: "acct-groq-2".to_string(),
+            provider: ProviderId::generic("groq"),
+            id_token: None,
+            last_refresh_at: None,
+            plan_type: None,
+        },
+    )
+    .expect("save second key");
+
+    let (status, reloaded) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/admin/reload")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(reloaded["reloaded"]["groq"]["added"], json!(["key-87654321"]));
+
+    let (status, accounts) = json_response(
+        app,
+        axum::http::Request::builder()
+            .uri("/admin/accounts")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(accounts["providers"]["groq"]["account_count"], 2);
+}
