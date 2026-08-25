@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use crate::types::ProviderKind;
+use crate::config::ConfiguredProvider;
+use crate::types::{ProviderId, ProviderKind};
 
 /// The models a single fetch returned: anthropic and codex each give one list.
 #[derive(Debug, Clone)]
@@ -39,17 +40,30 @@ impl ModelCatalog {
 
     /// Resolve a request's model id to the provider that should serve it, or `None` when no
     /// list and no heuristic claims it (the caller then rejects the request). An explicit
-    /// `<provider>/<model>` prefix wins; a bare id falls to the fetched lists then the
-    /// prefix heuristic.
+    /// `<provider>/<model>` prefix wins — including configured `providers:` entries, which
+    /// resolve to a `Generic` `ProviderId` named by the prefix; a bare id falls to the fetched
+    /// lists then the prefix heuristic.
     #[must_use]
-    pub fn resolve(&self, model: &str) -> Option<ProviderKind> {
-        if let Some(kind) = provider_prefix(model) {
-            return Some(kind);
+    pub fn resolve_id(
+        &self,
+        model: &str,
+        providers: &BTreeMap<String, ConfiguredProvider>,
+    ) -> Option<ProviderId> {
+        if let Some((prefix, _)) = model.split_once('/') {
+            match prefix {
+                "anthropic" => return Some(ProviderId::anthropic()),
+                "codex" => return Some(ProviderId::codex()),
+                other if providers.contains_key(other) => {
+                    return Some(ProviderId::generic(other));
+                }
+                _ => {}
+            }
         }
-        if let Some(kind) = self.direct.get(model) {
-            return Some(*kind);
-        }
-        heuristic_provider(model)
+        self.direct
+            .get(model)
+            .copied()
+            .map(ProviderId::for_kind)
+            .or_else(|| heuristic_provider(model).map(ProviderId::for_kind))
     }
 
     /// The advertised catalog for `/v1/models`: every id carries its `<provider>/<model>`
@@ -63,21 +77,16 @@ impl ModelCatalog {
     }
 }
 
-/// Strip a leading `<provider>/` from a model id so the bare id goes upstream. Only known
-/// provider prefixes are stripped; an unrelated id containing `/` is left intact.
+/// Strip a leading `<provider>/` from a model id so the bare id goes upstream. The prefix
+/// must be the resolved provider's own id (`anthropic`, `codex`, or the `providers:` entry
+/// name); an unrelated id containing `/` is left intact.
 #[must_use]
-pub fn upstream_model(model: &str) -> &str {
-    provider_prefix(model).map_or(model, |kind| &model[kind.canonical_id().len() + 1..])
-}
-
-/// The provider named by an explicit `<provider>/` prefix, if any.
-fn provider_prefix(model: &str) -> Option<ProviderKind> {
-    let prefix = model.split_once('/')?.0;
-    match prefix {
-        "anthropic" => Some(ProviderKind::Anthropic),
-        "codex" => Some(ProviderKind::Codex),
-        _ => None,
-    }
+pub fn upstream_model<'a>(model: &'a str, provider: &ProviderId) -> &'a str {
+    let prefix = provider.id.as_ref();
+    model
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .unwrap_or(model)
 }
 
 /// Route an id no fetched list claims, by name shape. Broad on purpose: a new `gpt-*` or
@@ -123,8 +132,9 @@ fn ids_from(array: Option<&Value>, field: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{ModelCatalog, parse_anthropic, parse_codex};
-    use crate::types::ProviderKind;
+    use crate::types::{ProviderId, ProviderKind};
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     #[test]
     fn parses_each_provider_body_shape() {
@@ -143,31 +153,64 @@ mod tests {
         let mut catalog = ModelCatalog::default();
         catalog.set_direct(ProviderKind::Anthropic, vec!["claude-opus-5".into()]);
         catalog.set_direct(ProviderKind::Codex, vec!["gpt-5.5".into()]);
+        let providers = BTreeMap::new();
 
         // fetched lists win for bare ids
         assert_eq!(
-            catalog.resolve("claude-opus-5"),
-            Some(ProviderKind::Anthropic)
+            catalog.resolve_id("claude-opus-5", &providers),
+            Some(ProviderId::anthropic())
         );
-        assert_eq!(catalog.resolve("gpt-5.5"), Some(ProviderKind::Codex));
+        assert_eq!(
+            catalog.resolve_id("gpt-5.5", &providers),
+            Some(ProviderId::codex())
+        );
         // an explicit <provider>/ prefix always wins
         assert_eq!(
-            catalog.resolve("anthropic/claude-opus-5"),
-            Some(ProviderKind::Anthropic)
+            catalog.resolve_id("anthropic/claude-opus-5", &providers),
+            Some(ProviderId::anthropic())
         );
-        assert_eq!(catalog.resolve("codex/gpt-5.5"), Some(ProviderKind::Codex));
-        // an id in no list still routes by shape (new families covered)
-        assert_eq!(catalog.resolve("gpt-6"), Some(ProviderKind::Codex));
         assert_eq!(
-            catalog.resolve("claude-opus-9"),
-            Some(ProviderKind::Anthropic)
+            catalog.resolve_id("codex/gpt-5.5", &providers),
+            Some(ProviderId::codex())
         );
-        assert_eq!(catalog.resolve("o5"), Some(ProviderKind::Codex));
+        // an id in no list still routes by shape (new families covered)
+        assert_eq!(
+            catalog.resolve_id("gpt-6", &providers),
+            Some(ProviderId::codex())
+        );
+        assert_eq!(
+            catalog.resolve_id("claude-opus-9", &providers),
+            Some(ProviderId::anthropic())
+        );
+        assert_eq!(
+            catalog.resolve_id("o5", &providers),
+            Some(ProviderId::codex())
+        );
         // a dropped alias / unknown id is claimed by nobody
-        assert_eq!(catalog.resolve("opus"), None);
-        assert_eq!(catalog.resolve("gemini-3"), None);
+        assert_eq!(catalog.resolve_id("opus", &providers), None);
+        assert_eq!(catalog.resolve_id("gemini-3", &providers), None);
         // a removed provider's prefix is claimed by nobody
-        assert_eq!(catalog.resolve("opencode/glm-5.2"), None);
+        assert_eq!(catalog.resolve_id("opencode/glm-5.2", &providers), None);
+    }
+
+    #[test]
+    fn resolves_configured_provider_prefixes_to_a_generic_id() {
+        let catalog = ModelCatalog::default();
+        let providers = BTreeMap::from([(
+            "groq".to_string(),
+            crate::config::ConfiguredProvider {
+                base_url: "https://api.groq.com/openai/v1".to_string(),
+            },
+        )]);
+
+        assert_eq!(
+            catalog.resolve_id("groq/llama-3.3-70b", &providers),
+            Some(ProviderId::generic("groq"))
+        );
+        // a configured prefix without a matching entry is claimed by nobody
+        assert_eq!(catalog.resolve_id("mistral/large", &providers), None);
+        // bare ids never route to configured providers, even for their models
+        assert_eq!(catalog.resolve_id("llama-3.3-70b", &providers), None);
     }
 
     #[test]
@@ -184,15 +227,28 @@ mod tests {
     }
 
     #[test]
-    fn upstream_model_strips_only_known_provider_prefixes() {
+    fn upstream_model_strips_the_resolved_provider_prefix() {
         assert_eq!(
-            super::upstream_model("anthropic/claude-opus-5"),
+            super::upstream_model("anthropic/claude-opus-5", &ProviderId::anthropic()),
             "claude-opus-5"
         );
-        assert_eq!(super::upstream_model("codex/gpt-5.5"), "gpt-5.5");
+        assert_eq!(
+            super::upstream_model("codex/gpt-5.5", &ProviderId::codex()),
+            "gpt-5.5"
+        );
+        assert_eq!(
+            super::upstream_model("groq/llama-3.3-70b", &ProviderId::generic("groq")),
+            "llama-3.3-70b"
+        );
         // bare ids and unrelated slashes pass through untouched
-        assert_eq!(super::upstream_model("claude-opus-5"), "claude-opus-5");
-        assert_eq!(super::upstream_model("vendor/weird-id"), "vendor/weird-id");
+        assert_eq!(
+            super::upstream_model("claude-opus-5", &ProviderId::anthropic()),
+            "claude-opus-5"
+        );
+        assert_eq!(
+            super::upstream_model("vendor/weird-id", &ProviderId::anthropic()),
+            "vendor/weird-id"
+        );
     }
 
     #[test]
@@ -200,7 +256,11 @@ mod tests {
         let mut catalog = ModelCatalog::default();
         catalog.set_direct(ProviderKind::Anthropic, vec!["claude-old".into()]);
         catalog.set_direct(ProviderKind::Anthropic, vec!["claude-new".into()]);
-        assert_eq!(catalog.resolve("claude-new"), Some(ProviderKind::Anthropic));
+        let providers = BTreeMap::new();
+        assert_eq!(
+            catalog.resolve_id("claude-new", &providers),
+            Some(ProviderId::anthropic())
+        );
         assert!(
             !catalog
                 .advertised()

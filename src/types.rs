@@ -74,6 +74,19 @@ impl ProviderId {
         Self::new(ProviderKind::Generic, id)
     }
 
+    /// The `ProviderId` a kind resolves to when the id is the kind's own name —
+    /// anthropic and codex only; a generic kind must carry its config entry name.
+    #[must_use]
+    pub fn for_kind(kind: ProviderKind) -> Self {
+        match kind {
+            ProviderKind::Anthropic => Self::anthropic(),
+            ProviderKind::Codex => Self::codex(),
+            ProviderKind::Generic => {
+                unreachable!("a generic provider needs its config entry name")
+            }
+        }
+    }
+
     /// Returns the per-id subdirectory name under `auth_dir`,
     /// used by `tokens::save_token` and `tokens::load_all_tokens`.
     #[must_use]

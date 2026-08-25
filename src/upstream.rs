@@ -538,3 +538,28 @@ fn codex_arch() -> &'static str {
         _ => "x86_64",
     }
 }
+
+/// Headers for a configured OpenAI-compatible endpoint: exactly the two the
+/// drill settled on — Content-Type and the bearer key. No cloaking, no session
+/// or stainless headers: there is no billing classifier to appease, and a
+/// minimal header set is what OpenAI-compatible endpoints expect.
+#[must_use]
+pub fn generic_chat_headers(account: &AvailableAccount) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("Content-Type".to_string(), "application/json".to_string()),
+        (
+            "Authorization".to_string(),
+            format!("Bearer {}", account.token.access_token),
+        ),
+    ])
+}
+
+/// The configured endpoint's base URL, trimmed of a trailing slash so the
+/// path join is deterministic.
+#[must_use]
+pub fn generic_base_url(config: &Config, provider_id: &str) -> Option<String> {
+    config
+        .providers
+        .get(provider_id)
+        .map(|provider| provider.base_url.trim_end_matches('/').to_string())
+}

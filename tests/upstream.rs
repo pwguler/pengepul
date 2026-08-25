@@ -5,7 +5,8 @@ use pengepul::config::{CloakingConfig, Config, DebugMode, TimeoutConfig};
 use pengepul::types::{AvailableAccount, ProviderId, ProviderKind, TokenData};
 use pengepul::upstream::{
     anthropic_headers, apply_cloaking, build_beta_header, codex_headers,
-    detect_classifier_tripping_in_messages, normalize_codex_responses_body,
+    detect_classifier_tripping_in_messages, generic_base_url, generic_chat_headers,
+    normalize_codex_responses_body,
 };
 use serde_json::{Value, json};
 
@@ -290,4 +291,54 @@ fn detects_classifier_tripping_sentence_in_messages_only_when_present() {
 
     assert!(detect_classifier_tripping_in_messages(&with_sentence));
     assert!(!detect_classifier_tripping_in_messages(&without_sentence));
+}
+
+#[test]
+fn generic_chat_headers_are_exactly_content_type_and_bearer() {
+    let account = AvailableAccount {
+        token: TokenData {
+            access_token: "gsk-secret".to_string(),
+            refresh_token: String::new(),
+            email: "key-1".to_string(),
+            expires_at: String::new(),
+            account_uuid: "acct".to_string(),
+            provider: ProviderId::generic("groq"),
+            id_token: None,
+            last_refresh_at: None,
+            plan_type: None,
+        },
+        device_id: "device".to_string(),
+        account_uuid: "acct".to_string(),
+        provider: ProviderId::generic("groq"),
+        chatgpt_account_id: None,
+    };
+
+    let headers = generic_chat_headers(&account);
+
+    assert_eq!(headers.len(), 2, "exactly two headers: {headers:?}");
+    assert_eq!(headers["Content-Type"], "application/json");
+    assert_eq!(headers["Authorization"], "Bearer gsk-secret");
+    assert!(
+        !headers
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("user-agent")),
+        "no User-Agent cloaking for generic endpoints"
+    );
+}
+
+#[test]
+fn generic_base_url_trims_trailing_slash() {
+    let mut cfg = config();
+    cfg.providers.insert(
+        "groq".to_string(),
+        pengepul::config::ConfiguredProvider {
+            base_url: "https://api.groq.com/openai/v1/".to_string(),
+        },
+    );
+
+    assert_eq!(
+        generic_base_url(&cfg, "groq").as_deref(),
+        Some("https://api.groq.com/openai/v1")
+    );
+    assert_eq!(generic_base_url(&cfg, "missing"), None);
 }
