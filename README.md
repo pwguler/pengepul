@@ -6,6 +6,7 @@ subscription instead of a per-token API key.
 
 - Pools several subscription accounts per provider and spreads requests across them.
 - Serves your subscription inside openclaw and hermes, with no API key.
+- Relays any OpenAI-compatible API (groq, openrouter, deepseek, ...) through the same pool.
 - Exposes the pool as a REST API, local or networked, for your own tools.
 
 ## Install
@@ -32,6 +33,32 @@ them. Credentials live under `~/.pengepul` (`0600`); a running relay picks up a 
 login on restart or `pengepul accounts --reload`. Read the local API key clients use from
 `pengepul config api-key`. Exposed on a network, that key is the only thing guarding your
 pooled subscriptions, so keep it secret and prefer a trusted network or an SSH tunnel.
+
+### OpenAI-compatible endpoints
+
+Point the pool at any service that speaks the OpenAI API. Add a `providers:` entry to
+`~/.pengepul/config.yaml` (one per endpoint), then save its static API key; requests
+address its models with a `<provider>/<model>` prefix:
+
+```sh
+# ~/.pengepul/config.yaml
+providers:
+  groq:
+    base-url: https://api.groq.com/openai/v1
+  openrouter:
+    base-url: https://openrouter.ai/api/v1
+```
+
+```sh
+pengepul login --provider groq --key $GROQ_API_KEY # save a key (repeat to pool more)
+curl -sS http://127.0.0.1:8317/v1/chat/completions \
+  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" -d '{
+  "model": "groq/llama-3.3-70b-versatile",
+  "messages": [{"role": "user", "content": "reply exactly: pong"}]}'
+```
+
+Configured endpoints accept the Chat Completions dialect and rotate across their keys
+with the same failure handling as the subscription providers.
 
 Login opens a browser and completes on a localhost callback. On a remote host, forward the
 callback port first:
@@ -106,13 +133,20 @@ curl -sS http://127.0.0.1:8317/v1/chat/completions \
   -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" -d '{
   "model": "gpt-5.4",
   "messages": [{"role": "user", "content": "reply exactly: pong"}]}'
+
+# groq, through a configured provider
+curl -sS http://127.0.0.1:8317/v1/chat/completions \
+  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" -d '{
+  "model": "groq/llama-3.3-70b-versatile",
+  "messages": [{"role": "user", "content": "reply exactly: pong"}]}'
 ```
 
 ## Commands
 
 ```sh
 pengepul serve # start the relay (the default with no subcommand)
-pengepul login # authorize an account in a browser
+pengepul login # authorize an account in a browser (--provider codex for Codex)
+pengepul login --provider groq --key $KEY # save a static key for a configured provider
 pengepul status # health of the running relay
 pengepul accounts # loaded accounts (--reload re-reads from disk)
 pengepul update # install the most recent release (--check only reports)
@@ -132,7 +166,11 @@ Routes: `POST /v1/messages`, `POST /v1/chat/completions`, `POST /v1/responses`,
 the local API key, as either `Authorization: Bearer <key>` or `x-api-key: <key>`.
 
 The provider is chosen by model id: `gpt-5`, `gpt-5.*`, `gpt-5-*`, `o<N>` and `codex-*`
-route to Codex, `claude-*` to Anthropic. A request with no `model` is rejected with 400.
+route to Codex, `claude-*` to Anthropic, and `<id>/<model>` routes to the configured
+provider `id` (`groq/llama-3.3-70b-versatile`). A request with no `model` is rejected
+with 400, as is a prefix no configured provider claims. `count_tokens` and the Messages
+and Responses routes answer 501 for configured providers; they accept only Chat
+Completions.
 
 pengepul writes `~/.pengepul/config.yaml` when it is missing, generating a fresh
 `sk-local-…` key. The keys you can set:
@@ -143,6 +181,9 @@ port: 8317
 auth-dir: ~/.pengepul
 api-keys:
   - sk-local-example
+providers:
+  groq:
+    base-url: https://api.groq.com/openai/v1
 body-limit: 200mb # checked against Content-Length; empty means unlimited
 timeouts:
   messages-ms: 120000
@@ -152,5 +193,7 @@ debug: off # off | errors | verbose
 ```
 
 Requests round-robin across accounts with no session affinity, failing over once per
-account on upstream 401, 403, 429, 500 and 502-599. A failed account backs off up to 5
-minutes; a dead refresh token locks it out for 24 hours until a fresh `pengepul login`.
+account on upstream 401, 403, 429, 500 and 502-599. Failover never crosses providers: a
+request stays on the endpoint or subscription family it named. A failed account backs
+off up to 5 minutes; a dead refresh token locks it out for 24 hours until a fresh
+`pengepul login`.
