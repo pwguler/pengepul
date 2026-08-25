@@ -21,7 +21,9 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::accounts::{AccountManager, RefreshPolicy, RefreshPolicyKind};
 use crate::config::Config;
 use crate::masquerade::{masquerade_request, restore_tool_use_names};
-use crate::models::{FetchedModels, ModelCatalog, parse_anthropic, parse_codex, upstream_model};
+use crate::models::{
+    FetchedModels, ModelCatalog, parse_anthropic, parse_codex, parse_openai, upstream_model,
+};
 use crate::oauth::{refresh_anthropic_tokens, refresh_codex_tokens};
 use crate::streaming::{
     AnthropicStreamState, ChatStreamState, ResponsesStreamState, anthropic_sse_to_chat,
@@ -376,7 +378,12 @@ impl UpstreamClient for HttpUpstreamClient {
         Box::pin(async move {
             match kind {
                 ProviderKind::Generic => {
-                    anyhow::bail!("model fetch for generic providers is not implemented")
+                    let base_url = generic_base_url(&config, &account.provider.id)
+                        .context("generic provider missing from config")?;
+                    let headers = generic_chat_headers(&account);
+                    let body =
+                        send_get(client, format!("{base_url}/models"), headers, timeout).await?;
+                    Ok(FetchedModels::new(parse_openai(&body)))
                 }
                 ProviderKind::Anthropic => {
                     let headers = BTreeMap::from([
@@ -545,20 +552,57 @@ async fn refresh_model_catalog(state: &AppState) {
             }
         }
     }
+    // Configured providers: one fetch each, advertised under their own prefix.
+    for provider_id in state.config.providers.keys() {
+        let provider = ProviderId::generic(provider_id.clone());
+        let Some(account) = catalog_account_id(state, &provider).await else {
+            continue;
+        };
+        match state
+            .upstream
+            .fetch_models(ProviderKind::Generic, account, state.config.clone())
+            .await
+        {
+            Ok(FetchedModels { ids }) => {
+                state
+                    .catalog
+                    .write()
+                    .expect("catalog lock poisoned")
+                    .set_generic(provider_id, ids);
+            }
+            Err(error) => {
+                tracing::warn!(provider = provider_id, ?error, "model list fetch failed");
+            }
+        }
+    }
 }
 
 /// An account for a background model fetch: refresh its token if due, then hand it back. The
 /// manager lock drops before the caller fetches, so the request path is never blocked on the
 /// model-list I/O.
 async fn catalog_account(state: &AppState, kind: ProviderKind) -> Option<AvailableAccount> {
-    let mut manager = match kind {
-        ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
-        ProviderKind::Codex => state.account_managers.codex.lock().await,
-        ProviderKind::Generic => return None,
-    };
-    let email = manager.next_account()?.token.email;
-    let _ = manager.refresh_if_due(&email).await;
-    manager.account(&email)
+    match kind {
+        ProviderKind::Anthropic => {
+            let mut manager = state.account_managers.anthropic.lock().await;
+            let email = manager.next_account()?.token.email;
+            let _ = manager.refresh_if_due(&email).await;
+            manager.account(&email)
+        }
+        ProviderKind::Codex => {
+            let mut manager = state.account_managers.codex.lock().await;
+            let email = manager.next_account()?.token.email;
+            let _ = manager.refresh_if_due(&email).await;
+            manager.account(&email)
+        }
+        ProviderKind::Generic => None,
+    }
+}
+
+/// An account for a configured provider's model fetch: static keys never refresh.
+async fn catalog_account_id(state: &AppState, provider: &ProviderId) -> Option<AvailableAccount> {
+    let manager = state.account_managers.generic.get(provider.id.as_ref())?;
+    let mut manager = manager.lock().await;
+    manager.next_account()
 }
 
 async fn health() -> Json<Value> {
@@ -665,12 +709,12 @@ async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
         .expect("catalog lock poisoned")
         .advertised()
         .into_iter()
-        .map(|(id, kind)| {
+        .map(|(id, provider)| {
             json!({
                 "id": id,
                 "object": "model",
                 "created": created,
-                "owned_by": kind.canonical_id()
+                "owned_by": provider.id.as_ref()
             })
         })
         .collect::<Vec<_>>();

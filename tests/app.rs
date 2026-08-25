@@ -1914,3 +1914,110 @@ async fn generic_failover_moves_between_keys_of_the_same_endpoint_only() {
             .all(|c| c.account.provider.id.as_ref() == "groq")
     );
 }
+
+#[derive(Default)]
+struct ModelsUpstream {
+    calls: Mutex<Vec<ProviderKind>>,
+}
+
+impl UpstreamClient for ModelsUpstream {
+    fn fetch_models(
+        &self,
+        kind: ProviderKind,
+        _account: AvailableAccount,
+        _config: Arc<Config>,
+    ) -> ModelsFuture {
+        self.calls.lock().expect("calls lock").push(kind);
+        let ids = if kind == ProviderKind::Generic {
+            vec!["llama-3.3-70b-versatile".to_string()]
+        } else {
+            Vec::new()
+        };
+        Box::pin(async move { Ok(FetchedModels::new(ids)) })
+    }
+    fn generic_chat(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("chat not used in models test")
+    }
+    fn generic_chat_stream(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        unreachable!("stream not used in models test")
+    }
+    fn anthropic_messages(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("anthropic not used in models test")
+    }
+    fn anthropic_messages_stream(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        unreachable!("anthropic stream not used in models test")
+    }
+    fn anthropic_count_tokens(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("count_tokens not used in models test")
+    }
+    fn codex_responses(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("codex not used in models test")
+    }
+    fn codex_responses_stream(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        unreachable!("codex stream not used in models test")
+    }
+}
+
+#[tokio::test]
+async fn v1_models_advertises_fetched_configured_models_with_their_prefix() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &groq_key_token()).expect("save groq key");
+    let upstream = Arc::new(ModelsUpstream::default());
+    let app =
+        create_app_with_upstream(config_with_groq(tmp.path().to_path_buf()), upstream.clone());
+
+    // The catalog refresh loop runs on a spawned task right after app creation;
+    // poll the route until the fetch lands (bounded, then fail).
+    let mut ids = Vec::new();
+    for _ in 0..50 {
+        let (status, body) = json_response(
+            app.clone(),
+            axum::http::Request::builder()
+                .uri("/v1/models")
+                .header("authorization", "Bearer sk-test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, 200);
+        ids = body["data"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item["id"].as_str().map(ToOwned::to_owned))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if ids.iter().any(|id| id == "groq/llama-3.3-70b-versatile") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    assert!(
+        ids.iter().any(|id| id == "groq/llama-3.3-70b-versatile"),
+        "advertised ids: {ids:?}"
+    );
+}

@@ -27,6 +27,9 @@ impl FetchedModels {
 pub struct ModelCatalog {
     /// model id -> the provider serving it. anthropic and codex id namespaces do not overlap.
     direct: BTreeMap<String, ProviderKind>,
+    /// configured provider id -> the model ids its `/v1/models` returned. Only
+    /// advertised; bare ids never route to generic providers (prefix-only).
+    generic: BTreeMap<String, Vec<String>>,
 }
 
 impl ModelCatalog {
@@ -36,6 +39,11 @@ impl ModelCatalog {
         for id in ids {
             self.direct.insert(id, kind);
         }
+    }
+
+    /// Replace a configured provider's advertised entries with a fresh fetch.
+    pub fn set_generic(&mut self, provider_id: &str, ids: Vec<String>) {
+        self.generic.insert(provider_id.to_string(), ids);
     }
 
     /// Resolve a request's model id to the provider that should serve it, or `None` when no
@@ -69,11 +77,26 @@ impl ModelCatalog {
     /// The advertised catalog for `/v1/models`: every id carries its `<provider>/<model>`
     /// prefix so a client can address a provider unambiguously even when ids overlap.
     #[must_use]
-    pub fn advertised(&self) -> Vec<(String, ProviderKind)> {
-        self.direct
+    pub fn advertised(&self) -> Vec<(String, ProviderId)> {
+        let mut out = self
+            .direct
             .iter()
-            .map(|(id, kind)| (format!("{}/{id}", kind.canonical_id()), *kind))
-            .collect()
+            .map(|(id, kind)| {
+                (
+                    format!("{}/{id}", kind.canonical_id()),
+                    ProviderId::for_kind(*kind),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (provider_id, ids) in &self.generic {
+            for id in ids {
+                out.push((
+                    format!("{provider_id}/{id}"),
+                    ProviderId::generic(provider_id.clone()),
+                ));
+            }
+        }
+        out
     }
 }
 
@@ -114,6 +137,13 @@ pub fn parse_anthropic(body: &Value) -> Vec<String> {
 #[must_use]
 pub fn parse_codex(body: &Value) -> Vec<String> {
     ids_from(body.get("models"), "slug")
+}
+
+/// Model ids from an OpenAI-style `/models` body (`{"data": [{"id": ...}]}`), the
+/// shape OpenAI-compatible endpoints return.
+#[must_use]
+pub fn parse_openai(body: &Value) -> Vec<String> {
+    ids_from(body.get("data"), "id")
 }
 
 fn ids_from(array: Option<&Value>, field: &str) -> Vec<String> {
@@ -221,9 +251,9 @@ mod tests {
         let advertised = catalog.advertised();
         assert!(advertised.contains(&(
             "anthropic/claude-opus-5".to_string(),
-            ProviderKind::Anthropic
+            ProviderId::anthropic()
         )));
-        assert!(advertised.contains(&("codex/gpt-5.5".to_string(), ProviderKind::Codex)));
+        assert!(advertised.contains(&("codex/gpt-5.5".to_string(), ProviderId::codex())));
     }
 
     #[test]
