@@ -244,6 +244,7 @@ fn config(auth_dir: PathBuf) -> Config {
         },
         stats_enabled: true,
         debug: DebugMode::Off,
+        providers: BTreeMap::default(),
     }
 }
 

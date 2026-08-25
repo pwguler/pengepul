@@ -2231,6 +2231,7 @@ mod tests {
             },
             stats_enabled: true,
             debug: DebugMode::Off,
+            providers: std::collections::BTreeMap::new(),
         }
     }
 

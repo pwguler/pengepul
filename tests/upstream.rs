@@ -33,6 +33,7 @@ fn config() -> Config {
         },
         stats_enabled: true,
         debug: DebugMode::Off,
+        providers: BTreeMap::default(),
     }
 }
 

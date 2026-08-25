@@ -124,6 +124,112 @@ fn explicit_config_path_is_respected() {
     );
 }
 
+fn write_config_with(
+    contents: &str,
+) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let tmp = tempdir().expect("tempdir");
+    let home = tmp.path().join("home");
+    let config_path = tmp.path().join("config.yaml");
+    fs::write(&config_path, contents).expect("write config");
+    (tmp, home, config_path)
+}
+
+#[test]
+fn configured_providers_load_with_base_urls() {
+    let (_tmp, home, config_path) = write_config_with(
+        r"api-keys:
+  - sk-local
+providers:
+  groq:
+    base-url: https://api.groq.com/openai/v1
+  openrouter:
+    base-url: https://openrouter.ai/api/v1
+",
+    );
+
+    let config = load_config(Some(&config_path), Some(&home), &home).expect("load config");
+
+    assert_eq!(config.providers.len(), 2);
+    assert_eq!(
+        config.providers["groq"].base_url,
+        "https://api.groq.com/openai/v1"
+    );
+    assert_eq!(
+        config.providers["openrouter"].base_url,
+        "https://openrouter.ai/api/v1"
+    );
+}
+
+#[test]
+fn provider_entry_without_base_url_is_rejected() {
+    let (_tmp, home, config_path) = write_config_with(
+        r"api-keys:
+  - sk-local
+providers:
+  groq: {}
+",
+    );
+
+    let error = load_config(Some(&config_path), Some(&home), &home).expect_err("rejected");
+    assert!(
+        error.to_string().contains("base-url"),
+        "error names the missing field: {error}"
+    );
+}
+
+#[test]
+fn provider_entry_named_like_a_builtin_is_rejected() {
+    for reserved in ["anthropic", "codex", "claude"] {
+        let (_tmp, home, config_path) = write_config_with(&format!(
+            "api-keys:\n  - sk-local\nproviders:\n  {reserved}:\n    base-url: https://example.com/v1\n"
+        ));
+
+        let error = load_config(Some(&config_path), Some(&home), &home).expect_err("rejected");
+        assert!(
+            error.to_string().contains(reserved),
+            "error names the reserved id: {error}"
+        );
+    }
+}
+
+#[test]
+fn provider_entry_with_unknown_field_is_rejected() {
+    let (_tmp, home, config_path) = write_config_with(
+        r"api-keys:
+  - sk-local
+providers:
+  groq:
+    base-url: https://api.groq.com/openai/v1
+    api-keys: [gsk-secret]
+",
+    );
+
+    let error = load_config(Some(&config_path), Some(&home), &home).expect_err("rejected");
+    let full = format!("{error:#}");
+    assert!(
+        full.contains("unknown field"),
+        "error names the unknown field: {full}"
+    );
+}
+
+#[test]
+fn provider_entry_id_containing_a_slash_is_rejected() {
+    let (_tmp, home, config_path) = write_config_with(
+        r"api-keys:
+  - sk-local
+providers:
+  a/b:
+    base-url: https://example.com/v1
+",
+    );
+
+    let error = load_config(Some(&config_path), Some(&home), &home).expect_err("rejected");
+    assert!(
+        error.to_string().contains("a/b"),
+        "error names the offending id: {error}"
+    );
+}
+
 #[test]
 fn token_storage_round_trips_provider_files() {
     let tmp = tempdir().expect("tempdir");

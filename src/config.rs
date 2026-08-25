@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -6,6 +6,11 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::utils::{generate_api_key, resolve_auth_dir};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredProvider {
+    pub base_url: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimeoutConfig {
@@ -32,6 +37,7 @@ pub struct Config {
     pub timeouts: TimeoutConfig,
     pub stats_enabled: bool,
     pub debug: DebugMode,
+    pub providers: BTreeMap<String, ConfiguredProvider>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +62,14 @@ struct RawConfig {
     timeouts: RawTimeouts,
     stats: RawStats,
     debug: serde_yaml::Value,
+    providers: BTreeMap<String, RawConfiguredProvider>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawConfiguredProvider {
+    #[serde(rename = "base-url")]
+    base_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +110,7 @@ impl Default for RawConfig {
             timeouts: RawTimeouts::default(),
             stats: RawStats::default(),
             debug: serde_yaml::Value::String("off".to_string()),
+            providers: BTreeMap::new(),
         }
     }
 }
@@ -186,6 +201,8 @@ pub fn load_config(
         write_config(&write_path, &raw, true)?;
     }
 
+    let providers = validate_providers(&raw.providers)?;
+
     Ok(Config {
         host: raw.host,
         port: raw.port,
@@ -204,7 +221,38 @@ pub fn load_config(
         },
         stats_enabled: raw.stats.enabled,
         debug: normalize_debug(&raw.debug),
+        providers,
     })
+}
+
+/// Turn the raw `providers:` section into validated configured providers.
+///
+/// The entry name becomes the provider id a client's model prefix must match, so
+/// it cannot collide with a built-in provider (anthropic, codex, or the claude
+/// spelling the glossary reserves) and cannot contain `/` (the prefix separator).
+/// `base-url` is required; the keys for the endpoint live in the auth-dir, not here.
+fn validate_providers(
+    raw: &BTreeMap<String, RawConfiguredProvider>,
+) -> Result<BTreeMap<String, ConfiguredProvider>> {
+    let mut providers = BTreeMap::new();
+    for (id, entry) in raw {
+        if matches!(id.as_str(), "anthropic" | "codex" | "claude") {
+            bail!("providers: {id} is a built-in provider name");
+        }
+        if id.contains('/') {
+            bail!("providers: {id} must not contain '/'");
+        }
+        if entry.base_url.trim().is_empty() {
+            bail!("providers: {id} is missing base-url");
+        }
+        providers.insert(
+            id.clone(),
+            ConfiguredProvider {
+                base_url: entry.base_url.trim().to_string(),
+            },
+        );
+    }
+    Ok(providers)
 }
 
 fn config_paths(
