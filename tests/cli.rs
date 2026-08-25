@@ -27,7 +27,6 @@ struct FakeRuntime {
     calls: Vec<String>,
     install_request: Option<ServiceInstallRequest>,
     login_provider: Option<ProviderId>,
-    login_key: Option<String>,
     latest_tag: Option<String>,
     installed: Option<(String, String)>,
 }
