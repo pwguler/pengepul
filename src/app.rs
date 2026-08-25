@@ -326,6 +326,9 @@ impl UpstreamClient for HttpUpstreamClient {
         let timeout = config.timeouts.count_tokens_ms;
         Box::pin(async move {
             match kind {
+                ProviderKind::Generic => {
+                    anyhow::bail!("model fetch for generic providers is not implemented")
+                }
                 ProviderKind::Anthropic => {
                     let headers = BTreeMap::from([
                         (
@@ -484,6 +487,7 @@ async fn catalog_account(state: &AppState, kind: ProviderKind) -> Option<Availab
     let mut manager = match kind {
         ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
         ProviderKind::Codex => state.account_managers.codex.lock().await,
+        ProviderKind::Generic => return None,
     };
     let email = manager.next_account()?.token.email;
     let _ = manager.refresh_if_due(&email).await;
@@ -494,6 +498,9 @@ fn provider_id_for(kind: ProviderKind) -> ProviderId {
     match kind {
         ProviderKind::Anthropic => ProviderId::anthropic(),
         ProviderKind::Codex => ProviderId::codex(),
+        // Generic providers have no single id; `resolve` will carry the full
+        // ProviderId once generic routing lands (slice 4). Unreachable today.
+        ProviderKind::Generic => ProviderId::generic("generic"),
     }
 }
 
@@ -739,6 +746,15 @@ async fn route_provider_request(
             Err(error) => return last_response.unwrap_or_else(|| error.into_response()),
         };
         let response = match provider.kind {
+            ProviderKind::Generic => {
+                return AppError::provider(
+                    StatusCode::NOT_IMPLEMENTED,
+                    format!("no serving path for the generic {provider} provider yet"),
+                    "unsupported_endpoint_for_provider",
+                    provider,
+                )
+                .into_response();
+            }
             ProviderKind::Codex => {
                 route_codex_request(
                     state,
@@ -790,6 +806,7 @@ async fn provider_account_count(state: &AppState, provider: ProviderId) -> usize
             .await
             .account_count(),
         ProviderKind::Codex => state.account_managers.codex.lock().await.account_count(),
+        ProviderKind::Generic => 0,
     }
 }
 
@@ -1104,6 +1121,14 @@ async fn next_provider_account(
     let mut manager = match provider.kind {
         ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
         ProviderKind::Codex => state.account_managers.codex.lock().await,
+        ProviderKind::Generic => {
+            return Err(AppError::provider(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("no available {provider} account; run login for {provider}"),
+                "no_account_for_provider",
+                provider,
+            ));
+        }
     };
     let result = manager.next_account_result();
     let Some(account) = result.account else {
@@ -1152,6 +1177,7 @@ async fn record_provider_success(
     let mut manager = match provider.kind {
         ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
         ProviderKind::Codex => state.account_managers.codex.lock().await,
+        ProviderKind::Generic => return,
     };
     manager.record_success(account.token.email.as_str(), usage.as_ref());
 }
@@ -1166,6 +1192,7 @@ async fn record_provider_failure(
     let mut manager = match provider.kind {
         ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
         ProviderKind::Codex => state.account_managers.codex.lock().await,
+        ProviderKind::Generic => return,
     };
     manager.record_failure(
         account.token.email.as_str(),
@@ -1290,6 +1317,13 @@ fn json_upstream_response(
         (ProviderKind::Codex, RequestRoute::Messages) => {
             responses_to_anthropic_message(&response.body, model)
         }
+        // A generic endpoint speaks Chat Completions; its success body passes
+        // through unchanged (slice 4 tests this path end to end). The arm is
+        // unreachable until generic routing lands, but it is the honest shape of
+        // the response matrix: Generic only ever arrives with Chat, and that
+        // body is already a Chat completion.
+        #[allow(clippy::match_same_arms)]
+        (ProviderKind::Generic, _) => response.body,
     };
     (response.status, Json(body)).into_response()
 }
@@ -1478,6 +1512,7 @@ fn update_stream_usage(
     match provider.kind {
         ProviderKind::Anthropic => update_anthropic_stream_usage(event, &data, usage, completed),
         ProviderKind::Codex => update_codex_stream_usage(event, &data, usage, completed),
+        ProviderKind::Generic => {}
     }
 }
 
@@ -1664,6 +1699,16 @@ fn transform_sse_event(
         (ProviderKind::Codex, RequestRoute::Messages) => parsed.map_or_else(
             |_| Vec::new(),
             |data| responses_sse_to_anthropic(event, &data, anthropic_state),
+        ),
+        // A generic endpoint's Chat Completions stream passes through unchanged
+        // (slice 4 tests this path end to end).
+        (ProviderKind::Generic, RequestRoute::Chat) => parsed.map_or_else(
+            |_| Vec::new(),
+            |data| vec![sse(&data, passthrough_event(event))],
+        ),
+        (ProviderKind::Generic, _) => parsed.map_or_else(
+            |_| Vec::new(),
+            |data| vec![sse(&data, passthrough_event(event))],
         ),
     }
 }
