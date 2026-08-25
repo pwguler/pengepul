@@ -41,6 +41,20 @@ impl RetryUpstream {
 }
 
 impl UpstreamClient for RetryUpstream {
+    fn generic_chat(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("generic chat not used in retry test")
+    }
+
+    fn generic_chat_stream(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        unreachable!("generic stream not used in retry test")
+    }
+
     fn anthropic_messages(
         &self,
         request: UpstreamRequest,
@@ -109,6 +123,20 @@ impl UpstreamClient for RetryUpstream {
 }
 
 impl UpstreamClient for FakeUpstream {
+    fn generic_chat(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("generic chat not used in fake tests")
+    }
+
+    fn generic_chat_stream(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        unreachable!("generic stream not used in fake tests")
+    }
+
     fn anthropic_messages(
         &self,
         request: UpstreamRequest,
@@ -244,6 +272,7 @@ fn config(auth_dir: PathBuf) -> Config {
         },
         stats_enabled: true,
         debug: DebugMode::Off,
+        providers: BTreeMap::default(),
     }
 }
 
@@ -1451,4 +1480,597 @@ async fn responses_route_normalizes_string_input_for_codex() {
         calls[0].body["input"],
         json!([{"role": "user", "content": "reply exactly: ok"}])
     );
+}
+
+#[tokio::test]
+async fn admin_accounts_lists_configured_provider_keys_loaded_at_startup() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Save a static key the way `pengepul login --provider groq --key` would.
+    save_token(
+        tmp.path(),
+        &TokenData {
+            access_token: "gsk-secret".to_string(),
+            refresh_token: String::new(),
+            email: "key-12345678".to_string(),
+            expires_at: String::new(),
+            account_uuid: "acct".to_string(),
+            provider: ProviderId::generic("groq"),
+            id_token: None,
+            last_refresh_at: None,
+            plan_type: None,
+        },
+    )
+    .expect("save groq key");
+
+    let mut cfg = config(tmp.path().to_path_buf());
+    cfg.providers.insert(
+        "groq".to_string(),
+        pengepul::config::ConfiguredProvider {
+            base_url: "https://api.groq.com/openai/v1".to_string(),
+        },
+    );
+    let app = create_app(cfg);
+
+    let (status, accounts) = json_response(
+        app,
+        axum::http::Request::builder()
+            .uri("/admin/accounts")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert_eq!(accounts["providers"]["groq"]["account_count"], 1);
+    assert_eq!(
+        accounts["providers"]["groq"]["accounts"][0]["email"],
+        "key-12345678"
+    );
+    assert_eq!(
+        accounts["providers"]["groq"]["accounts"][0]["available"],
+        true
+    );
+}
+
+#[derive(Default)]
+struct GenericUpstream {
+    calls: Mutex<Vec<UpstreamRequest>>,
+}
+
+impl GenericUpstream {
+    fn calls(&self) -> Vec<UpstreamRequest> {
+        self.calls.lock().expect("calls lock").clone()
+    }
+}
+
+impl UpstreamClient for GenericUpstream {
+    fn generic_chat(
+        &self,
+        request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        self.calls.lock().expect("calls lock").push(request);
+        Box::pin(async {
+            Ok(UpstreamJsonResponse {
+                status: axum::http::StatusCode::OK,
+                body: json!({
+                    "id": "chatcmpl_generic",
+                    "object": "chat.completion",
+                    "model": "llama-3.3-70b",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "pong"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                }),
+            })
+        })
+    }
+
+    fn generic_chat_stream(
+        &self,
+        request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        self.calls.lock().expect("calls lock").push(request);
+        Box::pin(async {
+            Ok(UpstreamSseResponse {
+                status: axum::http::StatusCode::OK,
+                body: Box::pin(futures_util::stream::iter([
+                    Ok(Bytes::from_static(
+                        b"data: {\"choices\":[{\"delta\":{\"content\":\"pong\"}}]}\n\n",
+                    )),
+                    Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+                ])),
+            })
+        })
+    }
+
+    fn anthropic_messages(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("anthropic not used in generic tests")
+    }
+
+    fn anthropic_messages_stream(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        unreachable!("anthropic stream not used in generic tests")
+    }
+
+    fn anthropic_count_tokens(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("count_tokens not used in generic tests")
+    }
+
+    fn codex_responses(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("codex not used in generic tests")
+    }
+
+    fn codex_responses_stream(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        unreachable!("codex stream not used in generic tests")
+    }
+
+    fn fetch_models(
+        &self,
+        _kind: ProviderKind,
+        _account: AvailableAccount,
+        _config: Arc<Config>,
+    ) -> ModelsFuture {
+        Box::pin(async { Ok(FetchedModels::new(Vec::new())) })
+    }
+}
+
+fn groq_key_token() -> TokenData {
+    TokenData {
+        access_token: "gsk-secret".to_string(),
+        refresh_token: String::new(),
+        email: "key-12345678".to_string(),
+        expires_at: String::new(),
+        account_uuid: "acct-groq".to_string(),
+        provider: ProviderId::generic("groq"),
+        id_token: None,
+        last_refresh_at: None,
+        plan_type: None,
+    }
+}
+
+fn config_with_groq(auth_dir: PathBuf) -> Config {
+    let mut cfg = config(auth_dir);
+    cfg.providers.insert(
+        "groq".to_string(),
+        pengepul::config::ConfiguredProvider {
+            base_url: "https://api.groq.com/openai/v1".to_string(),
+        },
+    );
+    cfg
+}
+
+#[tokio::test]
+async fn chat_completions_with_a_configured_model_reaches_the_endpoint_with_a_bare_id() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &groq_key_token()).expect("save groq key");
+    let upstream = Arc::new(GenericUpstream::default());
+    let app =
+        create_app_with_upstream(config_with_groq(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, body) = json_response(
+        app,
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1024")
+            .body(Body::from(
+                json!({
+                    "model": "groq/llama-3.3-70b",
+                    "messages": [{"role": "user", "content": "reply exactly: pong"}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert_eq!(body["choices"][0]["message"]["content"], "pong");
+    let calls = upstream.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].body["model"], "llama-3.3-70b");
+    assert_eq!(calls[0].account.token.access_token, "gsk-secret");
+    assert_eq!(calls[0].account.provider.id.as_ref(), "groq");
+}
+
+#[tokio::test]
+async fn a_model_prefix_no_configured_provider_claims_is_unknown() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let upstream = Arc::new(GenericUpstream::default());
+    let app =
+        create_app_with_upstream(config_with_groq(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, body) = json_response(
+        app,
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1024")
+            .body(Body::from(
+                json!({
+                    "model": "mistral/mistral-large",
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, 400);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown model")
+    );
+    assert!(upstream.calls().is_empty());
+}
+
+#[tokio::test]
+async fn generic_models_answer_501_on_messages_responses_and_count_tokens() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &groq_key_token()).expect("save groq key");
+    let upstream = Arc::new(GenericUpstream::default());
+    let app =
+        create_app_with_upstream(config_with_groq(tmp.path().to_path_buf()), upstream.clone());
+
+    for (uri, body) in [
+        (
+            "/v1/messages",
+            json!({
+                "model": "groq/llama-3.3-70b",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+        ),
+        (
+            "/v1/responses",
+            json!({"model": "groq/llama-3.3-70b", "input": "hi"}),
+        ),
+        (
+            "/v1/messages/count_tokens",
+            json!({
+                "model": "groq/llama-3.3-70b",
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+        ),
+    ] {
+        let (status, body) = json_response(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("authorization", "Bearer sk-test")
+                .header("content-type", "application/json")
+                .header("content-length", "1024")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(status, 501, "{uri} answered");
+        assert_eq!(body["error"]["type"], "unsupported_endpoint_for_provider");
+    }
+    assert!(upstream.calls().is_empty());
+}
+
+struct FirstKeyFailsUpstream {
+    calls: Mutex<Vec<UpstreamRequest>>,
+}
+
+impl UpstreamClient for FirstKeyFailsUpstream {
+    fn generic_chat(
+        &self,
+        request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        let fail = request.account.token.access_token == "gsk-secret";
+        self.calls.lock().expect("calls lock").push(request);
+        Box::pin(async move {
+            Ok(UpstreamJsonResponse {
+                status: if fail {
+                    axum::http::StatusCode::TOO_MANY_REQUESTS
+                } else {
+                    axum::http::StatusCode::OK
+                },
+                body: if fail {
+                    json!({"error": {"message": "rate limited"}})
+                } else {
+                    json!({
+                        "id": "chatcmpl_ok",
+                        "object": "chat.completion",
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]
+                    })
+                },
+            })
+        })
+    }
+
+    fn generic_chat_stream(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        unreachable!("stream not used in generic failover test")
+    }
+
+    fn anthropic_messages(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("anthropic not used")
+    }
+
+    fn anthropic_messages_stream(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        unreachable!("anthropic stream not used")
+    }
+
+    fn anthropic_count_tokens(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("count_tokens not used")
+    }
+
+    fn codex_responses(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("codex not used")
+    }
+
+    fn codex_responses_stream(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        unreachable!("codex stream not used")
+    }
+
+    fn fetch_models(
+        &self,
+        _kind: ProviderKind,
+        _account: AvailableAccount,
+        _config: Arc<Config>,
+    ) -> ModelsFuture {
+        Box::pin(async { Ok(FetchedModels::new(Vec::new())) })
+    }
+}
+
+#[tokio::test]
+async fn generic_failover_moves_between_keys_of_the_same_endpoint_only() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &groq_key_token()).expect("save first key");
+    save_token(
+        tmp.path(),
+        &TokenData {
+            access_token: "gsk-second".to_string(),
+            refresh_token: String::new(),
+            email: "key-87654321".to_string(),
+            expires_at: String::new(),
+            account_uuid: "acct-groq-2".to_string(),
+            provider: ProviderId::generic("groq"),
+            id_token: None,
+            last_refresh_at: None,
+            plan_type: None,
+        },
+    )
+    .expect("save second key");
+
+    let upstream = Arc::new(FirstKeyFailsUpstream {
+        calls: Mutex::new(Vec::new()),
+    });
+    let app =
+        create_app_with_upstream(config_with_groq(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, body) = json_response(
+        app,
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1024")
+            .body(Body::from(
+                json!({
+                    "model": "groq/llama-3.3-70b",
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert_eq!(body["choices"][0]["message"]["content"], "ok");
+    let calls = upstream.calls.lock().expect("calls lock");
+    let keys: Vec<_> = calls
+        .iter()
+        .map(|c| c.account.token.access_token.clone())
+        .collect();
+    assert_eq!(keys, ["gsk-secret", "gsk-second"]);
+    assert!(
+        calls
+            .iter()
+            .all(|c| c.account.provider.id.as_ref() == "groq")
+    );
+}
+
+#[derive(Default)]
+struct ModelsUpstream {
+    calls: Mutex<Vec<ProviderKind>>,
+}
+
+impl UpstreamClient for ModelsUpstream {
+    fn fetch_models(
+        &self,
+        kind: ProviderKind,
+        _account: AvailableAccount,
+        _config: Arc<Config>,
+    ) -> ModelsFuture {
+        self.calls.lock().expect("calls lock").push(kind);
+        let ids = if kind == ProviderKind::Generic {
+            vec!["llama-3.3-70b-versatile".to_string()]
+        } else {
+            Vec::new()
+        };
+        Box::pin(async move { Ok(FetchedModels::new(ids)) })
+    }
+    fn generic_chat(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("chat not used in models test")
+    }
+    fn generic_chat_stream(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        unreachable!("stream not used in models test")
+    }
+    fn anthropic_messages(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("anthropic not used in models test")
+    }
+    fn anthropic_messages_stream(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        unreachable!("anthropic stream not used in models test")
+    }
+    fn anthropic_count_tokens(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("count_tokens not used in models test")
+    }
+    fn codex_responses(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("codex not used in models test")
+    }
+    fn codex_responses_stream(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        unreachable!("codex stream not used in models test")
+    }
+}
+
+#[tokio::test]
+async fn v1_models_advertises_fetched_configured_models_with_their_prefix() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &groq_key_token()).expect("save groq key");
+    let upstream = Arc::new(ModelsUpstream::default());
+    let app =
+        create_app_with_upstream(config_with_groq(tmp.path().to_path_buf()), upstream.clone());
+
+    // The catalog refresh loop runs on a spawned task right after app creation;
+    // poll the route until the fetch lands (bounded, then fail).
+    let mut ids = Vec::new();
+    for _ in 0..50 {
+        let (status, body) = json_response(
+            app.clone(),
+            axum::http::Request::builder()
+                .uri("/v1/models")
+                .header("authorization", "Bearer sk-test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, 200);
+        ids = body["data"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item["id"].as_str().map(ToOwned::to_owned))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if ids.iter().any(|id| id == "groq/llama-3.3-70b-versatile") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    assert!(
+        ids.iter().any(|id| id == "groq/llama-3.3-70b-versatile"),
+        "advertised ids: {ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn admin_reload_picks_up_a_newly_saved_key_for_a_configured_provider() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &groq_key_token()).expect("save first key");
+    let upstream = Arc::new(GenericUpstream::default());
+    let app = create_app_with_upstream(config_with_groq(tmp.path().to_path_buf()), upstream);
+
+    // A second key lands on disk while the relay is running.
+    save_token(
+        tmp.path(),
+        &TokenData {
+            access_token: "gsk-second".to_string(),
+            refresh_token: String::new(),
+            email: "key-87654321".to_string(),
+            expires_at: String::new(),
+            account_uuid: "acct-groq-2".to_string(),
+            provider: ProviderId::generic("groq"),
+            id_token: None,
+            last_refresh_at: None,
+            plan_type: None,
+        },
+    )
+    .expect("save second key");
+
+    let (status, reloaded) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/admin/reload")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        reloaded["reloaded"]["groq"]["added"],
+        json!(["key-87654321"])
+    );
+
+    let (status, accounts) = json_response(
+        app,
+        axum::http::Request::builder()
+            .uri("/admin/accounts")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(accounts["providers"]["groq"]["account_count"], 2);
 }

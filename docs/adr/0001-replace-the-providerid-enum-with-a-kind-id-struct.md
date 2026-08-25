@@ -45,6 +45,8 @@ can be asked for.
   `ProviderId::new` has no caller outside `src/types.rs`, and `FromStr` derives
   the id from the parsed kind, so the field reads as a heap copy of the enum's
   own name, and reading `src/types.rs` cold gives no hint why it exists.
+  (Superseded for configured providers by ADR-0011: a `Generic` kind's id comes
+  from the `providers:` config entry name, so `Generic` has many ids.)
 - The layout on disk binds to `id`; the discriminator inside the file binds to
   `kind`. `save_token` writes `<auth_dir>/<id>/<email>.json`, `load_all_tokens`
   picks the directory by `id` and then keeps a file only when the kind it
@@ -54,7 +56,8 @@ can be asked for.
 - The type admits a second instance of a kind. Nothing constructs one:
   `ProviderId` values are built from their fixed kinds, and `src/config.rs` has
   no provider concept, so an instance declared outside Rust has nothing that
-  constructs it.
+  constructs it. (Superseded for configured providers by ADR-0011: the
+  `providers:` config section constructs a `Generic` ProviderId per entry.)
 - Adding a kind stops the compiler at every behavior site. `ProviderKind` is
   closed, so the exhaustive `match` arms in `app.rs`, `runtime.rs` and
   `tokens.rs` are the checklist for the work. That property is the reason not to

@@ -169,7 +169,12 @@ impl CliRuntime for RealRuntime {
         Ok(target)
     }
 
-    fn login(&mut self, config: &Config, provider: ProviderId) -> Result<String> {
+    fn login(
+        &mut self,
+        config: &Config,
+        provider: ProviderId,
+        _key: Option<&str>,
+    ) -> Result<String> {
         let state = random_urlsafe(32);
         let pkce = generate_pkce_codes();
         let auth_url = auth_url(&provider, &state, &pkce);
@@ -184,6 +189,9 @@ impl CliRuntime for RealRuntime {
                 }
                 ProviderKind::Codex => {
                     exchange_codex_code(&callback.code, &callback.state, &state, &pkce).await
+                }
+                ProviderKind::Generic => {
+                    unreachable!("cli::login saves static keys; the OAuth flow is never entered")
                 }
             }
         })?;
@@ -265,6 +273,9 @@ fn auth_url(provider: &ProviderId, state: &str, pkce: &PkceCodes) -> String {
     match provider.kind {
         ProviderKind::Anthropic => generate_anthropic_auth_url(state, pkce),
         ProviderKind::Codex => generate_codex_auth_url(state, pkce),
+        ProviderKind::Generic => {
+            unreachable!("static-key providers never build an OAuth authorize URL")
+        }
     }
 }
 
@@ -276,6 +287,9 @@ fn callback_endpoint(provider: &ProviderId) -> Result<(u16, &'static str)> {
             Ok((port, "/callback"))
         }
         ProviderKind::Codex => Ok((CODEX_CALLBACK_PORT, CODEX_CALLBACK_PATH)),
+        ProviderKind::Generic => {
+            unreachable!("static-key providers never serve an OAuth callback")
+        }
     }
 }
 

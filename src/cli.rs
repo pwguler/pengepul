@@ -6,7 +6,9 @@ use clap::{CommandFactory, Parser, Subcommand};
 use serde_json::Value;
 
 use crate::config::{Config, load_config, selected_config_path};
-use crate::types::ProviderId;
+use crate::tokens::save_token;
+use crate::types::{ProviderId, ProviderKind, TokenData};
+use crate::utils::sha256_hex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunOutcome {
@@ -104,10 +106,14 @@ pub trait CliRuntime {
 
     /// Authorize and save an upstream account.
     ///
+    /// A configured (static-key) provider carries its key in `key`; anthropic and
+    /// codex ignore it.
+    ///
     /// # Errors
     ///
     /// Returns an error if OAuth authorization, token exchange, or token persistence fails.
-    fn login(&mut self, config: &Config, provider: ProviderId) -> Result<String>;
+    fn login(&mut self, config: &Config, provider: ProviderId, key: Option<&str>)
+    -> Result<String>;
 
     /// Resolve the tag of the newest published release.
     ///
@@ -149,8 +155,11 @@ enum Command {
     Login {
         #[arg(long = "config")]
         command_config: Option<PathBuf>,
-        #[arg(long, default_value = "anthropic", value_parser = ["anthropic", "codex"])]
+        #[arg(long)]
         provider: String,
+        /// static API key for a configured OpenAI-compatible provider
+        #[arg(long)]
+        key: Option<String>,
     },
     /// show local server status
     Status {
@@ -312,10 +321,12 @@ pub fn run_with_env(
         Some(Command::Login {
             command_config,
             provider,
+            key,
         }) => {
             login(
                 command_config.as_deref().or(parsed_args.config.as_deref()),
                 &provider,
+                key.as_deref(),
                 home,
                 cwd,
                 runtime,
@@ -528,16 +539,50 @@ fn update(check: bool, runtime: &mut impl CliRuntime, output: &mut Output) -> Re
 fn login(
     config_path: Option<&Path>,
     provider: &str,
+    key: Option<&str>,
     home: &Path,
     cwd: &Path,
     runtime: &mut impl CliRuntime,
     output: &mut Output,
 ) -> Result<()> {
     let config = load_config(config_path, Some(home), cwd)?;
-    let provider = provider.parse::<ProviderId>().map_err(anyhow::Error::msg)?;
-    let provider_label = provider.clone();
-    let email = runtime.login(&config, provider)?;
-    output.line(&format!("saved {provider_label} account token for {email}"));
+    // anthropic and codex are always valid; anything else must name a configured
+    // provider, and only a configured provider may carry a key.
+    if let Ok(builtin) = provider.parse::<ProviderId>() {
+        if key.is_some() {
+            bail!("{builtin} uses OAuth; --key is for configured providers");
+        }
+        let email = runtime.login(&config, builtin.clone(), key)?;
+        output.line(&format!("saved {builtin} account token for {email}"));
+        return Ok(());
+    }
+    if !config.providers.contains_key(provider) {
+        bail!(
+            "{provider} is not configured; configured providers: {}",
+            config
+                .providers
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let key = key.context(format!("{provider} takes a static API key; pass --key"))?;
+    let label = format!("key-{}", &sha256_hex(key)[..8]);
+    let provider_id = ProviderId::new(ProviderKind::Generic, provider);
+    let token = TokenData {
+        access_token: key.to_string(),
+        refresh_token: String::new(),
+        email: label.clone(),
+        expires_at: String::new(),
+        account_uuid: sha256_hex(key),
+        provider: provider_id,
+        id_token: None,
+        last_refresh_at: None,
+        plan_type: None,
+    };
+    save_token(&config.auth_dir, &token)?;
+    output.line(&format!("saved {provider} account token for {label}"));
     Ok(())
 }
 

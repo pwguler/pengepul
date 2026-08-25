@@ -7,7 +7,7 @@ pengepul pools several AI-vendor accounts behind one local API and spreads clien
 ### Providers
 
 **Provider**:
-One of the two upstream vendor families pengepul relays to — anthropic, codex — and the top-level axis by which accounts, credentials, models and admin output are partitioned.
+An upstream vendor family pengepul relays to — anthropic, codex, or a configured OpenAI-compatible endpoint (e.g. groq) — and the top-level axis by which accounts, credentials, models and admin output are partitioned.
 _Avoid_: kind, provider id, backend, owned_by
 
 **Upstream**:
@@ -31,7 +31,7 @@ _Avoid_: conversion, adapter, mapping, shim
 ### Accounts
 
 **Account**:
-One authorized identity at a provider, keyed by email, holding the credential pengepul rotates through and the usage and failure record kept against it.
+One authorized identity at a provider, keyed by email (or by a derived label for static-key providers), holding the credential pengepul rotates through and the usage and failure record kept against it.
 _Avoid_: credential, token, token file, snapshot
 
 **Refresh**:
@@ -39,7 +39,7 @@ Replacement of an account's expiring access token using its refresh token, done 
 _Avoid_: renew, re-auth
 
 **Reauth**:
-The state an account enters when its refresh token is itself rejected, where nothing but a human re-running `pengepul login` restores it.
+The state an account enters when its refresh token is itself rejected, where nothing but a human re-running `pengepul login` restores it. Static-key accounts never enter Reauth — they have no refresh token — a rejected key only cools down and comes back to fail again until the operator replaces it.
 _Avoid_: refresh exhausted, invalid_grant, dead token
 
 **Cooldown**:
@@ -70,16 +70,16 @@ _Avoid_: billing classifier, detector, filter
 
 ## Relationships
 
-- pengepul has exactly two **Providers**: anthropic, codex.
+- pengepul has two built-in **Providers** — anthropic, codex — plus one configured **Provider** per `providers:` config entry.
 - One **Provider** has zero or more **Accounts**; one **Account** belongs to exactly one **Provider**.
-- Within one **Provider** an **Account** is keyed by exactly one email, and emails are unique.
-- One **Account** holds exactly one credential: an access-token/refresh-token pair.
+- Within one **Provider** an **Account** is keyed by exactly one email (anthropic/codex) or by a label derived from the key (static-key providers), and keys are unique.
+- One **Account** holds exactly one credential: an access-token/refresh-token pair for anthropic and codex, or one static API key for a configured OpenAI-compatible **Provider**.
 - One **Account** has at most one **Cooldown** in effect, with one duration policy for ordinary failures and a longer one for **Reauth**.
 - One model id resolves to exactly one **Provider**.
 - One client request is served by one **Account** at a time, and **Failover** only moves it between **Accounts** of the same **Provider**.
-- **Cloaking** applies to requests bound for both **Upstreams**. The **Local API key** applies to requests arriving from a client.
+- **Cloaking** applies to requests bound for the anthropic and codex **Upstreams**; configured OpenAI-compatible endpoints are never cloaked. The **Local API key** applies to requests arriving from a client.
 - One pengepul endpoint accepts exactly one **Inbound dialect**; one **Provider** accepts exactly one **Dialect** upstream.
-- Any **Inbound dialect** may be served by anthropic or codex, and **Translation** is what closes the gap. count_tokens is anthropic-only and answers 501 for codex.
+- Any **Inbound dialect** may be served by anthropic or codex, and **Translation** is what closes the gap. A configured OpenAI-compatible endpoint accepts only the Chat Completions dialect and answers 501 for the others. count_tokens is anthropic-only and answers 501 elsewhere.
 
 ## Example dialogue
 
@@ -101,7 +101,7 @@ _Avoid_: billing classifier, detector, filter
 
 ## Flagged ambiguities
 
-- "provider" names both the vendor and a configured entry for that vendor. Resolved: **Provider** means the vendor. Nothing operator-facing distinguishes a vendor from a configured entry for it, because there is exactly one entry per vendor.
+- "provider" names both the vendor and a configured entry for that vendor. Resolved: **Provider** means the vendor. For a configured OpenAI-compatible endpoint, the config entry is the Provider; for anthropic and codex there is no config entry because they are built in.
 - "claude" appears as an alias for anthropic in stored credentials. Resolved: **anthropic** is the only spelling an operator uses or types.
 - "account", "credential" and "token" all name the same file under the auth directory across the README, the CLI and the source. Resolved: **Account** is the domain noun — the identity, its credential, and its record. Credential is the secret inside an account. Token is a wire artifact and never means the account.
 - Accounts are keyed by email. Resolved: read the field as the account key, not as an address.

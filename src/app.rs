@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use async_stream::try_stream;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -20,7 +21,9 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::accounts::{AccountManager, RefreshPolicy, RefreshPolicyKind};
 use crate::config::Config;
 use crate::masquerade::{masquerade_request, restore_tool_use_names};
-use crate::models::{FetchedModels, ModelCatalog, parse_anthropic, parse_codex, upstream_model};
+use crate::models::{
+    FetchedModels, ModelCatalog, parse_anthropic, parse_codex, parse_openai, upstream_model,
+};
 use crate::oauth::{refresh_anthropic_tokens, refresh_codex_tokens};
 use crate::streaming::{
     AnthropicStreamState, ChatStreamState, ResponsesStreamState, anthropic_sse_to_chat,
@@ -35,8 +38,8 @@ use crate::translate::{
 use crate::types::{AvailableAccount, ProviderId, ProviderKind, UsageData};
 use crate::upstream::{
     ANTHROPIC_BASE_URL, CODEX_BASE_URL, CODEX_DEFAULT_CLI_VERSION, CODEX_MODELS_PATH,
-    CODEX_RESPONSES_PATH, anthropic_headers, apply_cloaking, codex_headers,
-    normalize_codex_responses_body,
+    CODEX_RESPONSES_PATH, anthropic_headers, apply_cloaking, codex_headers, generic_base_url,
+    generic_chat_headers, normalize_codex_responses_body,
 };
 use crate::utils::now_iso;
 
@@ -75,6 +78,11 @@ pub trait UpstreamClient: Send + Sync {
     fn anthropic_count_tokens(&self, request: UpstreamRequest) -> UpstreamFuture;
     fn codex_responses(&self, request: UpstreamRequest) -> UpstreamFuture;
     fn codex_responses_stream(&self, request: UpstreamRequest) -> UpstreamSseFuture;
+    /// A configured OpenAI-compatible endpoint's Chat Completions call. The
+    /// request carries the resolved base URL in its config; the body is a plain
+    /// chat completion.
+    fn generic_chat(&self, request: UpstreamRequest) -> UpstreamFuture;
+    fn generic_chat_stream(&self, request: UpstreamRequest) -> UpstreamSseFuture;
     fn fetch_models(
         &self,
         kind: ProviderKind,
@@ -96,6 +104,7 @@ struct AppState {
 struct AccountManagers {
     anthropic: tokio::sync::Mutex<AccountManager>,
     codex: tokio::sync::Mutex<AccountManager>,
+    generic: BTreeMap<String, tokio::sync::Mutex<AccountManager>>,
 }
 
 #[derive(Clone)]
@@ -316,6 +325,48 @@ impl UpstreamClient for HttpUpstreamClient {
         })
     }
 
+    fn generic_chat(&self, request: UpstreamRequest) -> UpstreamFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            let stream = request
+                .body
+                .get("stream")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let timeout_ms = if stream {
+                request.config.timeouts.stream_messages_ms
+            } else {
+                request.config.timeouts.messages_ms
+            };
+            let base_url = generic_base_url(&request.config, &request.account.provider.id)
+                .context("generic provider missing from config")?;
+            send_json(
+                client,
+                format!("{base_url}/chat/completions"),
+                generic_chat_headers(&request.account),
+                request.body,
+                timeout_ms,
+            )
+            .await
+        })
+    }
+
+    fn generic_chat_stream(&self, request: UpstreamRequest) -> UpstreamSseFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            let base_url = generic_base_url(&request.config, &request.account.provider.id)
+                .context("generic provider missing from config")?;
+            send_stream(
+                client,
+                format!("{base_url}/chat/completions"),
+                generic_chat_headers(&request.account),
+                request.body,
+                request.config.timeouts.stream_messages_ms,
+            )
+            .await
+        })
+    }
+
     fn fetch_models(
         &self,
         kind: ProviderKind,
@@ -326,6 +377,14 @@ impl UpstreamClient for HttpUpstreamClient {
         let timeout = config.timeouts.count_tokens_ms;
         Box::pin(async move {
             match kind {
+                ProviderKind::Generic => {
+                    let base_url = generic_base_url(&config, &account.provider.id)
+                        .context("generic provider missing from config")?;
+                    let headers = generic_chat_headers(&account);
+                    let body =
+                        send_get(client, format!("{base_url}/models"), headers, timeout).await?;
+                    Ok(FetchedModels::new(parse_openai(&body)))
+                }
                 ProviderKind::Anthropic => {
                     let headers = BTreeMap::from([
                         (
@@ -429,14 +488,32 @@ fn build_account_managers(config: &Config) -> AccountManagers {
     );
     let _ = anthropic.load();
     let _ = codex.load();
+    // One manager per configured provider; static keys never refresh, so the
+    // callback exists only to satisfy the type and must never be called.
+    let mut generic = BTreeMap::new();
+    for id in config.providers.keys() {
+        let mut manager = AccountManager::new(
+            config.auth_dir.clone(),
+            ProviderId::generic(id.clone()),
+            |_refresh_token| Box::pin(async { anyhow::bail!("static keys do not refresh") }),
+            RefreshPolicy {
+                kind: RefreshPolicyKind::Never,
+                seconds: 0,
+            },
+        );
+        let _ = manager.load();
+        generic.insert(id.clone(), tokio::sync::Mutex::new(manager));
+    }
     tracing::info!(
         anthropic = anthropic.account_count(),
         codex = codex.account_count(),
+        generic = generic.len(),
         "loaded provider accounts"
     );
     AccountManagers {
         anthropic: tokio::sync::Mutex::new(anthropic),
         codex: tokio::sync::Mutex::new(codex),
+        generic,
     }
 }
 
@@ -475,26 +552,57 @@ async fn refresh_model_catalog(state: &AppState) {
             }
         }
     }
+    // Configured providers: one fetch each, advertised under their own prefix.
+    for provider_id in state.config.providers.keys() {
+        let provider = ProviderId::generic(provider_id.clone());
+        let Some(account) = catalog_account_id(state, &provider).await else {
+            continue;
+        };
+        match state
+            .upstream
+            .fetch_models(ProviderKind::Generic, account, state.config.clone())
+            .await
+        {
+            Ok(FetchedModels { ids }) => {
+                state
+                    .catalog
+                    .write()
+                    .expect("catalog lock poisoned")
+                    .set_generic(provider_id, ids);
+            }
+            Err(error) => {
+                tracing::warn!(provider = provider_id, ?error, "model list fetch failed");
+            }
+        }
+    }
 }
 
 /// An account for a background model fetch: refresh its token if due, then hand it back. The
 /// manager lock drops before the caller fetches, so the request path is never blocked on the
 /// model-list I/O.
 async fn catalog_account(state: &AppState, kind: ProviderKind) -> Option<AvailableAccount> {
-    let mut manager = match kind {
-        ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
-        ProviderKind::Codex => state.account_managers.codex.lock().await,
-    };
-    let email = manager.next_account()?.token.email;
-    let _ = manager.refresh_if_due(&email).await;
-    manager.account(&email)
+    match kind {
+        ProviderKind::Anthropic => {
+            let mut manager = state.account_managers.anthropic.lock().await;
+            let email = manager.next_account()?.token.email;
+            let _ = manager.refresh_if_due(&email).await;
+            manager.account(&email)
+        }
+        ProviderKind::Codex => {
+            let mut manager = state.account_managers.codex.lock().await;
+            let email = manager.next_account()?.token.email;
+            let _ = manager.refresh_if_due(&email).await;
+            manager.account(&email)
+        }
+        ProviderKind::Generic => None,
+    }
 }
 
-fn provider_id_for(kind: ProviderKind) -> ProviderId {
-    match kind {
-        ProviderKind::Anthropic => ProviderId::anthropic(),
-        ProviderKind::Codex => ProviderId::codex(),
-    }
+/// An account for a configured provider's model fetch: static keys never refresh.
+async fn catalog_account_id(state: &AppState, provider: &ProviderId) -> Option<AvailableAccount> {
+    let manager = state.account_managers.generic.get(provider.id.as_ref())?;
+    let mut manager = manager.lock().await;
+    manager.next_account()
 }
 
 async fn health() -> Json<Value> {
@@ -508,7 +616,7 @@ async fn admin_accounts(State(state): State<AppState>, headers: HeaderMap) -> Re
 
     let anthropic = state.account_managers.anthropic.lock().await;
     let codex = state.account_managers.codex.lock().await;
-    let providers = serde_json::Map::from_iter([
+    let mut providers = serde_json::Map::from_iter([
         (
             ProviderId::anthropic().to_string(),
             json!({
@@ -524,6 +632,18 @@ async fn admin_accounts(State(state): State<AppState>, headers: HeaderMap) -> Re
             }),
         ),
     ]);
+    drop(anthropic);
+    drop(codex);
+    for (id, manager) in &state.account_managers.generic {
+        let manager = manager.lock().await;
+        providers.insert(
+            id.clone(),
+            json!({
+                "accounts": manager.snapshots(),
+                "account_count": manager.account_count()
+            }),
+        );
+    }
 
     Json(json!({"providers": providers, "generated_at": now_iso()})).into_response()
 }
@@ -535,11 +655,32 @@ async fn admin_reload(State(state): State<AppState>, headers: HeaderMap) -> Resp
 
     let anthropic = state.account_managers.anthropic.lock().await.reload();
     let codex = state.account_managers.codex.lock().await.reload();
+    let mut generic = BTreeMap::new();
+    let mut generic_failed = None;
+    for (id, manager) in &state.account_managers.generic {
+        match manager.lock().await.reload() {
+            Ok(result) => {
+                generic.insert(id.clone(), result);
+            }
+            Err(error) => generic_failed = Some(error),
+        }
+    }
+    if let Some(error) = generic_failed {
+        return AppError::simple(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to reload accounts: {error}"),
+        )
+        .into_response();
+    }
     let reloaded = match (anthropic, codex) {
-        (Ok(anthropic), Ok(codex)) => serde_json::Map::from_iter([
-            (ProviderId::anthropic().to_string(), anthropic),
-            (ProviderId::codex().to_string(), codex),
-        ]),
+        (Ok(anthropic), Ok(codex)) => {
+            let mut map = serde_json::Map::from_iter([
+                (ProviderId::anthropic().to_string(), anthropic),
+                (ProviderId::codex().to_string(), codex),
+            ]);
+            map.extend(generic);
+            map
+        }
         (Err(error), _) | (_, Err(error)) => {
             return AppError::simple(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -568,12 +709,12 @@ async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
         .expect("catalog lock poisoned")
         .advertised()
         .into_iter()
-        .map(|(id, kind)| {
+        .map(|(id, provider)| {
             json!({
                 "id": id,
                 "object": "model",
                 "created": created,
-                "owned_by": kind.canonical_id()
+                "owned_by": provider.id.as_ref()
             })
         })
         .collect::<Vec<_>>();
@@ -634,11 +775,11 @@ async fn count_tokens(State(state): State<AppState>, headers: HeaderMap, body: B
     let Some(model_id) = required_model(&body) else {
         return AppError::simple(StatusCode::BAD_REQUEST, "model is required").into_response();
     };
-    let Some(kind) = state
+    let Some(provider) = state
         .catalog
         .read()
         .expect("catalog lock poisoned")
-        .resolve(model_id)
+        .resolve_id(model_id, &state.config.providers)
     else {
         return AppError::simple(
             StatusCode::BAD_REQUEST,
@@ -646,9 +787,8 @@ async fn count_tokens(State(state): State<AppState>, headers: HeaderMap, body: B
         )
         .into_response();
     };
-    let provider = provider_id_for(kind);
-    let model = upstream_model(model_id).to_string();
-    if matches!(provider.kind, ProviderKind::Codex) {
+    let model = upstream_model(model_id, &provider).to_string();
+    if provider.kind != ProviderKind::Anthropic {
         return AppError::provider(
             StatusCode::NOT_IMPLEMENTED,
             format!("count_tokens is not supported for the {provider} provider"),
@@ -711,11 +851,11 @@ async fn route_provider_request(
     let Some(model_id) = required_model(body) else {
         return AppError::simple(StatusCode::BAD_REQUEST, "model is required").into_response();
     };
-    let Some(kind) = state
+    let Some(provider) = state
         .catalog
         .read()
         .expect("catalog lock poisoned")
-        .resolve(model_id)
+        .resolve_id(model_id, &state.config.providers)
     else {
         return AppError::simple(
             StatusCode::BAD_REQUEST,
@@ -723,8 +863,7 @@ async fn route_provider_request(
         )
         .into_response();
     };
-    let provider = provider_id_for(kind);
-    let model = upstream_model(model_id).to_string();
+    let model = upstream_model(model_id, &provider).to_string();
     let client_wants_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let attempts = provider_account_count(state, provider.clone()).await.max(1);
     let mut last_response = None;
@@ -739,6 +878,30 @@ async fn route_provider_request(
             Err(error) => return last_response.unwrap_or_else(|| error.into_response()),
         };
         let response = match provider.kind {
+            ProviderKind::Generic => {
+                if matches!(route, RequestRoute::Chat) {
+                    route_generic_chat_request(
+                        state,
+                        headers,
+                        body,
+                        &model,
+                        &account,
+                        client_wants_stream,
+                    )
+                    .await
+                } else {
+                    return AppError::provider(
+                        StatusCode::NOT_IMPLEMENTED,
+                        format!(
+                            "the {} dialect is not supported for the {provider} provider",
+                            route_name(route)
+                        ),
+                        "unsupported_endpoint_for_provider",
+                        provider,
+                    )
+                    .into_response();
+                }
+            }
             ProviderKind::Codex => {
                 route_codex_request(
                     state,
@@ -790,6 +953,12 @@ async fn provider_account_count(state: &AppState, provider: ProviderId) -> usize
             .await
             .account_count(),
         ProviderKind::Codex => state.account_managers.codex.lock().await.account_count(),
+        ProviderKind::Generic => {
+            let Some(manager) = state.account_managers.generic.get(provider.id.as_ref()) else {
+                return 0;
+            };
+            manager.lock().await.account_count()
+        }
     }
 }
 
@@ -797,6 +966,85 @@ fn should_retry_upstream_status(status: StatusCode) -> bool {
     // 501 is pengepul's own "unsupported route for provider" response, not a transient
     // upstream failure; retrying it would only re-generate the same error each pass.
     matches!(status.as_u16(), 401 | 403 | 429 | 500 | 502..=599)
+}
+
+/// The route's display name for error messages ("Chat Completions" etc.).
+fn route_name(route: RequestRoute) -> &'static str {
+    match route {
+        RequestRoute::Chat => "Chat Completions",
+        RequestRoute::Responses => "Responses",
+        RequestRoute::Messages => "Messages",
+    }
+}
+
+/// Serve a Chat Completions request on a configured OpenAI-compatible endpoint.
+/// The body goes upstream untouched (the endpoint speaks chat natively), stream
+/// flag rewritten to what the client asked for.
+async fn route_generic_chat_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &Value,
+    model: &str,
+    account: &AvailableAccount,
+    client_wants_stream: bool,
+) -> Response {
+    let mut upstream_body = body_with_model(body, model);
+    if let Some(object) = upstream_body.as_object_mut() {
+        object.insert("stream".to_string(), Value::Bool(client_wants_stream));
+    }
+    if client_wants_stream {
+        return match state
+            .upstream
+            .generic_chat_stream(UpstreamRequest {
+                body: upstream_body,
+                request_headers: headers_to_map(headers),
+                account: account.clone(),
+                config: state.config.clone(),
+            })
+            .await
+        {
+            Ok(response) => {
+                let accounting =
+                    stream_accounting(state, account.provider.clone(), account, response.status)
+                        .await;
+                sse_upstream_response(
+                    response,
+                    account.provider.clone(),
+                    RequestRoute::Chat,
+                    model,
+                    accounting,
+                    Arc::new(BTreeMap::new()),
+                )
+            }
+            Err(error) => {
+                upstream_failure_response(state, account.provider.clone(), account, &error).await
+            }
+        };
+    }
+    match state
+        .upstream
+        .generic_chat(UpstreamRequest {
+            body: upstream_body,
+            request_headers: headers_to_map(headers),
+            account: account.clone(),
+            config: state.config.clone(),
+        })
+        .await
+    {
+        Ok(response) => {
+            record_json_result(state, account.provider.clone(), account, &response).await;
+            json_upstream_response(
+                response,
+                &account.provider,
+                RequestRoute::Chat,
+                model,
+                &BTreeMap::new(),
+            )
+        }
+        Err(error) => {
+            upstream_failure_response(state, account.provider.clone(), account, &error).await
+        }
+    }
 }
 
 async fn route_codex_request(
@@ -1104,6 +1352,17 @@ async fn next_provider_account(
     let mut manager = match provider.kind {
         ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
         ProviderKind::Codex => state.account_managers.codex.lock().await,
+        ProviderKind::Generic => {
+            let Some(manager) = state.account_managers.generic.get(provider.id.as_ref()) else {
+                return Err(AppError::provider(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("no available {provider} account; run login for {provider}"),
+                    "no_account_for_provider",
+                    provider,
+                ));
+            };
+            manager.lock().await
+        }
     };
     let result = manager.next_account_result();
     let Some(account) = result.account else {
@@ -1152,6 +1411,12 @@ async fn record_provider_success(
     let mut manager = match provider.kind {
         ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
         ProviderKind::Codex => state.account_managers.codex.lock().await,
+        ProviderKind::Generic => {
+            let Some(manager) = state.account_managers.generic.get(provider.id.as_ref()) else {
+                return;
+            };
+            manager.lock().await
+        }
     };
     manager.record_success(account.token.email.as_str(), usage.as_ref());
 }
@@ -1166,6 +1431,12 @@ async fn record_provider_failure(
     let mut manager = match provider.kind {
         ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
         ProviderKind::Codex => state.account_managers.codex.lock().await,
+        ProviderKind::Generic => {
+            let Some(manager) = state.account_managers.generic.get(provider.id.as_ref()) else {
+                return;
+            };
+            manager.lock().await
+        }
     };
     manager.record_failure(
         account.token.email.as_str(),
@@ -1290,6 +1561,13 @@ fn json_upstream_response(
         (ProviderKind::Codex, RequestRoute::Messages) => {
             responses_to_anthropic_message(&response.body, model)
         }
+        // A generic endpoint speaks Chat Completions; its success body passes
+        // through unchanged (slice 4 tests this path end to end). The arm is
+        // unreachable until generic routing lands, but it is the honest shape of
+        // the response matrix: Generic only ever arrives with Chat, and that
+        // body is already a Chat completion.
+        #[allow(clippy::match_same_arms)]
+        (ProviderKind::Generic, _) => response.body,
     };
     (response.status, Json(body)).into_response()
 }
@@ -1478,6 +1756,7 @@ fn update_stream_usage(
     match provider.kind {
         ProviderKind::Anthropic => update_anthropic_stream_usage(event, &data, usage, completed),
         ProviderKind::Codex => update_codex_stream_usage(event, &data, usage, completed),
+        ProviderKind::Generic => {}
     }
 }
 
@@ -1664,6 +1943,16 @@ fn transform_sse_event(
         (ProviderKind::Codex, RequestRoute::Messages) => parsed.map_or_else(
             |_| Vec::new(),
             |data| responses_sse_to_anthropic(event, &data, anthropic_state),
+        ),
+        // A generic endpoint's Chat Completions stream passes through unchanged
+        // (slice 4 tests this path end to end).
+        (ProviderKind::Generic, RequestRoute::Chat) => parsed.map_or_else(
+            |_| Vec::new(),
+            |data| vec![sse(&data, passthrough_event(event))],
+        ),
+        (ProviderKind::Generic, _) => parsed.map_or_else(
+            |_| Vec::new(),
+            |data| vec![sse(&data, passthrough_event(event))],
         ),
     }
 }
@@ -2024,6 +2313,14 @@ mod tests {
     }
 
     impl UpstreamClient for CapturingUpstream {
+        fn generic_chat(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!("generic chat not used in refresh fallback test")
+        }
+
+        fn generic_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!("generic stream not used in refresh fallback test")
+        }
+
         fn anthropic_messages(&self, request: UpstreamRequest) -> UpstreamFuture {
             self.calls
                 .lock()
@@ -2231,6 +2528,7 @@ mod tests {
             },
             stats_enabled: true,
             debug: DebugMode::Off,
+            providers: std::collections::BTreeMap::new(),
         }
     }
 
@@ -2257,6 +2555,7 @@ mod tests {
             account_managers: Arc::new(AccountManagers {
                 anthropic: tokio::sync::Mutex::new(manager(tmp, ProviderId::anthropic())),
                 codex: tokio::sync::Mutex::new(manager(tmp, ProviderId::codex())),
+                generic: std::collections::BTreeMap::new(),
             }),
             rate_limit_buckets: Arc::new(Mutex::new(std::collections::BTreeMap::<
                 String,

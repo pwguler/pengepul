@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 pub enum ProviderKind {
     Anthropic,
     Codex,
+    /// A configured OpenAI-compatible endpoint. The id names the `providers:`
+    /// config entry ("groq", ...); the kind is what makes it generic.
+    Generic,
 }
 
 impl ProviderKind {
@@ -17,6 +20,7 @@ impl ProviderKind {
         match self {
             Self::Anthropic => "anthropic",
             Self::Codex => "codex",
+            Self::Generic => "generic",
         }
     }
 }
@@ -62,6 +66,25 @@ impl ProviderId {
     #[must_use]
     pub fn codex() -> Self {
         Self::new(ProviderKind::Codex, "codex")
+    }
+
+    /// A configured OpenAI-compatible endpoint, named by its `providers:` entry.
+    #[must_use]
+    pub fn generic(id: impl Into<Arc<str>>) -> Self {
+        Self::new(ProviderKind::Generic, id)
+    }
+
+    /// The `ProviderId` a kind resolves to when the id is the kind's own name —
+    /// anthropic and codex only; a generic kind must carry its config entry name.
+    #[must_use]
+    pub fn for_kind(kind: ProviderKind) -> Self {
+        match kind {
+            ProviderKind::Anthropic => Self::anthropic(),
+            ProviderKind::Codex => Self::codex(),
+            ProviderKind::Generic => {
+                unreachable!("a generic provider needs its config entry name")
+            }
+        }
     }
 
     /// Returns the per-id subdirectory name under `auth_dir`,

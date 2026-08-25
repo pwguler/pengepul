@@ -116,7 +116,12 @@ impl CliRuntime for FakeRuntime {
         Ok(())
     }
 
-    fn login(&mut self, _config: &Config, provider: ProviderId) -> Result<String> {
+    fn login(
+        &mut self,
+        _config: &Config,
+        provider: ProviderId,
+        _key: Option<&str>,
+    ) -> Result<String> {
         let email = format!("{provider}@example.com");
         self.login_provider = Some(provider);
         Ok(email)
@@ -363,8 +368,18 @@ fn service_logs_defaults_to_recent_lines_without_follow() {
     assert_eq!(runtime.calls, ["service:logs:follow=false:lines=50"]);
 }
 
+fn write_config_with_providers(home: &Path, providers: &str) {
+    let config_dir = home.join(".pengepul");
+    std::fs::create_dir_all(&config_dir).expect("config dir");
+    std::fs::write(
+        config_dir.join("config.yaml"),
+        format!("host: \"127.0.0.1\"\nport: 8317\nauth-dir: ~/.pengepul\napi-keys:\n  - sk-test\nproviders:\n{providers}"),
+    )
+    .expect("write config");
+}
+
 #[test]
-fn login_rejects_removed_provider_and_key_flag() {
+fn login_rejects_removed_provider() {
     let tmp = tempdir().expect("tempdir");
     write_config(tmp.path(), "127.0.0.1", 8317);
     let mut runtime = FakeRuntime::default();
@@ -381,17 +396,94 @@ fn login_rejects_removed_provider_and_key_flag() {
         "removed provider must be rejected at parse time"
     );
     assert!(runtime.login_provider.is_none());
+}
 
-    // The key flag that only existed for the removed provider is gone.
+#[test]
+fn login_with_key_saves_a_configured_provider_key() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  groq:\n    base-url: https://api.groq.com/openai/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+
+    let outcome = run(
+        &["login", "--provider", "groq", "--key", "gsk-secret-key"],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    assert_eq!(outcome.code, 0);
+    // Static keys are saved by the CLI itself; the OAuth runtime is never entered.
+    assert!(runtime.login_provider.is_none(), "no OAuth login for a key");
+    let token_file = tmp.path().join(".pengepul/groq");
+    assert!(token_file.exists(), "key token saved under auth-dir/groq");
+    let saved: serde_json::Value = {
+        let entry = std::fs::read_dir(&token_file)
+            .expect("groq dir")
+            .next()
+            .expect("one token file")
+            .expect("read entry");
+        let text = std::fs::read_to_string(entry.path()).expect("token json");
+        serde_json::from_str(&text).expect("parse token json")
+    };
+    assert_eq!(saved["access_token"], "gsk-secret-key");
+    assert_eq!(saved["type"], "generic");
+    assert!(
+        outcome.stdout.contains("groq"),
+        "{} {}",
+        outcome.stdout,
+        outcome.stderr
+    );
+    assert!(
+        !outcome.stdout.contains("gsk-secret-key"),
+        "the raw key must never be printed: {}",
+        outcome.stdout
+    );
+}
+
+#[test]
+fn login_without_key_for_a_configured_provider_fails() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  groq:\n    base-url: https://api.groq.com/openai/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+
     assert!(
         run_with_env(
-            &["login", "--provider", "codex", "--key", "sk-go"],
+            &["login", "--provider", "groq"],
             tmp.path(),
             tmp.path(),
             &mut runtime,
         )
         .is_err(),
-        "removed key flag must be rejected at parse time"
+        "a configured provider needs a --key"
+    );
+    assert!(runtime.login_provider.is_none());
+}
+
+#[test]
+fn login_for_an_unconfigured_provider_lists_the_configured_ones() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  groq:\n    base-url: https://api.groq.com/openai/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+
+    let error = run_with_env(
+        &["login", "--provider", "mistral", "--key", "x"],
+        tmp.path(),
+        tmp.path(),
+        &mut runtime,
+    )
+    .expect_err("unconfigured provider must be rejected");
+    let full = format!("{error:#}");
+    assert!(
+        full.contains("groq"),
+        "the error lists the configured providers: {full}"
     );
     assert!(runtime.login_provider.is_none());
 }
