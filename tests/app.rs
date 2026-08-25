@@ -2057,7 +2057,10 @@ async fn admin_reload_picks_up_a_newly_saved_key_for_a_configured_provider() {
     )
     .await;
     assert_eq!(status, 200);
-    assert_eq!(reloaded["reloaded"]["groq"]["added"], json!(["key-87654321"]));
+    assert_eq!(
+        reloaded["reloaded"]["groq"]["added"],
+        json!(["key-87654321"])
+    );
 
     let (status, accounts) = json_response(
         app,
