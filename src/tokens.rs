@@ -74,6 +74,10 @@ pub fn load_all_tokens(auth_dir: &Path, provider: Option<&ProviderId>) -> Result
         if !provider_dir.exists() {
             continue;
         }
+        let dir_id = provider_dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let mut paths = fs::read_dir(&provider_dir)
             .with_context(|| format!("failed to read {}", provider_dir.display()))?
             .collect::<Result<Vec<_>, _>>()
@@ -97,8 +101,10 @@ pub fn load_all_tokens(auth_dir: &Path, provider: Option<&ProviderId>) -> Result
                     continue;
                 }
             };
-            let token = storage_to_token(stored);
-            if provider.is_none_or(|p| token.provider.kind == p.kind) {
+            let token = storage_to_token(stored, &dir_id);
+            if provider.is_none_or(|p| {
+                token.provider.kind == p.kind && token.provider.id.as_ref() == p.id.as_ref()
+            }) {
                 tokens.push(token);
             }
         }
@@ -182,9 +188,13 @@ fn token_to_storage(token: &TokenData) -> StoredToken {
     }
 }
 
-fn storage_to_token(stored: StoredToken) -> TokenData {
+fn storage_to_token(stored: StoredToken, dir_id: &str) -> TokenData {
     let provider = match stored.token_type.as_deref() {
         Some("codex") => ProviderId::codex(),
+        // The id lives in the directory name, not the file: a configured
+        // provider's token_type is "generic" and its `providers:` entry name
+        // is the subdirectory under auth-dir.
+        Some("generic") => ProviderId::generic(dir_id),
         _ => ProviderId::anthropic(),
     };
     let plan_type = stored
@@ -275,6 +285,12 @@ mod tests {
         save_token(dir.path(), &token(ProviderId::anthropic(), "alice@x.com"))
             .expect("save anthropic");
         save_token(dir.path(), &token(ProviderId::codex(), "bob@y.com")).expect("save codex");
+        // A configured provider's directory IS read when asked for by id.
+        save_token(
+            dir.path(),
+            &token(ProviderId::generic("groq"), "key-a1b2c3d4"),
+        )
+        .expect("save groq");
         // A removed provider's directory must never be read as credentials, even
         // through the unfiltered load path. Seed a valid-shaped token with a
         // distinctive email so a regression would show up in the result set.
@@ -300,6 +316,13 @@ mod tests {
             load_all_tokens(dir.path(), Some(&ProviderId::anthropic())).expect("load anthropic");
         assert_eq!(just_anthropic.len(), 1);
         assert_eq!(just_anthropic[0].provider.kind, ProviderKind::Anthropic);
+
+        let just_groq =
+            load_all_tokens(dir.path(), Some(&ProviderId::generic("groq"))).expect("load groq");
+        assert_eq!(just_groq.len(), 1);
+        assert_eq!(just_groq[0].provider.kind, ProviderKind::Generic);
+        assert_eq!(just_groq[0].provider.id.as_ref(), "groq");
+        assert_eq!(just_groq[0].access_token, "a");
     }
 
     #[test]

@@ -96,6 +96,7 @@ struct AppState {
 struct AccountManagers {
     anthropic: tokio::sync::Mutex<AccountManager>,
     codex: tokio::sync::Mutex<AccountManager>,
+    generic: BTreeMap<String, tokio::sync::Mutex<AccountManager>>,
 }
 
 #[derive(Clone)]
@@ -432,14 +433,32 @@ fn build_account_managers(config: &Config) -> AccountManagers {
     );
     let _ = anthropic.load();
     let _ = codex.load();
+    // One manager per configured provider; static keys never refresh, so the
+    // callback exists only to satisfy the type and must never be called.
+    let mut generic = BTreeMap::new();
+    for id in config.providers.keys() {
+        let mut manager = AccountManager::new(
+            config.auth_dir.clone(),
+            ProviderId::generic(id.clone()),
+            |_refresh_token| Box::pin(async { anyhow::bail!("static keys do not refresh") }),
+            RefreshPolicy {
+                kind: RefreshPolicyKind::Never,
+                seconds: 0,
+            },
+        );
+        let _ = manager.load();
+        generic.insert(id.clone(), tokio::sync::Mutex::new(manager));
+    }
     tracing::info!(
         anthropic = anthropic.account_count(),
         codex = codex.account_count(),
+        generic = generic.len(),
         "loaded provider accounts"
     );
     AccountManagers {
         anthropic: tokio::sync::Mutex::new(anthropic),
         codex: tokio::sync::Mutex::new(codex),
+        generic,
     }
 }
 
@@ -515,7 +534,7 @@ async fn admin_accounts(State(state): State<AppState>, headers: HeaderMap) -> Re
 
     let anthropic = state.account_managers.anthropic.lock().await;
     let codex = state.account_managers.codex.lock().await;
-    let providers = serde_json::Map::from_iter([
+    let mut providers = serde_json::Map::from_iter([
         (
             ProviderId::anthropic().to_string(),
             json!({
@@ -531,6 +550,18 @@ async fn admin_accounts(State(state): State<AppState>, headers: HeaderMap) -> Re
             }),
         ),
     ]);
+    drop(anthropic);
+    drop(codex);
+    for (id, manager) in &state.account_managers.generic {
+        let manager = manager.lock().await;
+        providers.insert(
+            id.clone(),
+            json!({
+                "accounts": manager.snapshots(),
+                "account_count": manager.account_count()
+            }),
+        );
+    }
 
     Json(json!({"providers": providers, "generated_at": now_iso()})).into_response()
 }
@@ -542,11 +573,32 @@ async fn admin_reload(State(state): State<AppState>, headers: HeaderMap) -> Resp
 
     let anthropic = state.account_managers.anthropic.lock().await.reload();
     let codex = state.account_managers.codex.lock().await.reload();
+    let mut generic = BTreeMap::new();
+    let mut generic_failed = None;
+    for (id, manager) in &state.account_managers.generic {
+        match manager.lock().await.reload() {
+            Ok(result) => {
+                generic.insert(id.clone(), result);
+            }
+            Err(error) => generic_failed = Some(error),
+        }
+    }
+    if let Some(error) = generic_failed {
+        return AppError::simple(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to reload accounts: {error}"),
+        )
+        .into_response();
+    }
     let reloaded = match (anthropic, codex) {
-        (Ok(anthropic), Ok(codex)) => serde_json::Map::from_iter([
-            (ProviderId::anthropic().to_string(), anthropic),
-            (ProviderId::codex().to_string(), codex),
-        ]),
+        (Ok(anthropic), Ok(codex)) => {
+            let mut map = serde_json::Map::from_iter([
+                (ProviderId::anthropic().to_string(), anthropic),
+                (ProviderId::codex().to_string(), codex),
+            ]);
+            map.extend(generic);
+            map
+        }
         (Err(error), _) | (_, Err(error)) => {
             return AppError::simple(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -806,7 +858,12 @@ async fn provider_account_count(state: &AppState, provider: ProviderId) -> usize
             .await
             .account_count(),
         ProviderKind::Codex => state.account_managers.codex.lock().await.account_count(),
-        ProviderKind::Generic => 0,
+        ProviderKind::Generic => {
+            let Some(manager) = state.account_managers.generic.get(provider.id.as_ref()) else {
+                return 0;
+            };
+            manager.lock().await.account_count()
+        }
     }
 }
 
@@ -1122,12 +1179,15 @@ async fn next_provider_account(
         ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
         ProviderKind::Codex => state.account_managers.codex.lock().await,
         ProviderKind::Generic => {
-            return Err(AppError::provider(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("no available {provider} account; run login for {provider}"),
-                "no_account_for_provider",
-                provider,
-            ));
+            let Some(manager) = state.account_managers.generic.get(provider.id.as_ref()) else {
+                return Err(AppError::provider(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("no available {provider} account; run login for {provider}"),
+                    "no_account_for_provider",
+                    provider,
+                ));
+            };
+            manager.lock().await
         }
     };
     let result = manager.next_account_result();
@@ -1177,7 +1237,12 @@ async fn record_provider_success(
     let mut manager = match provider.kind {
         ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
         ProviderKind::Codex => state.account_managers.codex.lock().await,
-        ProviderKind::Generic => return,
+        ProviderKind::Generic => {
+            let Some(manager) = state.account_managers.generic.get(provider.id.as_ref()) else {
+                return;
+            };
+            manager.lock().await
+        }
     };
     manager.record_success(account.token.email.as_str(), usage.as_ref());
 }
@@ -1192,7 +1257,12 @@ async fn record_provider_failure(
     let mut manager = match provider.kind {
         ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
         ProviderKind::Codex => state.account_managers.codex.lock().await,
-        ProviderKind::Generic => return,
+        ProviderKind::Generic => {
+            let Some(manager) = state.account_managers.generic.get(provider.id.as_ref()) else {
+                return;
+            };
+            manager.lock().await
+        }
     };
     manager.record_failure(
         account.token.email.as_str(),
@@ -2303,6 +2373,7 @@ mod tests {
             account_managers: Arc::new(AccountManagers {
                 anthropic: tokio::sync::Mutex::new(manager(tmp, ProviderId::anthropic())),
                 codex: tokio::sync::Mutex::new(manager(tmp, ProviderId::codex())),
+                generic: std::collections::BTreeMap::new(),
             }),
             rate_limit_buckets: Arc::new(Mutex::new(std::collections::BTreeMap::<
                 String,

@@ -1453,3 +1453,54 @@ async fn responses_route_normalizes_string_input_for_codex() {
         json!([{"role": "user", "content": "reply exactly: ok"}])
     );
 }
+
+#[tokio::test]
+async fn admin_accounts_lists_configured_provider_keys_loaded_at_startup() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Save a static key the way `pengepul login --provider groq --key` would.
+    save_token(
+        tmp.path(),
+        &TokenData {
+            access_token: "gsk-secret".to_string(),
+            refresh_token: String::new(),
+            email: "key-12345678".to_string(),
+            expires_at: String::new(),
+            account_uuid: "acct".to_string(),
+            provider: ProviderId::generic("groq"),
+            id_token: None,
+            last_refresh_at: None,
+            plan_type: None,
+        },
+    )
+    .expect("save groq key");
+
+    let mut cfg = config(tmp.path().to_path_buf());
+    cfg.providers.insert(
+        "groq".to_string(),
+        pengepul::config::ConfiguredProvider {
+            base_url: "https://api.groq.com/openai/v1".to_string(),
+        },
+    );
+    let app = create_app(cfg);
+
+    let (status, accounts) = json_response(
+        app,
+        axum::http::Request::builder()
+            .uri("/admin/accounts")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert_eq!(accounts["providers"]["groq"]["account_count"], 1);
+    assert_eq!(
+        accounts["providers"]["groq"]["accounts"][0]["email"],
+        "key-12345678"
+    );
+    assert_eq!(
+        accounts["providers"]["groq"]["accounts"][0]["available"],
+        true
+    );
+}
