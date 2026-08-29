@@ -2074,3 +2074,50 @@ async fn admin_reload_picks_up_a_newly_saved_key_for_a_configured_provider() {
     assert_eq!(status, 200);
     assert_eq!(accounts["providers"]["groq"]["account_count"], 2);
 }
+
+#[tokio::test]
+async fn the_api_is_served_at_v1_and_at_a_doubled_v1() {
+    // An Anthropic SDK pointed at a `.../v1` base URL asks for `/v1/v1/messages`.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let upstream = Arc::new(FakeUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream);
+    let get = |uri: &str| {
+        axum::http::Request::builder()
+            .uri(uri)
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let post = |uri: &str| {
+        let body =
+            json!({"model": "claude-opus-5", "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]})
+                .to_string();
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", body.len().to_string())
+            .body(Body::from(body))
+            .unwrap()
+    };
+
+    let (single, _) = json_response(app.clone(), get("/v1/models")).await;
+    let (doubled, _) = json_response(app.clone(), get("/v1/v1/models")).await;
+    assert_eq!(single, 200);
+    assert_eq!(doubled, 200);
+
+    let (single, _) = json_response(app.clone(), post("/v1/messages")).await;
+    let (doubled, _) = json_response(app.clone(), post("/v1/v1/messages")).await;
+    assert_eq!(single, doubled, "both prefixes reach the same handler");
+
+    let response = app
+        .oneshot(get("/v1/v1/v1/models"))
+        .await
+        .expect("response");
+    assert_eq!(
+        response.status().as_u16(),
+        404,
+        "only one duplicate is tolerated"
+    );
+}

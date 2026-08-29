@@ -452,15 +452,23 @@ pub fn create_app_with_upstream(config: Config, upstream: Arc<dyn UpstreamClient
         tokio::spawn(model_catalog_refresh_loop(state.clone()));
     }
 
+    // The two SDK families disagree on where `/v1` lives: OpenAI clients want it in the
+    // base URL and append `/chat/completions`; Anthropic clients want it absent and append
+    // `/v1/messages`. A base URL of `http://host:port/v1` therefore reaches Anthropic
+    // routes as `/v1/v1/messages`. Mounting the API at both prefixes lets one documented
+    // base URL serve every client. Exactly one duplicate is tolerated; `/v1/v1/v1` is 404.
+    let api = Router::new()
+        .route("/models", get(models))
+        .route("/chat/completions", post(chat_completions))
+        .route("/responses", post(responses))
+        .route("/messages", post(messages))
+        .route("/messages/count_tokens", post(count_tokens));
     Router::new()
         .route("/health", get(health))
         .route("/admin/accounts", get(admin_accounts))
         .route("/admin/reload", post(admin_reload))
-        .route("/v1/models", get(models))
-        .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/responses", post(responses))
-        .route("/v1/messages", post(messages))
-        .route("/v1/messages/count_tokens", post(count_tokens))
+        .nest("/v1", api.clone())
+        .nest("/v1/v1", api)
         .with_state(state)
         .layer(
             CorsLayer::new()
