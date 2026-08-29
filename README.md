@@ -107,9 +107,8 @@ hermes config set providers.pengepul.api_mode anthropic_messages
 hermes config set providers.pengepul.api_key <pengepul api-key>
 ```
 
-- `api_mode: anthropic_messages` forces the native wire. The SDK appends `/v1/messages`
-  to the `base_url`, and pengepul answers whether that `base_url` is the root or ends in
-  `/v1` (the form the hermes wizard writes), so one provider entry serves every model.
+- `api_mode: anthropic_messages` forces the native wire. The `base_url` may be the root
+  or end in `/v1`; both work.
 - Use `provider: pengepul`, not `anthropic`. An `anthropic` provider makes hermes
   autodiscover the operator's `~/.claude` OAuth and route to `api.anthropic.com`,
   bypassing pengepul.
@@ -119,10 +118,8 @@ hermes config set providers.pengepul.api_key <pengepul api-key>
 ### Your own harness
 
 pengepul is a plain REST relay, so any client that speaks the Anthropic or OpenAI API can
-run on the pool. Point it at `http://127.0.0.1:8317/v1` with the local API key. OpenAI
-clients append `/chat/completions` to that; Anthropic clients append `/v1/messages`,
-producing `/v1/v1/messages`, which pengepul serves as `/v1/messages`. A root base URL
-without `/v1` works as well.
+run on the pool. Point it at `http://127.0.0.1:8317/v1` with the local API key; a root
+base URL without `/v1` works as well.
 
 ```sh
 # Claude, on the Anthropic Messages API
@@ -166,9 +163,7 @@ Run `pengepul <command> --help` for flags. The service is user-scoped, so
 
 Routes: `POST /v1/messages`, `POST /v1/chat/completions`, `POST /v1/responses`,
 `POST /v1/messages/count_tokens`, `GET /v1/models`, `GET /admin/accounts`,
-`POST /admin/reload`, and `GET /health` (unauthenticated). The `/v1/*` routes are also
-served under `/v1/v1/*`, for Anthropic SDKs given a base URL that already ends in `/v1`.
-Every route but `/health` needs
+`POST /admin/reload`, and `GET /health` (unauthenticated). Every route but `/health` needs
 the local API key, as either `Authorization: Bearer <key>` or `x-api-key: <key>`.
 
 The provider is chosen by model id: `gpt-5`, `gpt-5.*`, `gpt-5-*`, `o<N>` and `codex-*`
