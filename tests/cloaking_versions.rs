@@ -1,4 +1,4 @@
-use pengepul::cloaking_versions::{Cache, Version, codex_release, effective, npm_latest};
+use pengepul::cloaking_versions::{CliVersions, Version, codex_release, effective, npm_latest};
 use serde_json::json;
 
 #[test]
@@ -46,16 +46,16 @@ fn the_cache_round_trips_and_a_missing_file_is_empty() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let path = tmp.path().join("cloaking-versions.json");
 
-    let empty = Cache::load(&path);
+    let empty = CliVersions::load(&path);
     assert_eq!(empty.claude, None);
     assert_eq!(empty.codex, None);
 
-    let cache = Cache {
+    let cache = CliVersions {
         claude: "2.1.251".parse().ok(),
         codex: "0.151.0".parse().ok(),
     };
     cache.save(&path).expect("save");
-    let loaded = Cache::load(&path);
+    let loaded = CliVersions::load(&path);
     assert_eq!(loaded, cache);
     assert!(
         !tmp.path().join("cloaking-versions.json.tmp").exists(),
@@ -63,6 +63,6 @@ fn the_cache_round_trips_and_a_missing_file_is_empty() {
     );
 
     std::fs::write(&path, "not json").expect("corrupt");
-    let corrupt = Cache::load(&path);
+    let corrupt = CliVersions::load(&path);
     assert_eq!(corrupt.claude, None, "an unreadable cache is ignored");
 }

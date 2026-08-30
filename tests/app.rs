@@ -8,9 +8,10 @@ use anyhow::Result;
 use axum::body::{Body, Bytes};
 use http_body_util::BodyExt;
 use pengepul::app::{
-    ModelsFuture, UpstreamClient, UpstreamJsonResponse, UpstreamRequest, UpstreamSseResponse,
-    create_app, create_app_with_upstream,
+    CliVersionsFuture, ModelsFuture, UpstreamClient, UpstreamFuture, UpstreamJsonResponse,
+    UpstreamRequest, UpstreamSseFuture, UpstreamSseResponse, create_app, create_app_with_upstream,
 };
+use pengepul::cloaking_versions::CliVersions;
 use pengepul::config::{CloakingConfig, Config, DebugMode, TimeoutConfig};
 use pengepul::models::FetchedModels;
 use pengepul::tokens::save_token;
@@ -2119,5 +2120,184 @@ async fn the_api_is_served_at_v1_and_at_a_doubled_v1() {
         response.status().as_u16(),
         404,
         "only one duplicate is tolerated"
+    );
+}
+
+struct VersionedUpstream {
+    inner: FakeUpstream,
+    fetches: Mutex<u32>,
+}
+
+impl VersionedUpstream {
+    fn fetches(&self) -> u32 {
+        *self.fetches.lock().expect("fetches lock")
+    }
+}
+
+impl UpstreamClient for VersionedUpstream {
+    fn generic_chat(&self, request: UpstreamRequest) -> UpstreamFuture {
+        self.inner.generic_chat(request)
+    }
+    fn generic_chat_stream(&self, request: UpstreamRequest) -> UpstreamSseFuture {
+        self.inner.generic_chat_stream(request)
+    }
+    fn anthropic_messages(&self, request: UpstreamRequest) -> UpstreamFuture {
+        self.inner.anthropic_messages(request)
+    }
+    fn anthropic_messages_stream(&self, request: UpstreamRequest) -> UpstreamSseFuture {
+        self.inner.anthropic_messages_stream(request)
+    }
+    fn anthropic_count_tokens(&self, request: UpstreamRequest) -> UpstreamFuture {
+        self.inner.anthropic_count_tokens(request)
+    }
+    fn codex_responses(&self, request: UpstreamRequest) -> UpstreamFuture {
+        self.inner.codex_responses(request)
+    }
+    fn codex_responses_stream(&self, request: UpstreamRequest) -> UpstreamSseFuture {
+        self.inner.codex_responses_stream(request)
+    }
+    fn fetch_models(
+        &self,
+        kind: ProviderKind,
+        account: AvailableAccount,
+        config: Arc<Config>,
+    ) -> ModelsFuture {
+        self.inner.fetch_models(kind, account, config)
+    }
+    fn fetch_cli_versions(&self) -> CliVersionsFuture {
+        *self.fetches.lock().expect("fetches lock") += 1;
+        Box::pin(async {
+            Ok(CliVersions {
+                claude: "2.1.251".parse().ok(),
+                codex: "0.151.0".parse().ok(),
+            })
+        })
+    }
+}
+
+fn anthropic_account(dir: &std::path::Path) {
+    save_token(
+        dir,
+        &TokenData {
+            access_token: "anthropic-access".to_string(),
+            refresh_token: "anthropic-refresh".to_string(),
+            email: "anthropic@example.com".to_string(),
+            expires_at: "2030-01-01T00:00:00Z".to_string(),
+            account_uuid: "acct-anthropic".to_string(),
+            provider: ProviderId::anthropic(),
+            id_token: None,
+            last_refresh_at: None,
+            plan_type: None,
+        },
+    )
+    .expect("save token");
+}
+
+fn messages_request() -> axum::http::Request<Body> {
+    let body =
+        json!({"model": "claude-sonnet-4-6", "messages": [{"role": "user", "content": "hi"}]})
+            .to_string();
+    axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("authorization", "Bearer sk-test")
+        .header("content-type", "application/json")
+        .header("content-length", body.len().to_string())
+        .body(Body::from(body))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn fetched_cli_versions_reach_the_upstream_request_and_the_cache() {
+    // AC-1, AC-2 (fetched above the configured floor), AC-5 (write side)
+    let tmp = tempfile::tempdir().expect("tempdir");
+    anthropic_account(tmp.path());
+    let upstream = Arc::new(VersionedUpstream {
+        inner: FakeUpstream::default(),
+        fetches: Mutex::new(0),
+    });
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    for _ in 0..100 {
+        if upstream.fetches() > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(upstream.fetches() > 0, "the first fetch runs at startup");
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    let (status, _) = json_response(app, messages_request()).await;
+    assert_eq!(status, 200);
+    let call = &upstream.inner.calls()[0];
+    assert_eq!(call.config.cloaking.cli_version, "2.1.251");
+    assert_eq!(
+        call.config
+            .cloaking
+            .codex
+            .get("cli-version")
+            .map(String::as_str),
+        Some("0.151.0")
+    );
+
+    let cached = CliVersions::load(&tmp.path().join("cloaking-versions.json"));
+    assert_eq!(cached.claude, "2.1.251".parse().ok());
+    assert_eq!(cached.codex, "0.151.0".parse().ok());
+}
+
+#[tokio::test]
+async fn a_configured_version_above_the_fetched_one_is_kept() {
+    // AC-2 (configured above fetched)
+    let tmp = tempfile::tempdir().expect("tempdir");
+    anthropic_account(tmp.path());
+    let upstream = Arc::new(VersionedUpstream {
+        inner: FakeUpstream::default(),
+        fetches: Mutex::new(0),
+    });
+    let mut pinned = config(tmp.path().to_path_buf());
+    pinned.cloaking.cli_version = "9.0.0".to_string();
+    let app = create_app_with_upstream(pinned, upstream.clone());
+    for _ in 0..100 {
+        if upstream.fetches() > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    let (status, _) = json_response(app, messages_request()).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        upstream.inner.calls()[0].config.cloaking.cli_version,
+        "9.0.0"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_fetch_keeps_the_cached_or_baked_versions() {
+    // AC-4, AC-5 (read side): FakeUpstream has no version source, so every fetch fails.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    anthropic_account(tmp.path());
+    let upstream = Arc::new(FakeUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let (status, _) = json_response(app, messages_request()).await;
+    assert_eq!(status, 200, "a failed fetch does not stop the relay");
+    assert_eq!(upstream.calls()[0].config.cloaking.cli_version, "2.1.88");
+
+    CliVersions {
+        claude: "2.1.200".parse().ok(),
+        codex: None,
+    }
+    .save(&tmp.path().join("cloaking-versions.json"))
+    .expect("seed cache");
+    let upstream = Arc::new(FakeUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let (status, _) = json_response(app, messages_request()).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        upstream.calls()[0].config.cloaking.cli_version,
+        "2.1.200",
+        "the cache is effective before any fetch"
     );
 }

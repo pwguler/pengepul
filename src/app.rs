@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::accounts::{AccountManager, RefreshPolicy, RefreshPolicyKind};
+use crate::cloaking_versions::{CliVersions, codex_release, effective, npm_latest};
 use crate::config::Config;
 use crate::masquerade::{masquerade_request, restore_tool_use_names};
 use crate::models::{
@@ -52,6 +53,7 @@ pub type UpstreamSseStream = Pin<Box<dyn Stream<Item = anyhow::Result<Bytes>> + 
 pub type UpstreamSseFuture =
     Pin<Box<dyn Future<Output = anyhow::Result<UpstreamSseResponse>> + Send>>;
 pub type ModelsFuture = Pin<Box<dyn Future<Output = anyhow::Result<FetchedModels>> + Send>>;
+pub type CliVersionsFuture = Pin<Box<dyn Future<Output = anyhow::Result<CliVersions>> + Send>>;
 
 #[derive(Debug, Clone)]
 pub struct UpstreamRequest {
@@ -89,11 +91,19 @@ pub trait UpstreamClient: Send + Sync {
         account: AvailableAccount,
         config: Arc<Config>,
     ) -> ModelsFuture;
+    /// The CLI versions the vendors currently ship, for Cloaking to present. A client
+    /// with no version source reports an error; the relay then keeps what it has.
+    fn fetch_cli_versions(&self) -> CliVersionsFuture {
+        Box::pin(async { anyhow::bail!("no cli version source") })
+    }
 }
 
 #[derive(Clone)]
 struct AppState {
     config: Arc<Config>,
+    /// `config` with the effective Cloaking versions applied; what every upstream call
+    /// sees. Replaced whole when a fetch moves a version.
+    cloaked_config: Arc<StdRwLock<Arc<Config>>>,
     body_limit: BodyLimit,
     upstream: Arc<dyn UpstreamClient>,
     account_managers: Arc<AccountManagers>,
@@ -180,6 +190,36 @@ struct HttpUpstreamClient {
 }
 
 impl UpstreamClient for HttpUpstreamClient {
+    fn fetch_cli_versions(&self) -> CliVersionsFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            let npm = send_get(
+                client.clone(),
+                CLAUDE_CLI_REGISTRY_URL.to_string(),
+                BTreeMap::new(),
+                CLI_VERSIONS_TIMEOUT_MS,
+            )
+            .await?;
+            let github = send_get(
+                client,
+                CODEX_CLI_RELEASE_URL.to_string(),
+                BTreeMap::from([
+                    ("User-Agent".to_string(), "pengepul".to_string()),
+                    (
+                        "Accept".to_string(),
+                        "application/vnd.github+json".to_string(),
+                    ),
+                ]),
+                CLI_VERSIONS_TIMEOUT_MS,
+            )
+            .await?;
+            Ok(CliVersions {
+                claude: npm_latest(&npm),
+                codex: codex_release(&github),
+            })
+        })
+    }
+
     fn anthropic_messages(&self, request: UpstreamRequest) -> UpstreamFuture {
         let client = self.client.clone();
         Box::pin(async move {
@@ -437,8 +477,14 @@ pub fn create_app_with_upstream(config: Config, upstream: Arc<dyn UpstreamClient
     }
     let body_limit = parse_body_limit(&config.body_limit);
     let account_managers = build_account_managers(&config);
+    let config = Arc::new(config);
+    let cloaked_config = Arc::new(StdRwLock::new(cloak_versions(
+        &config,
+        &CliVersions::load(&cli_versions_path(&config)),
+    )));
     let state = AppState {
-        config: Arc::new(config),
+        config,
+        cloaked_config,
         body_limit,
         upstream,
         account_managers: Arc::new(account_managers),
@@ -450,6 +496,7 @@ pub fn create_app_with_upstream(config: Config, upstream: Arc<dyn UpstreamClient
     // both `serve` (create_app runs inside block_on) and the tests (#[tokio::test]) provide.
     if tokio::runtime::Handle::try_current().is_ok() {
         tokio::spawn(model_catalog_refresh_loop(state.clone()));
+        tokio::spawn(cli_versions_refresh_loop(state.clone()));
     }
 
     // The two SDK families disagree on where `/v1` lives: OpenAI clients want it in the
@@ -527,6 +574,83 @@ fn build_account_managers(config: &Config) -> AccountManagers {
 
 const MODEL_CATALOG_TTL: Duration = Duration::from_mins(15);
 
+const CLAUDE_CLI_REGISTRY_URL: &str = "https://registry.npmjs.org/@anthropic-ai/claude-code";
+const CODEX_CLI_RELEASE_URL: &str = "https://api.github.com/repos/openai/codex/releases/latest";
+const CLI_VERSIONS_TIMEOUT_MS: u64 = 30_000;
+const CLI_VERSIONS_TTL: Duration = Duration::from_hours(24);
+const CLI_VERSIONS_RETRY: Duration = Duration::from_hours(1);
+
+fn cli_versions_path(config: &Config) -> std::path::PathBuf {
+    config.auth_dir.join("cloaking-versions.json")
+}
+
+/// `config` with Cloaking's versions raised to the fetched ones where those are newer.
+fn cloak_versions(config: &Config, fetched: &CliVersions) -> Arc<Config> {
+    let mut cloaked = config.clone();
+    cloaked.cloaking.cli_version = effective(&config.cloaking.cli_version, fetched.claude.as_ref());
+    let codex_floor = config
+        .cloaking
+        .codex
+        .get("cli-version")
+        .map_or(CODEX_DEFAULT_CLI_VERSION, String::as_str);
+    cloaked.cloaking.codex.insert(
+        "cli-version".to_string(),
+        effective(codex_floor, fetched.codex.as_ref()),
+    );
+    Arc::new(cloaked)
+}
+
+/// The config every upstream call is built from.
+fn cloaked_config(state: &AppState) -> Arc<Config> {
+    state
+        .cloaked_config
+        .read()
+        .expect("cloaked config lock poisoned")
+        .clone()
+}
+
+/// Keep Cloaking's versions at what the vendors ship. The first fetch runs as soon as
+/// the relay is up; a success sleeps a day, a failure retries within the hour.
+async fn cli_versions_refresh_loop(state: AppState) {
+    loop {
+        let interval = if refresh_cli_versions(&state).await {
+            CLI_VERSIONS_TTL
+        } else {
+            CLI_VERSIONS_RETRY
+        };
+        tokio::time::sleep(interval).await;
+    }
+}
+
+async fn refresh_cli_versions(state: &AppState) -> bool {
+    let fetched = match state.upstream.fetch_cli_versions().await {
+        Ok(fetched) => fetched,
+        Err(error) => {
+            tracing::warn!(?error, "cli version fetch failed");
+            return false;
+        }
+    };
+    let next = cloak_versions(&state.config, &fetched);
+    let previous = std::mem::replace(
+        &mut *state
+            .cloaked_config
+            .write()
+            .expect("cloaked config lock poisoned"),
+        next.clone(),
+    );
+    if previous.cloaking != next.cloaking {
+        tracing::info!(
+            claude = %next.cloaking.cli_version,
+            codex = next.cloaking.codex.get("cli-version").map_or("", String::as_str),
+            "cloaking versions updated"
+        );
+    }
+    if let Err(error) = fetched.save(&cli_versions_path(&state.config)) {
+        tracing::warn!(?error, "cli version cache write failed");
+    }
+    true
+}
+
 async fn model_catalog_refresh_loop(state: AppState) {
     loop {
         refresh_model_catalog(&state).await;
@@ -541,7 +665,7 @@ async fn refresh_model_catalog(state: &AppState) {
         };
         match state
             .upstream
-            .fetch_models(kind, account, state.config.clone())
+            .fetch_models(kind, account, cloaked_config(state))
             .await
         {
             Ok(FetchedModels { ids }) => {
@@ -568,7 +692,7 @@ async fn refresh_model_catalog(state: &AppState) {
         };
         match state
             .upstream
-            .fetch_models(ProviderKind::Generic, account, state.config.clone())
+            .fetch_models(ProviderKind::Generic, account, cloaked_config(state))
             .await
         {
             Ok(FetchedModels { ids }) => {
@@ -816,7 +940,7 @@ async fn count_tokens(State(state): State<AppState>, headers: HeaderMap, body: B
             body,
             request_headers: headers_to_map(&headers),
             account: account.clone(),
-            config: state.config.clone(),
+            config: cloaked_config(&state),
         })
         .await
     {
@@ -1007,7 +1131,7 @@ async fn route_generic_chat_request(
                 body: upstream_body,
                 request_headers: headers_to_map(headers),
                 account: account.clone(),
-                config: state.config.clone(),
+                config: cloaked_config(state),
             })
             .await
         {
@@ -1035,7 +1159,7 @@ async fn route_generic_chat_request(
             body: upstream_body,
             request_headers: headers_to_map(headers),
             account: account.clone(),
-            config: state.config.clone(),
+            config: cloaked_config(state),
         })
         .await
     {
@@ -1072,7 +1196,7 @@ async fn route_codex_request(
                 body,
                 request_headers: headers_to_map(headers),
                 account: account.clone(),
-                config: state.config.clone(),
+                config: cloaked_config(state),
             })
             .await
         {
@@ -1100,7 +1224,7 @@ async fn route_codex_request(
             body,
             request_headers: headers_to_map(headers),
             account: account.clone(),
-            config: state.config.clone(),
+            config: cloaked_config(state),
         })
         .await
     {
@@ -1141,7 +1265,7 @@ async fn route_anthropic_request(
                 body,
                 request_headers: headers_to_map(headers),
                 account: account.clone(),
-                config: state.config.clone(),
+                config: cloaked_config(state),
             })
             .await
         {
@@ -1169,7 +1293,7 @@ async fn route_anthropic_request(
             body,
             request_headers: headers_to_map(headers),
             account: account.clone(),
-            config: state.config.clone(),
+            config: cloaked_config(state),
         })
         .await
     {

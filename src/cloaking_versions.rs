@@ -117,16 +117,17 @@ pub fn effective(configured: &str, fetched: Option<&Version>) -> String {
     }
 }
 
-/// The last fetched versions, kept on disk so an offline restart presents what was
-/// current at the last successful fetch rather than the baked defaults.
+/// The versions the vendors currently ship, as last fetched. Kept on disk so an offline
+/// restart presents what was current at the last successful fetch rather than the baked
+/// defaults.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct Cache {
+pub struct CliVersions {
     pub claude: Option<Version>,
     pub codex: Option<Version>,
 }
 
-impl Cache {
+impl CliVersions {
     /// Read the cache at `path`. A missing or unreadable file is an empty cache: the
     /// loop refetches on its first tick either way.
     #[must_use]
