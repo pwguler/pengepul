@@ -101,9 +101,10 @@ pub trait UpstreamClient: Send + Sync {
 #[derive(Clone)]
 struct AppState {
     config: Arc<Config>,
-    /// `config` with the effective Cloaking versions applied; what every upstream call
-    /// sees. Replaced whole when a fetch moves a version.
-    cloaked_config: Arc<StdRwLock<Arc<Config>>>,
+    /// What the vendors are known to ship, and `config` with those versions applied;
+    /// the latter is what every upstream call sees. Replaced whole when a fetch moves
+    /// a version.
+    cloaking: Arc<StdRwLock<Cloaking>>,
     body_limit: BodyLimit,
     upstream: Arc<dyn UpstreamClient>,
     account_managers: Arc<AccountManagers>,
@@ -478,13 +479,13 @@ pub fn create_app_with_upstream(config: Config, upstream: Arc<dyn UpstreamClient
     let body_limit = parse_body_limit(&config.body_limit);
     let account_managers = build_account_managers(&config);
     let config = Arc::new(config);
-    let cloaked_config = Arc::new(StdRwLock::new(cloak_versions(
+    let cloaking = Arc::new(StdRwLock::new(Cloaking::new(
         &config,
-        &CliVersions::load(&cli_versions_path(&config)),
+        CliVersions::load(&cli_versions_path(&config)),
     )));
     let state = AppState {
         config,
-        cloaked_config,
+        cloaking,
         body_limit,
         upstream,
         account_managers: Arc::new(account_managers),
@@ -584,6 +585,20 @@ fn cli_versions_path(config: &Config) -> std::path::PathBuf {
     config.auth_dir.join("cloaking-versions.json")
 }
 
+struct Cloaking {
+    known: CliVersions,
+    config: Arc<Config>,
+}
+
+impl Cloaking {
+    fn new(config: &Config, known: CliVersions) -> Self {
+        Self {
+            config: cloak_versions(config, &known),
+            known,
+        }
+    }
+}
+
 /// `config` with Cloaking's versions raised to the fetched ones where those are newer.
 fn cloak_versions(config: &Config, fetched: &CliVersions) -> Arc<Config> {
     let mut cloaked = config.clone();
@@ -603,9 +618,10 @@ fn cloak_versions(config: &Config, fetched: &CliVersions) -> Arc<Config> {
 /// The config every upstream call is built from.
 fn cloaked_config(state: &AppState) -> Arc<Config> {
     state
-        .cloaked_config
+        .cloaking
         .read()
-        .expect("cloaked config lock poisoned")
+        .expect("cloaking lock poisoned")
+        .config
         .clone()
 }
 
@@ -630,22 +646,28 @@ async fn refresh_cli_versions(state: &AppState) -> bool {
             return false;
         }
     };
-    let next = cloak_versions(&state.config, &fetched);
-    let previous = std::mem::replace(
-        &mut *state
-            .cloaked_config
-            .write()
-            .expect("cloaked config lock poisoned"),
-        next.clone(),
-    );
-    if previous.cloaking != next.cloaking {
+    // A field the registry did not yield keeps its last known value: a bad body must
+    // never move a version backwards or blank the cache.
+    let (known, changed) = {
+        let mut cloaking = state.cloaking.write().expect("cloaking lock poisoned");
+        let known = CliVersions {
+            claude: fetched.claude.or(cloaking.known.claude),
+            codex: fetched.codex.or(cloaking.known.codex),
+        };
+        let next = Cloaking::new(&state.config, known.clone());
+        let changed = next.config.cloaking != cloaking.config.cloaking;
+        *cloaking = next;
+        (known, changed)
+    };
+    if changed {
+        let config = cloaked_config(state);
         tracing::info!(
-            claude = %next.cloaking.cli_version,
-            codex = %next.cloaking.codex.get("cli-version").map_or("", String::as_str),
+            claude = %config.cloaking.cli_version,
+            codex = %config.cloaking.codex.get("cli-version").map_or("", String::as_str),
             "cloaking versions updated"
         );
     }
-    if let Err(error) = fetched.save(&cli_versions_path(&state.config)) {
+    if let Err(error) = known.save(&cli_versions_path(&state.config)) {
         tracing::warn!(?error, "cli version cache write failed");
     }
     true
@@ -2682,7 +2704,10 @@ mod tests {
     fn test_state(tmp: &std::path::Path, upstream: Arc<CapturingUpstream>) -> AppState {
         let config = Arc::new(test_config(tmp.to_path_buf()));
         AppState {
-            cloaked_config: Arc::new(StdRwLock::new(config.clone())),
+            cloaking: Arc::new(StdRwLock::new(super::Cloaking::new(
+                &config,
+                crate::cloaking_versions::CliVersions::default(),
+            ))),
             config,
             body_limit: BodyLimit::Unlimited,
             upstream,

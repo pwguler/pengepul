@@ -2126,11 +2126,30 @@ async fn the_api_is_served_at_v1_and_at_a_doubled_v1() {
 struct VersionedUpstream {
     inner: FakeUpstream,
     fetches: Mutex<u32>,
+    result: CliVersions,
 }
 
 impl VersionedUpstream {
-    fn fetches(&self) -> u32 {
-        *self.fetches.lock().expect("fetches lock")
+    fn shipping(claude: &str, codex: &str) -> Arc<Self> {
+        Arc::new(Self {
+            inner: FakeUpstream::default(),
+            fetches: Mutex::new(0),
+            result: CliVersions {
+                claude: claude.parse().ok(),
+                codex: codex.parse().ok(),
+            },
+        })
+    }
+
+    async fn fetched(&self) {
+        for _ in 0..100 {
+            if *self.fetches.lock().expect("fetches lock") > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the first fetch runs at startup");
     }
 }
 
@@ -2166,12 +2185,8 @@ impl UpstreamClient for VersionedUpstream {
     }
     fn fetch_cli_versions(&self) -> CliVersionsFuture {
         *self.fetches.lock().expect("fetches lock") += 1;
-        Box::pin(async {
-            Ok(CliVersions {
-                claude: "2.1.251".parse().ok(),
-                codex: "0.151.0".parse().ok(),
-            })
-        })
+        let result = self.result.clone();
+        Box::pin(async { Ok(result) })
     }
 }
 
@@ -2212,19 +2227,9 @@ async fn fetched_cli_versions_reach_the_upstream_request_and_the_cache() {
     // AC-1, AC-2 (fetched above the configured floor), AC-5 (write side)
     let tmp = tempfile::tempdir().expect("tempdir");
     anthropic_account(tmp.path());
-    let upstream = Arc::new(VersionedUpstream {
-        inner: FakeUpstream::default(),
-        fetches: Mutex::new(0),
-    });
+    let upstream = VersionedUpstream::shipping("2.1.251", "0.151.0");
     let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
-    for _ in 0..100 {
-        if upstream.fetches() > 0 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    assert!(upstream.fetches() > 0, "the first fetch runs at startup");
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    upstream.fetched().await;
 
     let (status, _) = json_response(app, messages_request()).await;
     assert_eq!(status, 200);
@@ -2249,20 +2254,11 @@ async fn a_configured_version_above_the_fetched_one_is_kept() {
     // AC-2 (configured above fetched)
     let tmp = tempfile::tempdir().expect("tempdir");
     anthropic_account(tmp.path());
-    let upstream = Arc::new(VersionedUpstream {
-        inner: FakeUpstream::default(),
-        fetches: Mutex::new(0),
-    });
+    let upstream = VersionedUpstream::shipping("2.1.251", "0.151.0");
     let mut pinned = config(tmp.path().to_path_buf());
     pinned.cloaking.cli_version = "9.0.0".to_string();
     let app = create_app_with_upstream(pinned, upstream.clone());
-    for _ in 0..100 {
-        if upstream.fetches() > 0 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    upstream.fetched().await;
 
     let (status, _) = json_response(app, messages_request()).await;
     assert_eq!(status, 200);
@@ -2300,4 +2296,38 @@ async fn a_failed_fetch_keeps_the_cached_or_baked_versions() {
         "2.1.200",
         "the cache is effective before any fetch"
     );
+}
+
+#[tokio::test]
+async fn a_fetch_that_parses_to_nothing_keeps_the_known_versions() {
+    // AC-4: a registry body that yields no version must not move what is known,
+    // in memory or on disk.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    anthropic_account(tmp.path());
+    let cache = tmp.path().join("cloaking-versions.json");
+    CliVersions {
+        claude: "2.1.200".parse().ok(),
+        codex: "0.140.0".parse().ok(),
+    }
+    .save(&cache)
+    .expect("seed cache");
+    let upstream = VersionedUpstream::shipping("not-a-version", "nightly");
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    upstream.fetched().await;
+
+    let (status, _) = json_response(app, messages_request()).await;
+    assert_eq!(status, 200);
+    let call = &upstream.inner.calls()[0];
+    assert_eq!(call.config.cloaking.cli_version, "2.1.200");
+    assert_eq!(
+        call.config
+            .cloaking
+            .codex
+            .get("cli-version")
+            .map(String::as_str),
+        Some("0.140.0")
+    );
+    let kept = CliVersions::load(&cache);
+    assert_eq!(kept.claude, "2.1.200".parse().ok());
+    assert_eq!(kept.codex, "0.140.0".parse().ok());
 }
