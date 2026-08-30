@@ -193,12 +193,6 @@ timeouts:
 debug: off # off | errors | verbose
 ```
 
-The CLI versions pengepul presents upstream follow what Claude Code and Codex currently
-ship: the relay reads the npm registry and the Codex GitHub releases once a day, keeps the
-result in `<auth-dir>/cloaking-versions.json`, and uses it on the next request without a
-restart. `cloaking.cli-version` and `cloaking.codex.cli-version` are optional floors: set
-one only to hold a version newer than the published one.
-
 Requests round-robin across accounts with no session affinity, failing over once per
 account on upstream 401, 403, 429, 500 and 502-599. Failover never crosses providers: a
 request stays on the endpoint or subscription family it named. A failed account backs
