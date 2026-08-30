@@ -1,6 +1,7 @@
 pub mod accounts;
 pub mod app;
 pub mod cli;
+pub mod cloaking_versions;
 pub mod config;
 pub mod masquerade;
 pub mod models;
