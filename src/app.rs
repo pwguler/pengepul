@@ -641,7 +641,7 @@ async fn refresh_cli_versions(state: &AppState) -> bool {
     if previous.cloaking != next.cloaking {
         tracing::info!(
             claude = %next.cloaking.cli_version,
-            codex = next.cloaking.codex.get("cli-version").map_or("", String::as_str),
+            codex = %next.cloaking.codex.get("cli-version").map_or("", String::as_str),
             "cloaking versions updated"
         );
     }
@@ -2680,8 +2680,10 @@ mod tests {
     }
 
     fn test_state(tmp: &std::path::Path, upstream: Arc<CapturingUpstream>) -> AppState {
+        let config = Arc::new(test_config(tmp.to_path_buf()));
         AppState {
-            config: Arc::new(test_config(tmp.to_path_buf())),
+            cloaked_config: Arc::new(StdRwLock::new(config.clone())),
+            config,
             body_limit: BodyLimit::Unlimited,
             upstream,
             account_managers: Arc::new(AccountManagers {
