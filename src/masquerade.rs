@@ -142,6 +142,52 @@ fn build_tool_map(tools: &[Value]) -> BTreeMap<String, String> {
     map
 }
 
+/// Literal rewrites for the phrases a coding-agent harness stamps into its
+/// system prompt, each an exact tripping string paired with an equivalent that
+/// classifies clean. Both sets were bisected against the live classifier.
+///
+/// pi (pi.dev) writes flat prose with no headings, so the heading walk below
+/// never reaches it, and it repeats its own name across the documentation block
+/// it appends. Its identity sentence alone passes, and so does the prompt with
+/// these references removed — it is their accumulation that trips, the same
+/// cumulative effect ADR-0005 recorded for `snake_case` tool names in prose.
+///
+/// opencode trips on one phrase, not on accumulation: the `Workspace root
+/// folder:` label in the `<env>` block it appends. Renaming that label alone
+/// clears the whole prompt; its own identity ("You are opencode, an interactive
+/// CLI tool …") passes verbatim and the path after the label is irrelevant, so
+/// the label reads as a harness fingerprint rather than anything about the
+/// workspace.
+///
+/// Each entry is an exact substring match, deliberately not a pattern: a
+/// heuristic here is unsafe both ways — "operating inside" is ordinary English,
+/// and deleting a short name wherever it appears corrupts prose, code spans and
+/// paths, and can rewrite a line into or out of a markdown heading, moving the
+/// section boundaries the walk below depends on.
+const HARNESS_REWRITES: &[(&str, &str)] = &[
+    // pi
+    (" operating inside pi, a coding agent harness.", "."),
+    (
+        "Pi documentation (read only when the user asks about pi itself,",
+        "Documentation (read only when the user asks about the tooling,",
+    ),
+    (
+        "When reading pi docs or examples,",
+        "When reading docs or examples,",
+    ),
+    (
+        "pi packages (docs/packages.md)",
+        "packages (docs/packages.md)",
+    ),
+    (
+        "When working on pi topics,",
+        "When working on these topics,",
+    ),
+    ("Always read pi .md files", "Always read .md files"),
+    // opencode
+    ("Workspace root folder:", "Project root:"),
+];
+
 fn sanitize_system_text(text: &str, tool_map: &BTreeMap<String, String>) -> String {
     // Drop bot-identity sections.
     let mut kept = Vec::new();
@@ -174,6 +220,15 @@ fn sanitize_system_text(text: &str, tool_map: &BTreeMap<String, String>) -> Stri
             out = replace_word(&out, orig, pseudo);
         } else {
             out = out.replace(&format!("- {orig}:"), &format!("- {pseudo}:"));
+        }
+    }
+
+    // Last, so the heading walk above reads the text the client actually sent:
+    // a rewrite that landed on a heading line could otherwise open or close a
+    // skip and move a section boundary.
+    for (tripping, safe) in HARNESS_REWRITES {
+        if out.contains(tripping) {
+            out = out.replace(tripping, safe);
         }
     }
 

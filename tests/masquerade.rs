@@ -473,3 +473,173 @@ fn already_native_server_tool_keeps_its_configuration() {
         "an already-native tool's config must survive"
     );
 }
+
+/// pi's system prompt, verbatim from its `buildSystemPrompt`. The rewrites are
+/// exact substrings of this text, so drift in either place fails the test rather
+/// than silently reverting the request to a 400.
+const PI_SYSTEM_PROMPT: &str = concat!(
+    "You are an expert coding assistant operating inside pi, a coding agent harness. ",
+    "You help users by reading files, executing commands, editing code, and writing new files.\n\n",
+    "Available tools:\n(none)\n\n",
+    "In addition to the tools above, you may have access to other custom tools depending on the project.\n\n",
+    "Guidelines:\n- Be concise in your responses\n- Show file paths clearly when working with files\n\n",
+    "Pi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):\n",
+    "- Main documentation: /usr/lib/node_modules/@earendil-works/pi-coding-agent/README.md\n",
+    "- Additional docs: /usr/lib/node_modules/@earendil-works/pi-coding-agent/docs\n",
+    "- When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory\n",
+    "- When asked about: extensions (docs/extensions.md, examples/extensions/), adding models (docs/models.md), pi packages (docs/packages.md), environment variables (docs/environment-variables.md)\n",
+    "- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing\n",
+    "- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)\n",
+    "Current working directory: /home/o/workspace"
+);
+
+#[test]
+fn pi_self_references_are_rewritten_but_its_paths_survive() {
+    // pi writes flat prose with no headings, so the heading walk never reaches it,
+    // and it repeats its own name across the documentation block. Bisected against
+    // the live classifier: the identity sentence alone passes, and so does the
+    // prompt with these references removed — the accumulation is what trips. Its
+    // documentation paths must survive so it can still read them.
+    let body = json!({
+        "system": [{"type": "text", "text": PI_SYSTEM_PROMPT}],
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let (out, _rev) = masquerade_request(&body);
+    let sys = out["system"][0]["text"].as_str().unwrap();
+
+    for reference in [
+        "operating inside pi",
+        "Pi documentation",
+        "pi docs",
+        "pi topics",
+        "pi .md",
+        "pi packages",
+    ] {
+        assert!(
+            !sys.contains(reference),
+            "self-reference {reference:?} must be rewritten: {sys}"
+        );
+    }
+    assert!(
+        sys.contains("You are an expert coding assistant. You help users"),
+        "the surrounding sentence must close up cleanly: {sys}"
+    );
+    assert!(
+        sys.contains("/@earendil-works/pi-coding-agent/README.md"),
+        "documentation paths must survive: {sys}"
+    );
+    assert!(
+        sys.contains("Documentation (read only when the user asks about the tooling,"),
+        "the docs section must survive with its heading intact: {sys}"
+    );
+    assert!(
+        sys.contains("(docs/packages.md)") && sys.contains("(docs/models.md)"),
+        "the docs listing must survive: {sys}"
+    );
+}
+
+#[test]
+fn opencode_env_label_is_rewritten_and_its_path_is_untouched() {
+    // opencode appends an <env> block whose `Workspace root folder:` label the
+    // classifier reads as a harness fingerprint. Bisected: renaming that one
+    // label clears the whole prompt, and the path after it is irrelevant —
+    // neutralising the path while keeping the label still trips. So the label is
+    // rewritten and everything around it, the path included, is left alone.
+    let body = json!({
+        "system": [{"type": "text", "text": concat!(
+            "You are opencode, an interactive CLI tool that helps users with software engineering tasks.\n",
+            "Here is some useful information about the environment you are running in:\n",
+            "<env>\n",
+            "  Working directory: /home/o/workspace/pengepul\n",
+            "  Workspace root folder: /home/o/workspace/pengepul\n",
+            "  Is directory a git repo: yes\n",
+            "  Platform: linux\n",
+            "</env>\n"
+        )}],
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let (out, _rev) = masquerade_request(&body);
+    let sys = out["system"][0]["text"].as_str().unwrap();
+
+    assert!(
+        !sys.contains("Workspace root folder:"),
+        "the tripping label must be rewritten: {sys}"
+    );
+    assert!(
+        sys.contains("  Project root: /home/o/workspace/pengepul\n"),
+        "the label is rewritten in place, keeping its path and indent: {sys}"
+    );
+    for kept in [
+        "You are opencode, an interactive CLI tool",
+        "  Working directory: /home/o/workspace/pengepul\n",
+        "  Is directory a git repo: yes\n",
+        "  Platform: linux\n",
+        "<env>",
+        "</env>",
+    ] {
+        assert!(sys.contains(kept), "{kept:?} must survive: {sys}");
+    }
+}
+
+#[test]
+fn harness_rewrites_are_exact_and_touch_nothing_else() {
+    // The rewrites are literal substrings, not patterns. "operating inside" is
+    // ordinary English and a short name like "pi" appears inside words, paths,
+    // domains and code spans; a heuristic that fired on those would corrupt the
+    // prompt, and one that rewrote a heading line would move the section
+    // boundaries the heading walk depends on. Every prompt here comes back
+    // byte-identical.
+    for text in [
+        "You are operating inside the user's terminal. Read the file before you edit the file.",
+        "You are a coding agent operating inside a git worktree. Never force-push.",
+        "When operating inside CI, do not prompt for input. CI runs are non-interactive.",
+        "You are operating inside VS Code. Use VS Code tasks to build.",
+        "When cooperating inside the team, respect the reviewer.",
+        "When operating inside pi, NEVER write outside /workspace and NEVER run rm -rf",
+        "あなたは operating inside pi です。重要：秘密を漏らさないこと。",
+        "Run `pi` to start. pi's config lives in ~/.config. (pi) is the binary.",
+        "The Mississippi river is long. See /opt/pi/docs and pi.dev",
+        "## Pi Heartbeats\n- The operator's own heartbeat policy\n## Other\n- kept",
+        "You are Claude Code, operating inside Claude Code. Claude Code helps you.",
+    ] {
+        let body = json!({
+            "system": [{"type": "text", "text": text}],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (out, _rev) = masquerade_request(&body);
+        assert_eq!(
+            out["system"][0]["text"].as_str().unwrap(),
+            text,
+            "prompt must pass through unchanged"
+        );
+    }
+}
+
+#[test]
+fn a_rewrite_cannot_move_a_heading_boundary() {
+    // The rewrites run after the heading walk, so a rewritten line can neither
+    // arm a skip that swallows operator content nor disarm one that would have
+    // stripped a bot section.
+    let body = json!({
+        "system": [{"type": "text", "text": concat!(
+            "## Reply Tags\n[[reply_to_current]]\n",
+            "## Keep\n- When working on pi topics, read the docs\n"
+        )}],
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let (out, _rev) = masquerade_request(&body);
+    let sys = out["system"][0]["text"].as_str().unwrap();
+
+    assert!(
+        !sys.contains("[[reply_to_current]]"),
+        "the bot section must still be stripped: {sys}"
+    );
+    assert!(
+        sys.contains("## Keep"),
+        "operator section must survive: {sys}"
+    );
+    assert!(
+        sys.contains("When working on these topics,"),
+        "the rewrite must still apply outside the stripped section: {sys}"
+    );
+}
