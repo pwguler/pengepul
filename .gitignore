@@ -6,3 +6,5 @@
 /.pengepul
 /docs/*
 !/docs/adr/
+!/docs/specs/
+!/docs/research/
