@@ -87,20 +87,22 @@ fn number_from(value: &Value) -> Option<f64> {
         .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
 }
 
-/// Per-model metadata for the direct anthropic and codex catalogs. The upstreams advertise
-/// only ids, so these numbers come from a curated table of the vendors' published limits;
-/// a model no entry claims is advertised without metadata rather than with guessed ones.
-/// Ordered longest-prefix first, so `claude-fable-5-1` wins over the `claude-fable` family
-/// default and dated aliases (`claude-opus-5-20260101`) match their family.
+/// Per-model metadata for the direct anthropic and codex catalogs. The anthropic upstream
+/// advertises only ids, so these numbers come from the vendor's published model docs
+/// (see `docs/research/claude-model-metadata.md`); a model no entry claims is advertised
+/// without metadata rather than with guessed ones. Ordered longest-prefix first, so
+/// `claude-fable-5-1` wins over the `claude-fable` family default and dated aliases
+/// (`claude-opus-5-20260101`) match their family.
 fn curated_metadata(id: &str) -> Option<ModelMetadata> {
     /// (context window, max output, input $/M, output $/M, cache-read $/M, cache-write $/M).
     /// `None` cache-write: the vendor does not bill a separate write rate for the family.
     const GPT5_LIMITS: (u64, u64, f64, f64, f64, Option<f64>) =
         (400_000, 128_000, 1.25, 10.0, 0.125, None);
     let entries: &[(&str, ModelMetadata)] = &[
+        // fable-5-1's cache read is 0.025x base input, not the standard 0.1x.
         (
             "claude-fable-5-1",
-            meta(1_000_000, 128_000, 10.0, 50.0, 1.0, Some(12.5)),
+            meta(1_000_000, 128_000, 10.0, 50.0, 0.25, Some(12.5)),
         ),
         (
             "claude-fable",
@@ -108,11 +110,35 @@ fn curated_metadata(id: &str) -> Option<ModelMetadata> {
         ),
         (
             "claude-opus-5",
-            meta(200_000, 64_000, 15.0, 75.0, 1.5, Some(18.75)),
+            meta(1_000_000, 128_000, 5.0, 25.0, 0.5, Some(6.25)),
+        ),
+        (
+            "claude-opus-4-8",
+            meta(1_000_000, 128_000, 5.0, 25.0, 0.5, Some(6.25)),
+        ),
+        (
+            "claude-opus-4-7",
+            meta(1_000_000, 128_000, 5.0, 25.0, 0.5, Some(6.25)),
+        ),
+        (
+            "claude-opus-4-6",
+            meta(1_000_000, 128_000, 5.0, 25.0, 0.5, Some(6.25)),
+        ),
+        (
+            "claude-opus-4",
+            meta(200_000, 64_000, 5.0, 25.0, 0.5, Some(6.25)),
         ),
         (
             "claude-sonnet-5",
-            meta(1_000_000, 64_000, 3.0, 15.0, 0.3, Some(3.75)),
+            meta(1_000_000, 128_000, 2.0, 10.0, 0.2, Some(2.5)),
+        ),
+        (
+            "claude-sonnet-4-6",
+            meta(1_000_000, 128_000, 3.0, 15.0, 0.3, Some(3.75)),
+        ),
+        (
+            "claude-sonnet-4",
+            meta(200_000, 64_000, 3.0, 15.0, 0.3, Some(3.75)),
         ),
         (
             "claude-haiku-4-5",
@@ -453,16 +479,31 @@ mod tests {
         let pricing = fable_meta.pricing.as_ref().expect("fable pricing");
         assert_eq!(pricing.input_per_million, Some(10.0));
         assert_eq!(pricing.output_per_million, Some(50.0));
-        assert_eq!(pricing.cache_read_per_million, Some(1.0));
+        // fable-5-1's cache read is 0.025x base input; every other family pays 0.1x
+        assert_eq!(pricing.cache_read_per_million, Some(0.25));
         assert_eq!(pricing.cache_write_per_million, Some(12.5));
-        // a family cousin no entry names exactly still rides the family default
-        assert_eq!(
-            fetched
-                .metadata
-                .get("claude-opus-5")
-                .and_then(|m| m.context_window),
-            Some(200_000)
-        );
+        // opus-5: 1M/128K at $5/$25 — the pre-4.1 opus rates do not carry forward
+        let opus = fetched
+            .metadata
+            .get("claude-opus-5")
+            .expect("opus metadata");
+        assert_eq!(opus.context_window, Some(1_000_000));
+        assert_eq!(opus.max_output_tokens, Some(128_000));
+        let opus_pricing = opus.pricing.as_ref().expect("opus pricing");
+        assert_eq!(opus_pricing.input_per_million, Some(5.0));
+        assert_eq!(opus_pricing.output_per_million, Some(25.0));
+        assert_eq!(opus_pricing.cache_read_per_million, Some(0.5));
+        assert_eq!(opus_pricing.cache_write_per_million, Some(6.25));
+        // the 4.x models the upstream still serves are covered too
+        let fetched_4x = parse_anthropic(&json!({"data": [
+            {"id": "claude-opus-4-8"}, {"id": "claude-opus-4-5"},
+            {"id": "claude-sonnet-4-6"}, {"id": "claude-sonnet-4-5"}
+        ]}));
+        let window = |id: &str| fetched_4x.metadata.get(id).and_then(|m| m.context_window);
+        assert_eq!(window("claude-opus-4-8"), Some(1_000_000));
+        assert_eq!(window("claude-opus-4-5"), Some(200_000));
+        assert_eq!(window("claude-sonnet-4-6"), Some(1_000_000));
+        assert_eq!(window("claude-sonnet-4-5"), Some(200_000));
         // a model no curated entry claims stays metadata-free, not guessed
         assert!(!fetched.metadata.contains_key("claude-opus-9"));
     }
