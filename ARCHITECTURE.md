@@ -35,7 +35,9 @@ in files.
   headers. `cloaking_versions.rs` supplies the vendor CLI versions it learns at
   runtime.
 - **Model catalog** (`models.rs`) — resolves a model id to exactly one Provider,
-  and advertises configured endpoints under a `<provider>/` prefix.
+  and advertises every served model under its `<provider>/` prefix with the
+  per-model metadata the client needs (context window, output cap, modalities,
+  pricing).
 - **Translation** (`translate.rs`, `streaming.rs`) — rewrites a body between
   Inbound and upstream **Dialect**, whole-document and one SSE event at a time;
   pure JSON, no I/O.

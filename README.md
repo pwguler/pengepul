@@ -173,6 +173,13 @@ with 400, as is a prefix no configured provider claims. `count_tokens` and the M
 and Responses routes answer 501 for configured providers; they accept only Chat
 Completions.
 
+`GET /v1/models` entries also carry optional per-model metadata when pengepul knows it:
+`context_window`, `max_output_tokens`, `input_modalities` and `pricing` (per-million
+rates for input, output and cache reads/writes). Direct anthropic and codex models get
+these from a curated table; configured providers pass through whatever their own
+`/v1/models` publishes. Fields are omitted when unknown, and clients reading only `id`
+are unaffected.
+
 pengepul writes `~/.pengepul/config.yaml` when it is missing, generating a fresh
 `sk-local-…` key. The keys you can set:
 

@@ -13,7 +13,7 @@ use pengepul::app::{
 };
 use pengepul::cloaking_versions::CliVersions;
 use pengepul::config::{CloakingConfig, Config, DebugMode, TimeoutConfig};
-use pengepul::models::FetchedModels;
+use pengepul::models::{FetchedModels, ModelMetadata, ModelPricing};
 use pengepul::tokens::save_token;
 use pengepul::types::{AvailableAccount, ProviderId, ProviderKind, TokenData};
 use serde_json::{Value, json};
@@ -1934,7 +1934,24 @@ impl UpstreamClient for ModelsUpstream {
         } else {
             Vec::new()
         };
-        Box::pin(async move { Ok(FetchedModels::new(ids)) })
+        let mut metadata = BTreeMap::new();
+        if kind == ProviderKind::Generic {
+            metadata.insert(
+                "llama-3.3-70b-versatile".to_string(),
+                ModelMetadata {
+                    context_window: Some(131_072),
+                    max_output_tokens: Some(32_768),
+                    input_modalities: Some(vec!["text".to_string()]),
+                    pricing: Some(ModelPricing {
+                        input_per_million: Some(0.59),
+                        output_per_million: Some(0.79),
+                        cache_read_per_million: None,
+                        cache_write_per_million: None,
+                    }),
+                },
+            );
+        }
+        Box::pin(async move { Ok(FetchedModels::with_metadata(ids, metadata)) })
     }
     fn generic_chat(
         &self,
@@ -2021,6 +2038,56 @@ async fn v1_models_advertises_fetched_configured_models_with_their_prefix() {
         ids.iter().any(|id| id == "groq/llama-3.3-70b-versatile"),
         "advertised ids: {ids:?}"
     );
+}
+
+#[tokio::test]
+async fn v1_models_carries_per_model_metadata_additively() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &groq_key_token()).expect("save groq key");
+    let app = create_app_with_upstream(
+        config_with_groq(tmp.path().to_path_buf()),
+        Arc::new(ModelsUpstream::default()),
+    );
+
+    let request = |_app: &axum::Router| {
+        axum::http::Request::builder()
+            .uri("/v1/models")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let mut entry = Value::Null;
+    for _ in 0..50 {
+        let (status, body) = json_response(app.clone(), request(&app)).await;
+        assert_eq!(status, 200);
+        entry = body["data"]
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item["id"] == "groq/llama-3.3-70b-versatile")
+            })
+            .cloned()
+            .unwrap_or(Value::Null);
+        if !entry.is_null() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // The base OpenAI fields are untouched...
+    assert_eq!(entry["id"], "groq/llama-3.3-70b-versatile");
+    assert_eq!(entry["object"], "model");
+    assert_eq!(entry["owned_by"], "groq");
+    // ...the metadata the upstream published is present...
+    assert_eq!(entry["context_window"], 131_072);
+    assert_eq!(entry["max_output_tokens"], 32_768);
+    assert_eq!(entry["input_modalities"], json!(["text"]));
+    assert_eq!(entry["pricing"]["input_per_million"], 0.59);
+    assert_eq!(entry["pricing"]["output_per_million"], 0.79);
+    // ...and rates the upstream did not publish are omitted, not zeroed.
+    assert!(entry["pricing"].get("cache_read_per_million").is_none());
+    assert!(entry["pricing"].get("cache_write_per_million").is_none());
 }
 
 #[tokio::test]

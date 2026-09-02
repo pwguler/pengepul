@@ -424,7 +424,7 @@ impl UpstreamClient for HttpUpstreamClient {
                     let headers = generic_chat_headers(&account);
                     let body =
                         send_get(client, format!("{base_url}/models"), headers, timeout).await?;
-                    Ok(FetchedModels::new(parse_openai(&body)))
+                    Ok(parse_openai(&body))
                 }
                 ProviderKind::Anthropic => {
                     let headers = BTreeMap::from([
@@ -442,7 +442,7 @@ impl UpstreamClient for HttpUpstreamClient {
                         timeout,
                     )
                     .await?;
-                    Ok(FetchedModels::new(parse_anthropic(&body)))
+                    Ok(parse_anthropic(&body))
                 }
                 ProviderKind::Codex => {
                     let version = config
@@ -454,7 +454,7 @@ impl UpstreamClient for HttpUpstreamClient {
                         format!("{CODEX_BASE_URL}{CODEX_MODELS_PATH}?client_version={version}");
                     let headers = codex_headers(&account, false, &config);
                     let body = send_get(client, url, headers, timeout).await?;
-                    Ok(FetchedModels::new(parse_codex(&body)))
+                    Ok(parse_codex(&body))
                 }
             }
         })
@@ -690,12 +690,12 @@ async fn refresh_model_catalog(state: &AppState) {
             .fetch_models(kind, account, cloaked_config(state))
             .await
         {
-            Ok(FetchedModels { ids }) => {
+            Ok(FetchedModels { ids, metadata }) => {
                 state
                     .catalog
                     .write()
                     .expect("catalog lock poisoned")
-                    .set_direct(kind, ids);
+                    .set_direct(kind, FetchedModels::with_metadata(ids, metadata));
             }
             Err(error) => {
                 tracing::warn!(
@@ -717,12 +717,12 @@ async fn refresh_model_catalog(state: &AppState) {
             .fetch_models(ProviderKind::Generic, account, cloaked_config(state))
             .await
         {
-            Ok(FetchedModels { ids }) => {
+            Ok(FetchedModels { ids, metadata }) => {
                 state
                     .catalog
                     .write()
                     .expect("catalog lock poisoned")
-                    .set_generic(provider_id, ids);
+                    .set_generic(provider_id, FetchedModels::with_metadata(ids, metadata));
             }
             Err(error) => {
                 tracing::warn!(provider = provider_id, ?error, "model list fetch failed");
@@ -863,13 +863,21 @@ async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
         .expect("catalog lock poisoned")
         .advertised()
         .into_iter()
-        .map(|(id, provider)| {
-            json!({
-                "id": id,
+        .map(|model| {
+            let mut entry = json!({
+                "id": model.id,
                 "object": "model",
                 "created": created,
-                "owned_by": provider.id.as_ref()
-            })
+                "owned_by": model.provider.id.as_ref()
+            });
+            // Metadata is additive: known fields merge in, unknown ones stay omitted, and a
+            // client reading only `id` sees the same shape as before.
+            if let Some(metadata) = model.metadata.and_then(|m| serde_json::to_value(m).ok())
+                && let (Some(entry), Some(extra)) = (entry.as_object_mut(), metadata.as_object())
+            {
+                entry.extend(extra.clone());
+            }
+            entry
         })
         .collect::<Vec<_>>();
 
@@ -2791,8 +2799,14 @@ mod tests {
         // Seed a known-good catalog, then force every upstream fetch to fail.
         {
             let mut catalog = state.catalog.write().expect("catalog lock");
-            catalog.set_direct(ProviderKind::Anthropic, vec!["claude-opus-5".into()]);
-            catalog.set_direct(ProviderKind::Codex, vec!["gpt-5.5".into()]);
+            catalog.set_direct(
+                ProviderKind::Anthropic,
+                FetchedModels::new(vec!["claude-opus-5".into()]),
+            );
+            catalog.set_direct(
+                ProviderKind::Codex,
+                FetchedModels::new(vec!["gpt-5.5".into()]),
+            );
         }
         upstream
             .fetch_fails
@@ -2807,7 +2821,7 @@ mod tests {
             .expect("catalog lock")
             .advertised()
             .into_iter()
-            .map(|(id, _)| id)
+            .map(|model| model.id)
             .collect();
         assert!(advertised.contains(&"anthropic/claude-opus-5".to_string()));
         assert!(advertised.contains(&"codex/gpt-5.5".to_string()));
