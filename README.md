@@ -22,7 +22,7 @@ From source: `cargo install --git https://github.com/pwguler/pengepul.git --lock
 ## Quickstart
 
 ```sh
-pengepul login # authorize an Anthropic account
+pengepul login --provider anthropic # authorize an Anthropic account
 pengepul login --provider codex # authorize a ChatGPT/Codex account
 pengepul serve # binds 127.0.0.1:8317
 pengepul serve --host 0.0.0.0 --port 8317 # reachable across your network
@@ -146,7 +146,7 @@ curl -sS http://127.0.0.1:8317/v1/chat/completions \
 
 ```sh
 pengepul serve # start the relay (the default with no subcommand)
-pengepul login # authorize an account in a browser (--provider codex for Codex)
+pengepul login --provider anthropic # authorize an account in a browser (--provider codex for Codex)
 pengepul login --provider groq --key $KEY # save a static key for a configured provider
 pengepul status # health of the running relay
 pengepul accounts # loaded accounts (--reload re-reads from disk)
