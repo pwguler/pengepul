@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
+use crate::render::{ActionGlyph, action_panel, format_duration, status_glyph};
 use anyhow::{Context, Result, bail};
 
 pub const SYSTEMD_UNIT_NAME: &str = "pengepul.service";
@@ -216,4 +217,171 @@ fn run(runner: &mut impl FnMut(&[String]) -> Result<ExitStatus>, command: &[&str
         bail!("{} exited with {}", command.join(" "), status);
     }
     Ok(())
+}
+
+/// Parse the platform service tool's text (systemctl on Linux, launchctl
+/// on macOS) into the structured `service` panel. Unrecognized lines are
+/// dropped; a text with no recognizable state renders as unknown rather
+/// than failing — the panel is observability, never a gate.
+pub(crate) fn service_status_panel(text: &str) -> Vec<String> {
+    let mut state: Option<String> = None;
+    let mut enabled: Option<String> = None;
+    let mut since: Option<String> = None;
+    let mut pid: Option<String> = None;
+    let mut memory: Option<String> = None;
+    let mut cpu: Option<String> = None;
+    let mut tasks: Option<String> = None;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        // launchctl key = value pairs.
+        if let Some((key, value)) = trimmed.split_once(" = ") {
+            match key {
+                "state" => state = Some(value.to_string()),
+                "pid" => pid = Some(value.to_string()),
+                _ => {}
+            }
+            continue;
+        }
+        // systemctl `Label: value` pairs.
+        if let Some((key, value)) = trimmed.split_once(':') {
+            let value = value.trim();
+            match key.trim() {
+                "Active" => {
+                    // `active (running) since Sat 2026-09-05 04:09:31 WIB; 4min 28s ago`
+                    let mut fields = value.splitn(2, " since ");
+                    let active = fields.next().unwrap_or(value).trim();
+                    state = Some(active.to_string());
+                    if let Some((_, ago)) = fields.next().and_then(|rest| rest.split_once("; ")) {
+                        let elapsed = parse_relative_seconds(ago);
+                        if elapsed > 0.0 {
+                            since = Some(format_duration(elapsed));
+                        }
+                    }
+                }
+                "Loaded" => {
+                    if let Some((_, rest)) = value.split_once("; ") {
+                        let flag = rest.split(';').next().unwrap_or("").trim();
+                        enabled = Some(flag.to_string());
+                    } else {
+                        enabled = Some(value.split(';').next().unwrap_or(value).trim().to_string());
+                    }
+                }
+                "Main PID" => {
+                    pid = Some(value.split_whitespace().next().unwrap_or(value).to_string());
+                }
+                "Memory" => {
+                    memory = Some(value.split_whitespace().next().unwrap_or(value).to_string());
+                }
+                "CPU" => {
+                    cpu = Some(value.split_whitespace().next().unwrap_or(value).to_string());
+                }
+                "Tasks" => {
+                    tasks = Some(value.split_whitespace().next().unwrap_or(value).to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let state_text = state.clone().unwrap_or_else(|| "unknown".to_string());
+    let active = state_text.starts_with("active") || state_text == "running";
+    let glyph = if active {
+        status_glyph(ActionGlyph::Ok)
+    } else if state_text.starts_with("failed") {
+        status_glyph(ActionGlyph::Failed)
+    } else {
+        status_glyph(ActionGlyph::Attention)
+    };
+    let mut rows = vec![format!("{glyph} {state_text}")];
+    if let Some(enabled) = enabled {
+        rows.push(enabled);
+    }
+    // systemd keeps printing the last Main PID of a dead unit
+    // (`code=killed`); a pid row for a stopped service would mislead.
+    if let (Some(pid), true) = (pid, active) {
+        rows.push(format!("pid  {pid}"));
+    }
+    if let Some(memory) = memory {
+        rows.push(format!("memory  {memory}"));
+    }
+    if let Some(cpu) = cpu {
+        rows.push(format!("cpu  {cpu}"));
+    }
+    if let Some(tasks) = tasks {
+        rows.push(format!("tasks  {tasks}"));
+    }
+    if let Some(since) = since {
+        // The same "since" reads as uptime for a running unit and as
+        // downtime for a stopped one.
+        rows.push(if active {
+            format!("uptime  {since}")
+        } else {
+            format!("stopped  {since} ago")
+        });
+    }
+    action_panel("service", &rows)
+}
+
+/// Parse systemd's relative time ("4min 28s ago", "3 days ago",
+/// "1 day 5h ago", "2 weeks 1 day ago", "500ms ago") into seconds. Units
+/// may sit against the number or in the next word. Unknown units drop
+/// their number; unparsable text yields 0.
+pub(crate) fn parse_relative_seconds(text: &str) -> f64 {
+    let mut seconds = 0.0;
+    let mut pending: Option<f64> = None;
+    for token in text.split_whitespace() {
+        let digits: String = token
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        let unit = &token[digits.len()..];
+        if digits.is_empty() {
+            if let Some(value) = pending.take() {
+                seconds += value * unit_seconds(unit);
+            }
+            continue;
+        }
+        let value: f64 = digits.parse().unwrap_or(0.0);
+        if unit.is_empty() {
+            pending = Some(value);
+        } else {
+            seconds += value * unit_seconds(unit);
+        }
+    }
+    seconds
+}
+
+/// Seconds per unit word, singular or plural; sub-second units and
+/// unknown words contribute nothing.
+pub(crate) fn unit_seconds(unit: &str) -> f64 {
+    match unit.trim_end_matches([',', ';']) {
+        "s" | "sec" | "second" | "seconds" => 1.0,
+        "min" | "minute" | "minutes" | "m" => 60.0,
+        "h" | "hour" | "hours" => 3600.0,
+        "d" | "day" | "days" => 86_400.0,
+        "w" | "week" | "weeks" => 604_800.0,
+        "month" | "months" => 30.0 * 86_400.0,
+        "y" | "year" | "years" => 365.0 * 86_400.0,
+        _ => 0.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_relative_seconds;
+    use crate::render::format_duration;
+    #[test]
+    fn relative_seconds_reads_every_systemd_shape() {
+        // Whole seconds: compare through the exact-integer formatter.
+        let seconds = |text: &str| format_duration(parse_relative_seconds(text));
+        assert_eq!(seconds("4min 28s ago"), "4m28s");
+        assert_eq!(seconds("3 days ago"), "3d0h");
+        assert_eq!(seconds("1 day 5h ago"), "1d5h");
+        assert_eq!(seconds("2 weeks 1 day ago"), "15d0h");
+        assert_eq!(seconds("1 month 3 days ago"), "33d0h");
+        // Sub-second units never masquerade as minutes.
+        assert_eq!(seconds("500ms ago"), "0s");
+        assert_eq!(seconds("nonsense"), "0s");
+    }
 }
