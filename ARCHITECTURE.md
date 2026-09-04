@@ -20,9 +20,12 @@ in files.
   route keys off client identity.
 - **Account** (`accounts.rs`) — `AccountManager`: holds every Account of one
   Provider and picks who serves next; **Rotation**, **Cooldown** and due
-  **Refresh** live here.
-- **Credential store** (`tokens.rs`) — reads and writes the one credential an
-  Account holds, under the auth dir at `0600`; knows nothing of selection.
+  **Refresh** live here, and every request outcome updates the Account's
+  Usage counters, which it hands to the Credential store to persist.
+- **Credential store** (`tokens.rs`) — the only module that reads or writes
+  under the auth dir: the one credential an Account holds, and the
+  provider's **Usage counters** file (`usage.json`), both at `0600`, the
+  latter written atomically (temp + rename); knows nothing of selection.
 - **OAuth** (`oauth.rs`) — mints and Refreshes the anthropic and codex
   credential, and is the only place a rejected refresh token becomes **Reauth**.
 - **Cloaking sanitizer** (`masquerade.rs`) — strips a harness's bot-identity
@@ -44,8 +47,16 @@ in files.
 - **Config** (`config.rs`) — parses `config.yaml`, including the `providers:`
   section, which is the only Provider registry: there is no database table.
 - **CLI + Runtime + Service** (`cli.rs`, `runtime.rs`, `service.rs`) — command
-  parsing (pure), the `CliRuntime` adapter that makes a verb touch the real world,
-  and the per-user systemd/launchd unit.
+  parsing and dispatch (pure), the `CliRuntime` adapter that makes a verb touch
+  the real world, and the per-user systemd/launchd unit — including the parser
+  that turns the platform tool's status text into panel rows.
+- **Render** (`render.rs`) — the panel language every verb prints with: the
+  64-column box, the three-color palette, glyphs, number formats, and the
+  `Style` (rich on a color TTY, plain otherwise) that `main.rs` decides once
+  at the edge. Knows nothing of Pools, Accounts, or the admin payload.
+- **Usage view** (`usage_view.rs`) — the admin payload turned into pool panels,
+  account rows, footers and the relay total block for `status`/`accounts`, in
+  both styles. Pure over the payload and a `now` the verb hands in.
 
 ## Seams
 
@@ -57,6 +68,9 @@ in files.
   compiler is the checklist when a fourth kind arrives.
 - **`CliRuntime`** — every side effect a CLI verb performs, so `cli.rs` stays
   pure argument handling.
+- **`Style`** — decided once from the TTY and environment in `main.rs` and
+  handed down; no renderer reads the environment, so tests drive either mode
+  hermetically and piped output stays byte-stable for scripts.
 - **Classifier-rewrite tables** — per-harness knowledge is a table entry, not an
   edit to the request path: openclaw's sections and tripping text, and the pi /
   opencode fingerprint rewrites.
@@ -88,5 +102,13 @@ in files.
   reload that sees a changed credential.
 - **The Provider registry is the `config.yaml` `providers:` section**, read at
   startup; there is no database and nothing on the serving path writes it.
+- **Usage counters survive a restart; Cooldown does not.** Requests, successes,
+  failures and tokens per Account are written to `usage.json` after every
+  outcome and reloaded at startup; a fresh process always retries every
+  Account. Deleting the file is the only reset.
+- **Cloaking follows Claude Code except where fidelity breaks the client.**
+  The beta set is audited against the current CLI binary, but
+  `redact-thinking` is never sent (it empties thinking text pengepul's clients
+  display) and `web-fetch` stays for the native tool swap — ADR-0014.
 - **A (Inbound dialect, Provider) pair the relay cannot serve is refused 501 at
   routing**, never sent upstream and never retried.
