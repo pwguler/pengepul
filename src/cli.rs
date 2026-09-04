@@ -383,7 +383,7 @@ fn status(
             .unwrap_or("unknown")
     ));
     let accounts = runtime.accounts(&base_url, &first_api_key(&config)?)?;
-    print_account_counts(&accounts, output);
+    print_pool(&accounts, output);
     Ok(())
 }
 
@@ -635,14 +635,130 @@ fn first_api_key(config: &Config) -> Result<String> {
         .context("config has no API keys")
 }
 
-fn print_account_counts(payload: &Value, output: &mut Output) {
+/// One decimal at K/M scale, integers under 1,000. Integer math throughout,
+/// so the rendered value is exact and truncation-free.
+fn format_count(value: i64) -> String {
+    let magnitude = value.unsigned_abs();
+    let sign = if value < 0 { "-" } else { "" };
+    if magnitude >= 1_000_000 {
+        let whole = magnitude / 1_000_000;
+        let tenths = (magnitude % 1_000_000) / 100_000;
+        format!("{sign}{whole}.{tenths}M")
+    } else if magnitude >= 1_000 {
+        let whole = magnitude / 1_000;
+        let tenths = (magnitude % 1_000) / 100;
+        format!("{sign}{whole}.{tenths}K")
+    } else {
+        format!("{sign}{magnitude}")
+    }
+}
+
+/// Comma-grouped form for request counts, which stay exact on the rollup line.
+fn format_exact(value: i64) -> String {
+    let magnitude = value.unsigned_abs().to_string();
+    let sign = if value < 0 { "-" } else { "" };
+    let mut grouped = String::with_capacity(magnitude.len() + magnitude.len() / 3);
+    for (index, character) in magnitude.chars().enumerate() {
+        if index > 0 && (magnitude.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(character);
+    }
+    format!("{sign}{grouped}")
+}
+
+/// `"on cooldown 4m12s"` while a cooldown lasts, `""` once it has cleared or
+/// was never set (`cooldownUntil` is an absolute unix timestamp).
+fn cooldown_label(now: f64, cooldown_until: f64) -> String {
+    let remaining = (cooldown_until - now).max(0.0).floor();
+    // Clamped non-negative and floored above, so the cast loses neither sign
+    // nor a meaningful fraction.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let remaining = remaining as u64;
+    if remaining == 0 {
+        return String::new();
+    }
+    let (minutes, seconds) = (remaining / 60, remaining % 60);
+    if minutes == 0 {
+        format!("on cooldown {seconds}s")
+    } else {
+        format!("on cooldown {minutes}m{seconds}s")
+    }
+}
+
+/// The per-provider pool view under `status`: availability header (with
+/// cooldown detail), summed request outcomes, summed token totals. Reads only
+/// what `GET /admin/accounts` already serves; the server is untouched. An
+/// empty pool prints only its bare header, matching the old count line.
+fn print_pool(payload: &Value, output: &mut Output) {
+    let mut first = true;
     for (provider_id, provider) in providers(payload) {
+        let accounts = provider
+            .get("accounts")
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
         let count = provider
             .get("account_count")
             .and_then(Value::as_i64)
             .unwrap_or(0);
         let suffix = if count == 1 { "account" } else { "accounts" };
-        output.line(&format!("{provider_id}: {count} {suffix}"));
+        if accounts.is_empty() {
+            output.line(&format!("{provider_id}: {count} {suffix}"));
+            continue;
+        }
+        if first {
+            output.line("");
+        }
+        first = false;
+        let available = accounts
+            .iter()
+            .filter(|account| {
+                account
+                    .get("available")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .count();
+        let mut header = format!("{provider_id}: {count} {suffix} ({available} available)");
+        let now = unix_now();
+        let cooling: Vec<String> = accounts
+            .iter()
+            .filter_map(|account| {
+                let available = account
+                    .get("available")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let until = account
+                    .get("cooldownUntil")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                (!available && until > now)
+                    .then(|| format!("{} {}", email(account), cooldown_label(now, until)))
+            })
+            .collect();
+        if !cooling.is_empty() {
+            write!(header, ", {}", cooling.join(", ")).expect("write to String cannot fail");
+        }
+        output.line(&header);
+
+        let mut totals = PoolTotals::default();
+        for account in accounts {
+            totals.add(account);
+        }
+        output.line(&format!(
+            "  requests {}  ({} ok, {} failed)",
+            format_exact(totals.requests),
+            format_exact(totals.successes),
+            format_exact(totals.failures)
+        ));
+        output.line(&format!(
+            "  tokens in {}  out {}  cache-read {}  cache-write {}  reasoning {}",
+            format_count(totals.input),
+            format_count(totals.output),
+            format_count(totals.cache_read),
+            format_count(totals.cache_write),
+            format_count(totals.reasoning)
+        ));
     }
 }
 
@@ -695,6 +811,48 @@ fn providers(payload: &Value) -> Vec<(&str, &Value)> {
 }
 
 #[derive(Default)]
+struct PoolTotals {
+    requests: i64,
+    successes: i64,
+    failures: i64,
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+    reasoning: i64,
+}
+
+impl PoolTotals {
+    fn add(&mut self, account: &Value) {
+        self.requests += i64_field(account, "totalRequests");
+        self.successes += i64_field(account, "totalSuccesses");
+        self.failures += i64_field(account, "totalFailures");
+        self.input += i64_field(account, "totalInputTokens");
+        self.output += i64_field(account, "totalOutputTokens");
+        self.cache_read += i64_field(account, "totalCacheReadInputTokens");
+        self.cache_write += i64_field(account, "totalCacheCreationInputTokens");
+        self.reasoning += i64_field(account, "totalReasoningOutputTokens");
+    }
+}
+
+fn i64_field(account: &Value, field: &str) -> i64 {
+    account.get(field).and_then(Value::as_i64).unwrap_or(0)
+}
+
+fn email(account: &Value) -> &str {
+    account
+        .get("email")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+}
+
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |duration| duration.as_secs_f64())
+}
+
+#[derive(Default)]
 struct Output {
     stdout: String,
     stderr: String,
@@ -704,5 +862,55 @@ impl Output {
     fn line(&mut self, value: &str) {
         self.stdout.push_str(value);
         self.stdout.push('\n');
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cooldown_label, format_count, format_exact};
+
+    #[test]
+    fn cooldown_label_rounds_down_to_minutes_and_seconds() {
+        let now = 1_000_000.0;
+        assert_eq!(cooldown_label(now, now + 252.0), "on cooldown 4m12s");
+        assert_eq!(cooldown_label(now, now + 61.0), "on cooldown 1m1s");
+        assert_eq!(cooldown_label(now, now + 60.0), "on cooldown 1m0s");
+        assert_eq!(cooldown_label(now, now + 59.0), "on cooldown 59s");
+        assert_eq!(cooldown_label(now, now + 1.0), "on cooldown 1s");
+        // A sub-second remainder floors to cleared, so both commands agree.
+        assert_eq!(cooldown_label(now, now + 0.5), "");
+    }
+
+    #[test]
+    fn cooldown_label_clears_for_elapsed_or_missing_cooldown() {
+        let now = 1_000_000.0;
+        assert_eq!(cooldown_label(now, now), "");
+        assert_eq!(cooldown_label(now, now - 10.0), "");
+        assert_eq!(cooldown_label(now, 0.0), "");
+    }
+
+    #[test]
+    fn format_count_scales_tokens_with_one_decimal() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(7), "7");
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(1_000), "1.0K");
+        assert_eq!(format_count(155_300), "155.3K");
+        assert_eq!(format_count(812_300), "812.3K");
+        assert_eq!(format_count(1_000_000), "1.0M");
+        assert_eq!(format_count(45_200_000), "45.2M");
+        assert_eq!(format_count(-1), "-1");
+    }
+
+    #[test]
+    fn format_exact_groups_request_counts_with_commas() {
+        assert_eq!(format_exact(0), "0");
+        assert_eq!(format_exact(6), "6");
+        assert_eq!(format_exact(999), "999");
+        assert_eq!(format_exact(1_000), "1,000");
+        assert_eq!(format_exact(1_204), "1,204");
+        assert_eq!(format_exact(999_999), "999,999");
+        assert_eq!(format_exact(1_000_000), "1,000,000");
+        assert_eq!(format_exact(-1), "-1");
     }
 }

@@ -29,6 +29,7 @@ struct FakeRuntime {
     login_provider: Option<ProviderId>,
     latest_tag: Option<String>,
     installed: Option<(String, String)>,
+    accounts_payload: Option<Value>,
 }
 
 impl CliRuntime for FakeRuntime {
@@ -59,6 +60,9 @@ impl CliRuntime for FakeRuntime {
         self.calls.push(format!("accounts:{base_url}:{api_key}"));
         self.accounts_url = Some(base_url.to_string());
         self.accounts_api_key = Some(api_key.to_string());
+        if let Some(payload) = &self.accounts_payload {
+            return Ok(payload.clone());
+        }
         Ok(json!({
             "providers": {
                 "anthropic": {
@@ -244,6 +248,122 @@ fn status_reports_health_and_account_counts() {
     assert!(outcome.stdout.contains("codex: 2 accounts"));
     assert_eq!(runtime.health_url.as_deref(), Some("http://127.0.0.1:8318"));
     assert_eq!(runtime.accounts_api_key.as_deref(), Some("sk-test"));
+}
+
+fn account(json: Value) -> Value {
+    json
+}
+
+/// An absolute instant `seconds` from now, for `cooldownUntil` fixtures.
+fn soon(seconds: f64) -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |duration| duration.as_secs_f64())
+        + seconds
+}
+
+#[test]
+fn status_rolls_up_pool_health_and_token_totals_per_provider() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "0.0.0.0", 8318);
+    let mut runtime = FakeRuntime {
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 3,
+                    "accounts": [
+                        account(json!({
+                            "email": "a@x.com",
+                            "available": true,
+                            "failureCount": 0,
+                            "totalRequests": 640,
+                            "totalSuccesses": 638,
+                            "totalFailures": 2,
+                            "totalInputTokens": 22_100_000,
+                            "totalOutputTokens": 401_200,
+                            "totalCacheCreationInputTokens": 6_000_000,
+                            "totalCacheReadInputTokens": 155_000_000,
+                            "totalReasoningOutputTokens": 64_000,
+                            "planType": "max"
+                        })),
+                        account(json!({
+                            "email": "b@x.com",
+                            "available": true,
+                            "failureCount": 4,
+                            "totalRequests": 564,
+                            "totalSuccesses": 560,
+                            "totalFailures": 4,
+                            "totalInputTokens": 23_100_000,
+                            "totalOutputTokens": 411_100,
+                            "totalCacheCreationInputTokens": 6_400_000,
+                            "totalCacheReadInputTokens": 156_700_000,
+                            "totalReasoningOutputTokens": 32_000,
+                            "planType": "pro"
+                        })),
+                        account(json!({
+                            "email": "c@x.com",
+                            "available": false,
+                            "cooldownUntil": soon(252.0),
+                            "failureCount": 9,
+                            "planType": "pro"
+                        }))
+                    ]
+                },
+                "groq": {
+                    "account_count": 1,
+                    "accounts": [
+                        account(json!({
+                            "email": "g@x.com",
+                            "available": true,
+                            "failureCount": 0,
+                            "planType": null
+                        }))
+                    ]
+                },
+                "deepseek": {
+                    "account_count": 0,
+                    "accounts": []
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run(&["status"], tmp.path(), &mut runtime);
+
+    assert_eq!(outcome.code, 0);
+    assert!(
+        outcome
+            .stdout
+            .contains("anthropic: 3 accounts (2 available)")
+    );
+    assert!(outcome.stdout.contains("on cooldown"));
+    assert!(
+        outcome
+            .stdout
+            .contains("requests 1,204  (1,198 ok, 6 failed)")
+    );
+    assert!(outcome.stdout.contains(
+        "tokens in 45.2M  out 812.3K  cache-read 311.7M  cache-write 12.4M  reasoning 96.0K"
+    ));
+    // A provider whose account omits every total rolls up as zeros (AC-4).
+    assert!(outcome.stdout.contains("groq: 1 account (1 available)"));
+    assert!(outcome.stdout.contains("requests 0  (0 ok, 0 failed)"));
+    assert!(
+        outcome
+            .stdout
+            .contains("tokens in 0  out 0  cache-read 0  cache-write 0  reasoning 0")
+    );
+    // An empty pool prints only its bare header line, no rollup (AC-7).
+    assert!(outcome.stdout.contains("deepseek: 0 accounts\n"));
+    assert!(!outcome.stdout.contains("deepseek: 0 accounts ("));
+    assert!(!outcome.stdout.contains("deepseek: 0 accounts\n  requests"));
+    // Each rollup block opens on its own line after a blank one (AC-1).
+    assert!(
+        outcome
+            .stdout
+            .contains("\n\nanthropic: 3 accounts (2 available)")
+    );
 }
 
 #[test]
