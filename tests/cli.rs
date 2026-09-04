@@ -1128,11 +1128,10 @@ fn update_renders_a_panel_when_rich_and_plain_bytes_when_piped() {
 
     runtime.latest_tag = Some("v0.0.1".to_string());
     let plain = run(&["update", "--check"], tmp.path(), &mut runtime);
-    assert!(
-        plain
-            .stdout
-            .contains("pengepul 0.9.2 is the latest release")
-    );
+    assert!(plain.stdout.contains(&format!(
+        "pengepul {} is the latest release",
+        env!("CARGO_PKG_VERSION")
+    )));
 }
 
 #[test]
@@ -1381,7 +1380,10 @@ fn update_plain_bytes_are_pinned() {
     let check = run(&["update", "--check"], tmp.path(), &mut runtime);
     assert_eq!(
         check.stdout,
-        "pengepul v99.0.0 is available (running 0.9.2); run `pengepul update` to install it\n"
+        format!(
+            "pengepul v99.0.0 is available (running {}); run `pengepul update` to install it\n",
+            env!("CARGO_PKG_VERSION")
+        )
     );
     let install = run(&["update"], tmp.path(), &mut runtime);
     assert_eq!(
