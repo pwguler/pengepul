@@ -397,7 +397,7 @@ fn accounts_detail_prints_usage_and_cooldown_per_account() {
         accounts_payload: Some(json!({
             "providers": {
                 "anthropic": {
-                    "account_count": 2,
+                    "account_count": 3,
                     "accounts": [
                         account(json!({
                             "email": "a@x.com",
@@ -418,6 +418,11 @@ fn accounts_detail_prints_usage_and_cooldown_per_account() {
                             "cooldownUntil": soon(191.0),
                             "failureCount": 2,
                             "planType": "pro"
+                        })),
+                        account(json!({
+                            "email": "c@x.com",
+                            "available": false,
+                            "failureCount": 5
                         }))
                     ]
                 }
@@ -432,10 +437,11 @@ fn accounts_detail_prints_usage_and_cooldown_per_account() {
     let stdout = outcome.stdout.clone();
     // Account header keeps its legacy shape; the cooldown account reads
     // "on cooldown" with remaining time, not "unavailable" (AC-6).
-    assert!(stdout.contains("anthropic: 2 accounts\n"));
+    assert!(stdout.contains("anthropic: 3 accounts\n"));
     assert!(stdout.contains("  a@x.com available failures=0 plan=max\n"));
     assert!(stdout.contains("  b@x.com on cooldown 3m10s failures=2 plan=pro\n"));
-    assert!(!stdout.contains("unavailable"));
+    // An unavailable snapshot with no future cooldownUntil keeps the old word.
+    assert!(stdout.contains("  c@x.com unavailable failures=5\n"));
     // Detail line under each account: requests (ok) plus token totals;
     // reasoning prints only when non-zero (AC-5).
     assert!(stdout.contains(
