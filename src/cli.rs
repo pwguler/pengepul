@@ -779,26 +779,25 @@ fn print_accounts(payload: &Value, output: &mut Output) {
                 .get("failureCount")
                 .and_then(Value::as_i64)
                 .unwrap_or(0);
-            let state = match account
+            let state = if account
                 .get("available")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
             {
-                true => "available".to_string(),
+                "available".to_string()
+            } else {
                 // Cooldown accounts show the remaining time; a snapshot with
                 // `available: false` and no future `cooldownUntil` stays
                 // "unavailable" (older relays, or a just-expired cooldown).
-                false => {
-                    let until = account
-                        .get("cooldownUntil")
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0);
-                    let label = cooldown_label(now, until);
-                    if label.is_empty() {
-                        "unavailable".to_string()
-                    } else {
-                        label
-                    }
+                let until = account
+                    .get("cooldownUntil")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                let label = cooldown_label(now, until);
+                if label.is_empty() {
+                    "unavailable".to_string()
+                } else {
+                    label
                 }
             };
             let mut line = format!("  {} {state} failures={failures}", email(account));
