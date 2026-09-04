@@ -902,6 +902,12 @@ struct PoolTotals {
 }
 
 impl PoolTotals {
+    /// The pool's carried load: the same sum `account_tokens` computes per
+    /// account, so footer totals match the share bars exactly.
+    fn tokens(&self) -> i64 {
+        self.input + self.output + self.cache_read + self.cache_write
+    }
+
     fn add(&mut self, account: &Value) {
         self.requests += i64_field(account, "totalRequests");
         self.successes += i64_field(account, "totalSuccesses");
@@ -1250,6 +1256,11 @@ fn footer_lines(totals: &PoolTotals) -> Vec<String> {
             paint(BOLD, &format_count(totals.reasoning))
         ));
     }
+    // The pool total stands alone, separated like the relay block's.
+    lines.push(format!(
+        "total {}",
+        paint(BOLD, &format_count(totals.tokens()))
+    ));
     lines
 }
 
