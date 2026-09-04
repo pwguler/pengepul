@@ -390,6 +390,62 @@ fn accounts_reload_then_prints_runtime_accounts() {
 }
 
 #[test]
+fn accounts_detail_prints_usage_and_cooldown_per_account() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 2,
+                    "accounts": [
+                        account(json!({
+                            "email": "a@x.com",
+                            "available": true,
+                            "failureCount": 0,
+                            "totalRequests": 640,
+                            "totalSuccesses": 638,
+                            "totalInputTokens": 22_100_000,
+                            "totalOutputTokens": 401_200,
+                            "totalCacheCreationInputTokens": 6_000_000,
+                            "totalCacheReadInputTokens": 155_000_000,
+                            "totalReasoningOutputTokens": 64_000,
+                            "planType": "max"
+                        })),
+                        account(json!({
+                            "email": "b@x.com",
+                            "available": false,
+                            "cooldownUntil": soon(191.0),
+                            "failureCount": 2,
+                            "planType": "pro"
+                        }))
+                    ]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run(&["accounts"], tmp.path(), &mut runtime);
+
+    assert_eq!(outcome.code, 0);
+    let stdout = outcome.stdout.clone();
+    // Account header keeps its legacy shape; the cooldown account reads
+    // "on cooldown" with remaining time, not "unavailable" (AC-6).
+    assert!(stdout.contains("anthropic: 2 accounts\n"));
+    assert!(stdout.contains("  a@x.com available failures=0 plan=max\n"));
+    assert!(stdout.contains("  b@x.com on cooldown 3m10s failures=2 plan=pro\n"));
+    assert!(!stdout.contains("unavailable"));
+    // Detail line under each account: requests (ok) plus token totals;
+    // reasoning prints only when non-zero (AC-5).
+    assert!(stdout.contains(
+        "    requests 640 (638 ok) in 22.1M out 401.2K cache-read 155.0M cache-write 6.0M reasoning 64.0K\n"
+    ));
+    assert!(stdout.contains("    requests 0 (0 ok) in 0 out 0 cache-read 0 cache-write 0\n"));
+    assert!(!stdout.contains("reasoning 0"));
+}
+
+#[test]
 fn service_install_delegates_custom_host_port() {
     let tmp = tempdir().expect("tempdir");
     write_config(tmp.path(), "127.0.0.1", 8317);

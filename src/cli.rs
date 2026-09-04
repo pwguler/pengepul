@@ -773,29 +773,54 @@ fn print_accounts(payload: &Value, output: &mut Output) {
         let Some(accounts) = provider.get("accounts").and_then(Value::as_array) else {
             continue;
         };
+        let now = unix_now();
         for account in accounts {
-            let email = account
-                .get("email")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            let state = if account
-                .get("available")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                "available"
-            } else {
-                "unavailable"
-            };
             let failures = account
                 .get("failureCount")
                 .and_then(Value::as_i64)
                 .unwrap_or(0);
-            let mut line = format!("  {email} {state} failures={failures}");
+            let state = match account
+                .get("available")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                true => "available".to_string(),
+                // Cooldown accounts show the remaining time; a snapshot with
+                // `available: false` and no future `cooldownUntil` stays
+                // "unavailable" (older relays, or a just-expired cooldown).
+                false => {
+                    let until = account
+                        .get("cooldownUntil")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
+                    let label = cooldown_label(now, until);
+                    if label.is_empty() {
+                        "unavailable".to_string()
+                    } else {
+                        label
+                    }
+                }
+            };
+            let mut line = format!("  {} {state} failures={failures}", email(account));
             if let Some(plan_type) = account.get("planType").and_then(Value::as_str) {
                 write!(line, " plan={plan_type}").expect("write to String cannot fail");
             }
             output.line(&line);
+            let reasoning = i64_field(account, "totalReasoningOutputTokens");
+            let mut detail = format!(
+                "    requests {} ({} ok) in {} out {} cache-read {} cache-write {}",
+                format_exact(i64_field(account, "totalRequests")),
+                format_exact(i64_field(account, "totalSuccesses")),
+                format_count(i64_field(account, "totalInputTokens")),
+                format_count(i64_field(account, "totalOutputTokens")),
+                format_count(i64_field(account, "totalCacheReadInputTokens")),
+                format_count(i64_field(account, "totalCacheCreationInputTokens")),
+            );
+            if reasoning != 0 {
+                write!(detail, " reasoning {}", format_count(reasoning))
+                    .expect("write to String cannot fail");
+            }
+            output.line(&detail);
         }
     }
 }
