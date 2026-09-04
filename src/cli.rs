@@ -1069,7 +1069,15 @@ impl RelayTotals {
     fn from_payload(payload: &Value) -> Self {
         let mut totals = Self::default();
         for (_provider_id, provider) in providers(payload) {
-            totals.pools += 1;
+            // Pools with no loaded accounts are hidden from the status
+            // output; the header must not count what it does not show.
+            let has_accounts = provider
+                .get("accounts")
+                .and_then(Value::as_array)
+                .is_some_and(|accounts| !accounts.is_empty());
+            if has_accounts {
+                totals.pools += 1;
+            }
             totals.accounts += usize::try_from(
                 provider
                     .get("account_count")
@@ -1091,20 +1099,26 @@ impl RelayTotals {
     }
 }
 
-/// The `Style::Plain` relay-total block: header, two totals, nothing else.
-fn print_relay_total_plain(payload: &Value, output: &mut Output) {
-    let totals = RelayTotals::from_payload(payload);
-    output.line("");
-    output.line(&format!(
-        "relay total: {} pools, {} {}",
+/// `relay total: P pools, A accounts` with singular forms where due.
+fn relay_header(totals: &RelayTotals) -> String {
+    format!(
+        "relay total: {} {}, {} {}",
         totals.pools,
+        if totals.pools == 1 { "pool" } else { "pools" },
         totals.accounts,
         if totals.accounts == 1 {
             "account"
         } else {
             "accounts"
         }
-    ));
+    )
+}
+
+/// The `Style::Plain` relay-total block: header, two totals, nothing else.
+fn print_relay_total_plain(payload: &Value, output: &mut Output) {
+    let totals = RelayTotals::from_payload(payload);
+    output.line("");
+    output.line(&relay_header(&totals));
     output.line(&format!("total requests {}", format_exact(totals.requests)));
     output.line(&format!("total tokens {}", format_count(totals.tokens)));
 }
@@ -1113,16 +1127,7 @@ fn print_relay_total_plain(payload: &Value, output: &mut Output) {
 /// inside, then the same two totals.
 fn print_relay_total_rich(payload: &Value, output: &mut Output) {
     let totals = RelayTotals::from_payload(payload);
-    let header = format!(
-        "relay total: {} pools, {} {}",
-        totals.pools,
-        totals.accounts,
-        if totals.accounts == 1 {
-            "account"
-        } else {
-            "accounts"
-        }
-    );
+    let header = relay_header(&totals);
     let fill = INNER_WIDTH.saturating_sub(header.chars().count() + 2);
     let mut rule = format!("──── {header} ");
     rule.extend(std::iter::repeat_n('─', fill));

@@ -1026,7 +1026,8 @@ fn status_relay_total_covers_empty_pools_and_zero_relay() {
 
     assert_eq!(outcome.code, 0);
     // AC-4: block prints even at a zero relay; AC-5: empty pools count.
-    assert!(outcome.stdout.contains("relay total: 3 pools, 1 account\n"));
+    // Empty pools are hidden, so the header counts only shown pools.
+    assert!(outcome.stdout.contains("relay total: 1 pool, 1 account\n"));
     assert!(outcome.stdout.contains("total requests 0\n"));
     assert!(outcome.stdout.contains("total tokens 0\n"));
 }
