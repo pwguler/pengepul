@@ -207,8 +207,9 @@ pub struct AccountManager {
     accounts: BTreeMap<String, AccountState>,
     order: Vec<String>,
     last_used_index: Option<usize>,
-    /// Usage counters read from disk at load time, kept current so every
-    /// write is a full-file snapshot. Entries survive account reloads.
+    /// Usage counters read from disk at `load()` and merged into fresh
+    /// account states; never updated afterwards. Writes rebuild the file
+    /// from the live accounts, dropping unknown entries.
     persisted_usage: BTreeMap<String, PersistedUsage>,
 }
 

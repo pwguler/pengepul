@@ -297,7 +297,16 @@ async fn token_refresh_keeps_the_counters() {
     manager.record_success("k@example.com", None);
     assert_eq!(manager.snapshots()[0]["totalRequests"], 1);
 
-    // Spec: token rotation must not reset usage counters.
+    // Spec: token rotation must not reset usage counters. Rotate for
+    // real so reload() takes the `updated` branch (where the resets live).
+    save_token(
+        tmp.path(),
+        &TokenData {
+            access_token: "rotated-access".to_string(),
+            ..static_token("k@example.com")
+        },
+    )
+    .expect("rotate token");
     manager.reload().expect("reload");
     assert_eq!(manager.snapshots()[0]["totalRequests"], 1);
     assert_eq!(manager.snapshots()[0]["totalSuccesses"], 1);

@@ -85,6 +85,10 @@ pub fn load_all_tokens(auth_dir: &Path, provider: Option<&ProviderId>) -> Result
             .into_iter()
             .map(|entry| entry.path())
             .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            // usage.json is per-provider state written by AccountManager,
+            // not a credential; scanning it would log a spurious warning
+            // on every startup.
+            .filter(|path| path.file_name().is_none_or(|name| name != "usage.json"))
             .collect::<Vec<_>>();
         paths.sort();
 
