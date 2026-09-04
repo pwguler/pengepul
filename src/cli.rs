@@ -599,6 +599,7 @@ fn service_status_panel(text: &str) -> Vec<String> {
     let mut pid: Option<String> = None;
     let mut memory: Option<String> = None;
     let mut cpu: Option<String> = None;
+    let mut tasks: Option<String> = None;
 
     for line in text.lines() {
         let trimmed = line.trim();
@@ -644,6 +645,9 @@ fn service_status_panel(text: &str) -> Vec<String> {
                 "CPU" => {
                     cpu = Some(value.split_whitespace().next().unwrap_or(value).to_string());
                 }
+                "Tasks" => {
+                    tasks = Some(value.split_whitespace().next().unwrap_or(value).to_string());
+                }
                 _ => {}
             }
         }
@@ -653,6 +657,8 @@ fn service_status_panel(text: &str) -> Vec<String> {
     let active = state_text.starts_with("active") || state_text == "running";
     let glyph = if active {
         status_glyph(ActionGlyph::Ok)
+    } else if state_text.starts_with("failed") {
+        status_glyph(ActionGlyph::Failed)
     } else {
         status_glyph(ActionGlyph::Attention)
     };
@@ -670,6 +676,9 @@ fn service_status_panel(text: &str) -> Vec<String> {
     }
     if let Some(cpu) = cpu {
         rows.push(format!("cpu  {cpu}"));
+    }
+    if let Some(tasks) = tasks {
+        rows.push(format!("tasks  {tasks}"));
     }
     if let Some(since) = since {
         // The same "since" reads as uptime for a running unit and as
@@ -1545,11 +1554,12 @@ fn action_panel(subject: &str, rows: &[String]) -> Vec<String> {
     lines
 }
 
-/// A status glyph with its color: green success, amber attention.
+/// A status glyph with its color: green success, amber attention, red failure.
 fn status_glyph(kind: ActionGlyph) -> String {
     match kind {
         ActionGlyph::Ok => paint(GREEN, "●"),
         ActionGlyph::Attention => paint(AMBER, "●"),
+        ActionGlyph::Failed => paint(RED, "●"),
     }
 }
 
@@ -1558,6 +1568,7 @@ fn status_glyph(kind: ActionGlyph) -> String {
 pub(crate) enum ActionGlyph {
     Ok,
     Attention,
+    Failed,
 }
 
 /// One colored account row: email, glyph + state, ok count, share bar.

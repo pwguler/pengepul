@@ -1179,6 +1179,7 @@ fn service_status_parses_systemctl_into_a_panel_when_rich() {
     assert!(visible.contains("3162166"));
     assert!(visible.contains("2.3M"));
     assert!(visible.contains("2.614s"));
+    assert!(visible.contains("tasks  7"));
     assert!(visible.contains("4m28s"));
     for line in visible.lines() {
         assert!(line.chars().count() <= 64, "too wide: {line}");
@@ -1387,4 +1388,26 @@ fn update_plain_bytes_are_pinned() {
         install.stdout,
         "updated to v99.0.0 at /usr/local/bin/pengepul\n"
     );
+}
+
+#[test]
+fn service_status_paints_a_failed_unit_red() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime = FakeRuntime {
+        service_status_text: Some(
+            "× pengepul.service - pengepul API relay\n     Loaded: loaded (/x/pengepul.service; enabled; preset: enabled)\n     Active: failed (Result: exit-code) since Sat 2026-09-05 04:09:31 WIB; 2h ago\n"
+                .to_string(),
+        ),
+        ..FakeRuntime::default()
+    };
+
+    let rich = run_style(
+        &["service", "status"],
+        tmp.path(),
+        &mut runtime,
+        Style::Rich,
+    );
+
+    assert!(strip_ansi(&rich.stdout).contains("failed (Result: exit-code)"));
+    assert!(rich.stdout.contains("\u{1b}[31m●"), "{}", rich.stdout);
 }
