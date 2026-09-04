@@ -1967,6 +1967,7 @@ impl UpstreamClient for ModelsUpstream {
                     context_window: Some(131_072),
                     max_output_tokens: Some(32_768),
                     input_modalities: Some(vec!["text".to_string()]),
+                    reasoning: None,
                     pricing: Some(ModelPricing {
                         input_per_million: Some(0.59),
                         output_per_million: Some(0.79),
