@@ -388,29 +388,26 @@ fn status(
 ) -> Result<()> {
     let config = load_config(config_path, Some(home), cwd)?;
     let base_url = base_url(&config);
-    output.line(&format!(
-        "config: {}",
-        selected_config_path(config_path, Some(home), cwd).display()
-    ));
-    output.line(&format!("url: {base_url}"));
     let health = runtime.health(&base_url)?;
-    output.line(&format!(
-        "server: {}",
-        health
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-    ));
+    let server = health
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let connection = format!(
+        "url {base_url} \u{2014} server {server}  config {}",
+        selected_config_path(config_path, Some(home), cwd).display()
+    );
     let accounts = runtime.accounts(&base_url, &first_api_key(&config)?)?;
     let now = unix_now();
     match style {
         Style::Plain => {
             print_pool_inner(&accounts, output);
-            print_relay_total_plain(&accounts, output);
+            print_relay_total_plain(&accounts, output, &connection);
         }
         Style::Rich => {
             print_pool_rich(&accounts, output, false, now);
-            print_relay_total_rich(&accounts, output);
+            print_relay_total_rich(&accounts, output, &connection);
         }
     }
     Ok(())
@@ -1028,7 +1025,7 @@ fn print_pool_inner(payload: &Value, output: &mut Output) {
         if accounts.is_empty() {
             continue;
         }
-        if first {
+        if first && !output.is_empty() {
             output.line("");
         }
         first = false;
@@ -1382,23 +1379,25 @@ fn relay_header(totals: &RelayTotals) -> String {
 }
 
 /// The `Style::Plain` relay-total block: header, two totals, nothing else.
-fn print_relay_total_plain(payload: &Value, output: &mut Output) {
+fn print_relay_total_plain(payload: &Value, output: &mut Output, connection: &str) {
     let totals = RelayTotals::from_payload(payload);
     output.line("");
     output.line(&relay_header(&totals));
+    output.line(connection);
     output.line(&format!("total requests {}", format_exact(totals.requests)));
     output.line(&format!("total tokens {}", format_count(totals.tokens)));
 }
 
 /// The `Style::Rich` relay-total block: a 64-wide rule with the header
 /// inside, then the same two totals.
-fn print_relay_total_rich(payload: &Value, output: &mut Output) {
+fn print_relay_total_rich(payload: &Value, output: &mut Output, connection: &str) {
     let totals = RelayTotals::from_payload(payload);
     let header = relay_header(&totals);
     let fill = INNER_WIDTH.saturating_sub(header.chars().count() + 2);
     let mut rule = format!("──── {header} ");
     rule.extend(std::iter::repeat_n('─', fill));
     output.line(&rule);
+    output.line(&panel_row(connection));
     output.line(&format!("total requests {}", format_exact(totals.requests)));
     output.line(&format!("total tokens {}", format_count(totals.tokens)));
 }
@@ -1655,6 +1654,12 @@ impl Output {
     pub(crate) fn line(&mut self, value: &str) {
         self.stdout.push_str(value);
         self.stdout.push('\n');
+    }
+
+    /// Whether nothing has been printed yet, so leading blank separators
+    /// can be skipped.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.stdout.is_empty()
     }
 }
 

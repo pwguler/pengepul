@@ -264,9 +264,9 @@ fn status_reports_health_and_account_counts() {
     let outcome = run(&["status"], tmp.path(), &mut runtime);
 
     assert_eq!(outcome.code, 0);
-    assert!(outcome.stdout.contains("config: "));
-    assert!(outcome.stdout.contains("url: http://127.0.0.1:8318"));
-    assert!(outcome.stdout.contains("server: ok"));
+    // Header facts moved into the relay block (rich-everywhere AC-7).
+    assert!(outcome.stdout.contains("url http://127.0.0.1:8318 \u{2014} server ok"));
+
     assert!(outcome.stdout.contains("anthropic: 1 account"));
     // Empty pools are hidden (AC-7, revised): codex has no loaded accounts.
     assert!(!outcome.stdout.contains("codex:"));
@@ -407,7 +407,7 @@ fn status_rolls_up_pool_health_and_token_totals_per_provider() {
     assert!(
         outcome
             .stdout
-            .contains("\n\nanthropic: 3 accounts (2 available)")
+            .starts_with("anthropic: 3 accounts (2 available")
     );
 }
 
@@ -1209,4 +1209,35 @@ fn service_status_without_a_service_renders_an_amber_panel_when_rich() {
         .expect_err("plain errors")
         .to_string()
         .contains("no service installed"));
+}
+
+#[test]
+fn status_moves_the_header_facts_into_the_relay_block() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "0.0.0.0", 8318);
+    let mut runtime = FakeRuntime::default();
+
+    // Rich: no header lines before the first panel.
+    let rich = run_style(&["status"], tmp.path(), &mut runtime, Style::Rich);
+    let visible = strip_ansi(&rich.stdout);
+    let first_panel = visible.find('\u{250c}').expect("panel present");
+    assert!(
+        !visible[..first_panel].contains("config:"),
+        "header must not precede panels: {}",
+        &visible[..first_panel]
+    );
+    assert!(!visible[..first_panel].contains("url:"));
+    assert!(!visible[..first_panel].contains("server:"));
+    // Facts live in the relay block.
+    assert!(visible.contains("relay total:"));
+    assert!(visible.contains("server ok"));
+    assert!(visible.contains("url http://127.0.0.1:8318 \u{2014} server ok"));
+
+    // Plain: same facts, same place.
+    let plain = run(&["status"], tmp.path(), &mut runtime);
+    let body = plain.stdout;
+    let first_pool = body.find("anthropic:").expect("pool line");
+    assert!(!body[..first_pool].contains("config:"));
+    assert!(body.contains("relay total:"));
+    assert!(body.contains("url http://127.0.0.1:8318 \u{2014} server ok"));
 }
