@@ -39,20 +39,26 @@ today's plain text.
   `┌─ pool: <id> ─ <N accounts, A available> ─┐`, one row per account with
   email, glyph, state, ok-count, share bar and percentage, a footer section
   with the summed requests line and tokens line, and a bottom rule `└…┘`.
+  Panels are a fixed 64 columns — 60 cannot hold the row columns without
+  truncating most emails; 64 is still fixed and width-query-free.
   Empty pools render as a single-line panel note, not a broken box.
 - AC-4: The share bar is exactly 10 cells: `█` for whole tenths of the
   account's `totalInputTokens + totalOutputTokens + totalCacheRead* +
   totalCacheCreation*` share of the pool total, `░` for the rest, with the
   integer percentage right-aligned. A pool whose total is 0 renders ten `░`
   cells and no percentage.
-- AC-5: Account rows carry `● available` (green) for available accounts and
-  `● on cooldown 3m10s` (amber, remaining time from `cooldownUntil` via the
-  existing pure helper) otherwise; an unavailable account with no future
-  cooldown keeps `● unavailable` (red). Rollup numbers are bold; labels are
-  dim. Color wraps only the glyph/state spans, never the whole line.
-- AC-6: With `Rich`, `accounts` renders the same panels with per-account
-  token detail in place of the share bar's suffix — email, state, requests
-  (ok), and the in/out/cache-read/cache-write totals; the plain branch keeps
+- AC-5: Account rows carry `● available` (green) for available accounts,
+  `● cooldown 4m12s` (amber, remaining time from `cooldownUntil` via the
+  existing pure helper) otherwise, and `● unavailable` (red) for an
+  unavailable account with no future cooldown — the row drops the plain
+  branch's leading "on" because the glyph already states the condition (the
+  approved mockup shows `● cooldown`). "on cooldown" stays in plain output.
+  Rollup numbers are bold; labels are dim. Color wraps only the glyph/state
+  spans, never the whole line.
+- AC-6: With `Rich`, `accounts` renders the same panels as `status` and adds
+  beneath each account row a dim detail line with in, out, read/write
+  totals, plus a second `reasoning` line only when that total is non-zero
+  (five fields cannot fit one fixed-width row); the plain branch keeps
   today's detail lines unchanged.
 - AC-7: Panel rendering is a pure function from the admin payload and the
   style to strings: no clock reads, no TTY queries, no I/O inside the

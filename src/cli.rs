@@ -396,7 +396,10 @@ fn status(
             .unwrap_or("unknown")
     ));
     let accounts = runtime.accounts(&base_url, &first_api_key(&config)?)?;
-    print_pool(&accounts, output);
+    match style {
+        Style::Plain => print_pool(&accounts, output),
+        Style::Rich => print_pool_rich(&accounts, output, false),
+    }
     Ok(())
 }
 
@@ -417,7 +420,10 @@ fn accounts(
         output.line("reloaded accounts");
     }
     let accounts = runtime.accounts(&base_url, &api_key)?;
-    print_accounts(&accounts, output);
+    match style {
+        Style::Plain => print_accounts(&accounts, output),
+        Style::Rich => print_pool_rich(&accounts, output, true),
+    }
     Ok(())
 }
 
@@ -641,11 +647,7 @@ impl Style {
     /// piped output, `NO_COLOR` set (even empty), `TERM=dumb` — is `Plain`.
     /// Plain is the only non-Rich mode: there is no uncolored panel.
     #[must_use]
-    pub fn from_tty(
-        is_tty: bool,
-        no_color: Option<&OsStr>,
-        term: Option<&OsStr>,
-    ) -> Self {
+    pub fn from_tty(is_tty: bool, no_color: Option<&OsStr>, term: Option<&OsStr>) -> Self {
         let no_color = no_color.is_some();
         let dumb = term == Some(OsStr::new("dumb"));
         if is_tty && !no_color && !dumb {
@@ -720,11 +722,16 @@ fn cooldown_label(now: f64, cooldown_until: f64) -> String {
     if remaining == 0 {
         return String::new();
     }
-    let (minutes, seconds) = (remaining / 60, remaining % 60);
-    if minutes == 0 {
-        format!("on cooldown {seconds}s")
+    let (hours, rem) = (remaining / 3_600, remaining % 3_600);
+    if hours > 0 {
+        format!("on cooldown {hours}h{}m", rem / 60)
     } else {
-        format!("on cooldown {minutes}m{seconds}s")
+        let (minutes, seconds) = (rem / 60, rem % 60);
+        if minutes == 0 {
+            format!("on cooldown {seconds}s")
+        } else {
+            format!("on cooldown {minutes}m{seconds}s")
+        }
     }
 }
 
@@ -912,18 +919,297 @@ fn email(account: &Value) -> &str {
         .unwrap_or("unknown")
 }
 
+/// Panel geometry: inner width (between the `│ ` and ` │` gutters), glyph
+/// column, and the email column wide enough for most addresses before
+/// truncation. Deriving the row layout from one table keeps the columns
+/// aligned by construction.
+/// Panel geometry, with the column budget summing to 59 of 60 inner
+/// columns: email 16 + state 17 (glyph, space, text) + ok 9 + bar 10 +
+/// pct 3, single spaces between.
+const INNER_WIDTH: usize = PANEL_WIDTH - 4;
+const EMAIL_WIDTH: usize = 16;
+const STATE_SPAN_WIDTH: usize = 17; // "● " + "cooldown 23h59m"
+const OK_WIDTH: usize = 9; // "999,999 ok"
+
+/// One `│ … │` row, trimmed to the panel width if the content overruns —
+/// box integrity wins over content, and overruns cannot happen for the
+/// numbers this renderer prints (emails truncate via `pad`).
+/// One `│ … │` row. The colored content is kept verbatim; only its *visible*
+/// width is measured, and tail padding is added after it, so escape bytes
+/// never fool the geometry. A row whose visible text overruns the fixed
+/// width degrades to uncolored, clipped text — box integrity wins over
+/// content, and the renderer's own columns never overrun.
+fn panel_row(content: &str) -> String {
+    let plain = strip_ansi(content);
+    let visible = plain.chars().count();
+    if visible > INNER_WIDTH {
+        let clipped: String = plain.chars().take(INNER_WIDTH).collect();
+        format!("│ {clipped} │")
+    } else {
+        let tail = " ".repeat(INNER_WIDTH - visible);
+        format!("│ {content}{tail} │")
+    }
+}
+
+/// Strip ANSI escape sequences, keeping the visible text. Lives with the
+/// render code so measurement and tests share one definition.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\x1b' {
+            while let Some(&next) = chars.peek() {
+                chars.next();
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(character);
+        }
+    }
+    out
+}
+
+fn glyph(available: bool, on_cooldown: bool) -> String {
+    if available {
+        paint(GREEN, "●")
+    } else if on_cooldown {
+        paint(AMBER, "●")
+    } else {
+        paint(RED, "●")
+    }
+}
+
+/// The rich pool view: one panel per provider with rows and a footer rollup.
+/// Pure over the payload and the clock value handed to it; `with_detail`
+/// adds the per-account token line the `accounts` command shows.
+fn print_pool_rich(payload: &Value, output: &mut Output, with_detail: bool) {
+    let now = unix_now();
+    for (provider_id, provider) in providers(payload) {
+        let accounts = provider
+            .get("accounts")
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
+        let count = provider
+            .get("account_count")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let suffix = if count == 1 { "account" } else { "accounts" };
+        if accounts.is_empty() {
+            output.line(&format!(
+                "{} {provider_id}: {count} {suffix} {}",
+                paint(DIM, "·"),
+                paint(DIM, "(no accounts loaded)")
+            ));
+            continue;
+        }
+        let available = accounts
+            .iter()
+            .filter(|account| {
+                account
+                    .get("available")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .count();
+
+        output.line(&top_rule(provider_id, count, suffix, available));
+
+        let pool_total: i64 = accounts.iter().map(account_tokens).sum();
+        let mut totals = PoolTotals::default();
+        for account in accounts {
+            totals.add(account);
+        }
+        for account in accounts {
+            output.line(&panel_row(&account_row(account, pool_total, now)));
+            if with_detail {
+                for line in account_detail_lines(account) {
+                    output.line(&panel_row(&line));
+                }
+            }
+        }
+
+        output.line(&format!("├{}┤", "─".repeat(INNER_WIDTH + 2)));
+        for line in footer_lines(&totals) {
+            output.line(&panel_row(&line));
+        }
+        output.line(&format!("└{}┘", "─".repeat(INNER_WIDTH + 2)));
+    }
+}
+
+/// Top rule with the pool header inside: `┌─ pool: <id> ─ <N, A> ─…┐`. The
+/// fill brings the rule to the same width as a panel row.
+fn top_rule(provider_id: &str, count: i64, suffix: &str, available: usize) -> String {
+    let header = format!("pool: {provider_id} ─ {count} {suffix}, {available} available");
+    let fill = INNER_WIDTH - header.chars().count() - 1;
+    let mut top = format!("┌─ {header} ");
+    top.extend(std::iter::repeat_n('─', fill));
+    top.push('┐');
+    top
+}
+
+/// One colored account row: email, glyph + state, ok count, share bar.
+fn account_row(account: &Value, pool_total: i64, now: f64) -> String {
+    let is_available = account
+        .get("available")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let until = account
+        .get("cooldownUntil")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let raw_cooldown = cooldown_label(now, until);
+    let on_cooldown = !is_available && !raw_cooldown.is_empty();
+    let label = if is_available {
+        "available".to_string()
+    } else if on_cooldown {
+        // The glyph already says the condition; the row drops the plain
+        // branch's leading "on".
+        raw_cooldown
+            .strip_prefix("on ")
+            .unwrap_or(&raw_cooldown)
+            .to_string()
+    } else {
+        "unavailable".to_string()
+    };
+    let state_color = if is_available {
+        GREEN
+    } else if on_cooldown {
+        AMBER
+    } else {
+        RED
+    };
+    let ok = i64_field(account, "totalSuccesses");
+    let state_span = format!(
+        "{} {}",
+        glyph(is_available, on_cooldown),
+        paint(state_color, &pad(&label, STATE_SPAN_WIDTH - 2))
+    );
+    let ok_text = format!("{} ok", format_exact(ok));
+    let (bar, share) = share_bar(account_tokens(account), pool_total);
+    let share_text = share.map_or_else(|| " ".to_string(), |value| format!("{value}%"));
+    [
+        pad(email(account), EMAIL_WIDTH),
+        state_span,
+        paint(BOLD, &pad(&ok_text, OK_WIDTH)),
+        bar,
+        paint(DIM, &share_text),
+    ]
+    .join(" ")
+}
+
+/// The dim per-account token lines shown under `accounts`: in/out/read/write,
+/// plus a reasoning line only when that total is non-zero.
+fn account_detail_lines(account: &Value) -> Vec<String> {
+    let mut lines = vec![paint(
+        DIM,
+        &format!(
+            "in {}  out {}  read {}  write {}",
+            format_count(i64_field(account, "totalInputTokens")),
+            format_count(i64_field(account, "totalOutputTokens")),
+            format_count(i64_field(account, "totalCacheReadInputTokens")),
+            format_count(i64_field(account, "totalCacheCreationInputTokens")),
+        ),
+    )];
+    let reasoning = i64_field(account, "totalReasoningOutputTokens");
+    if reasoning != 0 {
+        lines.push(paint(
+            DIM,
+            &format!("reasoning {}", format_count(reasoning)),
+        ));
+    }
+    lines
+}
+
+/// Footer rollup lines: requests, tokens, and reasoning when non-zero.
+fn footer_lines(totals: &PoolTotals) -> Vec<String> {
+    let mut lines = vec![format!(
+        "requests {}  ({} ok, {} failed)",
+        paint(BOLD, &format_exact(totals.requests)),
+        format_exact(totals.successes),
+        format_exact(totals.failures)
+    )];
+    lines.push(format!(
+        "tokens in {}  out {}  read {}  write {}",
+        paint(BOLD, &format_count(totals.input)),
+        paint(BOLD, &format_count(totals.output)),
+        format_count(totals.cache_read),
+        format_count(totals.cache_write),
+    ));
+    // Reasoning totals get their own line only when non-zero; one row
+    // for all five fields cannot fit the fixed width.
+    if totals.reasoning != 0 {
+        lines.push(format!(
+            "reasoning {}",
+            paint(BOLD, &format_count(totals.reasoning))
+        ));
+    }
+    lines
+}
+
 fn unix_now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |duration| duration.as_secs_f64())
 }
 
-fn decide_style(
-    is_tty: bool,
-    no_color: Option<&OsStr>,
-    term: Option<&OsStr>,
-) -> Style {
-    Style::from_tty(is_tty, no_color, term)
+/// The panel is a fixed 64 columns; every row is padded or truncated to it.
+/// (60 could not hold the row columns without truncating most emails.)
+const PANEL_WIDTH: usize = 64;
+
+/// ANSI: green / amber / red / dim / bold — the whole palette.
+const GREEN: &str = "\x1b[32m";
+const AMBER: &str = "\x1b[33m";
+const RED: &str = "\x1b[31m";
+const DIM: &str = "\x1b[2m";
+const BOLD: &str = "\x1b[1m";
+const RESET: &str = "\x1b[0m";
+
+/// Wrap one span in a color, always resetting after it, so color never
+/// bleeds into neighbouring cells.
+fn paint(color: &str, text: &str) -> String {
+    format!("{color}{text}{RESET}")
+}
+
+/// Clamp to exactly `width` display columns: spaces pad short text and an
+/// ellipsis replaces the last visible character of long text.
+fn pad(text: &str, width: usize) -> String {
+    let characters: Vec<char> = text.chars().collect();
+    if characters.len() > width {
+        let mut clipped: String = characters[..width - 1].iter().collect();
+        clipped.push('…');
+        return clipped;
+    }
+    let mut padded = text.to_string();
+    padded.extend(std::iter::repeat_n(' ', width - characters.len()));
+    padded
+}
+
+/// A 10-cell share bar: `█` per whole tenth of the share, `░` for the rest,
+/// with the integer percentage — `None` only when the pool total is 0.
+fn share_bar(tokens: i64, pool_total: i64) -> (String, Option<i64>) {
+    if pool_total == 0 {
+        return ("░░░░░░░░░░".to_string(), None);
+    }
+    let share = (tokens.max(0).min(pool_total) * 100).div_euclid(pool_total);
+    // share is clamped to 0..=100 above, so the division is exact and the
+    // cast loses nothing.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let filled = (share as usize).div_euclid(10);
+    let mut bar = String::with_capacity(30);
+    bar.extend(std::iter::repeat_n('█', filled));
+    bar.extend(std::iter::repeat_n('░', 10 - filled));
+    (bar, Some(share))
+}
+
+/// The account's carried load: every token that crossed it. This is what the
+/// share bar divides; there is no quota in the domain to fill one with.
+fn account_tokens(account: &Value) -> i64 {
+    i64_field(account, "totalInputTokens")
+        + i64_field(account, "totalOutputTokens")
+        + i64_field(account, "totalCacheReadInputTokens")
+        + i64_field(account, "totalCacheCreationInputTokens")
 }
 
 #[derive(Default)]
@@ -941,27 +1227,28 @@ impl Output {
 
 #[cfg(test)]
 mod tests {
-    use super::{Style, cooldown_label, decide_style, format_count, format_exact};
+    use super::{Style, cooldown_label, format_count, format_exact, pad, paint, share_bar};
     use std::ffi::OsStr;
 
     #[test]
     fn style_is_rich_only_on_a_color_tty() {
-        assert_eq!(decide_style(true, None, None), Style::Rich);
-        assert_eq!(decide_style(false, None, None), Style::Plain);
+        // Via the free function so the non-test build carries no dead shim.
+        assert_eq!(Style::from_tty(true, None, None), Style::Rich);
+        assert_eq!(Style::from_tty(false, None, None), Style::Plain);
         assert_eq!(
-            decide_style(true, Some(OsStr::new("1")), None),
+            Style::from_tty(true, Some(OsStr::new("1")), None),
             Style::Plain
         );
         assert_eq!(
-            decide_style(true, Some(OsStr::new("")), None),
+            Style::from_tty(true, Some(OsStr::new("")), None),
             Style::Plain
         );
         assert_eq!(
-            decide_style(true, None, Some(OsStr::new("dumb"))),
+            Style::from_tty(true, None, Some(OsStr::new("dumb"))),
             Style::Plain
         );
         assert_eq!(
-            decide_style(true, None, Some(OsStr::new("xterm-256color"))),
+            Style::from_tty(true, None, Some(OsStr::new("xterm-256color"))),
             Style::Rich
         );
     }
@@ -976,6 +1263,14 @@ mod tests {
         assert_eq!(cooldown_label(now, now + 1.0), "on cooldown 1s");
         // A sub-second remainder floors to cleared, so both commands agree.
         assert_eq!(cooldown_label(now, now + 0.5), "");
+    }
+
+    #[test]
+    fn cooldown_label_switches_to_hours_past_an_hour() {
+        let now = 1_000_000.0;
+        assert_eq!(cooldown_label(now, now + 3_600.0), "on cooldown 1h0m");
+        assert_eq!(cooldown_label(now, now + 3_661.0), "on cooldown 1h1m");
+        assert_eq!(cooldown_label(now, now + 86_399.0), "on cooldown 23h59m");
     }
 
     #[test]
@@ -1009,5 +1304,37 @@ mod tests {
         assert_eq!(format_exact(999_999), "999,999");
         assert_eq!(format_exact(1_000_000), "1,000,000");
         assert_eq!(format_exact(-1), "-1");
+    }
+
+    #[test]
+    fn pad_pads_to_the_fixed_width() {
+        assert_eq!(pad("abc", 6), "abc   ");
+        assert_eq!(pad("", 3), "   ");
+        assert_eq!(pad("abcdef", 6), "abcdef");
+    }
+
+    #[test]
+    fn pad_truncates_with_an_ellipsis_never_exceeding_width() {
+        assert_eq!(pad("abcdefg", 5), "abcd…");
+        assert_eq!(pad("abcdefg", 1), "…");
+        assert_eq!(pad("abcdefg", 6).chars().count(), 6);
+    }
+
+    #[test]
+    fn share_bar_fills_whole_tenths_of_the_share() {
+        assert_eq!(share_bar(50, 100), ("█████░░░░░".to_string(), Some(50)));
+        assert_eq!(share_bar(45, 100), ("████░░░░░░".to_string(), Some(45)));
+        assert_eq!(share_bar(1, 3), ("███░░░░░░░".to_string(), Some(33)));
+        assert_eq!(share_bar(7, 7), ("██████████".to_string(), Some(100)));
+    }
+
+    #[test]
+    fn share_bar_without_a_pool_total_is_empty_cells() {
+        assert_eq!(share_bar(0, 0), ("░░░░░░░░░░".to_string(), None));
+    }
+
+    #[test]
+    fn paint_wraps_the_span_and_resets() {
+        assert_eq!(paint("\x1b[33m", "x"), "\x1b[33mx\x1b[0m");
     }
 }

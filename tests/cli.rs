@@ -259,6 +259,26 @@ fn account(json: Value) -> Value {
     json
 }
 
+/// Strip ANSI escape sequences, leaving the visible text — assertions about
+/// layout run on this, assertions about color run on the raw bytes.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\x1b' {
+            while let Some(&next) = chars.peek() {
+                chars.next();
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(character);
+        }
+    }
+    out
+}
+
 /// An absolute instant `seconds` from now, for `cooldownUntil` fixtures.
 fn soon(seconds: f64) -> f64 {
     std::time::SystemTime::now()
@@ -308,7 +328,7 @@ fn status_rolls_up_pool_health_and_token_totals_per_provider() {
                         account(json!({
                             "email": "c@x.com",
                             "available": false,
-                            "cooldownUntil": soon(252.0),
+                            "cooldownUntil": soon(252.9),
                             "failureCount": 9,
                             "planType": "pro"
                         }))
@@ -369,6 +389,137 @@ fn status_rolls_up_pool_health_and_token_totals_per_provider() {
             .stdout
             .contains("\n\nanthropic: 3 accounts (2 available)")
     );
+}
+
+#[test]
+fn status_renders_panels_on_a_tty() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "0.0.0.0", 8318);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 3,
+                    "accounts": [
+                        account(json!({
+                            "email": "a@x.com",
+                            "available": true,
+                            "failureCount": 0,
+                            "totalRequests": 640,
+                            "totalSuccesses": 638,
+                            "totalInputTokens": 22_100_000,
+                            "totalOutputTokens": 401_200,
+                            "totalCacheCreationInputTokens": 6_000_000,
+                            "totalCacheReadInputTokens": 155_000_000,
+                            "totalReasoningOutputTokens": 64_000,
+                            "planType": "max"
+                        })),
+                        account(json!({
+                            "email": "b@x.com",
+                            "available": false,
+                            "cooldownUntil": soon(252.9),
+                            "failureCount": 2,
+                            "planType": "pro"
+                        }))
+                    ]
+                },
+                "deepseek": {"account_count": 0, "accounts": []}
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run(&["status"], tmp.path(), &mut runtime);
+
+    assert_eq!(outcome.code, 0);
+    let stdout = outcome.stdout.clone();
+    let visible = strip_ansi(&stdout);
+    // Color is present in the raw bytes: green glyph, amber cooldown glyph,
+    // bold numbers (AC-5).
+    assert!(stdout.contains("\x1b[32m●\x1b[0m"));
+    assert!(stdout.contains("\x1b[33m●\x1b[0m"));
+    assert!(stdout.contains("\x1b[1m"));
+    // Panel rules with the pool header inside the top rule (AC-3).
+    assert!(visible.contains("┌─ pool: anthropic"));
+    assert!(visible.contains("─ 3 accounts, 1 available"));
+    assert!(visible.contains('└'));
+    // Rows: email, glyph, state, ok count, share bar, percentage (AC-3/5).
+    assert!(visible.contains('│'));
+    assert!(visible.contains("a@x.com"));
+    assert!(visible.contains("● available"));
+    assert!(visible.contains("638 ok"));
+    // Row state drops the plain branch's leading "on"; the glyph carries it.
+    assert!(visible.contains("● cooldown 4m12s"));
+    assert!(visible.contains("100%"));
+    assert!(visible.contains("█"));
+    assert!(visible.contains("░"));
+    // Footer carries this fixture's summed rollup (AC-3).
+    assert!(visible.contains("requests 640"));
+    assert!(visible.contains("tokens in 22.1M"));
+    assert!(visible.contains("reasoning 64.0K"));
+    // Empty pool is a one-line note, not a broken box (AC-3).
+    assert!(visible.contains("deepseek"));
+    assert!(!visible.contains("pool: deepseek"));
+    // Every panel line fits the fixed width, ANSI excluded (AC-3/AC-7).
+    for line in visible.lines() {
+        assert!(line.chars().count() <= 64, "panel line too wide: {line}");
+    }
+}
+
+#[test]
+fn accounts_renders_panels_with_detail_lines_on_a_tty() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 2,
+                    "accounts": [
+                        account(json!({
+                            "email": "a@x.com",
+                            "available": true,
+                            "failureCount": 0,
+                            "totalRequests": 640,
+                            "totalSuccesses": 638,
+                            "totalInputTokens": 22_100_000,
+                            "totalOutputTokens": 401_200,
+                            "totalCacheCreationInputTokens": 6_000_000,
+                            "totalCacheReadInputTokens": 155_000_000,
+                            "totalReasoningOutputTokens": 64_000,
+                            "planType": "max"
+                        })),
+                        account(json!({
+                            "email": "b@x.com",
+                            "available": false,
+                            "failureCount": 2
+                        }))
+                    ]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run(&["accounts"], tmp.path(), &mut runtime);
+
+    assert_eq!(outcome.code, 0);
+    let stdout = outcome.stdout.clone();
+    let visible = strip_ansi(&stdout);
+    // Same panel frame as status (AC-6).
+    assert!(visible.contains("┌─ pool: anthropic"));
+    assert!(visible.contains('└'));
+    assert!(visible.contains("● available"));
+    assert!(visible.contains("● unavailable"));
+    // Per-account detail lines beneath each row (AC-6); reasoning gets its
+    // own line because five fields cannot fit the fixed width.
+    assert!(visible.contains("in 22.1M  out 401.2K  read 155.0M  write 6.0M"));
+    assert!(visible.contains("reasoning 64.0K"));
+    // The no-reasoning account omits the reasoning line (AC-6).
+    assert!(visible.contains("in 0  out 0  read 0  write 0"));
+    assert!(!visible.contains("reasoning 0"));
 }
 
 #[test]
