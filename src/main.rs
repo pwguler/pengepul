@@ -2,7 +2,7 @@ use std::io::{self, Write as _};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use pengepul::cli::run_with_env;
+use pengepul::cli::{CliRuntime, Style, run_with_env};
 use pengepul::runtime::RealRuntime;
 
 fn main() {
@@ -21,7 +21,14 @@ fn run() -> Result<()> {
     let home = home_dir()?;
     let cwd = std::env::current_dir().context("failed to read current directory")?;
     let mut runtime = RealRuntime::new()?;
-    let outcome = run_with_env(&cli_arguments, &home, &cwd, &mut runtime)?;
+    // The Style decision belongs to the process edge: TTY probe plus the
+    // color-suppression environment, answered once and handed to the CLI.
+    let style = Style::from_tty(
+        runtime.stdout_is_tty(),
+        std::env::var_os("NO_COLOR").as_deref(),
+        std::env::var_os("TERM").as_deref(),
+    );
+    let outcome = run_with_env(&cli_arguments, &home, &cwd, &mut runtime, style)?;
 
     io::stdout()
         .write_all(outcome.stdout.as_bytes())

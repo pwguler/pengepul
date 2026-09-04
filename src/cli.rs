@@ -257,12 +257,10 @@ pub fn run_with_env(
     home: &Path,
     cwd: &Path,
     runtime: &mut impl CliRuntime,
+    style: Style,
 ) -> Result<RunOutcome> {
-    let style = Style::from_tty(
-        runtime.stdout_is_tty(),
-        std::env::var_os("NO_COLOR").as_deref(),
-        std::env::var_os("TERM").as_deref(),
-    );
+    // The Style decision is handed in, not made here: the CLI core never
+    // reads the environment, so tests can drive either mode hermetically.
     let mut raw = Vec::with_capacity(argv.len() + 1);
     raw.push("pengepul");
     raw.extend_from_slice(argv);
@@ -396,9 +394,10 @@ fn status(
             .unwrap_or("unknown")
     ));
     let accounts = runtime.accounts(&base_url, &first_api_key(&config)?)?;
+    let now = unix_now();
     match style {
         Style::Plain => print_pool(&accounts, output),
-        Style::Rich => print_pool_rich(&accounts, output, false),
+        Style::Rich => print_pool_rich(&accounts, output, false, now),
     }
     Ok(())
 }
@@ -420,9 +419,10 @@ fn accounts(
         output.line("reloaded accounts");
     }
     let accounts = runtime.accounts(&base_url, &api_key)?;
+    let now = unix_now();
     match style {
         Style::Plain => print_accounts(&accounts, output),
-        Style::Rich => print_pool_rich(&accounts, output, true),
+        Style::Rich => print_pool_rich(&accounts, output, true, now),
     }
     Ok(())
 }
@@ -929,7 +929,20 @@ fn email(account: &Value) -> &str {
 const INNER_WIDTH: usize = PANEL_WIDTH - 4;
 const EMAIL_WIDTH: usize = 16;
 const STATE_SPAN_WIDTH: usize = 17; // "● " + "cooldown 23h59m"
-const OK_WIDTH: usize = 9; // "999,999 ok"
+const OK_WIDTH: usize = 9; // "999,999 ok" — bigger counts compact via format_count
+
+/// The ok-count cell: exact while it fits the column, compact beyond —
+/// a silently truncated number would be a lie, so large pools degrade to
+/// the humanized form ("1.2M ok") the same way the footer does.
+fn ok_cell(ok: i64) -> String {
+    let exact = format!("{} ok", format_exact(ok));
+    let text = if exact.chars().count() <= OK_WIDTH {
+        exact
+    } else {
+        format!("{} ok", format_count(ok))
+    };
+    pad(&text, OK_WIDTH)
+}
 
 /// One `│ … │` row, trimmed to the panel width if the content overruns —
 /// box integrity wins over content, and overruns cannot happen for the
@@ -983,9 +996,9 @@ fn glyph(available: bool, on_cooldown: bool) -> String {
 
 /// The rich pool view: one panel per provider with rows and a footer rollup.
 /// Pure over the payload and the clock value handed to it; `with_detail`
-/// adds the per-account token line the `accounts` command shows.
-fn print_pool_rich(payload: &Value, output: &mut Output, with_detail: bool) {
-    let now = unix_now();
+/// adds the per-account token line the `accounts` command shows. `now` is
+/// handed in by the command layer: the renderer reads no clock (AC-7).
+pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, with_detail: bool, now: f64) {
     for (provider_id, provider) in providers(payload) {
         let accounts = provider
             .get("accounts")
@@ -1042,7 +1055,18 @@ fn print_pool_rich(payload: &Value, output: &mut Output, with_detail: bool) {
 /// fill brings the rule to the same width as a panel row.
 fn top_rule(provider_id: &str, count: i64, suffix: &str, available: usize) -> String {
     let header = format!("pool: {provider_id} ─ {count} {suffix}, {available} available");
-    let fill = INNER_WIDTH - header.chars().count() - 1;
+    // Box integrity wins over content, as in `panel_row`: an oversized
+    // header (long configured provider ids are operator strings) is
+    // truncated to the fixed width instead of underflowing the fill.
+    let header: String = {
+        let characters: Vec<char> = header.chars().collect();
+        if characters.len() > INNER_WIDTH - 2 {
+            characters[..INNER_WIDTH - 2].iter().collect()
+        } else {
+            header
+        }
+    };
+    let fill = INNER_WIDTH.saturating_sub(header.chars().count() + 1);
     let mut top = format!("┌─ {header} ");
     top.extend(std::iter::repeat_n('─', fill));
     top.push('┐');
@@ -1071,7 +1095,9 @@ fn account_row(account: &Value, pool_total: i64, now: f64) -> String {
             .unwrap_or(&raw_cooldown)
             .to_string()
     } else {
-        "unavailable".to_string()
+        // Glossary-safe: "unavailable" is on the Cooldown avoid-list; the
+        // leftover case (no future cooldownUntil) reads "unresponsive".
+        "unresponsive".to_string()
     };
     let state_color = if is_available {
         GREEN
@@ -1086,13 +1112,15 @@ fn account_row(account: &Value, pool_total: i64, now: f64) -> String {
         glyph(is_available, on_cooldown),
         paint(state_color, &pad(&label, STATE_SPAN_WIDTH - 2))
     );
-    let ok_text = format!("{} ok", format_exact(ok));
+    let ok_text = ok_cell(ok);
     let (bar, share) = share_bar(account_tokens(account), pool_total);
-    let share_text = share.map_or_else(|| " ".to_string(), |value| format!("{value}%"));
+    // AC-4: the percentage is right-aligned into a fixed 4-cell field
+    // (" 45%", "100%", four spaces when the pool total is 0).
+    let share_text = share.map_or_else(|| "    ".to_string(), |value| format!("{value:>3}%"));
     [
         pad(email(account), EMAIL_WIDTH),
         state_span,
-        paint(BOLD, &pad(&ok_text, OK_WIDTH)),
+        paint(BOLD, &ok_text),
         bar,
         paint(DIM, &share_text),
     ]
@@ -1213,13 +1241,13 @@ fn account_tokens(account: &Value) -> i64 {
 }
 
 #[derive(Default)]
-struct Output {
+pub(crate) struct Output {
     stdout: String,
     stderr: String,
 }
 
 impl Output {
-    fn line(&mut self, value: &str) {
+    pub(crate) fn line(&mut self, value: &str) {
         self.stdout.push_str(value);
         self.stdout.push('\n');
     }
@@ -1227,7 +1255,9 @@ impl Output {
 
 #[cfg(test)]
 mod tests {
-    use super::{Style, cooldown_label, format_count, format_exact, pad, paint, share_bar};
+    use super::{
+        Style, cooldown_label, format_count, format_exact, pad, paint, share_bar, strip_ansi,
+    };
     use std::ffi::OsStr;
 
     #[test]
@@ -1336,5 +1366,80 @@ mod tests {
     #[test]
     fn paint_wraps_the_span_and_resets() {
         assert_eq!(paint("\x1b[33m", "x"), "\x1b[33mx\x1b[0m");
+    }
+
+    #[test]
+    fn rich_renderer_panels_are_exactly_the_fixed_width() {
+        use super::{Output, print_pool_rich};
+        use serde_json::json;
+
+        let payload = json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [{
+                        "email": "a@x.com",
+                        "available": true,
+                        "failureCount": 0,
+                        "totalRequests": 640,
+                        "totalSuccesses": 638,
+                        "totalInputTokens": 22_100_000,
+                        "totalOutputTokens": 401_200,
+                        "totalCacheCreationInputTokens": 6_000_000,
+                        "totalCacheReadInputTokens": 155_000_000,
+                        "totalReasoningOutputTokens": 64_000
+                    }]
+                }
+            }
+        });
+        let mut output = Output::default();
+        print_pool_rich(&payload, &mut output, false, 1_000_000.0);
+        for line in output.stdout.lines() {
+            assert_eq!(
+                strip_ansi(line).chars().count(),
+                64,
+                "panel line off the fixed width: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn rich_renderer_survives_an_oversized_provider_id() {
+        use super::{Output, print_pool_rich};
+        use serde_json::json;
+
+        let long_id = "p".repeat(80);
+        let payload = json!({
+            "providers": {
+                long_id: {
+                    "account_count": 1,
+                    "accounts": [{
+                        "email": "a@x.com",
+                        "available": true,
+                        "failureCount": 0
+                    }]
+                }
+            }
+        });
+        let mut output = Output::default();
+        print_pool_rich(&payload, &mut output, false, 1_000_000.0);
+        for line in output.stdout.lines() {
+            assert_eq!(
+                strip_ansi(line).chars().count(),
+                64,
+                "oversized header broke the box: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn ok_cell_compacts_counts_that_cannot_fit_the_column() {
+        use super::ok_cell;
+
+        assert_eq!(ok_cell(638), "638 ok   ");
+        assert_eq!(ok_cell(999_999), "999.9K ok");
+        // A million successes cannot render exactly in 9 columns; the cell
+        // degrades to the humanized form instead of truncating digits.
+        assert_eq!(ok_cell(1_000_000), "1.0M ok  ");
     }
 }

@@ -14,8 +14,9 @@ today's plain text.
   colored help.
 - **No new dependency.** Box-drawing, ANSI codes and glyph rendering are
   hand-rolled in `cli.rs`; no crates.io style crate is added.
-- **No terminal-width queries.** Panels are a fixed 60 columns; the layout is
-  identical in every terminal.
+- **No terminal-width queries.** Panels are a fixed 64 columns — 60 cannot
+  hold the row columns without truncating most emails — and the layout is
+  identical in every terminal; no terminal-width queries.
 - **No quota bars.** The bar shows share-of-pool (an account's total tokens
   divided by its pool's total); it never implies a plan limit, which the
   domain does not have.
@@ -49,12 +50,13 @@ today's plain text.
   cells and no percentage.
 - AC-5: Account rows carry `● available` (green) for available accounts,
   `● cooldown 4m12s` (amber, remaining time from `cooldownUntil` via the
-  existing pure helper) otherwise, and `● unavailable` (red) for an
-  unavailable account with no future cooldown — the row drops the plain
-  branch's leading "on" because the glyph already states the condition (the
-  approved mockup shows `● cooldown`). "on cooldown" stays in plain output.
-  Rollup numbers are bold; labels are dim. Color wraps only the glyph/state
-  spans, never the whole line.
+  existing pure helper) otherwise, and — for an unavailable account with no
+  future cooldown — `● unresponsive` (red), the glossary-safe wording for
+  the leftover case (CONTEXT.md's Cooldown avoid-list bars "unavailable";
+  plain-branch output is grandfathered). "unresponsive" covers an account
+  whose credential exists but cannot currently serve. Rollup numbers are
+  bold; labels are dim. Color wraps only the glyph/state spans, never the
+  whole line.
 - AC-6: With `Rich`, `accounts` renders the same panels as `status` and adds
   beneath each account row a dim detail line with in, out, read/write
   totals, plus a second `reasoning` line only when that total is non-zero

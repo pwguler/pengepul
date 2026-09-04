@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use pengepul::cli::{CliRuntime, RunOutcome, ServiceInstallRequest, run_with_env};
+use pengepul::cli::{CliRuntime, RunOutcome, ServiceInstallRequest, Style, run_with_env};
 use pengepul::config::Config;
 use pengepul::types::ProviderId;
 use serde_json::{Value, json};
@@ -138,7 +138,17 @@ impl CliRuntime for FakeRuntime {
 }
 
 fn run(argv: &[&str], home: &Path, runtime: &mut impl CliRuntime) -> RunOutcome {
-    run_with_env(argv, home, home, runtime).expect("cli run")
+    // Default test path is Plain; the rich tests call run_style explicitly.
+    run_with_env(argv, home, home, runtime, Style::Plain).expect("cli run")
+}
+
+fn run_style(
+    argv: &[&str],
+    home: &Path,
+    runtime: &mut impl CliRuntime,
+    style: Style,
+) -> RunOutcome {
+    run_with_env(argv, home, home, runtime, style).expect("cli run")
 }
 
 #[test]
@@ -430,7 +440,7 @@ fn status_renders_panels_on_a_tty() {
         ..FakeRuntime::default()
     };
 
-    let outcome = run(&["status"], tmp.path(), &mut runtime);
+    let outcome = run_style(&["status"], tmp.path(), &mut runtime, Style::Rich);
 
     assert_eq!(outcome.code, 0);
     let stdout = outcome.stdout.clone();
@@ -503,7 +513,7 @@ fn accounts_renders_panels_with_detail_lines_on_a_tty() {
         ..FakeRuntime::default()
     };
 
-    let outcome = run(&["accounts"], tmp.path(), &mut runtime);
+    let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
 
     assert_eq!(outcome.code, 0);
     let stdout = outcome.stdout.clone();
@@ -512,7 +522,7 @@ fn accounts_renders_panels_with_detail_lines_on_a_tty() {
     assert!(visible.contains("┌─ pool: anthropic"));
     assert!(visible.contains('└'));
     assert!(visible.contains("● available"));
-    assert!(visible.contains("● unavailable"));
+    assert!(visible.contains("● unresponsive"));
     // Per-account detail lines beneath each row (AC-6); reasoning gets its
     // own line because five fields cannot fit the fixed width.
     assert!(visible.contains("in 22.1M  out 401.2K  read 155.0M  write 6.0M"));
@@ -729,6 +739,7 @@ fn login_rejects_removed_provider() {
             tmp.path(),
             tmp.path(),
             &mut runtime,
+            Style::Plain,
         )
         .is_err(),
         "removed provider must be rejected at parse time"
@@ -795,6 +806,7 @@ fn login_without_key_for_a_configured_provider_fails() {
             tmp.path(),
             tmp.path(),
             &mut runtime,
+            Style::Plain,
         )
         .is_err(),
         "a configured provider needs a --key"
@@ -816,6 +828,7 @@ fn login_for_an_unconfigured_provider_lists_the_configured_ones() {
         tmp.path(),
         tmp.path(),
         &mut runtime,
+        Style::Plain,
     )
     .expect_err("unconfigured provider must be rejected");
     let full = format!("{error:#}");
