@@ -898,3 +898,121 @@ fn update_is_a_noop_when_already_current() {
     assert!(outcome.stdout.contains("latest"), "{}", outcome.stdout);
     assert!(runtime.installed.is_none(), "must not reinstall");
 }
+
+#[test]
+fn status_ends_with_relay_total_block_in_plain() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "0.0.0.0", 8318);
+    let mut runtime = FakeRuntime {
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalRequests": 640,
+                        "totalInputTokens": 33,
+                        "totalOutputTokens": 120
+                    }))]
+                },
+                "commandcode": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "k@x.com",
+                        "available": true,
+                        "totalRequests": 10,
+                        "totalInputTokens": 10,
+                        "totalOutputTokens": 5
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run(&["status"], tmp.path(), &mut runtime);
+
+    assert_eq!(outcome.code, 0);
+    // AC-1: blank line, header, two totals.
+    assert!(
+        outcome
+            .stdout
+            .contains("\nrelay total: 2 pools, 2 accounts\n")
+    );
+    assert!(outcome.stdout.contains("total requests 650\n"));
+    assert!(outcome.stdout.contains("total tokens 168\n"));
+    // The block is last: nothing after `total tokens`.
+    assert!(outcome.stdout.trim_end().ends_with("total tokens 168"));
+}
+
+#[test]
+fn status_relay_total_block_in_rich_has_64_wide_rule() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "0.0.0.0", 8318);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalRequests": 640,
+                        "totalInputTokens": 33,
+                        "totalOutputTokens": 120
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["status"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    // AC-2: rule of exactly 64 with the header inside, then the two totals.
+    let rule = visible
+        .lines()
+        .find(|line| line.contains("relay total:"))
+        .expect("relay total rule present");
+    assert_eq!(rule.chars().count(), 64, "rule line: {rule}");
+    assert!(rule.starts_with('─'));
+    assert!(visible.contains("total requests 640"));
+    assert!(visible.contains("total tokens 153"));
+    assert!(visible.trim_end().ends_with("total tokens 153"));
+}
+
+#[test]
+fn status_relay_total_covers_empty_pools_and_zero_relay() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "0.0.0.0", 8318);
+    let mut runtime = FakeRuntime {
+        accounts_payload: Some(json!({
+            "providers": {
+                // Loaded accounts with no traffic (AC-3 second half).
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true
+                    }))]
+                },
+                // Empty pool: counts toward pools (AC-5), adds no tokens.
+                "codex": {"account_count": 0, "accounts": []},
+                "commandcode": {"account_count": 0, "accounts": []}
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run(&["status"], tmp.path(), &mut runtime);
+
+    assert_eq!(outcome.code, 0);
+    // AC-4: block prints even at a zero relay; AC-5: empty pools count.
+    assert!(outcome.stdout.contains("relay total: 3 pools, 1 account\n"));
+    assert!(outcome.stdout.contains("total requests 0\n"));
+    assert!(outcome.stdout.contains("total tokens 0\n"));
+}

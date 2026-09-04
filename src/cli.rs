@@ -396,8 +396,14 @@ fn status(
     let accounts = runtime.accounts(&base_url, &first_api_key(&config)?)?;
     let now = unix_now();
     match style {
-        Style::Plain => print_pool(&accounts, output),
-        Style::Rich => print_pool_rich(&accounts, output, false, now),
+        Style::Plain => {
+            print_pool_inner(&accounts, output);
+            print_relay_total_plain(&accounts, output);
+        }
+        Style::Rich => {
+            print_pool_rich(&accounts, output, false, now);
+            print_relay_total_rich(&accounts, output);
+        }
     }
     Ok(())
 }
@@ -739,7 +745,7 @@ fn cooldown_label(now: f64, cooldown_until: f64) -> String {
 /// cooldown detail), summed request outcomes, summed token totals. Reads only
 /// what `GET /admin/accounts` already serves; the server is untouched. An
 /// empty pool prints only its bare header, matching the old count line.
-fn print_pool(payload: &Value, output: &mut Output) {
+fn print_pool_inner(payload: &Value, output: &mut Output) {
     let mut first = true;
     for (provider_id, provider) in providers(payload) {
         let accounts = provider
@@ -1045,6 +1051,81 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, with_detail:
         }
         output.line(&format!("└{}┘", "─".repeat(INNER_WIDTH + 2)));
     }
+}
+
+/// Sums across every pool of the relay: the aggregates behind the block.
+#[derive(Default)]
+struct RelayTotals {
+    pools: usize,
+    accounts: usize,
+    requests: i64,
+    tokens: i64,
+}
+
+impl RelayTotals {
+    fn from_payload(payload: &Value) -> Self {
+        let mut totals = Self::default();
+        for (_provider_id, provider) in providers(payload) {
+            totals.pools += 1;
+            totals.accounts += usize::try_from(
+                provider
+                    .get("account_count")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+                    .max(0),
+            )
+            .unwrap_or(0);
+            let accounts = provider
+                .get("accounts")
+                .and_then(Value::as_array)
+                .map_or(&[][..], Vec::as_slice);
+            for account in accounts {
+                totals.requests += i64_field(account, "totalRequests");
+                totals.tokens += account_tokens(account);
+            }
+        }
+        totals
+    }
+}
+
+/// The `Style::Plain` relay-total block: header, two totals, nothing else.
+fn print_relay_total_plain(payload: &Value, output: &mut Output) {
+    let totals = RelayTotals::from_payload(payload);
+    output.line("");
+    output.line(&format!(
+        "relay total: {} pools, {} {}",
+        totals.pools,
+        totals.accounts,
+        if totals.accounts == 1 {
+            "account"
+        } else {
+            "accounts"
+        }
+    ));
+    output.line(&format!("total requests {}", format_exact(totals.requests)));
+    output.line(&format!("total tokens {}", format_count(totals.tokens)));
+}
+
+/// The `Style::Rich` relay-total block: a 64-wide rule with the header
+/// inside, then the same two totals.
+fn print_relay_total_rich(payload: &Value, output: &mut Output) {
+    let totals = RelayTotals::from_payload(payload);
+    let header = format!(
+        "relay total: {} pools, {} {}",
+        totals.pools,
+        totals.accounts,
+        if totals.accounts == 1 {
+            "account"
+        } else {
+            "accounts"
+        }
+    );
+    let fill = INNER_WIDTH.saturating_sub(header.chars().count() + 2);
+    let mut rule = format!("──── {header} ");
+    rule.extend(std::iter::repeat_n('─', fill));
+    output.line(&rule);
+    output.line(&format!("total requests {}", format_exact(totals.requests)));
+    output.line(&format!("total tokens {}", format_count(totals.tokens)));
 }
 
 /// Top rule with the pool header inside: `┌─ pool: <id> ─ <N, A> ─…┐`. The
