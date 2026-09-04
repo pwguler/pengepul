@@ -101,6 +101,14 @@ fn beta_header_switches_for_structured_and_haiku() {
     assert!(
         build_beta_header("claude-sonnet-4-6", false).contains("thinking-token-count-2026-05-13")
     );
+    // The whole set, pinned: an accidental drop while editing the list fails here.
+    assert_eq!(
+        build_beta_header("claude-sonnet-4-6", false),
+        "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+         thinking-token-count-2026-05-13,context-management-2025-06-27,\
+         prompt-caching-scope-2026-01-05,web-fetch-2025-09-10,\
+         advanced-tool-use-2025-11-20,effort-2025-11-24"
+    );
     assert!(build_beta_header("claude-haiku-4-5-20251001", false).contains("claude-code-20250219"));
     assert!(!build_beta_header("claude-haiku-4-5-20251001", false).contains("effort-2025-11-24"));
 }

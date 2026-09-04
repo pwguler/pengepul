@@ -1751,7 +1751,13 @@ fn usage_from_response(body: &Value) -> Option<UsageData> {
             .unwrap_or(0),
         reasoning_output_tokens: usage
             .get("output_tokens_details")
-            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(|details| {
+                // OpenAI-style `reasoning_tokens`; Anthropic (with the
+                // thinking-token-count beta) reports `thinking_tokens`.
+                details
+                    .get("reasoning_tokens")
+                    .or_else(|| details.get("thinking_tokens"))
+            })
             .or_else(|| {
                 usage
                     .get("completion_tokens_details")
@@ -1858,7 +1864,7 @@ fn transformed_sse_stream(
         let mut chat_state = ChatStreamState::new(model.clone());
         let mut responses_state = ResponsesStreamState::new(model.clone());
         let mut anthropic_state = AnthropicStreamState::new(model.clone());
-        let mut usage = UsageData::default();
+        let mut usage = crate::types::UsageData::default();
         let mut completed = false;
         let mut refusal_next_index: u64 = 0;
         let mut refusal_open_index: Option<u64> = None;
@@ -2046,6 +2052,11 @@ fn update_anthropic_stream_usage(
         "message_delta" => {
             if let Some(payload) = data.get("usage") {
                 usage.output_tokens = int_field_or(payload, "output_tokens", usage.output_tokens);
+                usage.reasoning_output_tokens = payload
+                    .get("output_tokens_details")
+                    .and_then(|details| details.get("thinking_tokens"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(usage.reasoning_output_tokens);
             }
         }
         "message_stop" => *completed = true,
@@ -2944,6 +2955,38 @@ mod tests {
         assert_eq!(usage.output_tokens, 26);
         assert_eq!(usage.cache_read_input_tokens, 7);
         assert_eq!(usage.reasoning_output_tokens, 23);
+    }
+
+    #[test]
+    fn usage_from_response_reads_anthropic_thinking_tokens() {
+        // With the thinking-token-count beta, Anthropic reports thinking
+        // inside output_tokens_details; it feeds the reasoning counter.
+        let usage = super::usage_from_response(&json!({
+            "usage": {
+                "input_tokens": 64,
+                "output_tokens": 229,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "output_tokens_details": {"thinking_tokens": 145}
+            }
+        }))
+        .expect("usage");
+        assert_eq!(usage.output_tokens, 229);
+        assert_eq!(usage.reasoning_output_tokens, 145);
+    }
+
+    #[test]
+    fn anthropic_stream_usage_reads_thinking_tokens_from_message_delta() {
+        let mut usage = crate::types::UsageData::default();
+        let mut completed = false;
+        super::update_anthropic_stream_usage(
+            "message_delta",
+            &json!({"usage": {"output_tokens": 72, "output_tokens_details": {"thinking_tokens": 58}}}),
+            &mut usage,
+            &mut completed,
+        );
+        assert_eq!(usage.output_tokens, 72);
+        assert_eq!(usage.reasoning_output_tokens, 58);
     }
 
     #[test]

@@ -31,7 +31,8 @@ type Sessions = BTreeMap<String, (String, Instant, Duration)>;
 
 static SESSIONS: OnceLock<Mutex<Sessions>> = OnceLock::new();
 
-/// The beta set Claude Code 2.1.261 attaches to a first-party request.
+/// The beta set, based on what Claude Code 2.1.261 attaches to a first-party
+/// request (audit: docs/research/claude-code-2.1.261-cloaking-audit.md).
 ///
 /// Deliberately absent: `redact-thinking-2026-02-12`. Claude Code sends it
 /// only because its own TUI hides thinking, and the server then empties
