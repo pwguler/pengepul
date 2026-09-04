@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use pengepul::cli::{CliRuntime, RunOutcome, ServiceInstallRequest, Style, run_with_env};
 use pengepul::config::Config;
 use pengepul::types::ProviderId;
@@ -265,7 +265,11 @@ fn status_reports_health_and_account_counts() {
 
     assert_eq!(outcome.code, 0);
     // Header facts moved into the relay block (rich-everywhere AC-7).
-    assert!(outcome.stdout.contains("url http://127.0.0.1:8318 \u{2014} server ok"));
+    assert!(
+        outcome
+            .stdout
+            .contains("url http://127.0.0.1:8318 \u{2014} server ok")
+    );
 
     assert!(outcome.stdout.contains("anthropic: 1 account"));
     // Empty pools are hidden (AC-7, revised): codex has no loaded accounts.
@@ -1053,7 +1057,7 @@ fn service_actions_render_a_panel_when_rich_and_plain_bytes_when_piped() {
     );
     assert_eq!(rich.code, 0);
     let visible = strip_ansi(&rich.stdout);
-    assert!(visible.contains("┌─ service "), "panel header: {}", visible);
+    assert!(visible.contains("┌─ service "), "panel header: {visible}");
     assert!(visible.contains("●"));
     assert!(visible.contains("restarted"));
     for line in visible.lines() {
@@ -1085,7 +1089,7 @@ fn login_renders_a_panel_when_rich_and_plain_bytes_when_piped() {
     );
     assert_eq!(rich.code, 0);
     let visible = strip_ansi(&rich.stdout);
-    assert!(visible.contains("┌─ login: commandcode "), "{}", visible);
+    assert!(visible.contains("┌─ login: commandcode "), "{visible}");
     assert!(visible.contains("key-"));
     assert!(visible.contains("●"));
     assert!(visible.contains("saved"));
@@ -1095,9 +1099,11 @@ fn login_renders_a_panel_when_rich_and_plain_bytes_when_piped() {
         tmp.path(),
         &mut runtime,
     );
-    assert!(plain
-        .stdout
-        .contains("saved commandcode account token for key-"));
+    assert!(
+        plain
+            .stdout
+            .contains("saved commandcode account token for key-")
+    );
 }
 
 #[test]
@@ -1108,16 +1114,25 @@ fn update_renders_a_panel_when_rich_and_plain_bytes_when_piped() {
         ..FakeRuntime::default()
     };
 
-    let rich = run_style(&["update", "--check"], tmp.path(), &mut runtime, Style::Rich);
+    let rich = run_style(
+        &["update", "--check"],
+        tmp.path(),
+        &mut runtime,
+        Style::Rich,
+    );
     assert_eq!(rich.code, 0);
     let visible = strip_ansi(&rich.stdout);
-    assert!(visible.contains("┌─ update "), "{}", visible);
+    assert!(visible.contains("┌─ update "), "{visible}");
     assert!(visible.contains("v99.0.0"));
     assert!(visible.contains("●"));
 
     runtime.latest_tag = Some("v0.0.1".to_string());
     let plain = run(&["update", "--check"], tmp.path(), &mut runtime);
-    assert!(plain.stdout.contains("pengepul 0.9.2 is the latest release"));
+    assert!(
+        plain
+            .stdout
+            .contains("pengepul 0.9.2 is the latest release")
+    );
 }
 
 #[test]
@@ -1128,7 +1143,7 @@ fn config_path_and_api_key_render_a_panel_when_rich_and_bare_when_piped() {
 
     let rich = run_style(&["config", "path"], tmp.path(), &mut runtime, Style::Rich);
     let visible = strip_ansi(&rich.stdout);
-    assert!(visible.contains("┌─ config "), "{}", visible);
+    assert!(visible.contains("┌─ config "), "{visible}");
     assert!(visible.contains("config.yaml"));
 
     let plain = run(&["config", "path"], tmp.path(), &mut runtime);
@@ -1141,17 +1156,24 @@ fn config_path_and_api_key_render_a_panel_when_rich_and_bare_when_piped() {
 #[test]
 fn service_status_parses_systemctl_into_a_panel_when_rich() {
     let tmp = tempdir().expect("tempdir");
-    let mut runtime = FakeRuntime::default();
-    runtime.service_status_text = Some(
-        "● pengepul.service - pengepul API relay\n     Loaded: loaded (/home/kognos/.config/systemd/user/pengepul.service; enabled; preset: enabled)\n     Active: active (running) since Sat 2026-09-05 04:09:31 WIB; 4min 28s ago\n   Main PID: 3162166 (pengepul)\n      Tasks: 7 (limit: 14306)\n     Memory: 2.3M (peak: 14.6M)\n        CPU: 2.614s\n     CGroup: /user.slice\n"
-            .to_string(),
-    );
+    let mut runtime = FakeRuntime {
+        service_status_text: Some(
+            "● pengepul.service - pengepul API relay\n     Loaded: loaded (/home/kognos/.config/systemd/user/pengepul.service; enabled; preset: enabled)\n     Active: active (running) since Sat 2026-09-05 04:09:31 WIB; 4min 28s ago\n   Main PID: 3162166 (pengepul)\n      Tasks: 7 (limit: 14306)\n     Memory: 2.3M (peak: 14.6M)\n        CPU: 2.614s\n     CGroup: /user.slice\n"
+                .to_string(),
+        ),
+        ..FakeRuntime::default()
+    };
 
-    let rich = run_style(&["service", "status"], tmp.path(), &mut runtime, Style::Rich);
+    let rich = run_style(
+        &["service", "status"],
+        tmp.path(),
+        &mut runtime,
+        Style::Rich,
+    );
 
     assert_eq!(rich.code, 0);
     let visible = strip_ansi(&rich.stdout);
-    assert!(visible.contains("┌─ service "), "{}", visible);
+    assert!(visible.contains("┌─ service "), "{visible}");
     assert!(visible.contains("active (running)"));
     assert!(visible.contains("enabled"));
     assert!(visible.contains("3162166"));
@@ -1171,29 +1193,43 @@ fn service_status_parses_systemctl_into_a_panel_when_rich() {
 #[test]
 fn service_status_parses_launchctl_into_the_same_panel_shape() {
     let tmp = tempdir().expect("tempdir");
-    let mut runtime = FakeRuntime::default();
-    runtime.service_status_text = Some(
-        "pid = 411\nstate = running\nprogram = pengepul\n".to_string(),
+    let mut runtime = FakeRuntime {
+        service_status_text: Some("pid = 411\nstate = running\nprogram = pengepul\n".to_string()),
+        ..FakeRuntime::default()
+    };
+
+    let rich = run_style(
+        &["service", "status"],
+        tmp.path(),
+        &mut runtime,
+        Style::Rich,
     );
 
-    let rich = run_style(&["service", "status"], tmp.path(), &mut runtime, Style::Rich);
-
     let visible = strip_ansi(&rich.stdout);
-    assert!(visible.contains("running"), "{}", visible);
+    assert!(visible.contains("running"), "{visible}");
     assert!(visible.contains("411"));
 }
 
 #[test]
 fn service_status_without_a_service_renders_an_amber_panel_when_rich() {
     let tmp = tempdir().expect("tempdir");
-    let mut runtime = FakeRuntime::default();
-    runtime.service_status_error = Some("no service installed; run `pengepul service install`".to_string());
+    let mut runtime = FakeRuntime {
+        service_status_error: Some(
+            "no service installed; run `pengepul service install`".to_string(),
+        ),
+        ..FakeRuntime::default()
+    };
 
-    let rich = run_style(&["service", "status"], tmp.path(), &mut runtime, Style::Rich);
+    let rich = run_style(
+        &["service", "status"],
+        tmp.path(),
+        &mut runtime,
+        Style::Rich,
+    );
 
     assert_eq!(rich.code, 0);
     let visible = strip_ansi(&rich.stdout);
-    assert!(visible.contains("not installed"), "{}", visible);
+    assert!(visible.contains("not installed"), "{visible}");
     assert!(visible.contains("pengepul service install"));
 
     // Piped: the error path stays an error (AC-4).
@@ -1205,10 +1241,12 @@ fn service_status_without_a_service_renders_an_amber_panel_when_rich() {
         Style::Plain,
     );
     assert!(plain.is_err());
-    assert!(plain
-        .expect_err("plain errors")
-        .to_string()
-        .contains("no service installed"));
+    assert!(
+        plain
+            .expect_err("plain errors")
+            .to_string()
+            .contains("no service installed")
+    );
 }
 
 #[test]

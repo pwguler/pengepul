@@ -394,10 +394,13 @@ fn status(
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_string();
-    let connection = format!(
-        "url {base_url} \u{2014} server {server}  config {}",
-        selected_config_path(config_path, Some(home), cwd).display()
-    );
+    let connection = [
+        format!(
+            "config {}",
+            selected_config_path(config_path, Some(home), cwd).display()
+        ),
+        format!("url {base_url} \u{2014} server {server}"),
+    ];
     let accounts = runtime.accounts(&base_url, &first_api_key(&config)?)?;
     let now = unix_now();
     match style {
@@ -453,7 +456,10 @@ fn config_command(
             Style::Rich => {
                 for line in action_panel(
                     "config",
-                    &[format!("path  {}", paint(BOLD, &path.display().to_string()))],
+                    &[format!(
+                        "path  {}",
+                        paint(BOLD, &path.display().to_string())
+                    )],
                 ) {
                     output.line(&line);
                 }
@@ -465,10 +471,8 @@ fn config_command(
             match style {
                 Style::Plain => output.line(&key),
                 Style::Rich => {
-                    for line in action_panel(
-                        "config",
-                        &[format!("api key  {}", paint(BOLD, &key))],
-                    ) {
+                    for line in action_panel("config", &[format!("api key  {}", paint(BOLD, &key))])
+                    {
                         output.line(&line);
                     }
                 }
@@ -508,27 +512,40 @@ fn service_command(
                 start,
                 enable,
             })?;
-            let detail = format!("installed  {}", path.display());
-            match style {
-                Style::Plain => output.line(&format!("installed service: {}", path.display())),
-                Style::Rich => {
-                    for line in action_panel("service", &[format!("{} {detail}", status_glyph(ActionGlyph::Ok))]) {
-                        output.line(&line);
-                    }
-                }
-            }
+            print_action_with_path("service", "installed", &path, output, style);
         }
         ServiceCommand::Start => {
             runtime.start_service()?;
-            print_action("service", "started service", "started", ActionGlyph::Ok, output, style);
+            print_action(
+                "service",
+                "started service",
+                "started",
+                ActionGlyph::Ok,
+                output,
+                style,
+            );
         }
         ServiceCommand::Stop => {
             runtime.stop_service()?;
-            print_action("service", "stopped service", "stopped", ActionGlyph::Ok, output, style);
+            print_action(
+                "service",
+                "stopped service",
+                "stopped",
+                ActionGlyph::Ok,
+                output,
+                style,
+            );
         }
         ServiceCommand::Restart => {
             runtime.restart_service()?;
-            print_action("service", "restarted service", "restarted", ActionGlyph::Ok, output, style);
+            print_action(
+                "service",
+                "restarted service",
+                "restarted",
+                ActionGlyph::Ok,
+                output,
+                style,
+            );
         }
         ServiceCommand::Status => match runtime.service_status() {
             Ok(text) => match style {
@@ -560,15 +577,7 @@ fn service_command(
         },
         ServiceCommand::Uninstall => {
             let path = runtime.uninstall_service()?;
-            let detail = format!("uninstalled  {}", path.display());
-            match style {
-                Style::Plain => output.line(&format!("uninstalled service: {}", path.display())),
-                Style::Rich => {
-                    for line in action_panel("service", &[format!("{} {detail}", status_glyph(ActionGlyph::Ok))]) {
-                        output.line(&line);
-                    }
-                }
-            }
+            print_action_with_path("service", "uninstalled", &path, output, style);
         }
         ServiceCommand::Logs { follow, lines } => runtime.service_logs(follow, lines)?,
     }
@@ -607,10 +616,11 @@ fn service_status_panel(text: &str) -> Vec<String> {
                     let mut fields = value.splitn(2, " since ");
                     let active = fields.next().unwrap_or(value).trim();
                     state = Some(active.to_string());
-                    if let Some(rest) = fields.next() {
-                        if let Some((_, ago)) = rest.split_once("; ") {
-                            since = Some(cooldown_label(0.0, parse_relative_seconds(ago)).replace("on cooldown ", ""));
-                        }
+                    if let Some((_, ago)) = fields.next().and_then(|rest| rest.split_once("; ")) {
+                        since = Some(
+                            cooldown_label(0.0, parse_relative_seconds(ago))
+                                .replace("on cooldown ", ""),
+                        );
                     }
                 }
                 "Loaded" => {
@@ -643,7 +653,7 @@ fn service_status_panel(text: &str) -> Vec<String> {
     };
     let mut rows = vec![format!("{glyph} {state_text}")];
     if let Some(enabled) = enabled {
-        rows.push(format!("enabled  {enabled}"));
+        rows.push(enabled);
     }
     if let Some(pid) = pid {
         rows.push(format!("pid  {pid}"));
@@ -686,6 +696,31 @@ fn parse_relative_seconds(text: &str) -> f64 {
     seconds
 }
 
+/// Print an install/uninstall outcome whose detail carries a path.
+fn print_action_with_path(
+    subject: &str,
+    verb: &str,
+    path: &Path,
+    output: &mut Output,
+    style: Style,
+) {
+    match style {
+        Style::Plain => output.line(&format!("{verb} service: {}", path.display())),
+        Style::Rich => {
+            for line in action_panel(
+                subject,
+                &[format!(
+                    "{} {verb}  {}",
+                    status_glyph(ActionGlyph::Ok),
+                    path.display()
+                )],
+            ) {
+                output.line(&line);
+            }
+        }
+    }
+}
+
 /// Print one action outcome: the plain line when piped, a one-row panel
 /// when rich. `plain` is today's exact bytes (AC-1/AC-8).
 fn print_action(
@@ -706,7 +741,6 @@ fn print_action(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Release asset for the platform this binary was built for.
 ///
 /// # Errors
@@ -805,6 +839,7 @@ fn update(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn login(
     config_path: Option<&Path>,
     provider: &str,
@@ -1379,25 +1414,30 @@ fn relay_header(totals: &RelayTotals) -> String {
 }
 
 /// The `Style::Plain` relay-total block: header, two totals, nothing else.
-fn print_relay_total_plain(payload: &Value, output: &mut Output, connection: &str) {
+fn print_relay_total_plain(payload: &Value, output: &mut Output, connection: &[String]) {
     let totals = RelayTotals::from_payload(payload);
     output.line("");
     output.line(&relay_header(&totals));
-    output.line(connection);
+    for line in connection {
+        output.line(line);
+    }
     output.line(&format!("total requests {}", format_exact(totals.requests)));
     output.line(&format!("total tokens {}", format_count(totals.tokens)));
 }
 
 /// The `Style::Rich` relay-total block: a 64-wide rule with the header
 /// inside, then the same two totals.
-fn print_relay_total_rich(payload: &Value, output: &mut Output, connection: &str) {
+fn print_relay_total_rich(payload: &Value, output: &mut Output, connection: &[String]) {
     let totals = RelayTotals::from_payload(payload);
     let header = relay_header(&totals);
     let fill = INNER_WIDTH.saturating_sub(header.chars().count() + 2);
     let mut rule = format!("──── {header} ");
     rule.extend(std::iter::repeat_n('─', fill));
     output.line(&rule);
-    output.line(&panel_row(connection));
+    // Bare lines like the totals: the relay block is a rule, not a box.
+    for line in connection {
+        output.line(&paint(DIM, line));
+    }
     output.line(&format!("total requests {}", format_exact(totals.requests)));
     output.line(&format!("total tokens {}", format_count(totals.tokens)));
 }
@@ -1459,7 +1499,6 @@ fn status_glyph(kind: ActionGlyph) -> String {
     match kind {
         ActionGlyph::Ok => paint(GREEN, "●"),
         ActionGlyph::Attention => paint(AMBER, "●"),
-        ActionGlyph::Failed => paint(RED, "●"),
     }
 }
 
@@ -1468,7 +1507,6 @@ fn status_glyph(kind: ActionGlyph) -> String {
 pub(crate) enum ActionGlyph {
     Ok,
     Attention,
-    Failed,
 }
 
 /// One colored account row: email, glyph + state, ok count, share bar.
