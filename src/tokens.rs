@@ -1,8 +1,10 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::types::{ProviderId, ProviderKind, TokenData};
 use crate::utils::{decode_jwt_payload, now_iso, sanitize_email};
@@ -228,7 +230,7 @@ fn plan_type_from_id_token(id_token: Option<&str>) -> Option<String> {
 }
 
 #[cfg(unix)]
-pub(crate) fn set_mode(path: &Path, mode: u32) -> Result<()> {
+fn set_mode(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let mut permissions = fs::metadata(path)
@@ -241,6 +243,102 @@ pub(crate) fn set_mode(path: &Path, mode: u32) -> Result<()> {
 
 #[cfg(not(unix))]
 fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
+    Ok(())
+}
+
+/// The on-disk usage counters for one account. Only the running totals
+/// persist; cooldown walls and failure streaks stay in-memory so a fresh
+/// process always gets a clean retry.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PersistedUsage {
+    pub(crate) requests: i64,
+    pub(crate) successes: i64,
+    pub(crate) failures: i64,
+    pub(crate) input_tokens: i64,
+    pub(crate) output_tokens: i64,
+    pub(crate) cache_creation_input_tokens: i64,
+    pub(crate) cache_read_input_tokens: i64,
+    pub(crate) reasoning_output_tokens: i64,
+}
+
+/// Path of a provider's usage file: `~/.pengepul/<provider>/usage.json`.
+fn usage_path(auth_dir: &Path, provider: &ProviderId) -> PathBuf {
+    auth_dir.join(provider.storage_dir()).join("usage.json")
+}
+
+/// Read a provider's usage counters (`<auth_dir>/<provider>/usage.json`). A missing or corrupted file yields an
+/// empty map: usage is observability, never worth failing a startup over.
+pub(crate) fn load_usage(
+    auth_dir: &Path,
+    provider: &ProviderId,
+) -> BTreeMap<String, PersistedUsage> {
+    let path = usage_path(auth_dir, provider);
+    let path = path.as_path();
+    let Ok(raw) = fs::read_to_string(path) else {
+        return BTreeMap::new();
+    };
+    let Ok(Value::Object(entries)) = serde_json::from_str::<Value>(&raw) else {
+        return BTreeMap::new();
+    };
+    entries
+        .into_iter()
+        .filter_map(|(email, entry)| {
+            let usage = parse_persisted_usage(&entry)?;
+            Some((email, usage))
+        })
+        .collect()
+}
+
+fn parse_persisted_usage(entry: &Value) -> Option<PersistedUsage> {
+    let object = entry.as_object()?;
+    let field = |key: &str| object.get(key).and_then(Value::as_i64).unwrap_or(0);
+    Some(PersistedUsage {
+        requests: field("total_requests"),
+        successes: field("total_successes"),
+        failures: field("total_failures"),
+        input_tokens: field("total_input_tokens"),
+        output_tokens: field("total_output_tokens"),
+        cache_creation_input_tokens: field("total_cache_creation_input_tokens"),
+        cache_read_input_tokens: field("total_cache_read_input_tokens"),
+        reasoning_output_tokens: field("total_reasoning_output_tokens"),
+    })
+}
+
+/// Atomically write a provider's usage counters: temp file + rename, so a crash mid-
+/// write can never leave a truncated `usage.json`.
+pub(crate) fn save_usage(
+    auth_dir: &Path,
+    provider: &ProviderId,
+    usage: &BTreeMap<String, PersistedUsage>,
+) -> Result<()> {
+    let path = usage_path(auth_dir, provider);
+    let path = path.as_path();
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+        set_mode(dir, 0o700)?;
+    }
+    let mut entries = serde_json::Map::new();
+    for (email, usage) in usage {
+        entries.insert(
+            email.clone(),
+            json!({
+                "total_requests": usage.requests,
+                "total_successes": usage.successes,
+                "total_failures": usage.failures,
+                "total_input_tokens": usage.input_tokens,
+                "total_output_tokens": usage.output_tokens,
+                "total_cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                "total_cache_read_input_tokens": usage.cache_read_input_tokens,
+                "total_reasoning_output_tokens": usage.reasoning_output_tokens,
+            }),
+        );
+    }
+    let temp = path.with_extension("json.tmp");
+    fs::write(&temp, serde_json::to_string_pretty(&json!(entries))?)
+        .with_context(|| format!("failed to write {}", temp.display()))?;
+    fs::rename(&temp, path)
+        .with_context(|| format!("failed to move {} into place", temp.display()))?;
+    set_mode(path, 0o600)?;
     Ok(())
 }
 

@@ -1,27 +1,30 @@
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::{Value, json};
 
-use crate::tokens::{load_all_tokens, save_token, set_mode};
+use crate::tokens::{PersistedUsage, load_all_tokens, load_usage, save_token, save_usage};
 use crate::types::{
     AvailableAccount, ProviderId, ProviderKind, RefreshTokenExhaustedError, TokenData, UsageData,
 };
 use crate::utils::{now_iso, sha256_hex};
 
 pub type RefreshFuture = Pin<Box<dyn Future<Output = Result<TokenData>> + Send>>;
+
 pub type RefreshFn = Box<dyn Fn(String) -> RefreshFuture + Send + Sync>;
 
 /// Every failure kind backs off the same: 1s, 2s, 4s, 8s, … per consecutive failure, capped
 /// at 5 minutes, reset on the next success. Short first retries keep a single static key (or a
 /// lone account) from being locked out by one transient error.
 const FAILURE_BACKOFF: (f64, f64) = (1.0, 5.0 * 60.0);
+
 /// Billing failures (an account out of credits or quota) do not recover mid-session the
 /// way a transient error does, so the account sits out far longer before being retried.
 const BILLING_COOLDOWN_SECONDS: f64 = 10.0 * 60.0;
+
 const REAUTH_COOLDOWN_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,21 +101,6 @@ impl AccountState {
     }
 }
 
-/// The on-disk usage counters for one account. Only the running totals
-/// persist; cooldown walls and failure streaks stay in-memory so a fresh
-/// process always gets a clean retry.
-#[derive(Debug, Default, Clone)]
-struct PersistedUsage {
-    requests: i64,
-    successes: i64,
-    failures: i64,
-    input_tokens: i64,
-    output_tokens: i64,
-    cache_creation_input_tokens: i64,
-    cache_read_input_tokens: i64,
-    reasoning_output_tokens: i64,
-}
-
 impl From<&AccountState> for PersistedUsage {
     fn from(state: &AccountState) -> Self {
         Self {
@@ -126,77 +114,6 @@ impl From<&AccountState> for PersistedUsage {
             reasoning_output_tokens: state.total_reasoning_output_tokens,
         }
     }
-}
-
-/// Path of a provider's usage file: `~/.pengepul/<provider>/usage.json`.
-fn usage_path(auth_dir: &Path, provider: &ProviderId) -> PathBuf {
-    auth_dir.join(provider.storage_dir()).join("usage.json")
-}
-
-/// Read a provider's usage file. A missing or corrupted file yields an
-/// empty map: usage is observability, never worth failing a startup over.
-fn read_persisted_usage(path: &Path) -> BTreeMap<String, PersistedUsage> {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return BTreeMap::new();
-    };
-    let Ok(Value::Object(entries)) = serde_json::from_str::<Value>(&raw) else {
-        return BTreeMap::new();
-    };
-    entries
-        .into_iter()
-        .filter_map(|(email, entry)| {
-            let usage = parse_persisted_usage(&entry)?;
-            Some((email, usage))
-        })
-        .collect()
-}
-
-fn parse_persisted_usage(entry: &Value) -> Option<PersistedUsage> {
-    let object = entry.as_object()?;
-    let field = |key: &str| object.get(key).and_then(Value::as_i64).unwrap_or(0);
-    Some(PersistedUsage {
-        requests: field("total_requests"),
-        successes: field("total_successes"),
-        failures: field("total_failures"),
-        input_tokens: field("total_input_tokens"),
-        output_tokens: field("total_output_tokens"),
-        cache_creation_input_tokens: field("total_cache_creation_input_tokens"),
-        cache_read_input_tokens: field("total_cache_read_input_tokens"),
-        reasoning_output_tokens: field("total_reasoning_output_tokens"),
-    })
-}
-
-/// Atomically write the usage file: temp file + rename, so a crash mid-
-/// write can never leave a truncated `usage.json`.
-fn write_persisted_usage(path: &Path, usage: &BTreeMap<String, PersistedUsage>) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("failed to create {}", dir.display()))?;
-        set_mode(dir, 0o700)?;
-    }
-    let mut entries = serde_json::Map::new();
-    for (email, usage) in usage {
-        entries.insert(
-            email.clone(),
-            json!({
-                "total_requests": usage.requests,
-                "total_successes": usage.successes,
-                "total_failures": usage.failures,
-                "total_input_tokens": usage.input_tokens,
-                "total_output_tokens": usage.output_tokens,
-                "total_cache_creation_input_tokens": usage.cache_creation_input_tokens,
-                "total_cache_read_input_tokens": usage.cache_read_input_tokens,
-                "total_reasoning_output_tokens": usage.reasoning_output_tokens,
-            }),
-        );
-    }
-    let temp = path.with_extension("json.tmp");
-    std::fs::write(&temp, serde_json::to_string_pretty(&json!(entries))?)
-        .with_context(|| format!("failed to write {}", temp.display()))?;
-    std::fs::rename(&temp, path)
-        .with_context(|| format!("failed to move {} into place", temp.display()))?;
-    set_mode(path, 0o600)?;
-    Ok(())
 }
 
 pub struct AccountManager {
@@ -244,7 +161,7 @@ impl AccountManager {
     ///
     /// Returns an error when the auth directory exists but cannot be read.
     pub fn load(&mut self) -> Result<()> {
-        self.persisted_usage = read_persisted_usage(&usage_path(&self.auth_dir, &self.provider));
+        self.persisted_usage = load_usage(&self.auth_dir, &self.provider);
         for token in load_all_tokens(&self.auth_dir, Some(&self.provider))? {
             self.upsert_loaded_token(token);
         }
@@ -546,10 +463,9 @@ impl AccountManager {
             .iter()
             .map(|(email, state)| (email.clone(), PersistedUsage::from(state)))
             .collect();
-        let path = usage_path(&self.auth_dir, &self.provider);
         // Write failures are swallowed: losing an increment of
         // observability must never fail the request that produced it.
-        let _ = write_persisted_usage(&path, &usage);
+        let _ = save_usage(&self.auth_dir, &self.provider, &usage);
     }
 
     fn upsert_loaded_token(&mut self, token: TokenData) {
