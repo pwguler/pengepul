@@ -272,8 +272,7 @@ pub fn run_with_env(
     let parsed_args = Args::try_parse_from(raw)?;
     let mut output = Output::default();
 
-    let root = parsed_args.config.as_deref();
-    let root_env = CommandEnv::new(root, home, cwd);
+    let root_env = CommandEnv::new(parsed_args.config.as_deref(), home, cwd);
 
     match parsed_args.command {
         None => serve(root_env, None, None, runtime)?,
@@ -312,7 +311,7 @@ pub fn run_with_env(
             config_command(command, root_env, &mut output, style)?;
         }
         Some(Command::Service { command }) => {
-            service_command(command, root, runtime, &mut output, style)?;
+            service_command(command, root_env, runtime, &mut output, style)?;
         }
         Some(Command::Help { topic }) => {
             output.line(&help_text(&topic)?);
@@ -497,7 +496,7 @@ fn config_command(
 
 fn service_command(
     command: ServiceCommand,
-    root_config_path: Option<&Path>,
+    env: CommandEnv<'_>,
     runtime: &mut impl CliRuntime,
     output: &mut Output,
     style: Style,
@@ -511,7 +510,10 @@ fn service_command(
             enable,
         } => {
             let path = runtime.install_service(ServiceInstallRequest {
-                config_path: command_config.or_else(|| root_config_path.map(Path::to_path_buf)),
+                config_path: env
+                    .with_override(command_config.as_deref())
+                    .config_path
+                    .map(Path::to_path_buf),
                 host,
                 port,
                 start,

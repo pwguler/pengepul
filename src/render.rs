@@ -80,9 +80,6 @@ pub(crate) fn format_duration(seconds: f64) -> String {
     }
 }
 
-/// Panel geometry, with the column budget summing to 60 of 60 inner
-/// columns: email 16 + state 17 (glyph, space, text) + ok 9 + bar 10 +
-/// pct 4, single spaces between.
 pub(crate) const INNER_WIDTH: usize = PANEL_WIDTH - 4;
 
 /// One `│ … │` row. The colored content is kept verbatim; only its *visible*

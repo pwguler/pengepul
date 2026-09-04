@@ -1413,3 +1413,47 @@ fn service_status_paints_a_failed_unit_red() {
     assert!(strip_ansi(&rich.stdout).contains("failed (Result: exit-code)"));
     assert!(rich.stdout.contains("\u{1b}[31m●"), "{}", rich.stdout);
 }
+
+#[test]
+fn a_command_level_config_wins_over_the_root_one() {
+    let tmp = tempdir().expect("tempdir");
+    let root = tmp.path().join("root.yaml");
+    let command = tmp.path().join("command.yaml");
+    std::fs::write(
+        &root,
+        "host: \"127.0.0.1\"\nport: 8317\nauth-dir: ~/.pengepul\napi-keys:\n  - sk-root\n",
+    )
+    .expect("write root config");
+    std::fs::write(
+        &command,
+        "host: \"127.0.0.1\"\nport: 8318\nauth-dir: ~/.pengepul\napi-keys:\n  - sk-command\n",
+    )
+    .expect("write command config");
+    let mut runtime = FakeRuntime::default();
+
+    let outcome = run(
+        &[
+            "--config",
+            root.to_str().expect("utf-8"),
+            "status",
+            "--config",
+            command.to_str().expect("utf-8"),
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    assert_eq!(outcome.code, 0);
+    assert_eq!(runtime.health_url.as_deref(), Some("http://127.0.0.1:8318"));
+    assert_eq!(runtime.accounts_api_key.as_deref(), Some("sk-command"));
+
+    // Without the command-level flag the root one applies.
+    let mut runtime = FakeRuntime::default();
+    run(
+        &["--config", root.to_str().expect("utf-8"), "status"],
+        tmp.path(),
+        &mut runtime,
+    );
+    assert_eq!(runtime.health_url.as_deref(), Some("http://127.0.0.1:8317"));
+    assert_eq!(runtime.accounts_api_key.as_deref(), Some("sk-root"));
+}

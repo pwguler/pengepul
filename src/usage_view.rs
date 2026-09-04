@@ -224,8 +224,10 @@ pub(crate) fn email(account: &Value) -> &str {
         .unwrap_or("unknown")
 }
 
+/// The account row's column budget, summing to the 60 inner columns:
+/// email 16 + state 17 (glyph, space, text) + ok 9 + bar 10 + pct 4,
+/// single spaces between.
 pub(crate) const EMAIL_WIDTH: usize = 16;
-
 pub(crate) const STATE_SPAN_WIDTH: usize = 17; // "● " + "cooldown 23h59m"
 
 pub(crate) const OK_WIDTH: usize = 9; // "999,999 ok" — bigger counts compact via format_count

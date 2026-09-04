@@ -21,7 +21,8 @@ store — with every observable behavior of the CLI and the relay unchanged.
   `parse_relative_seconds`, `unit_seconds` — the module that already owns
   the systemd/launchd unit owns the shape of their status text.
 - **`tokens.rs`** (Credential store) gains `load_usage`/`save_usage`: the
-  only module that reads or writes under the auth dir. `AccountManager`
+  one module that reads or writes an Account's files under the auth dir
+  (`cloaking_versions.rs` keeps its own cache there). `AccountManager`
   calls them as free functions, exactly as it calls `save_token`.
 - **`cli.rs`** keeps `Args`, `CliRuntime`, `run_with_env`, the verbs, and
   a `CommandEnv { config_path, home, cwd }` value that replaces the three

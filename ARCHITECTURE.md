@@ -22,10 +22,12 @@ in files.
   Provider and picks who serves next; **Rotation**, **Cooldown** and due
   **Refresh** live here, and every request outcome updates the Account's
   Usage counters, which it hands to the Credential store to persist.
-- **Credential store** (`tokens.rs`) — the only module that reads or writes
-  under the auth dir: the one credential an Account holds, and the
+- **Credential store** (`tokens.rs`) — reads and writes what an Account
+  leaves on disk under the auth dir: the one credential it holds, and the
   provider's **Usage counters** file (`usage.json`), both at `0600`, the
   latter written atomically (temp + rename); knows nothing of selection.
+  (The only other file under the auth dir, `cloaking-versions.json`, is the
+  Upstream module's own cache — `cloaking_versions.rs`.)
 - **OAuth** (`oauth.rs`) — mints and Refreshes the anthropic and codex
   credential, and is the only place a rejected refresh token becomes **Reauth**.
 - **Cloaking sanitizer** (`masquerade.rs`) — strips a harness's bot-identity
