@@ -913,7 +913,9 @@ fn status_ends_with_relay_total_block_in_plain() {
                         "available": true,
                         "totalRequests": 640,
                         "totalInputTokens": 33,
-                        "totalOutputTokens": 120
+                        "totalOutputTokens": 120,
+                        "totalCacheReadInputTokens": 7,
+                        "totalCacheCreationInputTokens": 0
                     }))]
                 },
                 "commandcode": {
@@ -941,9 +943,9 @@ fn status_ends_with_relay_total_block_in_plain() {
             .contains("\nrelay total: 2 pools, 2 accounts\n")
     );
     assert!(outcome.stdout.contains("total requests 650\n"));
-    assert!(outcome.stdout.contains("total tokens 168\n"));
+    assert!(outcome.stdout.contains("total tokens 175\n"));
     // The block is last: nothing after `total tokens`.
-    assert!(outcome.stdout.trim_end().ends_with("total tokens 168"));
+    assert!(outcome.stdout.trim_end().ends_with("total tokens 175"));
 }
 
 #[test]
@@ -974,10 +976,18 @@ fn status_relay_total_block_in_rich_has_64_wide_rule() {
     assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
     // AC-2: rule of exactly 64 with the header inside, then the two totals.
-    let rule = visible
-        .lines()
-        .find(|line| line.contains("relay total:"))
+    let lines: Vec<&str> = visible.lines().collect();
+    let rule_index = lines
+        .iter()
+        .position(|line| line.contains("relay total:"))
         .expect("relay total rule present");
+    let last_panel = lines
+        .iter()
+        .rposition(|line| line.starts_with('└'))
+        .expect("panel bottom rule present");
+    // AC-2: the block sits after the panels, not before them.
+    assert!(rule_index > last_panel);
+    let rule = lines[rule_index];
     assert_eq!(rule.chars().count(), 64, "rule line: {rule}");
     assert!(rule.starts_with('─'));
     assert!(visible.contains("total requests 640"));
