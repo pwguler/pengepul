@@ -31,13 +31,21 @@ type Sessions = BTreeMap<String, (String, Instant, Duration)>;
 
 static SESSIONS: OnceLock<Mutex<Sessions>> = OnceLock::new();
 
+/// The beta set Claude Code 2.1.261 attaches to a first-party request.
+///
+/// Deliberately absent: `redact-thinking-2026-02-12`. Claude Code sends it
+/// only because its own TUI hides thinking, and the server then empties
+/// every `thinking` block while still billing `thinking_tokens`. A relay
+/// serving pi/openclaw must let the text through. `web-fetch-2025-09-10`
+/// is kept for the native `web_fetch` server tool swap (masquerade) even
+/// though 2.1.261 no longer sends it.
 #[must_use]
 pub fn build_beta_header(model: &str, structured: bool) -> String {
     let is_haiku = model.contains("haiku");
     let mut common = vec![
         "oauth-2025-04-20",
         "interleaved-thinking-2025-05-14",
-        "redact-thinking-2026-02-12",
+        "thinking-token-count-2026-05-13",
         "context-management-2025-06-27",
         "prompt-caching-scope-2026-01-05",
         "web-fetch-2025-09-10",
@@ -85,14 +93,16 @@ pub fn anthropic_headers(
             session_id(&api_hash),
         ),
         ("X-Stainless-Lang".to_string(), "js".to_string()),
+        // The SDK bundled in Claude Code 2.1.261; the binary runs on bun,
+        // whose node-compat `process.version` reports v26.
         (
             "X-Stainless-Package-Version".to_string(),
-            "0.74.0".to_string(),
+            "0.112.1".to_string(),
         ),
         ("X-Stainless-Runtime".to_string(), "node".to_string()),
         (
             "X-Stainless-Runtime-Version".to_string(),
-            "v22.13.0".to_string(),
+            "v26.3.0".to_string(),
         ),
         ("X-Stainless-Arch".to_string(), stainless_arch()),
         ("X-Stainless-Os".to_string(), stainless_os()),
@@ -115,6 +125,10 @@ pub fn anthropic_headers(
         ),
         ("anthropic-version".to_string(), "2023-06-01".to_string()),
         ("x-app".to_string(), "cli".to_string()),
+        (
+            "anthropic-client-platform".to_string(),
+            config.cloaking.entrypoint.clone(),
+        ),
         (
             "x-client-request-id".to_string(),
             Uuid::new_v4().to_string(),

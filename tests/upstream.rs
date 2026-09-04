@@ -81,11 +81,26 @@ fn anthropic_headers_include_cloaking_session_and_beta() {
     assert!(headers["X-Claude-Code-Session-Id"].len() >= 32);
     assert!(headers["anthropic-beta"].contains("oauth-2025-04-20"));
     assert!(headers["anthropic-beta"].contains("advanced-tool-use-2025-11-20"));
+    // Stainless fingerprint tracks the SDK bundled in Claude Code 2.1.261
+    // (a bun binary reporting node-compat v26).
+    assert_eq!(headers["X-Stainless-Package-Version"], "0.112.1");
+    assert_eq!(headers["X-Stainless-Runtime-Version"], "v26.3.0");
+    assert_eq!(headers["anthropic-client-platform"], "cli");
 }
 
 #[test]
 fn beta_header_switches_for_structured_and_haiku() {
     assert!(build_beta_header("claude-sonnet-4-6", true).contains("structured-outputs-2025-12-15"));
+    // Thinking text must reach the client: Claude Code asks the server to
+    // redact it only because its own TUI hides thinking; a relay serving
+    // pi/openclaw must not (verified: the flag empties `thinking` blocks
+    // while still billing thinking_tokens).
+    assert!(!build_beta_header("claude-sonnet-4-6", false).contains("redact-thinking"));
+    assert!(!build_beta_header("claude-haiku-4-5-20251001", false).contains("redact-thinking"));
+    // Claude Code 2.1.261 sends thinking-token-count on thinking-capable models.
+    assert!(
+        build_beta_header("claude-sonnet-4-6", false).contains("thinking-token-count-2026-05-13")
+    );
     assert!(build_beta_header("claude-haiku-4-5-20251001", false).contains("claude-code-20250219"));
     assert!(!build_beta_header("claude-haiku-4-5-20251001", false).contains("effort-2025-11-24"));
 }
