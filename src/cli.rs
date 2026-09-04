@@ -288,7 +288,7 @@ pub fn run_with_env(
             cwd,
             runtime,
         )?,
-        Some(Command::Update { check }) => update(check, runtime, &mut output)?,
+        Some(Command::Update { check }) => update(check, runtime, &mut output, style)?,
         Some(Command::Status { command_config }) => {
             status(
                 command_config.as_deref().or(parsed_args.config.as_deref()),
@@ -320,10 +320,17 @@ pub fn run_with_env(
                 home,
                 cwd,
                 &mut output,
+                style,
             )?;
         }
         Some(Command::Service { command }) => {
-            service_command(command, parsed_args.config.as_deref(), runtime, &mut output)?;
+            service_command(
+                command,
+                parsed_args.config.as_deref(),
+                runtime,
+                &mut output,
+                style,
+            )?;
         }
         Some(Command::Help { topic }) => {
             output.line(&help_text(&topic)?);
@@ -341,6 +348,7 @@ pub fn run_with_env(
                 cwd,
                 runtime,
                 &mut output,
+                style,
             )?;
         }
     }
@@ -439,13 +447,35 @@ fn config_command(
     home: &Path,
     cwd: &Path,
     output: &mut Output,
+    style: Style,
 ) -> Result<()> {
     let path = selected_config_path(config_path, Some(home), cwd);
     match command {
-        ConfigCommand::Path => output.line(&path.display().to_string()),
+        ConfigCommand::Path => match style {
+            Style::Plain => output.line(&path.display().to_string()),
+            Style::Rich => {
+                for line in action_panel(
+                    "config",
+                    &[format!("path  {}", paint(BOLD, &path.display().to_string()))],
+                ) {
+                    output.line(&line);
+                }
+            }
+        },
         ConfigCommand::ApiKey => {
             let config = load_config(config_path, Some(home), cwd)?;
-            output.line(&first_api_key(&config)?);
+            let key = first_api_key(&config)?;
+            match style {
+                Style::Plain => output.line(&key),
+                Style::Rich => {
+                    for line in action_panel(
+                        "config",
+                        &[format!("api key  {}", paint(BOLD, &key))],
+                    ) {
+                        output.line(&line);
+                    }
+                }
+            }
         }
         ConfigCommand::Show => {
             // Generates the config when absent, so `show` works on a fresh
@@ -464,6 +494,7 @@ fn service_command(
     root_config_path: Option<&Path>,
     runtime: &mut impl CliRuntime,
     output: &mut Output,
+    style: Style,
 ) -> Result<()> {
     match command {
         ServiceCommand::Install {
@@ -480,28 +511,202 @@ fn service_command(
                 start,
                 enable,
             })?;
-            output.line(&format!("installed service: {}", path.display()));
+            let detail = format!("installed  {}", path.display());
+            match style {
+                Style::Plain => output.line(&format!("installed service: {}", path.display())),
+                Style::Rich => {
+                    for line in action_panel("service", &[format!("{} {detail}", status_glyph(ActionGlyph::Ok))]) {
+                        output.line(&line);
+                    }
+                }
+            }
         }
         ServiceCommand::Start => {
             runtime.start_service()?;
-            output.line("started service");
+            print_action("service", "started service", "started", ActionGlyph::Ok, output, style);
         }
         ServiceCommand::Stop => {
             runtime.stop_service()?;
-            output.line("stopped service");
+            print_action("service", "stopped service", "stopped", ActionGlyph::Ok, output, style);
         }
         ServiceCommand::Restart => {
             runtime.restart_service()?;
-            output.line("restarted service");
+            print_action("service", "restarted service", "restarted", ActionGlyph::Ok, output, style);
         }
-        ServiceCommand::Status => output.line(&runtime.service_status()?),
+        ServiceCommand::Status => match runtime.service_status() {
+            Ok(text) => match style {
+                Style::Plain => output.line(&text),
+                Style::Rich => {
+                    for line in service_status_panel(&text) {
+                        output.line(&line);
+                    }
+                }
+            },
+            // Not installed (or the tool failed): the panel turns it into
+            // an amber row instead of failing the render; plain keeps the
+            // error so scripts see the failure.
+            Err(error) => match style {
+                Style::Plain => return Err(error),
+                Style::Rich => {
+                    for line in action_panel(
+                        "service",
+                        &[format!(
+                            "{} not installed  {}",
+                            status_glyph(ActionGlyph::Attention),
+                            paint(DIM, "run pengepul service install")
+                        )],
+                    ) {
+                        output.line(&line);
+                    }
+                }
+            },
+        },
         ServiceCommand::Uninstall => {
             let path = runtime.uninstall_service()?;
-            output.line(&format!("uninstalled service: {}", path.display()));
+            let detail = format!("uninstalled  {}", path.display());
+            match style {
+                Style::Plain => output.line(&format!("uninstalled service: {}", path.display())),
+                Style::Rich => {
+                    for line in action_panel("service", &[format!("{} {detail}", status_glyph(ActionGlyph::Ok))]) {
+                        output.line(&line);
+                    }
+                }
+            }
         }
         ServiceCommand::Logs { follow, lines } => runtime.service_logs(follow, lines)?,
     }
     Ok(())
+}
+
+/// Parse the platform service tool's text (systemctl on Linux, launchctl
+/// on macOS) into the structured `service` panel. Unrecognized lines are
+/// dropped; a text with no recognizable state renders as unknown rather
+/// than failing — the panel is observability, never a gate.
+fn service_status_panel(text: &str) -> Vec<String> {
+    let mut state: Option<String> = None;
+    let mut enabled: Option<String> = None;
+    let mut since: Option<String> = None;
+    let mut pid: Option<String> = None;
+    let mut memory: Option<String> = None;
+    let mut cpu: Option<String> = None;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        // launchctl key = value pairs.
+        if let Some((key, value)) = trimmed.split_once(" = ") {
+            match key {
+                "state" => state = Some(value.to_string()),
+                "pid" => pid = Some(value.to_string()),
+                _ => {}
+            }
+            continue;
+        }
+        // systemctl `Label: value` pairs.
+        if let Some((key, value)) = trimmed.split_once(':') {
+            let value = value.trim();
+            match key.trim() {
+                "Active" => {
+                    // `active (running) since Sat 2026-09-05 04:09:31 WIB; 4min 28s ago`
+                    let mut fields = value.splitn(2, " since ");
+                    let active = fields.next().unwrap_or(value).trim();
+                    state = Some(active.to_string());
+                    if let Some(rest) = fields.next() {
+                        if let Some((_, ago)) = rest.split_once("; ") {
+                            since = Some(cooldown_label(0.0, parse_relative_seconds(ago)).replace("on cooldown ", ""));
+                        }
+                    }
+                }
+                "Loaded" => {
+                    if let Some((_, rest)) = value.split_once("; ") {
+                        let flag = rest.split(';').next().unwrap_or("").trim();
+                        enabled = Some(flag.to_string());
+                    } else {
+                        enabled = Some(value.split(';').next().unwrap_or(value).trim().to_string());
+                    }
+                }
+                "Main PID" => {
+                    pid = Some(value.split_whitespace().next().unwrap_or(value).to_string());
+                }
+                "Memory" => {
+                    memory = Some(value.split_whitespace().next().unwrap_or(value).to_string());
+                }
+                "CPU" => {
+                    cpu = Some(value.split_whitespace().next().unwrap_or(value).to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let state_text = state.clone().unwrap_or_else(|| "unknown".to_string());
+    let glyph = if state_text.starts_with("active") || state_text == "running" {
+        status_glyph(ActionGlyph::Ok)
+    } else {
+        status_glyph(ActionGlyph::Attention)
+    };
+    let mut rows = vec![format!("{glyph} {state_text}")];
+    if let Some(enabled) = enabled {
+        rows.push(format!("enabled  {enabled}"));
+    }
+    if let Some(pid) = pid {
+        rows.push(format!("pid  {pid}"));
+    }
+    if let Some(memory) = memory {
+        rows.push(format!("memory  {memory}"));
+    }
+    if let Some(cpu) = cpu {
+        rows.push(format!("cpu  {cpu}"));
+    }
+    if let Some(since) = since {
+        rows.push(format!("uptime  {since}"));
+    }
+    action_panel("service", &rows)
+}
+
+/// Parse a human "4min 28s ago" / "1h2m ago" duration into seconds for
+/// the shared relative-time label. Unparsable text yields 0 ("now").
+fn parse_relative_seconds(text: &str) -> f64 {
+    let mut seconds = 0.0;
+    let mut number = String::new();
+    for character in text.chars() {
+        if character.is_ascii_digit() || character == '.' {
+            number.push(character);
+            continue;
+        }
+        if !number.is_empty() {
+            let value: f64 = number.parse().unwrap_or(0.0);
+            number.clear();
+            seconds += match character {
+                's' => value,
+                'm' => value * 60.0,
+                'h' => value * 3600.0,
+                'd' => value * 86_400.0,
+                'w' => value * 604_800.0,
+                _ => 0.0,
+            };
+        }
+    }
+    seconds
+}
+
+/// Print one action outcome: the plain line when piped, a one-row panel
+/// when rich. `plain` is today's exact bytes (AC-1/AC-8).
+fn print_action(
+    subject: &str,
+    plain: &str,
+    state: &str,
+    glyph: ActionGlyph,
+    output: &mut Output,
+    style: Style,
+) {
+    match style {
+        Style::Plain => output.line(plain),
+        Style::Rich => {
+            for line in action_panel(subject, &[format!("{} {state}", status_glyph(glyph))]) {
+                output.line(&line);
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -541,24 +746,65 @@ pub fn tag_is_newer(tag: &str, current: &str) -> bool {
     }
 }
 
-fn update(check: bool, runtime: &mut impl CliRuntime, output: &mut Output) -> Result<()> {
+fn update(
+    check: bool,
+    runtime: &mut impl CliRuntime,
+    output: &mut Output,
+    style: Style,
+) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     let asset = release_asset()?;
     let tag = runtime.latest_release_tag()?;
 
     if !tag_is_newer(&tag, current) {
-        output.line(&format!("pengepul {current} is the latest release"));
+        print_action(
+            "update",
+            &format!("pengepul {current} is the latest release"),
+            &format!("latest  {current}"),
+            ActionGlyph::Ok,
+            output,
+            style,
+        );
         return Ok(());
     }
     if check {
-        output.line(&format!(
+        let plain = format!(
             "pengepul {tag} is available (running {current}); run `pengepul update` to install it"
-        ));
+        );
+        match style {
+            Style::Plain => output.line(&plain),
+            Style::Rich => {
+                for line in action_panel(
+                    "update",
+                    &[format!(
+                        "{} running {current}  available {tag}",
+                        status_glyph(ActionGlyph::Attention)
+                    )],
+                ) {
+                    output.line(&line);
+                }
+            }
+        }
         return Ok(());
     }
 
     let path = runtime.install_release(&tag, asset)?;
-    output.line(&format!("updated to {tag} at {}", path.display()));
+    let plain = format!("updated to {tag} at {}", path.display());
+    match style {
+        Style::Plain => output.line(&plain),
+        Style::Rich => {
+            for line in action_panel(
+                "update",
+                &[format!(
+                    "{} updated {tag}  {}",
+                    status_glyph(ActionGlyph::Ok),
+                    path.display()
+                )],
+            ) {
+                output.line(&line);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -570,6 +816,7 @@ fn login(
     cwd: &Path,
     runtime: &mut impl CliRuntime,
     output: &mut Output,
+    style: Style,
 ) -> Result<()> {
     let config = load_config(config_path, Some(home), cwd)?;
     // anthropic and codex are always valid; anything else must name a configured
@@ -579,7 +826,7 @@ fn login(
             bail!("{builtin} uses OAuth; --key is for configured providers");
         }
         let email = runtime.login(&config, builtin.clone(), key)?;
-        output.line(&format!("saved {builtin} account token for {email}"));
+        print_login_saved(&builtin.to_string(), &email, output, style);
         return Ok(());
     }
     if !config.providers.contains_key(provider) {
@@ -608,8 +855,28 @@ fn login(
         plan_type: None,
     };
     save_token(&config.auth_dir, &token)?;
-    output.line(&format!("saved {provider} account token for {label}"));
+    print_login_saved(provider, &label, output, style);
     Ok(())
+}
+
+/// The login outcome: the plain line when piped, a `login: <provider>`
+/// panel when rich.
+fn print_login_saved(provider: &str, label: &str, output: &mut Output, style: Style) {
+    match style {
+        Style::Plain => output.line(&format!("saved {provider} account token for {label}")),
+        Style::Rich => {
+            for line in action_panel(
+                &format!("login: {provider}"),
+                &[format!(
+                    "{} saved  {}",
+                    status_glyph(ActionGlyph::Ok),
+                    paint(BOLD, label)
+                )],
+            ) {
+                output.line(&line);
+            }
+        }
+    }
 }
 
 fn help_text(topic: &[String]) -> Result<String> {
@@ -1156,6 +1423,53 @@ fn top_rule(provider_id: &str, count: i64, suffix: &str, available: usize) -> St
     top.extend(std::iter::repeat_n('─', fill));
     top.push('┐');
     top
+}
+
+/// Header rule for action panels: `┌─ <subject> ─…┐`, same geometry and
+/// clipping as `top_rule`.
+fn action_rule(subject: &str) -> String {
+    let header: String = {
+        let characters: Vec<char> = subject.chars().collect();
+        if characters.len() > INNER_WIDTH - 2 {
+            characters[..INNER_WIDTH - 2].iter().collect()
+        } else {
+            subject.to_string()
+        }
+    };
+    let fill = INNER_WIDTH.saturating_sub(header.chars().count() + 1);
+    let mut top = format!("┌─ {header} ");
+    top.extend(std::iter::repeat_n('─', fill));
+    top.push('┐');
+    top
+}
+
+/// The one panel every action command shares: a header rule, one row per
+/// fact (`<label>  <glyphed outcome>`), and the bottom rule. Pure over
+/// its inputs; printing is the caller's job.
+fn action_panel(subject: &str, rows: &[String]) -> Vec<String> {
+    let mut lines = vec![action_rule(subject)];
+    for row in rows {
+        lines.push(panel_row(row));
+    }
+    lines.push(format!("└{}┘", "─".repeat(INNER_WIDTH + 2)));
+    lines
+}
+
+/// A status glyph with its color: green success, amber attention, red failure.
+fn status_glyph(kind: ActionGlyph) -> String {
+    match kind {
+        ActionGlyph::Ok => paint(GREEN, "●"),
+        ActionGlyph::Attention => paint(AMBER, "●"),
+        ActionGlyph::Failed => paint(RED, "●"),
+    }
+}
+
+/// Which color an action status glyph carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActionGlyph {
+    Ok,
+    Attention,
+    Failed,
 }
 
 /// One colored account row: email, glyph + state, ok count, share bar.
