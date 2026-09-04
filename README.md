@@ -208,4 +208,6 @@ off up to 5 minutes; a dead refresh token locks it out for 24 hours until a fres
 
 `pengepul status` shows each pool: accounts available and on cooldown, requests served,
 and token totals per account and summed. `pengepul accounts` lists the same totals per
-account. These numbers live in memory and reset when the relay restarts.
+account. In a terminal both render as panels with per-account share-of-pool bars;
+piped or `NO_COLOR` output stays plain. These numbers live in memory and reset when the
+relay restarts.
