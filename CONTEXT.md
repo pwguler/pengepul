@@ -54,6 +54,10 @@ _Avoid_: round-robin, load balancing, sticky windows, account selection
 Re-serving one client request on a different account of the same provider after the upstream rejects it in a way another account could survive.
 _Avoid_: retry, fallback, attempt budget
 
+**Pool**:
+The set of Accounts of one Provider behind the relay, spread across by Rotation.
+_Avoid_: account list, fleet, grouping
+
 ### Access and billing identity
 
 **Local API key**:
@@ -110,3 +114,5 @@ _Avoid_: billing classifier, detector, filter
 - "cloaking" and "masquerade" are used interchangeably. Resolved: **Cloaking** is the domain term.
 - "refresh" names both the secret an account holds and the act of replacing its expiring access token. Resolved: **Refresh** is the act. The secret is the refresh token.
 - "round-robin with sticky windows" survives in `docs/`, contradicting the README. Resolved: **Rotation** has no stickiness. Selection resumes after the last-used account and advances on every request, with no client or session key anywhere.
+- "pool" and "pooling" name both the whole relay and one provider's accounts. Resolved: **Pool** is one Provider's set of Accounts; the process serving every pool is the relay.
+- The CLI printed cooldown accounts as "unavailable". Resolved: operator-facing output says "on cooldown" with the remaining time; "unavailable" is on the avoid list.
