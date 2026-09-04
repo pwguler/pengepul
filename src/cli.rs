@@ -919,13 +919,9 @@ fn email(account: &Value) -> &str {
         .unwrap_or("unknown")
 }
 
-/// Panel geometry: inner width (between the `│ ` and ` │` gutters), glyph
-/// column, and the email column wide enough for most addresses before
-/// truncation. Deriving the row layout from one table keeps the columns
-/// aligned by construction.
-/// Panel geometry, with the column budget summing to 59 of 60 inner
+/// Panel geometry, with the column budget summing to 60 of 60 inner
 /// columns: email 16 + state 17 (glyph, space, text) + ok 9 + bar 10 +
-/// pct 3, single spaces between.
+/// pct 4, single spaces between.
 const INNER_WIDTH: usize = PANEL_WIDTH - 4;
 const EMAIL_WIDTH: usize = 16;
 const STATE_SPAN_WIDTH: usize = 17; // "● " + "cooldown 23h59m"
