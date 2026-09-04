@@ -1039,7 +1039,7 @@ async fn route_provider_request(
             }
             Err(error) => return last_response.unwrap_or_else(|| error.into_response()),
         };
-        let response = match provider.kind {
+        let mut response = match provider.kind {
             ProviderKind::Generic => {
                 if matches!(route, RequestRoute::Chat) {
                     route_generic_chat_request(
@@ -1089,9 +1089,13 @@ async fn route_provider_request(
                 .await
             }
         };
-        if !should_retry_upstream_status(response.status()) {
+        if !should_retry_upstream_status(response.status())
+            && !is_account_scoped_billing_failure(state, provider.clone(), &account, &mut response)
+                .await
+        {
             return response;
         }
+        // an account-scoped billing failure retries: a sibling account may still have credits
         last_response = Some(response);
     }
 
@@ -1128,6 +1132,66 @@ fn should_retry_upstream_status(status: StatusCode) -> bool {
     // 501 is pengepul's own "unsupported route for provider" response, not a transient
     // upstream failure; retrying it would only re-generate the same error each pass.
     matches!(status.as_u16(), 401 | 403 | 429 | 500 | 502..=599)
+}
+
+/// Error strings that mark an upstream rejection as about the account's credit or quota
+/// rather than the request itself. Credits live per account, so a sibling account may
+/// still serve the request and it should fail over instead of failing the client.
+const BILLING_FAILURE_MARKERS: [&str; 4] = [
+    "insufficient credits",
+    "insufficient_quota",
+    "insufficient quota",
+    "out of credits",
+];
+
+/// Whether a non-retryable-by-status upstream rejection is account-scoped billing —
+/// credits live per account, so a sibling account may still serve the request. Records
+/// the failure as billing when it matches. The response is buffered for the check and
+/// rebuilt in place either way.
+async fn is_account_scoped_billing_failure(
+    state: &AppState,
+    provider: ProviderId,
+    account: &AvailableAccount,
+    response: &mut Response,
+) -> bool {
+    let status = response.status();
+    if status != StatusCode::BAD_REQUEST && status != StatusCode::PAYMENT_REQUIRED {
+        return false;
+    }
+    record_billing_scoped_failure(state, provider, account, response).await
+}
+
+/// Buffer a 400/402 response and decide whether the upstream rejected this account's
+/// balance rather than the request. When it matches, the failure is recorded as billing
+/// (a long cooldown — credits do not return mid-session) and the request may fail over.
+/// Returns the matched flag; the response is rebuilt in place either way.
+async fn record_billing_scoped_failure(
+    state: &AppState,
+    provider: ProviderId,
+    account: &AvailableAccount,
+    response: &mut Response,
+) -> bool {
+    let (parts, body) = std::mem::take(response).into_parts();
+    let Some(buffered) = axum::body::to_bytes(body, 64 * 1024).await.ok() else {
+        *response = Response::from_parts(parts, Body::empty());
+        return false;
+    };
+    let text = String::from_utf8_lossy(&buffered).to_ascii_lowercase();
+    let billing = BILLING_FAILURE_MARKERS
+        .iter()
+        .any(|marker| text.contains(marker));
+    if billing {
+        record_provider_failure_kind(
+            state,
+            provider,
+            account,
+            "billing",
+            Some(&String::from_utf8_lossy(&buffered)),
+        )
+        .await;
+    }
+    *response = Response::from_parts(parts, Body::from(buffered));
+    billing
 }
 
 /// The route's display name for error messages ("Chat Completions" etc.).
@@ -1590,6 +1654,22 @@ async fn record_provider_failure(
     status: StatusCode,
     detail: Option<&str>,
 ) {
+    // 400/402 by themselves say nothing about account health — a malformed request is
+    // the client's fault, and a drained balance is recorded by the failover path with
+    // the billing kind instead. Recording both would double-count the backoff.
+    if status == StatusCode::BAD_REQUEST || status == StatusCode::PAYMENT_REQUIRED {
+        return;
+    }
+    record_provider_failure_kind(state, provider, account, classify_status(status), detail).await;
+}
+
+async fn record_provider_failure_kind(
+    state: &AppState,
+    provider: ProviderId,
+    account: &AvailableAccount,
+    kind: &'static str,
+    detail: Option<&str>,
+) {
     let mut manager = match provider.kind {
         ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
         ProviderKind::Codex => state.account_managers.codex.lock().await,
@@ -1600,11 +1680,7 @@ async fn record_provider_failure(
             manager.lock().await
         }
     };
-    manager.record_failure(
-        account.token.email.as_str(),
-        classify_status(status),
-        detail,
-    );
+    manager.record_failure(account.token.email.as_str(), kind, detail);
 }
 
 fn no_account_message(

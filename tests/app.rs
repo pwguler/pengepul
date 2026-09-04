@@ -1628,6 +1628,20 @@ impl UpstreamClient for GenericUpstream {
     }
 }
 
+fn static_key_token(provider: &str, label: &str) -> TokenData {
+    TokenData {
+        access_token: format!("secret-{provider}-{label}"),
+        refresh_token: String::new(),
+        email: label.to_string(),
+        expires_at: String::new(),
+        account_uuid: format!("acct-{label}"),
+        provider: ProviderId::generic(provider),
+        id_token: None,
+        last_refresh_at: None,
+        plan_type: None,
+    }
+}
+
 fn groq_key_token() -> TokenData {
     TokenData {
         access_token: "gsk-secret".to_string(),
@@ -1648,6 +1662,17 @@ fn config_with_groq(auth_dir: PathBuf) -> Config {
         "groq".to_string(),
         pengepul::config::ConfiguredProvider {
             base_url: "https://api.groq.com/openai/v1".to_string(),
+        },
+    );
+    cfg
+}
+
+fn config_with_static_provider(name: &str, auth_dir: PathBuf) -> Config {
+    let mut cfg = config(auth_dir);
+    cfg.providers.insert(
+        name.to_string(),
+        pengepul::config::ConfiguredProvider {
+            base_url: format!("https://{name}.example/v1"),
         },
     );
     cfg
@@ -2038,6 +2063,170 @@ async fn v1_models_advertises_fetched_configured_models_with_their_prefix() {
         ids.iter().any(|id| id == "groq/llama-3.3-70b-versatile"),
         "advertised ids: {ids:?}"
     );
+}
+
+#[derive(Default)]
+struct BillingFailoverUpstream {
+    /// account labels that have been called, in order
+    calls: Mutex<Vec<String>>,
+}
+
+impl UpstreamClient for BillingFailoverUpstream {
+    fn generic_chat(
+        &self,
+        request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        let email = request.account.token.email.clone();
+        let mut calls = self.calls.lock().expect("calls lock");
+        let call_index = calls.len() + 1;
+        calls.push(email);
+        drop(calls);
+        Box::pin(async move {
+            if call_index == 1 {
+                Ok(UpstreamJsonResponse {
+                    status: axum::http::StatusCode::BAD_REQUEST,
+                    body: json!({
+                        "error": {
+                            "message": "You have insufficient credits to make this request. Please purchase more credits to continue using the service.",
+                            "type": "invalid_request_error",
+                            "code": "BAD_REQUEST"
+                        }
+                    }),
+                })
+            } else {
+                Ok(UpstreamJsonResponse {
+                    status: axum::http::StatusCode::OK,
+                    body: json!({
+                        "id": "chatcmpl_billfailover",
+                        "object": "chat.completion",
+                        "model": "gpt-5.6-sol",
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": "pong"}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                    }),
+                })
+            }
+        })
+    }
+    fn generic_chat_stream(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        unreachable!("stream not used in billing failover test")
+    }
+    fn anthropic_messages(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("anthropic not used in billing failover test")
+    }
+    fn anthropic_messages_stream(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        unreachable!("anthropic stream not used in billing failover test")
+    }
+    fn anthropic_count_tokens(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("count_tokens not used in billing failover test")
+    }
+    fn codex_responses(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("codex not used in billing failover test")
+    }
+    fn codex_responses_stream(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        unreachable!("codex stream not used in billing failover test")
+    }
+    fn fetch_models(
+        &self,
+        _kind: ProviderKind,
+        _account: AvailableAccount,
+        _config: Arc<Config>,
+    ) -> ModelsFuture {
+        Box::pin(async { Ok(FetchedModels::new(Vec::new())) })
+    }
+}
+
+#[tokio::test]
+async fn billing_scoped_upstream_rejection_fails_over_to_the_next_account() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_key_token("commandcode", "key-90445c90"))
+        .expect("save first key");
+    save_token(tmp.path(), &static_key_token("commandcode", "key-d792179a"))
+        .expect("save second key");
+    let upstream = Arc::new(BillingFailoverUpstream::default());
+    let app = create_app_with_upstream(
+        config_with_static_provider("commandcode", tmp.path().to_path_buf()),
+        upstream.clone(),
+    );
+
+    let (status, body) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1024")
+            .body(Body::from(
+                json!({
+                    "model": "commandcode/gpt-5.6-sol",
+                    "messages": [{"role": "user", "content": "reply exactly: pong"}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+
+    // The first account is out of credits; the request still succeeds on the sibling.
+    assert_eq!(status, 200);
+    assert_eq!(body["choices"][0]["message"]["content"], "pong");
+    let calls = upstream.calls.lock().expect("calls lock").clone();
+    assert_eq!(
+        calls.len(),
+        2,
+        "failover should have reached the second account"
+    );
+    assert_ne!(
+        calls[0], calls[1],
+        "failover must move to a different account"
+    );
+    // the drained account is marked billing, so rotation skips it for a long while
+    let (admin_status, admin) = json_response(
+        app,
+        axum::http::Request::builder()
+            .uri("/admin/accounts")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(admin_status, 200);
+    let drained = admin["providers"]["commandcode"]["accounts"]
+        .as_array()
+        .and_then(|accounts| accounts.iter().find(|a| a["email"] == calls[0]))
+        .expect("drained account in admin output");
+    assert_eq!(drained["failureCount"], 1);
+    assert!(
+        drained["lastError"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("billing:")),
+        "failure must be classified billing, got {:?}",
+        drained["lastError"]
+    );
+    // the sibling that served the request shows no failure
+    let served = admin["providers"]["commandcode"]["accounts"]
+        .as_array()
+        .and_then(|accounts| accounts.iter().find(|a| a["email"] == calls[1]))
+        .expect("serving account in admin output");
+    assert_eq!(served["failureCount"], 0);
 }
 
 #[tokio::test]

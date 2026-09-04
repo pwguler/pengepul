@@ -19,6 +19,9 @@ pub type RefreshFn = Box<dyn Fn(String) -> RefreshFuture + Send + Sync>;
 /// at 5 minutes, reset on the next success. Short first retries keep a single static key (or a
 /// lone account) from being locked out by one transient error.
 const FAILURE_BACKOFF: (f64, f64) = (1.0, 5.0 * 60.0);
+/// Billing failures (an account out of credits or quota) do not recover mid-session the
+/// way a transient error does, so the account sits out far longer before being retried.
+const BILLING_COOLDOWN_SECONDS: f64 = 10.0 * 60.0;
 const REAUTH_COOLDOWN_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,7 +286,11 @@ impl AccountManager {
         state.last_failure_at = Some(now_iso());
         state.last_error =
             Some(detail.map_or_else(|| kind.to_string(), |detail| format!("{kind}: {detail}")));
-        let (base, maximum) = FAILURE_BACKOFF;
+        let (base, maximum) = if kind == "billing" {
+            (BILLING_COOLDOWN_SECONDS, BILLING_COOLDOWN_SECONDS)
+        } else {
+            FAILURE_BACKOFF
+        };
         let multiplier = 2_f64.powi(i32::try_from(state.failure_count - 1).unwrap_or(0));
         state.cooldown_until = unix_now() + (base * multiplier).min(maximum);
     }

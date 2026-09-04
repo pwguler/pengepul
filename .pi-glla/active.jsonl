@@ -1,0 +1,9 @@
+{"type":"session_rebound","value":{"reason":"startup"},"at":"2026-09-04T02:38:33.073Z"}
+{"type":"session_waiting_for_load","value":{"reason":"startup"},"at":"2026-09-04T02:38:33.103Z"}
+{"type":"session_shutdown","value":{"reason":"resume"},"at":"2026-09-04T02:39:04.018Z"}
+{"type":"session_rebound","value":{"reason":"resume"},"at":"2026-09-04T02:39:04.613Z"}
+{"type":"id_invalidation","value":{"oldId":"01a06a48-27c2-75a7-800e-38f1f764d366","newId":"01a060ef-8be5-75d9-838a-339c5601bd4f","reason":"session_shutdown","shutdownReason":"resume","at":"2026-09-04T02:39:04.678Z"},"at":"2026-09-04T02:39:04.678Z"}
+{"type":"state","value":{"goal":null,"list":[],"loop":null,"mainModelRecovery":null,"lastModelRef":"openrouter/z-ai/glm-5.3-flash","lastCompactionAt":null,"supervisorPausedAt":null,"loadHoldAt":null,"lastOutcome":null},"at":"2026-09-04T04:40:24.849Z"}
+{"type":"context_usage_sample","value":{"goalId":null,"provider":"openrouter","model":"z-ai/glm-5.3-flash","providerUsage":{"inputTokens":8322,"outputTokens":412,"cacheReadTokens":103040,"cacheWriteTokens":0,"totalTokens":111774},"contextUsage":{"tokens":111774,"contextWindow":1048576,"percent":10.659599304199219}},"at":"2026-09-04T04:41:44.389Z"}
+{"type":"context_usage_sample","value":{"goalId":null,"provider":"openrouter","model":"z-ai/glm-5.3-flash","providerUsage":{"inputTokens":6998,"outputTokens":432,"cacheReadTokens":107520,"cacheWriteTokens":0,"totalTokens":114950},"contextUsage":{"tokens":114950,"contextWindow":1048576,"percent":10.962486267089844}},"at":"2026-09-04T04:43:31.399Z"}
+{"type":"context_usage_sample","value":{"goalId":null,"provider":"openrouter","model":"z-ai/glm-5.3-flash","providerUsage":{"inputTokens":5753,"outputTokens":817,"cacheReadTokens":112000,"cacheWriteTokens":0,"totalTokens":118570},"contextUsage":{"tokens":118570,"contextWindow":1048576,"percent":11.307716369628906}},"at":"2026-09-04T04:45:26.093Z"}
