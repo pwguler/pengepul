@@ -272,33 +272,25 @@ pub fn run_with_env(
     let parsed_args = Args::try_parse_from(raw)?;
     let mut output = Output::default();
 
+    let root = parsed_args.config.as_deref();
+    let root_env = CommandEnv::new(root, home, cwd);
+
     match parsed_args.command {
-        None => serve(
-            parsed_args.config.as_deref(),
-            None,
-            None,
-            home,
-            cwd,
-            runtime,
-        )?,
+        None => serve(root_env, None, None, runtime)?,
         Some(Command::Serve {
             command_config,
             host,
             port,
         }) => serve(
-            command_config.as_deref().or(parsed_args.config.as_deref()),
+            root_env.with_override(command_config.as_deref()),
             host,
             port,
-            home,
-            cwd,
             runtime,
         )?,
         Some(Command::Update { check }) => update(check, runtime, &mut output, style)?,
         Some(Command::Status { command_config }) => {
             status(
-                command_config.as_deref().or(parsed_args.config.as_deref()),
-                home,
-                cwd,
+                root_env.with_override(command_config.as_deref()),
                 runtime,
                 &mut output,
                 style,
@@ -309,33 +301,18 @@ pub fn run_with_env(
             reload,
         }) => {
             accounts(
-                command_config.as_deref().or(parsed_args.config.as_deref()),
+                root_env.with_override(command_config.as_deref()),
                 reload,
-                home,
-                cwd,
                 runtime,
                 &mut output,
                 style,
             )?;
         }
         Some(Command::Config { command }) => {
-            config_command(
-                command,
-                parsed_args.config.as_deref(),
-                home,
-                cwd,
-                &mut output,
-                style,
-            )?;
+            config_command(command, root_env, &mut output, style)?;
         }
         Some(Command::Service { command }) => {
-            service_command(
-                command,
-                parsed_args.config.as_deref(),
-                runtime,
-                &mut output,
-                style,
-            )?;
+            service_command(command, root, runtime, &mut output, style)?;
         }
         Some(Command::Help { topic }) => {
             output.line(&help_text(&topic)?);
@@ -346,11 +323,9 @@ pub fn run_with_env(
             key,
         }) => {
             login(
-                command_config.as_deref().or(parsed_args.config.as_deref()),
+                root_env.with_override(command_config.as_deref()),
                 &provider,
                 key.as_deref(),
-                home,
-                cwd,
                 runtime,
                 &mut output,
                 style,
@@ -365,15 +340,49 @@ pub fn run_with_env(
     })
 }
 
+/// Where a verb looks for its config: the `--config` override (command-
+/// level first, then root), the home directory, and the working directory
+/// `load_config` resolves relative paths against.
+#[derive(Clone, Copy)]
+struct CommandEnv<'a> {
+    config_path: Option<&'a Path>,
+    home: &'a Path,
+    cwd: &'a Path,
+}
+
+impl<'a> CommandEnv<'a> {
+    fn new(config_path: Option<&'a Path>, home: &'a Path, cwd: &'a Path) -> Self {
+        Self {
+            config_path,
+            home,
+            cwd,
+        }
+    }
+
+    /// A command-level `--config` wins over the root one.
+    fn with_override(self, command_config: Option<&'a Path>) -> Self {
+        Self {
+            config_path: command_config.or(self.config_path),
+            ..self
+        }
+    }
+
+    fn load(&self) -> Result<Config> {
+        load_config(self.config_path, Some(self.home), self.cwd)
+    }
+
+    fn config_file(&self) -> PathBuf {
+        selected_config_path(self.config_path, Some(self.home), self.cwd)
+    }
+}
+
 fn serve(
-    config_path: Option<&Path>,
+    env: CommandEnv<'_>,
     host: Option<String>,
     port: Option<u16>,
-    home: &Path,
-    cwd: &Path,
     runtime: &mut impl CliRuntime,
 ) -> Result<()> {
-    let mut config = load_config(config_path, Some(home), cwd)?;
+    let mut config = env.load()?;
     if let Some(host) = host {
         config.host = host;
     }
@@ -384,14 +393,12 @@ fn serve(
 }
 
 fn status(
-    config_path: Option<&Path>,
-    home: &Path,
-    cwd: &Path,
+    env: CommandEnv<'_>,
     runtime: &mut impl CliRuntime,
     output: &mut Output,
     style: Style,
 ) -> Result<()> {
-    let config = load_config(config_path, Some(home), cwd)?;
+    let config = env.load()?;
     let base_url = base_url(&config);
     let health = runtime.health(&base_url)?;
     let server = health
@@ -400,10 +407,7 @@ fn status(
         .unwrap_or("unknown")
         .to_string();
     let connection = [
-        format!(
-            "config {}",
-            selected_config_path(config_path, Some(home), cwd).display()
-        ),
+        format!("config {}", env.config_file().display()),
         format!("url {base_url} \u{2014} server {server}"),
     ];
     let accounts = runtime.accounts(&base_url, &first_api_key(&config)?)?;
@@ -422,15 +426,13 @@ fn status(
 }
 
 fn accounts(
-    config_path: Option<&Path>,
+    env: CommandEnv<'_>,
     reload: bool,
-    home: &Path,
-    cwd: &Path,
     runtime: &mut impl CliRuntime,
     output: &mut Output,
     style: Style,
 ) -> Result<()> {
-    let config = load_config(config_path, Some(home), cwd)?;
+    let config = env.load()?;
     let base_url = base_url(&config);
     let api_key = first_api_key(&config)?;
     if reload {
@@ -448,13 +450,11 @@ fn accounts(
 
 fn config_command(
     command: ConfigCommand,
-    config_path: Option<&Path>,
-    home: &Path,
-    cwd: &Path,
+    env: CommandEnv<'_>,
     output: &mut Output,
     style: Style,
 ) -> Result<()> {
-    let path = selected_config_path(config_path, Some(home), cwd);
+    let path = env.config_file();
     match command {
         ConfigCommand::Path => match style {
             Style::Plain => output.line(&path.display().to_string()),
@@ -471,7 +471,7 @@ fn config_command(
             }
         },
         ConfigCommand::ApiKey => {
-            let config = load_config(config_path, Some(home), cwd)?;
+            let config = env.load()?;
             let key = first_api_key(&config)?;
             match style {
                 Style::Plain => output.line(&key),
@@ -486,7 +486,7 @@ fn config_command(
         ConfigCommand::Show => {
             // Generates the config when absent, so `show` works on a fresh
             // install like every other config subcommand.
-            load_config(config_path, Some(home), cwd)?;
+            env.load()?;
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("failed to read {}", path.display()))?;
             output.line(text.trim_end());
@@ -736,18 +736,15 @@ fn update(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn login(
-    config_path: Option<&Path>,
+    env: CommandEnv<'_>,
     provider: &str,
     key: Option<&str>,
-    home: &Path,
-    cwd: &Path,
     runtime: &mut impl CliRuntime,
     output: &mut Output,
     style: Style,
 ) -> Result<()> {
-    let config = load_config(config_path, Some(home), cwd)?;
+    let config = env.load()?;
     // anthropic and codex are always valid; anything else must name a configured
     // provider, and only a configured provider may carry a key.
     if let Ok(builtin) = provider.parse::<ProviderId>() {
