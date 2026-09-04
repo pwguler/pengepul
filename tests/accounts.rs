@@ -1,9 +1,11 @@
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use pengepul::accounts::{AccountManager, RefreshPolicy, RefreshPolicyKind};
-use pengepul::types::{RefreshTokenExhaustedError, TokenData};
-use serde_json::json;
+use pengepul::tokens::save_token;
+use pengepul::types::{ProviderId, RefreshTokenExhaustedError, TokenData, UsageData};
+use serde_json::{Value, json};
 use tempfile::tempdir;
 
 #[tokio::test]
@@ -160,4 +162,143 @@ async fn failure_cooldown_doubles_from_one_second() {
             "failure expected ~{expected}s cooldown, got {remaining}s"
         );
     }
+}
+
+fn static_token(email: &str) -> TokenData {
+    TokenData {
+        access_token: format!("access-{email}"),
+        refresh_token: String::new(),
+        email: email.to_string(),
+        expires_at: "2030-01-01T00:00:00Z".to_string(),
+        account_uuid: format!("acct-{email}"),
+        provider: ProviderId::generic("commandcode"),
+        id_token: None,
+        last_refresh_at: None,
+        plan_type: None,
+    }
+}
+
+fn never_refresh_manager(auth_dir: PathBuf) -> AccountManager {
+    AccountManager::new(
+        auth_dir,
+        ProviderId::generic("commandcode"),
+        |_refresh_token| {
+            Box::pin(async { Err(anyhow::anyhow!("refresh must never run for static keys")) })
+        },
+        RefreshPolicy {
+            kind: RefreshPolicyKind::Never,
+            seconds: 0,
+        },
+    )
+}
+
+fn persisted(path: &Path) -> Value {
+    serde_json::from_str(&fs::read_to_string(path).expect("read usage.json"))
+        .expect("parse usage.json")
+}
+
+#[tokio::test]
+async fn usage_counters_survive_a_manager_rebuild() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+
+    manager.record_attempt("k@example.com");
+    manager.record_attempt("k@example.com");
+    manager.record_success(
+        "k@example.com",
+        Some(&UsageData {
+            input_tokens: 33,
+            output_tokens: 120,
+            cache_creation_input_tokens: 7,
+            cache_read_input_tokens: 4,
+            reasoning_output_tokens: 13,
+        }),
+    );
+    manager.record_failure("k@example.com", "upstream", Some("boom"));
+
+    // AC-1..AC-3: a fresh manager over the same auth dir sees the totals.
+    let mut rebuilt = never_refresh_manager(tmp.path().to_path_buf());
+    rebuilt.load().expect("reload");
+    let snapshot = &rebuilt.snapshots()[0];
+    assert_eq!(snapshot["totalRequests"], 2);
+    assert_eq!(snapshot["totalSuccesses"], 1);
+    assert_eq!(snapshot["totalFailures"], 1);
+    assert_eq!(snapshot["totalInputTokens"], 33);
+    assert_eq!(snapshot["totalOutputTokens"], 120);
+    assert_eq!(snapshot["totalCacheCreationInputTokens"], 7);
+    assert_eq!(snapshot["totalCacheReadInputTokens"], 4);
+    assert_eq!(snapshot["totalReasoningOutputTokens"], 13);
+    // AC-2: the failure wall itself is not persisted — fresh process retries.
+    assert_eq!(snapshot["available"], true);
+}
+
+#[tokio::test]
+async fn usage_file_lies_per_provider_and_ignores_strangers() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    // AC-4: a usage.json entry for an email with no token is ignored...
+    let provider_dir = tmp.path().join("commandcode");
+    fs::create_dir_all(&provider_dir).expect("provider dir");
+    let usage_path = provider_dir.join("usage.json");
+    fs::write(
+        &usage_path,
+        json!({
+            "k@example.com": {"total_requests": 5, "total_input_tokens": 50},
+            "ghost@example.com": {"total_requests": 99}
+        })
+        .to_string(),
+    )
+    .expect("write usage");
+
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    let snapshot = &manager.snapshots()[0];
+    assert_eq!(snapshot["totalRequests"], 5);
+    assert_eq!(snapshot["totalInputTokens"], 50);
+    assert!(manager.account("ghost@example.com").is_none());
+
+    // ...and the next write drops the stranger instead of keeping it.
+    manager.record_attempt("k@example.com");
+    let stored = persisted(&usage_path);
+    assert!(stored.get("ghost@example.com").is_none());
+}
+
+#[tokio::test]
+async fn corrupted_usage_file_starts_from_zero() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let provider_dir = tmp.path().join("commandcode");
+    fs::create_dir_all(&provider_dir).expect("provider dir");
+    fs::write(provider_dir.join("usage.json"), "{not json").expect("write junk");
+
+    // AC-5: permissive load, zeros, and startup is not broken.
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load survives corruption");
+    let snapshot = &manager.snapshots()[0];
+    assert_eq!(snapshot["totalRequests"], 0);
+
+    // The next write replaces the junk with valid JSON.
+    manager.record_attempt("k@example.com");
+    assert_eq!(
+        persisted(&provider_dir.join("usage.json"))["k@example.com"]["total_requests"],
+        1
+    );
+}
+
+#[tokio::test]
+async fn token_refresh_keeps_the_counters() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    manager.record_attempt("k@example.com");
+    manager.record_success("k@example.com", None);
+    assert_eq!(manager.snapshots()[0]["totalRequests"], 1);
+
+    // Spec: token rotation must not reset usage counters.
+    manager.reload().expect("reload");
+    assert_eq!(manager.snapshots()[0]["totalRequests"], 1);
+    assert_eq!(manager.snapshots()[0]["totalSuccesses"], 1);
 }

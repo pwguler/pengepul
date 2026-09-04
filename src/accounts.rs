@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use crate::tokens::{load_all_tokens, save_token};
+use crate::tokens::{load_all_tokens, save_token, set_mode};
 use crate::types::{
     AvailableAccount, ProviderId, ProviderKind, RefreshTokenExhaustedError, TokenData, UsageData,
 };
@@ -98,6 +98,107 @@ impl AccountState {
     }
 }
 
+/// The on-disk usage counters for one account. Only the running totals
+/// persist; cooldown walls and failure streaks stay in-memory so a fresh
+/// process always gets a clean retry.
+#[derive(Debug, Default, Clone)]
+struct PersistedUsage {
+    requests: i64,
+    successes: i64,
+    failures: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_creation_input_tokens: i64,
+    cache_read_input_tokens: i64,
+    reasoning_output_tokens: i64,
+}
+
+impl From<&AccountState> for PersistedUsage {
+    fn from(state: &AccountState) -> Self {
+        Self {
+            requests: state.total_requests,
+            successes: state.total_successes,
+            failures: state.total_failures,
+            input_tokens: state.total_input_tokens,
+            output_tokens: state.total_output_tokens,
+            cache_creation_input_tokens: state.total_cache_creation_input_tokens,
+            cache_read_input_tokens: state.total_cache_read_input_tokens,
+            reasoning_output_tokens: state.total_reasoning_output_tokens,
+        }
+    }
+}
+
+/// Path of a provider's usage file: `~/.pengepul/<provider>/usage.json`.
+fn usage_path(auth_dir: &Path, provider: &ProviderId) -> PathBuf {
+    auth_dir.join(provider.storage_dir()).join("usage.json")
+}
+
+/// Read a provider's usage file. A missing or corrupted file yields an
+/// empty map: usage is observability, never worth failing a startup over.
+fn read_persisted_usage(path: &Path) -> BTreeMap<String, PersistedUsage> {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return BTreeMap::new();
+    };
+    let Ok(Value::Object(entries)) = serde_json::from_str::<Value>(&raw) else {
+        return BTreeMap::new();
+    };
+    entries
+        .into_iter()
+        .filter_map(|(email, entry)| {
+            let usage = parse_persisted_usage(&entry)?;
+            Some((email, usage))
+        })
+        .collect()
+}
+
+fn parse_persisted_usage(entry: &Value) -> Option<PersistedUsage> {
+    let object = entry.as_object()?;
+    let field = |key: &str| object.get(key).and_then(Value::as_i64).unwrap_or(0);
+    Some(PersistedUsage {
+        requests: field("total_requests"),
+        successes: field("total_successes"),
+        failures: field("total_failures"),
+        input_tokens: field("total_input_tokens"),
+        output_tokens: field("total_output_tokens"),
+        cache_creation_input_tokens: field("total_cache_creation_input_tokens"),
+        cache_read_input_tokens: field("total_cache_read_input_tokens"),
+        reasoning_output_tokens: field("total_reasoning_output_tokens"),
+    })
+}
+
+/// Atomically write the usage file: temp file + rename, so a crash mid-
+/// write can never leave a truncated `usage.json`.
+fn write_persisted_usage(path: &Path, usage: &BTreeMap<String, PersistedUsage>) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+        set_mode(dir, 0o700)?;
+    }
+    let mut entries = serde_json::Map::new();
+    for (email, usage) in usage {
+        entries.insert(
+            email.clone(),
+            json!({
+                "total_requests": usage.requests,
+                "total_successes": usage.successes,
+                "total_failures": usage.failures,
+                "total_input_tokens": usage.input_tokens,
+                "total_output_tokens": usage.output_tokens,
+                "total_cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                "total_cache_read_input_tokens": usage.cache_read_input_tokens,
+                "total_reasoning_output_tokens": usage.reasoning_output_tokens,
+            }),
+        );
+    }
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, serde_json::to_string_pretty(&json!(entries))?)
+        .with_context(|| format!("failed to write {}", temp.display()))?;
+    std::fs::rename(&temp, path)
+        .with_context(|| format!("failed to move {} into place", temp.display()))?;
+    set_mode(path, 0o600)?;
+    Ok(())
+}
+
 pub struct AccountManager {
     auth_dir: PathBuf,
     provider: ProviderId,
@@ -106,6 +207,9 @@ pub struct AccountManager {
     accounts: BTreeMap<String, AccountState>,
     order: Vec<String>,
     last_used_index: Option<usize>,
+    /// Usage counters read from disk at load time, kept current so every
+    /// write is a full-file snapshot. Entries survive account reloads.
+    persisted_usage: BTreeMap<String, PersistedUsage>,
 }
 
 impl AccountManager {
@@ -124,6 +228,7 @@ impl AccountManager {
             accounts: BTreeMap::new(),
             order: Vec::new(),
             last_used_index: None,
+            persisted_usage: BTreeMap::new(),
         }
     }
 
@@ -138,6 +243,7 @@ impl AccountManager {
     ///
     /// Returns an error when the auth directory exists but cannot be read.
     pub fn load(&mut self) -> Result<()> {
+        self.persisted_usage = read_persisted_usage(&usage_path(&self.auth_dir, &self.provider));
         for token in load_all_tokens(&self.auth_dir, Some(&self.provider))? {
             self.upsert_loaded_token(token);
         }
@@ -268,11 +374,13 @@ impl AccountManager {
             state.total_cache_read_input_tokens += usage.cache_read_input_tokens;
             state.total_reasoning_output_tokens += usage.reasoning_output_tokens;
         }
+        self.persist_usage();
     }
 
     pub fn record_attempt(&mut self, email: &str) {
         if let Some(state) = self.accounts.get_mut(email) {
             state.total_requests += 1;
+            self.persist_usage();
         }
     }
 
@@ -293,6 +401,7 @@ impl AccountManager {
         };
         let multiplier = 2_f64.powi(i32::try_from(state.failure_count - 1).unwrap_or(0));
         state.cooldown_until = unix_now() + (base * multiplier).min(maximum);
+        self.persist_usage();
     }
 
     pub fn record_refresh_exhausted(&mut self, email: &str, reason: &str) {
@@ -308,6 +417,7 @@ impl AccountManager {
             self.provider
         ));
         state.cooldown_until = unix_now() + REAUTH_COOLDOWN_SECONDS;
+        self.persist_usage();
     }
 
     #[must_use]
@@ -424,6 +534,23 @@ impl AccountManager {
         }
     }
 
+    /// Snapshot every account's counters to `usage.json`. Write failures
+    /// are swallowed: losing an increment of observability must never
+    /// fail the request that produced it.
+    fn persist_usage(&self) {
+        // Only loaded accounts are written: entries in the file for
+        // unknown emails are dropped rather than carried forever.
+        let usage: BTreeMap<String, PersistedUsage> = self
+            .accounts
+            .iter()
+            .map(|(email, state)| (email.clone(), PersistedUsage::from(state)))
+            .collect();
+        let path = usage_path(&self.auth_dir, &self.provider);
+        // Write failures are swallowed: losing an increment of
+        // observability must never fail the request that produced it.
+        let _ = write_persisted_usage(&path, &usage);
+    }
+
     fn upsert_loaded_token(&mut self, token: TokenData) {
         let email = token.email.clone();
         if self.accounts.contains_key(&email) {
@@ -432,8 +559,19 @@ impl AccountManager {
                 .expect("account exists after contains_key")
                 .token = token;
         } else {
+            let mut state = AccountState::new(token);
+            if let Some(usage) = self.persisted_usage.get(&email) {
+                state.total_requests = usage.requests;
+                state.total_successes = usage.successes;
+                state.total_failures = usage.failures;
+                state.total_input_tokens = usage.input_tokens;
+                state.total_output_tokens = usage.output_tokens;
+                state.total_cache_creation_input_tokens = usage.cache_creation_input_tokens;
+                state.total_cache_read_input_tokens = usage.cache_read_input_tokens;
+                state.total_reasoning_output_tokens = usage.reasoning_output_tokens;
+            }
             self.order.push(email.clone());
-            self.accounts.insert(email, AccountState::new(token));
+            self.accounts.insert(email, state);
         }
     }
 
