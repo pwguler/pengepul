@@ -757,8 +757,8 @@ fn print_pool_inner(payload: &Value, output: &mut Output) {
             .and_then(Value::as_i64)
             .unwrap_or(0);
         let suffix = if count == 1 { "account" } else { "accounts" };
+        // An empty pool says nothing the relay total block doesn't; skip it.
         if accounts.is_empty() {
-            output.line(&format!("{provider_id}: {count} {suffix}"));
             continue;
         }
         if first {
@@ -807,11 +807,10 @@ fn print_pool_inner(payload: &Value, output: &mut Output) {
             format_exact(totals.failures)
         ));
         output.line(&format!(
-            "  tokens in {}  out {}  cache-read {}  cache-write {}  reasoning {}",
+            "  tokens in {}  out {}  cache {}  reasoning {}",
             format_count(totals.input),
             format_count(totals.output),
-            format_count(totals.cache_read),
-            format_count(totals.cache_write),
+            format_count(totals.cache_read + totals.cache_write),
             format_count(totals.reasoning)
         ));
     }
@@ -862,13 +861,15 @@ fn print_accounts(payload: &Value, output: &mut Output) {
             output.line(&line);
             let reasoning = i64_field(account, "totalReasoningOutputTokens");
             let mut detail = format!(
-                "    requests {} ({} ok) in {} out {} cache-read {} cache-write {}",
+                "    requests {} ({} ok) in {} out {} cache {}",
                 format_exact(i64_field(account, "totalRequests")),
                 format_exact(i64_field(account, "totalSuccesses")),
                 format_count(i64_field(account, "totalInputTokens")),
                 format_count(i64_field(account, "totalOutputTokens")),
-                format_count(i64_field(account, "totalCacheReadInputTokens")),
-                format_count(i64_field(account, "totalCacheCreationInputTokens")),
+                format_count(
+                    i64_field(account, "totalCacheReadInputTokens")
+                        + i64_field(account, "totalCacheCreationInputTokens")
+                ),
             );
             if reasoning != 0 {
                 write!(detail, " reasoning {}", format_count(reasoning))
@@ -1017,12 +1018,8 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, with_detail:
             .and_then(Value::as_i64)
             .unwrap_or(0);
         let suffix = if count == 1 { "account" } else { "accounts" };
+        // An empty pool says nothing the relay total block doesn't; skip it.
         if accounts.is_empty() {
-            output.line(&format!(
-                "{} {provider_id}: {count} {suffix} {}",
-                paint(DIM, "·"),
-                paint(DIM, "(no accounts loaded)")
-            ));
             continue;
         }
         let available = accounts
@@ -1210,17 +1207,19 @@ fn account_row(account: &Value, pool_total: i64, now: f64) -> String {
     .join(" ")
 }
 
-/// The dim per-account token lines shown under `accounts`: in/out/read/write,
+/// The dim per-account token lines shown under `accounts`: in/out/cache,
 /// plus a reasoning line only when that total is non-zero.
 fn account_detail_lines(account: &Value) -> Vec<String> {
     let mut lines = vec![paint(
         DIM,
         &format!(
-            "in {}  out {}  read {}  write {}",
+            "in {}  out {}  cache {}",
             format_count(i64_field(account, "totalInputTokens")),
             format_count(i64_field(account, "totalOutputTokens")),
-            format_count(i64_field(account, "totalCacheReadInputTokens")),
-            format_count(i64_field(account, "totalCacheCreationInputTokens")),
+            format_count(
+                i64_field(account, "totalCacheReadInputTokens")
+                    + i64_field(account, "totalCacheCreationInputTokens")
+            ),
         ),
     )];
     let reasoning = i64_field(account, "totalReasoningOutputTokens");
@@ -1242,11 +1241,10 @@ fn footer_lines(totals: &PoolTotals) -> Vec<String> {
         format_exact(totals.failures)
     )];
     lines.push(format!(
-        "tokens in {}  out {}  read {}  write {}",
+        "tokens in {}  out {}  cache {}",
         paint(BOLD, &format_count(totals.input)),
         paint(BOLD, &format_count(totals.output)),
-        format_count(totals.cache_read),
-        format_count(totals.cache_write),
+        format_count(totals.cache_read + totals.cache_write),
     ));
     // Reasoning totals get their own line only when non-zero; one row
     // for all five fields cannot fit the fixed width.

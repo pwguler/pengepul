@@ -260,7 +260,8 @@ fn status_reports_health_and_account_counts() {
     assert!(outcome.stdout.contains("url: http://127.0.0.1:8318"));
     assert!(outcome.stdout.contains("server: ok"));
     assert!(outcome.stdout.contains("anthropic: 1 account"));
-    assert!(outcome.stdout.contains("codex: 2 accounts"));
+    // Empty pools are hidden (AC-7, revised): codex has no loaded accounts.
+    assert!(!outcome.stdout.contains("codex:"));
     assert_eq!(runtime.health_url.as_deref(), Some("http://127.0.0.1:8318"));
     assert_eq!(runtime.accounts_api_key.as_deref(), Some("sk-test"));
 }
@@ -378,21 +379,22 @@ fn status_rolls_up_pool_health_and_token_totals_per_provider() {
             .stdout
             .contains("requests 1,204  (1,198 ok, 6 failed)")
     );
-    assert!(outcome.stdout.contains(
-        "tokens in 45.2M  out 812.3K  cache-read 311.7M  cache-write 12.4M  reasoning 96.0K"
-    ));
+    assert!(
+        outcome
+            .stdout
+            .contains("tokens in 45.2M  out 812.3K  cache 324.1M  reasoning 96.0K")
+    );
     // A provider whose account omits every total rolls up as zeros (AC-4).
     assert!(outcome.stdout.contains("groq: 1 account (1 available)"));
     assert!(outcome.stdout.contains("requests 0  (0 ok, 0 failed)"));
     assert!(
         outcome
             .stdout
-            .contains("tokens in 0  out 0  cache-read 0  cache-write 0  reasoning 0")
+            .contains("tokens in 0  out 0  cache 0  reasoning 0")
     );
-    // An empty pool prints only its bare header line, no rollup (AC-7).
-    assert!(outcome.stdout.contains("deepseek: 0 accounts\n"));
-    assert!(!outcome.stdout.contains("deepseek: 0 accounts ("));
-    assert!(!outcome.stdout.contains("deepseek: 0 accounts\n  requests"));
+    // An empty pool is hidden entirely, not even a bare header (AC-7,
+    // revised: the user asked for empty pools not to be shown).
+    assert!(!outcome.stdout.contains("deepseek"));
     // Each rollup block opens on its own line after a blank one (AC-1).
     assert!(
         outcome
@@ -468,9 +470,9 @@ fn status_renders_panels_on_a_tty() {
     assert!(visible.contains("requests 640"));
     assert!(visible.contains("tokens in 22.1M"));
     assert!(visible.contains("reasoning 64.0K"));
-    // Empty pool is a one-line note, not a broken box (AC-3).
-    assert!(visible.contains("deepseek"));
-    assert!(!visible.contains("pool: deepseek"));
+    // Empty pool is hidden entirely, not a note and not a box (AC-3,
+    // revised: the user asked for empty pools not to be shown).
+    assert!(!visible.contains("deepseek"));
     // Every panel line fits the fixed width, ANSI excluded (AC-3/AC-7).
     for line in visible.lines() {
         assert!(line.chars().count() <= 64, "panel line too wide: {line}");
@@ -525,10 +527,10 @@ fn accounts_renders_panels_with_detail_lines_on_a_tty() {
     assert!(visible.contains("● unresponsive"));
     // Per-account detail lines beneath each row (AC-6); reasoning gets its
     // own line because five fields cannot fit the fixed width.
-    assert!(visible.contains("in 22.1M  out 401.2K  read 155.0M  write 6.0M"));
+    assert!(visible.contains("in 22.1M  out 401.2K  cache 161.0M"));
     assert!(visible.contains("reasoning 64.0K"));
     // The no-reasoning account omits the reasoning line (AC-6).
-    assert!(visible.contains("in 0  out 0  read 0  write 0"));
+    assert!(visible.contains("in 0  out 0  cache 0"));
     assert!(!visible.contains("reasoning 0"));
 }
 
@@ -610,10 +612,12 @@ fn accounts_detail_prints_usage_and_cooldown_per_account() {
     assert!(stdout.contains("  c@x.com unavailable failures=5\n"));
     // Detail line under each account: requests (ok) plus token totals;
     // reasoning prints only when non-zero (AC-5).
-    assert!(stdout.contains(
-        "    requests 640 (638 ok) in 22.1M out 401.2K cache-read 155.0M cache-write 6.0M reasoning 64.0K\n"
-    ));
-    assert!(stdout.contains("    requests 0 (0 ok) in 0 out 0 cache-read 0 cache-write 0\n"));
+    assert!(
+        stdout.contains(
+            "    requests 640 (638 ok) in 22.1M out 401.2K cache 161.0M reasoning 64.0K\n"
+        )
+    );
+    assert!(stdout.contains("    requests 0 (0 ok) in 0 out 0 cache 0\n"));
     assert!(!stdout.contains("reasoning 0"));
 }
 
