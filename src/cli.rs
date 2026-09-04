@@ -556,24 +556,28 @@ fn service_command(
                     }
                 }
             },
-            // Not installed (or the tool failed): the panel turns it into
-            // an amber row instead of failing the render; plain keeps the
-            // error so scripts see the failure.
-            Err(error) => match style {
-                Style::Plain => return Err(error),
-                Style::Rich => {
-                    for line in action_panel(
-                        "service",
-                        &[format!(
-                            "{} not installed  {}",
-                            status_glyph(ActionGlyph::Attention),
-                            paint(DIM, "run pengepul service install")
-                        )],
-                    ) {
-                        output.line(&line);
+            // Not installed: the panel turns it into an amber row instead of
+            // failing the render; plain keeps the error so scripts see it.
+            // Any other failure (tool missing, permission) stays an error
+            // in both styles — a panel claiming "not installed" would lie.
+            Err(error) => {
+                let not_installed = error.to_string().contains("no service installed");
+                match style {
+                    Style::Rich if not_installed => {
+                        for line in action_panel(
+                            "service",
+                            &[format!(
+                                "{} not installed  {}",
+                                status_glyph(ActionGlyph::Attention),
+                                paint(DIM, "run pengepul service install")
+                            )],
+                        ) {
+                            output.line(&line);
+                        }
                     }
+                    Style::Rich | Style::Plain => return Err(error),
                 }
-            },
+            }
         },
         ServiceCommand::Uninstall => {
             let path = runtime.uninstall_service()?;
@@ -617,10 +621,10 @@ fn service_status_panel(text: &str) -> Vec<String> {
                     let active = fields.next().unwrap_or(value).trim();
                     state = Some(active.to_string());
                     if let Some((_, ago)) = fields.next().and_then(|rest| rest.split_once("; ")) {
-                        since = Some(
-                            cooldown_label(0.0, parse_relative_seconds(ago))
-                                .replace("on cooldown ", ""),
-                        );
+                        let elapsed = parse_relative_seconds(ago);
+                        if elapsed > 0.0 {
+                            since = Some(format_duration(elapsed));
+                        }
                     }
                 }
                 "Loaded" => {
@@ -646,7 +650,8 @@ fn service_status_panel(text: &str) -> Vec<String> {
     }
 
     let state_text = state.clone().unwrap_or_else(|| "unknown".to_string());
-    let glyph = if state_text.starts_with("active") || state_text == "running" {
+    let active = state_text.starts_with("active") || state_text == "running";
+    let glyph = if active {
         status_glyph(ActionGlyph::Ok)
     } else {
         status_glyph(ActionGlyph::Attention)
@@ -655,7 +660,9 @@ fn service_status_panel(text: &str) -> Vec<String> {
     if let Some(enabled) = enabled {
         rows.push(enabled);
     }
-    if let Some(pid) = pid {
+    // systemd keeps printing the last Main PID of a dead unit
+    // (`code=killed`); a pid row for a stopped service would mislead.
+    if let (Some(pid), true) = (pid, active) {
         rows.push(format!("pid  {pid}"));
     }
     if let Some(memory) = memory {
@@ -665,35 +672,79 @@ fn service_status_panel(text: &str) -> Vec<String> {
         rows.push(format!("cpu  {cpu}"));
     }
     if let Some(since) = since {
-        rows.push(format!("uptime  {since}"));
+        // The same "since" reads as uptime for a running unit and as
+        // downtime for a stopped one.
+        rows.push(if active {
+            format!("uptime  {since}")
+        } else {
+            format!("stopped  {since} ago")
+        });
     }
     action_panel("service", &rows)
 }
 
-/// Parse a human "4min 28s ago" / "1h2m ago" duration into seconds for
-/// the shared relative-time label. Unparsable text yields 0 ("now").
+/// Parse systemd's relative time ("4min 28s ago", "3 days ago",
+/// "1 day 5h ago", "2 weeks 1 day ago", "500ms ago") into seconds. Units
+/// may sit against the number or in the next word. Unknown units drop
+/// their number; unparsable text yields 0.
 fn parse_relative_seconds(text: &str) -> f64 {
     let mut seconds = 0.0;
-    let mut number = String::new();
-    for character in text.chars() {
-        if character.is_ascii_digit() || character == '.' {
-            number.push(character);
+    let mut pending: Option<f64> = None;
+    for token in text.split_whitespace() {
+        let digits: String = token
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        let unit = &token[digits.len()..];
+        if digits.is_empty() {
+            if let Some(value) = pending.take() {
+                seconds += value * unit_seconds(unit);
+            }
             continue;
         }
-        if !number.is_empty() {
-            let value: f64 = number.parse().unwrap_or(0.0);
-            number.clear();
-            seconds += match character {
-                's' => value,
-                'm' => value * 60.0,
-                'h' => value * 3600.0,
-                'd' => value * 86_400.0,
-                'w' => value * 604_800.0,
-                _ => 0.0,
-            };
+        let value: f64 = digits.parse().unwrap_or(0.0);
+        if unit.is_empty() {
+            pending = Some(value);
+        } else {
+            seconds += value * unit_seconds(unit);
         }
     }
     seconds
+}
+
+/// Seconds per unit word, singular or plural; sub-second units and
+/// unknown words contribute nothing.
+fn unit_seconds(unit: &str) -> f64 {
+    match unit.trim_end_matches([',', ';']) {
+        "s" | "sec" | "second" | "seconds" => 1.0,
+        "min" | "minute" | "minutes" | "m" => 60.0,
+        "h" | "hour" | "hours" => 3600.0,
+        "d" | "day" | "days" => 86_400.0,
+        "w" | "week" | "weeks" => 604_800.0,
+        "month" | "months" => 30.0 * 86_400.0,
+        "y" | "year" | "years" => 365.0 * 86_400.0,
+        _ => 0.0,
+    }
+}
+
+/// `1h2m` / `4m28s` / `59s` / `3d4h` for a duration: the same rounding
+/// down the cooldown label uses, without borrowing its wording.
+fn format_duration(seconds: f64) -> String {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let total = seconds.max(0.0).floor() as u64;
+    let days = total / 86_400;
+    let hours = (total % 86_400) / 3600;
+    let minutes = (total % 3600) / 60;
+    let secs = total % 60;
+    if days > 0 {
+        format!("{days}d{hours}h")
+    } else if hours > 0 {
+        format!("{hours}h{minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m{secs}s")
+    } else {
+        format!("{secs}s")
+    }
 }
 
 /// Print an install/uninstall outcome whose detail carries a path.
@@ -1494,7 +1545,7 @@ fn action_panel(subject: &str, rows: &[String]) -> Vec<String> {
     lines
 }
 
-/// A status glyph with its color: green success, amber attention, red failure.
+/// A status glyph with its color: green success, amber attention.
 fn status_glyph(kind: ActionGlyph) -> String {
     match kind {
         ActionGlyph::Ok => paint(GREEN, "●"),
@@ -1704,7 +1755,8 @@ impl Output {
 #[cfg(test)]
 mod tests {
     use super::{
-        Style, cooldown_label, format_count, format_exact, pad, paint, share_bar, strip_ansi,
+        Style, cooldown_label, format_count, format_duration, format_exact, pad, paint,
+        parse_relative_seconds, share_bar, strip_ansi,
     };
     use std::ffi::OsStr;
 
@@ -1729,6 +1781,29 @@ mod tests {
             Style::from_tty(true, None, Some(OsStr::new("xterm-256color"))),
             Style::Rich
         );
+    }
+
+    #[test]
+    fn relative_seconds_reads_every_systemd_shape() {
+        // Whole seconds: compare through the exact-integer formatter.
+        let seconds = |text: &str| format_duration(parse_relative_seconds(text));
+        assert_eq!(seconds("4min 28s ago"), "4m28s");
+        assert_eq!(seconds("3 days ago"), "3d0h");
+        assert_eq!(seconds("1 day 5h ago"), "1d5h");
+        assert_eq!(seconds("2 weeks 1 day ago"), "15d0h");
+        assert_eq!(seconds("1 month 3 days ago"), "33d0h");
+        // Sub-second units never masquerade as minutes.
+        assert_eq!(seconds("500ms ago"), "0s");
+        assert_eq!(seconds("nonsense"), "0s");
+    }
+
+    #[test]
+    fn duration_formats_by_magnitude() {
+        assert_eq!(format_duration(59.0), "59s");
+        assert_eq!(format_duration(268.0), "4m28s");
+        assert_eq!(format_duration(3_661.0), "1h1m");
+        assert_eq!(format_duration(104_400.0), "1d5h");
+        assert_eq!(format_duration(2_592_000.0), "30d0h");
     }
 
     #[test]

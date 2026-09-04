@@ -87,3 +87,22 @@ script -qec "./target/debug/pengepul service restart" /dev/null | cat -v   # AC-
 ./target/debug/pengepul service restart                                    # AC-1 plain bytes
 script -qec "./target/debug/pengepul status" /dev/null | tail -6           # AC-7
 ```
+
+## Revisions (recorded at implementation)
+
+- AC-3, macOS: `launchctl print` exposes state and pid but no "enabled"
+  or "since" fact in a stable form; the macOS panel carries state and
+  pid only. Accepted deviation.
+- AC-4: only the "no service installed" error becomes the amber panel.
+  Any other failure (tool missing, permission) stays an error in both
+  styles — a panel claiming "not installed" would lie. On Linux the
+  runtime distinguishes systemctl exit 4 (unknown unit) from 3
+  (inactive/failed), so a stopped service renders its real state.
+- AC-8: dropping the header also drops the blank line that separated it
+  from the first pool in plain `status`; plain output now starts at the
+  first pool line. The blank between pools is unchanged.
+- AC-9: the relay total block is a rule, not a box; its bare lines
+  (`config <path>`, `url … — server …`) are not clipped to 64 columns.
+  Panel rows and rules still are.
+- `service status` shows a pid row only for an active unit: systemd
+  keeps printing the last Main PID of a dead unit.

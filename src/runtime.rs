@@ -426,13 +426,30 @@ fn control_platform_service(action: &str) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn platform_service_status() -> Result<String> {
-    command_output(&[
-        "systemctl",
-        "--user",
-        "status",
-        "--no-pager",
-        crate::service::SYSTEMD_UNIT_NAME,
-    ])
+    // `systemctl status` exits 3 for a unit that exists but is inactive or
+    // failed — still a real status worth showing — and 4 for a unit it
+    // does not know. Only the latter means "not installed".
+    let output = std::process::Command::new("systemctl")
+        .args([
+            "--user",
+            "status",
+            "--no-pager",
+            crate::service::SYSTEMD_UNIT_NAME,
+        ])
+        .output()
+        .context("failed to run systemctl")?;
+    if output.status.code() == Some(4) {
+        bail!("no service installed; run `pengepul service install`");
+    }
+    let stdout = String::from_utf8(output.stdout).context("command stdout was not UTF-8")?;
+    if stdout.trim().is_empty() {
+        let stderr = String::from_utf8(output.stderr).context("command stderr was not UTF-8")?;
+        if !output.status.success() {
+            bail!("systemctl exited with {}: {}", output.status, stderr.trim());
+        }
+        return Ok(stderr.trim_end().to_string());
+    }
+    Ok(stdout.trim_end().to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -631,6 +648,7 @@ fn run_log_viewer(command: &[String]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn command_output(command: &[&str]) -> Result<String> {
     let Some((program, args)) = command.split_first() else {
         bail!("empty command");

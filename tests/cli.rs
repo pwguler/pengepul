@@ -1279,3 +1279,112 @@ fn status_moves_the_header_facts_into_the_relay_block() {
     assert!(body.contains("relay total:"));
     assert!(body.contains("url http://127.0.0.1:8318 \u{2014} server ok"));
 }
+
+#[test]
+fn service_status_renders_a_stopped_unit_without_claiming_not_installed() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime = FakeRuntime {
+        service_status_text: Some(
+            "○ pengepul.service - pengepul API relay\n     Loaded: loaded (/x/pengepul.service; enabled; preset: enabled)\n     Active: inactive (dead) since Sat 2026-09-05 04:09:31 WIB; 3 days ago\n"
+                .to_string(),
+        ),
+        ..FakeRuntime::default()
+    };
+
+    let rich = run_style(
+        &["service", "status"],
+        tmp.path(),
+        &mut runtime,
+        Style::Rich,
+    );
+
+    let visible = strip_ansi(&rich.stdout);
+    assert!(visible.contains("inactive (dead)"), "{visible}");
+    assert!(!visible.contains("not installed"));
+    assert!(visible.contains("stopped  3d0h ago"), "{visible}");
+    // Amber glyph on raw bytes for a non-active unit (AC-3 color contract).
+    assert!(rich.stdout.contains("\u{1b}[33m●"), "{}", rich.stdout);
+}
+
+#[test]
+fn service_status_other_errors_stay_errors_even_when_rich() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime = FakeRuntime {
+        service_status_error: Some("failed to run systemctl".to_string()),
+        ..FakeRuntime::default()
+    };
+
+    let rich = run_with_env(
+        &["service", "status"],
+        tmp.path(),
+        tmp.path(),
+        &mut runtime,
+        Style::Rich,
+    );
+
+    assert!(rich.is_err(), "a tool failure must not render as a panel");
+}
+
+#[test]
+fn action_panels_hold_the_width_and_paint_the_glyph() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "\n  commandcode:\n    base-url: https://api.commandcode.ai/v1",
+    );
+    let mut runtime = FakeRuntime {
+        latest_tag: Some("v99.0.0".to_string()),
+        ..FakeRuntime::default()
+    };
+
+    let login = run_style(
+        &["login", "--provider", "commandcode", "--key", "sk-secret"],
+        tmp.path(),
+        &mut runtime,
+        Style::Rich,
+    );
+    let update_check = run_style(
+        &["update", "--check"],
+        tmp.path(),
+        &mut runtime,
+        Style::Rich,
+    );
+    let update = run_style(&["update"], tmp.path(), &mut runtime, Style::Rich);
+    let config = run_style(
+        &["config", "api-key"],
+        tmp.path(),
+        &mut runtime,
+        Style::Rich,
+    );
+
+    for outcome in [&login, &update_check, &update, &config] {
+        for line in strip_ansi(&outcome.stdout).lines() {
+            assert_eq!(line.chars().count(), 64, "panel line: {line}");
+        }
+    }
+    // Green for saved/updated, amber for an available update (AC-2/AC-5).
+    assert!(login.stdout.contains("\u{1b}[32m●"));
+    assert!(update.stdout.contains("\u{1b}[32m●"));
+    assert!(update_check.stdout.contains("\u{1b}[33m●"));
+    assert!(strip_ansi(&update.stdout).contains("updated v99.0.0"));
+}
+
+#[test]
+fn update_plain_bytes_are_pinned() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime = FakeRuntime {
+        latest_tag: Some("v99.0.0".to_string()),
+        ..FakeRuntime::default()
+    };
+
+    let check = run(&["update", "--check"], tmp.path(), &mut runtime);
+    assert_eq!(
+        check.stdout,
+        "pengepul v99.0.0 is available (running 0.9.2); run `pengepul update` to install it\n"
+    );
+    let install = run(&["update"], tmp.path(), &mut runtime);
+    assert_eq!(
+        install.stdout,
+        "updated to v99.0.0 at /usr/local/bin/pengepul\n"
+    );
+}
