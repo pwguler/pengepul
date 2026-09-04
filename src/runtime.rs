@@ -71,6 +71,10 @@ impl CliRuntime for RealRuntime {
             .block_on(request_json(Method::Get, base_url, "/health", None))
     }
 
+    fn stdout_is_tty(&mut self) -> bool {
+        std::io::IsTerminal::is_terminal(&std::io::stdout())
+    }
+
     fn accounts(&mut self, base_url: &str, api_key: &str) -> Result<Value> {
         self.runtime.block_on(request_json(
             Method::Get,

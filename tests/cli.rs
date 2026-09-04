@@ -30,6 +30,7 @@ struct FakeRuntime {
     latest_tag: Option<String>,
     installed: Option<(String, String)>,
     accounts_payload: Option<Value>,
+    rich: bool,
 }
 
 impl CliRuntime for FakeRuntime {
@@ -77,6 +78,10 @@ impl CliRuntime for FakeRuntime {
                 "codex": {"account_count": 2, "accounts": []}
             }
         }))
+    }
+
+    fn stdout_is_tty(&mut self) -> bool {
+        self.rich
     }
 
     fn reload_accounts(&mut self, base_url: &str, api_key: &str) -> Result<Value> {

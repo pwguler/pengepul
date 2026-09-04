@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -47,6 +48,10 @@ pub trait CliRuntime {
     ///
     /// Returns an error if the admin request fails.
     fn accounts(&mut self, base_url: &str, api_key: &str) -> Result<Value>;
+
+    /// Whether stdout is a terminal, so the pool views may render panels.
+    /// Asked once at the edge; the CLI core only sees the answer.
+    fn stdout_is_tty(&mut self) -> bool;
 
     /// Reload runtime account state.
     ///
@@ -253,6 +258,11 @@ pub fn run_with_env(
     cwd: &Path,
     runtime: &mut impl CliRuntime,
 ) -> Result<RunOutcome> {
+    let style = Style::from_tty(
+        runtime.stdout_is_tty(),
+        std::env::var_os("NO_COLOR").as_deref(),
+        std::env::var_os("TERM").as_deref(),
+    );
     let mut raw = Vec::with_capacity(argv.len() + 1);
     raw.push("pengepul");
     raw.extend_from_slice(argv);
@@ -288,6 +298,7 @@ pub fn run_with_env(
                 cwd,
                 runtime,
                 &mut output,
+                style,
             )?;
         }
         Some(Command::Accounts {
@@ -301,6 +312,7 @@ pub fn run_with_env(
                 cwd,
                 runtime,
                 &mut output,
+                style,
             )?;
         }
         Some(Command::Config { command }) => {
@@ -366,6 +378,7 @@ fn status(
     cwd: &Path,
     runtime: &mut impl CliRuntime,
     output: &mut Output,
+    style: Style,
 ) -> Result<()> {
     let config = load_config(config_path, Some(home), cwd)?;
     let base_url = base_url(&config);
@@ -394,6 +407,7 @@ fn accounts(
     cwd: &Path,
     runtime: &mut impl CliRuntime,
     output: &mut Output,
+    style: Style,
 ) -> Result<()> {
     let config = load_config(config_path, Some(home), cwd)?;
     let base_url = base_url(&config);
@@ -611,6 +625,34 @@ fn help_text(topic: &[String]) -> Result<String> {
         Ok(text[index..].to_string())
     } else {
         Ok(text)
+    }
+}
+
+/// Whether the pool views render panels or plain text. Decided once at the
+/// edge from TTY and environment answers; the CLI core only sees the value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Style {
+    Rich,
+    Plain,
+}
+
+impl Style {
+    /// `Rich` needs a TTY and no color-suppression variable; anything else —
+    /// piped output, `NO_COLOR` set (even empty), `TERM=dumb` — is `Plain`.
+    /// Plain is the only non-Rich mode: there is no uncolored panel.
+    #[must_use]
+    pub fn from_tty(
+        is_tty: bool,
+        no_color: Option<&OsStr>,
+        term: Option<&OsStr>,
+    ) -> Self {
+        let no_color = no_color.is_some();
+        let dumb = term == Some(OsStr::new("dumb"));
+        if is_tty && !no_color && !dumb {
+            Self::Rich
+        } else {
+            Self::Plain
+        }
     }
 }
 
@@ -876,6 +918,14 @@ fn unix_now() -> f64 {
         .map_or(0.0, |duration| duration.as_secs_f64())
 }
 
+fn decide_style(
+    is_tty: bool,
+    no_color: Option<&OsStr>,
+    term: Option<&OsStr>,
+) -> Style {
+    Style::from_tty(is_tty, no_color, term)
+}
+
 #[derive(Default)]
 struct Output {
     stdout: String,
@@ -891,7 +941,30 @@ impl Output {
 
 #[cfg(test)]
 mod tests {
-    use super::{cooldown_label, format_count, format_exact};
+    use super::{Style, cooldown_label, decide_style, format_count, format_exact};
+    use std::ffi::OsStr;
+
+    #[test]
+    fn style_is_rich_only_on_a_color_tty() {
+        assert_eq!(decide_style(true, None, None), Style::Rich);
+        assert_eq!(decide_style(false, None, None), Style::Plain);
+        assert_eq!(
+            decide_style(true, Some(OsStr::new("1")), None),
+            Style::Plain
+        );
+        assert_eq!(
+            decide_style(true, Some(OsStr::new("")), None),
+            Style::Plain
+        );
+        assert_eq!(
+            decide_style(true, None, Some(OsStr::new("dumb"))),
+            Style::Plain
+        );
+        assert_eq!(
+            decide_style(true, None, Some(OsStr::new("xterm-256color"))),
+            Style::Rich
+        );
+    }
 
     #[test]
     fn cooldown_label_rounds_down_to_minutes_and_seconds() {
