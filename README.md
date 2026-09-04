@@ -205,3 +205,7 @@ account on upstream 401, 403, 429, 500 and 502-599. Failover never crosses provi
 request stays on the endpoint or subscription family it named. A failed account backs
 off up to 5 minutes; a dead refresh token locks it out for 24 hours until a fresh
 `pengepul login`.
+
+`pengepul status` shows each pool: accounts available and on cooldown, requests served,
+and token totals per account and summed. `pengepul accounts` lists the same totals per
+account. These numbers live in memory and reset when the relay restarts.
