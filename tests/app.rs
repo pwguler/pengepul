@@ -1381,6 +1381,57 @@ async fn chat_completions_route_streams_codex_usage_to_account_stats() {
 }
 
 #[tokio::test]
+async fn chat_completions_route_records_generic_stream_usage() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &groq_key_token()).expect("save groq key");
+    let upstream = Arc::new(GenericUpstream::default());
+    let app =
+        create_app_with_upstream(config_with_groq(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, _headers, body) = raw_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .body(Body::from(
+                json!({
+                    "model": "groq/llama-3.3-70b",
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "reply exactly: pong"}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert!(body.contains("data: [DONE]"));
+
+    let (status, body) = json_response(
+        app,
+        axum::http::Request::builder()
+            .method("GET")
+            .uri("/admin/accounts")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    let account = &body["providers"]["groq"]["accounts"][0];
+    assert_eq!(account["totalSuccesses"], 1);
+    // The fake upstream's final chunk carries usage before [DONE]; the
+    // relay must read it the way it reads the non-streamed body.
+    assert_eq!(account["totalInputTokens"], 21);
+    assert_eq!(account["totalOutputTokens"], 22);
+}
+
+#[tokio::test]
 async fn chat_route_preserves_responses_web_search_for_codex() {
     let tmp = tempfile::tempdir().expect("tempdir");
     save_token(
@@ -1576,6 +1627,9 @@ impl UpstreamClient for GenericUpstream {
                 body: Box::pin(futures_util::stream::iter([
                     Ok(Bytes::from_static(
                         b"data: {\"choices\":[{\"delta\":{\"content\":\"pong\"}}]}\n\n",
+                    )),
+                    Ok(Bytes::from_static(
+                        b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":21,\"completion_tokens\":22,\"prompt_tokens_details\":{\"cached_tokens\":4},\"completion_tokens_details\":{\"reasoning_tokens\":7}}}\n\n",
                     )),
                     Ok(Bytes::from_static(b"data: [DONE]\n\n")),
                 ])),

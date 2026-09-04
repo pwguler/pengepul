@@ -1994,8 +1994,31 @@ fn update_stream_usage(
     match provider.kind {
         ProviderKind::Anthropic => update_anthropic_stream_usage(event, &data, usage, completed),
         ProviderKind::Codex => update_codex_stream_usage(event, &data, usage, completed),
-        ProviderKind::Generic => {}
+        // A generic endpoint streams Chat Completions chunks; servers that
+        // opt into usage carry it on a late chunk (often the last before
+        // [DONE]) in the same shape as the non-streamed body.
+        ProviderKind::Generic => update_generic_stream_usage(&data, usage),
     }
+}
+
+fn update_generic_stream_usage(data: &Value, usage: &mut UsageData) {
+    let Some(next) = data.get("usage") else {
+        return;
+    };
+    // Chunks without usage (or with null fields) must not clobber what
+    // earlier chunks recorded.
+    usage.input_tokens = int_field_or(next, "prompt_tokens", usage.input_tokens);
+    usage.output_tokens = int_field_or(next, "completion_tokens", usage.output_tokens);
+    usage.cache_read_input_tokens = next
+        .get("prompt_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(usage.cache_read_input_tokens);
+    usage.reasoning_output_tokens = next
+        .get("completion_tokens_details")
+        .and_then(|details| details.get("reasoning_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(usage.reasoning_output_tokens);
 }
 
 fn update_anthropic_stream_usage(
@@ -2147,7 +2170,10 @@ fn transform_sse_event(
             | (ProviderKind::Codex, RequestRoute::Responses) => {
                 vec!["data: [DONE]\n\n".to_string()]
             }
-            _ => Vec::new(),
+            // Chat Completions clients — generic upstreams included — end
+            // their stream with [DONE]; dropping it hangs parsers that wait
+            // for the terminator.
+            _ => vec!["data: [DONE]\n\n".to_string()],
         };
     }
 
