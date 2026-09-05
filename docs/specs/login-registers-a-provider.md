@@ -138,6 +138,21 @@ Setiap kriteria butuh tes yang gagal ketika perbaikannya dibalik.
   huruf, angka, `.`, `-`, `_`, dengan `.` dan `..` ditolak by name.
   Ditemukan dengan menjalankan, bukan dengan membaca.
 
+- **`--key` kosong tidak lagi menyimpan apa pun.** Ini sudah ada di
+  `main`, bukan dibawa cabang ini: `login --provider groq --key ""`
+  menyimpan kredensial tanpa rahasia di dalamnya, yang lalu ikut rotasi
+  dan gagal di setiap request. Diperbaiki di sini karena penjaga fungsi
+  ini memang sudah milik cabang ini. AC-10 mengatakan jalur tanpa
+  `--base-url` identik dengan sebelumnya; ini satu-satunya perkecualian.
+- **Rollback hanya mengambil kembali yang dibuatnya sendiri.** Ketika
+  penulisan config gagal, kredensial yang baru ditulis dihapus. Versi
+  pertama menghapusnya tanpa syarat — dan karena label file adalah hash
+  dari key, mengulang perintah yang sama pada provider yang sudah hidup
+  menimpa file lamanya, lalu rollback menghapusnya. Perintah yang spec
+  sebut aman justru menghancurkan kredensial yang sudah ada sebelumnya.
+  Sekarang rollback hanya jalan untuk provider yang memang baru
+  didaftarkan perintah itu.
+
 ## Not yet specified
 
 - **Tabrakan id yang hanya beda huruf besar-kecil.** `providers:` adalah

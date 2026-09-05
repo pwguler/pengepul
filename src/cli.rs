@@ -890,6 +890,11 @@ fn login(
     // orphan token in the auth-dir, which is harmless because the
     // provider is still unconfigured. The other order leaves a registered
     // provider with no account (AC-9).
+    // Whether this command could have created the pool at all. The label
+    // is `key-<hash of the key>`, so re-running the same command
+    // overwrites the same filename: without this, a failed config write
+    // would roll back a credential that existed before the command ran.
+    let provider_is_new = !config.providers.contains_key(provider);
     let written = save_token(&config.auth_dir, &token)?;
     let mut registered = false;
     if let Some(base_url) = base_url {
@@ -901,19 +906,26 @@ fn login(
             // The token was written first so a refusal could never leave a
             // registered provider without an account. When the write
             // itself fails the mirror problem appears: a credential in a
-            // pool the config never gained, invisible to the operator. Take
-            // it back, and say so if that also fails.
-            if let Err(cleanup) = fs::remove_file(&written) {
-                return Err(error.context(format!(
-                    "left a credential at {} that could not be removed: {cleanup}",
-                    written.display()
-                )));
-            }
-            // And the directory it created, if this was the first key for
-            // an id that never became a provider. `remove_dir` refuses a
-            // non-empty one, so an existing pool is never touched.
-            if let Some(pool) = written.parent() {
-                let _ = fs::remove_dir(pool);
+            // pool the config never gained, invisible to the operator.
+            //
+            // Only for a provider this command was registering. Repeating
+            // the same command against a configured provider overwrites
+            // its existing credential file, and rolling that back would
+            // destroy a credential that predates the command — the
+            // opposite of the guarantee that repeating is safe (AC-4).
+            if provider_is_new {
+                if let Err(cleanup) = fs::remove_file(&written) {
+                    return Err(error.context(format!(
+                        "left a credential at {} that could not be removed: {cleanup}",
+                        written.display()
+                    )));
+                }
+                // And the directory, which this command also created.
+                // `remove_dir` refuses a non-empty one, so a pool that
+                // gained other keys meanwhile is left alone.
+                if let Some(pool) = written.parent() {
+                    let _ = fs::remove_dir(pool);
+                }
             }
             return Err(error);
         }

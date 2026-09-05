@@ -175,10 +175,24 @@ pub fn selected_config_path(
 /// when `base_url` is empty, or when `id` is already registered with a
 /// different `base-url`.
 pub fn register_provider(path: &Path, id: &str, base_url: &str) -> Result<()> {
+    // Read-modify-write on one shared file. Two registrations racing each
+    // other each read, insert, and write the whole file back, so the
+    // slower one silently drops the faster one's provider while both
+    // report success and both leave a credential on disk. Verified: eight
+    // concurrent registrations left eight pools and one provider.
+    //
+    // `create_new` is atomic in the OS, so it needs no dependency: the
+    // process that creates the lock owns the file until it removes it.
+    let lock_path = path.with_extension("lock");
+    let _lock = FileLock::acquire(&lock_path)?;
     // A trailing slash would make `{base_url}/chat/completions` a double
     // slash, which some hosts answer with a 404 that names nothing
     // (AC-5).
-    let base_url = base_url.trim().trim_end_matches('/');
+    // Trimmed on both sides of the slash strip: `"https://h/v1 /"` would
+    // otherwise be stored with a trailing space that `validate_providers`
+    // trims on load, so the stored form and the loaded form disagree and
+    // repeating the command refuses itself.
+    let base_url = base_url.trim().trim_end_matches('/').trim_end();
     if base_url.is_empty() {
         bail!("providers: {id} is missing base-url");
     }
@@ -277,6 +291,54 @@ pub fn load_config(
 /// The entry name becomes the provider id a client's model prefix must match, so
 /// it cannot collide with a built-in provider (anthropic, codex, or the claude
 /// spelling the glossary reserves) and cannot contain `/` (the prefix separator).
+/// Exclusive ownership of a config file for the length of a
+/// read-modify-write, released on drop however the write ends.
+struct FileLock {
+    path: PathBuf,
+}
+
+impl FileLock {
+    /// Take the lock, waiting briefly for a holder to finish.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the lock is still held after the wait, which
+    /// means another process is registering or one died holding it.
+    fn acquire(path: &Path) -> Result<Self> {
+        // Short and bounded: this guards a file write, not a network call.
+        for _ in 0..50 {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
+                Ok(_) => {
+                    return Ok(Self {
+                        path: path.to_path_buf(),
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(error) => {
+                    return Err(anyhow::Error::new(error)
+                        .context(format!("failed to lock {}", path.display())));
+                }
+            }
+        }
+        bail!(
+            "{} is locked by another pengepul; remove it if no other command is running",
+            path.display()
+        )
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 /// Reject a Provider id the registry cannot hold.
 ///
 /// A caller that writes anything keyed by the id — a credential
@@ -510,6 +572,45 @@ mod register_tests {
         assert!(
             after.contains("https://api.groq.com/openai/v1") && !after.contains("elsewhere.host"),
             "the live URL was overwritten: {after}"
+        );
+    }
+
+    /// Read-modify-write on one shared file loses everything but the last
+    /// writer: eight concurrent registrations left eight credentials on
+    /// disk and one provider in the config, every command reporting
+    /// success. Threads here rather than processes, which is the same
+    /// race through the same lock.
+    #[test]
+    fn concurrent_registrations_do_not_lose_each_other() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yaml");
+        fs::write(
+            &path,
+            "host: \"127.0.0.1\"\nport: 8317\napi-keys:\n  - sk-test\nproviders:\n  base:\n    base-url: https://base/v1\n",
+        )
+        .expect("write config");
+
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let path = path.clone();
+                scope.spawn(move || {
+                    register_provider(&path, &format!("p{index}"), &format!("https://h{index}/v1"))
+                        .expect("register");
+                });
+            }
+        });
+
+        let after = fs::read_to_string(&path).expect("read config");
+        for index in 0..8 {
+            assert!(
+                after.contains(&format!("p{index}:")),
+                "p{index} was lost to a concurrent registration: {after}"
+            );
+        }
+        assert!(after.contains("base:"), "the original provider was lost");
+        assert!(
+            !path.with_extension("lock").exists(),
+            "the lock outlived the registration"
         );
     }
 

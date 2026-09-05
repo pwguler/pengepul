@@ -4132,9 +4132,15 @@ fn a_failed_config_write_takes_its_credential_back() {
     );
 }
 
-/// The cleanup above must never take more than it wrote. Registering a
-/// second key for a provider that is already live, with a config that
-/// cannot be written, must leave the existing pool exactly as it was.
+/// The cleanup must never take more than this command created. The first
+/// version of this test used a *different* URL, which the conflict check
+/// refuses before `save_token` ever runs — so it passed with the whole
+/// cleanup block deleted, policing code it never reached.
+///
+/// The configured URL, so the conflict check passes and the cleanup
+/// genuinely runs; and the same key as the seeded credential, so
+/// `save_token` overwrites that exact file. Rolling it back would destroy
+/// a credential that predates the command.
 #[test]
 fn the_cleanup_never_empties_an_existing_pool() {
     let tmp = tempdir().expect("tempdir");
@@ -4142,7 +4148,6 @@ fn the_cleanup_never_empties_an_existing_pool() {
     let auth_dir = tmp.path().join("auth");
     let pool = auth_dir.join("groq");
     std::fs::create_dir_all(&pool).expect("pool");
-    std::fs::write(pool.join("key-legit.json"), "{}").expect("legit key");
     std::fs::write(
         &config_path,
         format!(
@@ -4151,15 +4156,43 @@ fn the_cleanup_never_empties_an_existing_pool() {
         ),
     )
     .expect("write config");
+    let mut runtime = FakeRuntime::default();
+    // Seed the pool through the CLI, so the file carries the label the
+    // key actually hashes to and the second run overwrites it.
+    run_with_env(
+        &[
+            "--config",
+            config_path.to_str().expect("path"),
+            "login",
+            "--provider",
+            "groq",
+            "--key",
+            "sk-legit",
+        ],
+        tmp.path(),
+        tmp.path(),
+        &mut runtime,
+        Style::Plain,
+    )
+    .expect("seed the pool");
+    let seeded: Vec<_> = std::fs::read_dir(&pool)
+        .expect("read pool")
+        .filter_map(|entry| {
+            entry
+                .ok()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+        })
+        .collect();
+    assert_eq!(seeded.len(), 1, "the pool was not seeded: {seeded:?}");
     let mut permissions = std::fs::metadata(&config_path)
         .expect("metadata")
         .permissions();
     permissions.set_readonly(true);
     std::fs::set_permissions(&config_path, permissions).expect("chmod");
-    let mut runtime = FakeRuntime::default();
 
-    // A different URL for a live provider: refused before anything is
-    // written at all.
+    // The configured URL and the seeded key: accepted, so save_token
+    // overwrites key-legit.json, and only then does the config write
+    // fail.
     let _ = run_with_env(
         &[
             "--config",
@@ -4168,9 +4201,9 @@ fn the_cleanup_never_empties_an_existing_pool() {
             "--provider",
             "groq",
             "--base-url",
-            "https://elsewhere.host/v1",
+            "https://api.groq.com/openai/v1",
             "--key",
-            "sk-second",
+            "sk-legit",
         ],
         tmp.path(),
         tmp.path(),
@@ -4178,6 +4211,10 @@ fn the_cleanup_never_empties_an_existing_pool() {
         Style::Plain,
     );
 
+    assert!(
+        pool.exists(),
+        "the cleanup removed a pool that predates the command"
+    );
     let files: Vec<_> = std::fs::read_dir(&pool)
         .expect("read pool")
         .filter_map(|entry| {
@@ -4187,8 +4224,56 @@ fn the_cleanup_never_empties_an_existing_pool() {
         })
         .collect();
     assert_eq!(
-        files,
-        vec!["key-legit.json".to_string()],
-        "the cleanup disturbed a live pool: {files:?}"
+        files, seeded,
+        "the cleanup took a credential it did not create: {files:?}"
+    );
+}
+
+/// A URL whose tail is a space before the slash was stored with that
+/// space intact, while `validate_providers` trims it on load — so the
+/// stored form and the loaded form disagreed and repeating the identical
+/// command refused itself.
+#[test]
+fn a_url_with_a_space_before_its_slash_is_stored_trimmed() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  existing:\n    base-url: https://existing.host/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+
+    run(
+        &[
+            "login",
+            "--provider",
+            "openrouter",
+            "--base-url",
+            "https://openrouter.ai/api/v1 /",
+            "--key",
+            "sk-test",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    let written = std::fs::read_to_string(tmp.path().join(".pengepul").join("config.yaml"))
+        .expect("read config");
+    assert!(
+        written.contains("base-url: https://openrouter.ai/api/v1\n"),
+        "a trailing space survived into the file: {written}"
+    );
+    // And so repeating it is accepted rather than refusing itself.
+    run(
+        &[
+            "login",
+            "--provider",
+            "openrouter",
+            "--base-url",
+            "https://openrouter.ai/api/v1",
+            "--key",
+            "sk-test",
+        ],
+        tmp.path(),
+        &mut runtime,
     );
 }
