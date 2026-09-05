@@ -2283,7 +2283,7 @@ async fn billing_scoped_upstream_rejection_fails_over_to_the_next_account() {
         .expect("serving account in admin output");
     assert_eq!(served["failureCount"], 0);
     // One attempt, one outcome: the billing marker adds the cooldown, not
-    // a second failure (ARCHITECTURE, "Every attempt reaches an outcome").
+    // a second failure (ARCHITECTURE, "Outcomes never exceed attempts").
     let requests = drained["totalRequests"].as_i64().expect("requests");
     let ok = drained["totalSuccesses"].as_i64().expect("ok");
     let failed = drained["totalFailures"].as_i64().expect("failed");
@@ -2658,7 +2658,7 @@ async fn a_fetch_that_parses_to_nothing_keeps_the_known_versions() {
     assert_eq!(kept.codex, "0.140.0".parse().ok());
 }
 
-/// ARCHITECTURE, "Every attempt reaches an outcome": a client that hangs
+/// ARCHITECTURE, "Outcomes never exceed attempts": a client that hangs
 /// up mid-stream still made a request. The outcome is recorded after the
 /// yield loop, so dropping the body skips it and the attempt leaks.
 #[tokio::test]
@@ -2748,7 +2748,7 @@ async fn a_client_disconnect_mid_stream_still_reaches_an_outcome() {
     );
 }
 
-/// ARCHITECTURE, "Every attempt reaches an outcome", on the request paths
+/// ARCHITECTURE, "Outcomes never exceed attempts", on the request paths
 /// rather than on the manager: a 501 refusal counts its attempt as a
 /// failed request, and leaves the account's health alone so rotation
 /// still offers it.
@@ -2867,7 +2867,7 @@ impl UpstreamClient for RejectingUpstream {
     }
 }
 
-/// ARCHITECTURE, "Every attempt reaches an outcome": an upstream 400 is
+/// ARCHITECTURE, "Outcomes never exceed attempts": an upstream 400 is
 /// the client's fault, not the account's. It counts as a failed request
 /// so the panels reconcile, and leaves the account in rotation.
 #[tokio::test]

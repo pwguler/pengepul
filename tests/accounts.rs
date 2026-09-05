@@ -995,13 +995,16 @@ async fn no_sequence_of_outcomes_can_break_the_invariant() {
             "{name}: got {requests} requests, {ok} ok, {failed} failed"
         );
         assert_eq!(requests, ok + failed, "{name}: unbalanced");
-        let day = &snapshot["days"][0];
-        assert_eq!(
-            day["requests"].as_i64().expect("day requests"),
-            day["successes"].as_i64().expect("day ok")
-                + day["failures"].as_i64().expect("day failed"),
-            "{name}: the daily bucket disagrees: {day}"
-        );
+        // Every bucket, not only the first: a sequence producing two, the
+        // second unbalanced, would otherwise pass.
+        for day in snapshot["days"].as_array().expect("days") {
+            assert_eq!(
+                day["requests"].as_i64().expect("day requests"),
+                day["successes"].as_i64().expect("day ok")
+                    + day["failures"].as_i64().expect("day failed"),
+                "{name}: bucket disagrees: {day}"
+            );
+        }
     }
 }
 

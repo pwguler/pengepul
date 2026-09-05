@@ -125,19 +125,26 @@ impl AccountState {
         }
     }
 
-    /// Count one outcome, cumulative and in today's bucket, keeping
-    /// `requests == successes + failures` true by construction.
+    /// Count one outcome, cumulative and in the bucket of the day its
+    /// attempt opened on, keeping `successes + failures <= requests` true
+    /// by construction.
     ///
-    /// Every recorder goes through here. Two properties hold whatever the
-    /// call sites do, so no future one has to remember them:
+    /// Every recorder goes through here, and the one property that holds
+    /// whatever the call sites do is:
     ///
-    /// - **An outcome implies an attempt.** If the outcomes would exceed
-    ///   the attempts (a recorder fired without `record_attempt`), the
-    ///   attempt is counted too rather than leaving `ok + failed > requests`
-    ///   — the direction load-time repair cannot fix.
-    /// - **One attempt, one outcome.** A second outcome for the same
-    ///   attempt is refused, so a path that records twice (as the billing
-    ///   rejection did) cannot double-count.
+    /// - **An outcome implies an attempt.** When nothing is in flight — a
+    ///   recorder fired without `record_attempt`, or a path recorded a
+    ///   second outcome — the attempt is counted too, rather than leaving
+    ///   `ok + failed > requests`, the direction load-time repair cannot
+    ///   fix.
+    ///
+    /// It does **not** refuse a second outcome: with a count rather than a
+    /// flag it cannot tell one apart from the first outcome of another
+    /// attempt in flight, which is the bug a per-account flag caused. A
+    /// path that records twice therefore inflates `requests` by one rather
+    /// than corrupting the balance. A caller that must not record twice
+    /// applies its health without an outcome instead
+    /// (`record_billing_cooldown`).
     ///
     fn settle(&mut self, success: bool) -> String {
         // The oldest attempt in flight reaches its outcome, booked to the
@@ -697,7 +704,7 @@ fn unix_now() -> f64 {
 /// no outcome did not succeed, so it failed; an outcome with no attempt
 /// implies the attempt that produced it. Successes are never rewritten
 /// and no recorded outcome is discarded (ARCHITECTURE, "Every attempt
-/// reaches exactly one outcome").
+/// reaches its outcome").
 fn reconcile_loaded_counters(state: &mut AccountState) {
     let outcomes = state.total_successes + state.total_failures;
     if state.total_requests > outcomes {
@@ -754,6 +761,13 @@ mod settle_tests {
         state.days.get(date).cloned().unwrap_or_default()
     }
 
+    /// A local date `offset` days from today, as the store keys them.
+    fn day_offset(offset: i64) -> String {
+        (chrono::Local::now() + chrono::Duration::days(offset))
+            .format("%Y-%m-%d")
+            .to_string()
+    }
+
     /// An outcome is booked to the day its attempt opened on, not the day
     /// it finished. A request spanning local midnight would otherwise
     /// leave one bucket short an outcome and the next short an attempt,
@@ -761,42 +775,58 @@ mod settle_tests {
     /// for an operator working across midnight.
     #[test]
     fn an_outcome_settles_in_the_day_its_attempt_opened() {
+        // Dates from the clock, not literals: a fixed date eventually
+        // falls outside the retention window, `day()` trims the bucket it
+        // just wrote, and the suite goes red with no code change.
+        let opened_on = day_offset(-1);
+        let today = day_offset(0);
         let mut state = state();
         // An attempt that opened yesterday, still in flight at midnight.
         state.total_requests += 1;
-        state.day("2026-09-05").requests += 1;
-        state.in_flight.push("2026-09-05".to_string());
+        state.day(&opened_on).requests += 1;
+        state.in_flight.push(opened_on.clone());
 
         // Its outcome arrives after the date has rolled over.
         let settled_on = state.settle(true);
 
-        assert_eq!(settled_on, "2026-09-05", "the outcome left its attempt");
-        let opened = bucket(&state, "2026-09-05");
+        assert_eq!(settled_on, opened_on, "the outcome left its attempt");
+        assert!(
+            state.days.contains_key(&opened_on),
+            "the bucket was dropped"
+        );
+        let opened = bucket(&state, &opened_on);
         assert_eq!(opened.requests, 1);
         assert_eq!(opened.successes, 1, "the bucket is unbalanced");
         // And nothing was booked to the new day.
-        assert_eq!(bucket(&state, "2026-09-06").successes, 0);
+        assert!(
+            !state.days.contains_key(&today) || bucket(&state, &today).successes == 0,
+            "the outcome leaked into the new day"
+        );
     }
 
     /// Attempts settle oldest-first, so two in flight across a midnight
     /// each keep their own day.
     #[test]
     fn two_attempts_across_midnight_keep_their_own_days() {
+        let (first, second) = (day_offset(-1), day_offset(0));
         let mut state = state();
-        for date in ["2026-09-05", "2026-09-06"] {
+        for date in [&first, &second] {
             state.total_requests += 1;
             state.day(date).requests += 1;
-            state.in_flight.push((*date).to_string());
+            state.in_flight.push(date.clone());
         }
 
-        assert_eq!(state.settle(true), "2026-09-05");
-        assert_eq!(state.settle(false), "2026-09-06");
+        assert_eq!(state.settle(true), first);
+        assert_eq!(state.settle(false), second);
 
-        assert_eq!(bucket(&state, "2026-09-05").successes, 1);
-        assert_eq!(bucket(&state, "2026-09-05").failures, 0);
-        assert_eq!(bucket(&state, "2026-09-06").successes, 0);
-        assert_eq!(bucket(&state, "2026-09-06").failures, 1);
-        for date in ["2026-09-05", "2026-09-06"] {
+        for date in [&first, &second] {
+            assert!(state.days.contains_key(date), "bucket {date} was dropped");
+        }
+        assert_eq!(bucket(&state, &first).successes, 1);
+        assert_eq!(bucket(&state, &first).failures, 0);
+        assert_eq!(bucket(&state, &second).successes, 0);
+        assert_eq!(bucket(&state, &second).failures, 1);
+        for date in [&first, &second] {
             let day = bucket(&state, date);
             assert_eq!(
                 day.requests,

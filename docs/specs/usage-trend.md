@@ -50,9 +50,12 @@ before.
 
 - AC-1: `AccountManager::record_success` / `record_attempt` /
   `record_failure` / `record_refresh_exhausted` — every writer of a
-  cumulative counter — add their outcome to a bucket keyed by the **local**
+  cumulative counter — add their outcome to a bucket keyed by a **local**
   calendar date (`%Y-%m-%d` in the host's timezone) in addition to the
-  cumulative counters, for the account they already touch.
+  cumulative counters, for the account they already touch. The date is the
+  one the **attempt opened on**, not the one its outcome arrived on: a
+  request spanning local midnight would otherwise leave one bucket short
+  an outcome and the next short an attempt.
 - AC-2: A daily bucket holds the same eight counters as the cumulative
   record: requests, successes, failures, input, output, cache-creation,
   cache-read, reasoning. Tokens are what the sparkline renders; the rest
@@ -220,10 +223,15 @@ before.
   attempt takes exactly one outcome. Round 3's fixes caused round 3's
   defects — recording a Refusal for 400/402 made the billing path count
   twice. Twelve counter writes across five methods now route through
-  `AccountState::settle`, which counts an implied attempt when an outcome
-  arrives without one and refuses a second outcome for a settled attempt.
-  Proof it is structural rather than another patch: re-introducing the
-  double-count leaves the invariant intact, because the seam refuses it.
+  `AccountState::settle`, which counts the attempt an outcome implies
+  when nothing is in flight. It does **not** refuse a second outcome: a
+  count cannot tell one from the first outcome of another attempt in
+  flight, which is the bug the per-account flag caused. A double-recording
+  path therefore inflates `requests` by one instead of corrupting the
+  balance, and a caller that must not record twice applies its health
+  without an outcome (`record_billing_cooldown`). An earlier draft of this
+  entry claimed the seam refuses — it does not, and the table test asserts
+  the opposite (`attempt, refusal, failure → 2 requests, 0 ok, 2 failed`).
   The table asserts exact counts per sequence, not only that they
   balance: balance alone cannot tell "counted correctly" from "attempt
   and outcome both dropped". Ten sequences, including two attempts in
