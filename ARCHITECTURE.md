@@ -60,9 +60,9 @@ in files.
   Accounts, or the admin payload.
 - **Usage view** (`usage_view.rs`) — the admin payload turned into the relay
   total block for `status` (one block: pool summary lines and the relay-wide
-  aggregate) and pool panels with account rows, per-model lines and footers
-  for `accounts`, in both styles. Pure over the payload and a `now` the verb
-  hands in.
+  aggregate), pool panels with account rows, per-model lines and footers for
+  `accounts`, and the 30-day sparkline for `usage`, in both styles. Pure over
+  the payload and a `now` or a date the verb hands in.
 
 ## Seams
 
@@ -109,10 +109,17 @@ in files.
 - **The Provider registry is the `config.yaml` `providers:` section**, read at
   startup; there is no database and nothing on the serving path writes it.
 - **Usage counters survive a restart; Cooldown does not.** Requests, successes,
-  failures and tokens per Account — and per model within an Account, for the
-  successes — are written to `usage.json` after every outcome and reloaded at
-  startup; a fresh process always retries every Account. Deleting the file is
-  the only reset.
+  failures and tokens per Account — per model within an Account for the
+  successes, and per local calendar day — are written to `usage.json` after
+  every outcome and reloaded at startup; a fresh process always retries every
+  Account. Daily buckets are trimmed to 90 days on write. Deleting the file
+  is the only reset.
+- **One word, one scope.** Two verbs never print the same label for different
+  spans: `status` totals all time, `usage` names its `window` and its
+  `all time` separately, and the all-time figure both print comes from one
+  sum over one payload, so they cannot drift. A row reports a fact the panel
+  does not already carry — it never restates another row or narrates another
+  verb.
 - **Every rich panel speaks one grammar.** Header is `<subject>` or
   `<subject> ─ <qualifier>`, never a colon, and a qualifier must add a
   fact the rows do not carry. Fact rows are `<label>  <value>` with the

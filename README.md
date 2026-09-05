@@ -150,6 +150,7 @@ pengepul login --provider anthropic # authorize an account in a browser (--provi
 pengepul login --provider groq --key $KEY # save a static key for a configured provider
 pengepul status # health of the running relay
 pengepul accounts # loaded accounts (--reload re-reads from disk)
+pengepul usage # the last 30 days of tokens, as a sparkline
 pengepul update # install the most recent release (--check only reports)
 pengepul config path|show|api-key # show the config path, contents, or a key
 pengepul service install|start|stop|restart|status|uninstall|logs # manage the user service (systemd on Linux, launchd on macOS)
@@ -209,6 +210,9 @@ off up to 5 minutes; a dead refresh token locks it out for 24 hours until a fres
 `pengepul status` shows one block: where the relay is, one summary line per pool, and
 the relay-wide totals — requests served and tokens in/out/cache. `pengepul accounts`
 is the detailed view: a panel per pool with per-account rows, share-of-pool bars, and
-the models each account served. In a terminal both render as panels; piped or
-`NO_COLOR` output stays plain. The counters persist to `usage.json` in each provider's
-auth directory, so they survive a restart; cooldowns do not.
+the models each account served. `pengepul usage` shows the last 30 days as a
+sparkline, with the peak day, this window's tokens, and the all-time figure `status`
+prints. In a terminal all three render as panels; piped or `NO_COLOR` output stays
+plain — `usage` piped is one parseable row per day. The counters persist to
+`usage.json` in each provider's auth directory, so they survive a restart; daily
+buckets are kept for 90 days and cooldowns are not persisted at all.
