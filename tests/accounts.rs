@@ -1008,3 +1008,73 @@ async fn the_invariant_holds_across_a_restart() {
         "{requests} requests, {ok} ok, {failed} failed"
     );
 }
+
+/// A file written before the seam existed can hold more outcomes than
+/// attempts — the direction the first repair did not cover. An outcome
+/// implies an attempt, so the attempts rise to meet them: never the
+/// reverse, which would discard a recorded outcome.
+#[tokio::test]
+async fn load_repairs_outcomes_that_exceed_their_attempts() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let usage_file = tmp.path().join("commandcode").join("usage.json");
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    fs::create_dir_all(usage_file.parent().expect("parent")).expect("mkdir");
+    fs::write(
+        &usage_file,
+        json!({
+            "k@example.com": {
+                "total_requests": 30,
+                "total_successes": 0,
+                "total_failures": 31,
+                "days": {
+                    today.clone(): {"requests": 2, "successes": 0, "failures": 3}
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write");
+
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    let snapshot = &manager.snapshots()[0];
+
+    assert_eq!(
+        snapshot["totalRequests"], 31,
+        "attempts rise to the outcomes"
+    );
+    assert_eq!(snapshot["totalFailures"], 31, "no outcome is discarded");
+    assert_eq!(snapshot["totalSuccesses"], 0);
+    let day = &snapshot["days"][0];
+    assert_eq!(day["requests"], 3, "the bucket rises too");
+    assert_eq!(day["failures"], 3);
+}
+
+/// The repair reaches disk at load, not at the next outcome: an account
+/// that serves nothing after a restart must not leave a stale file behind
+/// a corrected panel.
+#[tokio::test]
+async fn the_repair_is_written_at_load_not_at_the_next_request() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let usage_file = tmp.path().join("commandcode").join("usage.json");
+    fs::create_dir_all(usage_file.parent().expect("parent")).expect("mkdir");
+    fs::write(
+        &usage_file,
+        json!({"k@example.com": {"total_requests": 30, "total_successes": 0, "total_failures": 31}})
+            .to_string(),
+    )
+    .expect("write");
+
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    // No request served since the restart.
+    let stored = persisted(&usage_file);
+    let entry = &stored["k@example.com"];
+    assert_eq!(
+        entry["total_requests"], 31,
+        "the file still disagrees with the panel: {entry}"
+    );
+    assert_eq!(entry["total_failures"], 31);
+}

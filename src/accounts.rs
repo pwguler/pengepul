@@ -238,10 +238,20 @@ impl AccountManager {
     /// # Errors
     ///
     /// Returns an error when the auth directory exists but cannot be read.
+    /// Read every token from the auth dir, merge persisted usage, and
+    /// repair any attempt/outcome gap the files carry. The repair is
+    /// written back immediately: an account that serves nothing after a
+    /// restart would otherwise keep a stale file behind a correct panel.
     pub fn load(&mut self) -> Result<()> {
         self.persisted_usage = load_usage(&self.auth_dir, &self.provider);
         for token in load_all_tokens(&self.auth_dir, Some(&self.provider))? {
             self.upsert_loaded_token(token);
+        }
+        // Write the repair back now. An account that serves nothing after
+        // a restart would otherwise leave a stale file behind a correct
+        // panel, and the two would disagree until its next request.
+        if !self.accounts.is_empty() {
+            self.persist_usage();
         }
         Ok(())
     }
@@ -672,21 +682,29 @@ fn unix_now() -> f64 {
         .map_or(0.0, |duration| duration.as_secs_f64())
 }
 
-/// Close any attempt/outcome gap a file carries. Counters written before
-/// every path recorded an outcome hold attempts that reached neither
-/// success nor failure, and at load nothing is in flight, so the gap is
-/// knowable: a request that did not succeed failed. Attempts and
-/// successes are never rewritten — only the unaccounted remainder is
-/// named (ARCHITECTURE, "Every attempt reaches an outcome").
+/// Close any attempt/outcome gap a file carries, in either direction. At
+/// load nothing is in flight, so both gaps are knowable: an attempt with
+/// no outcome did not succeed, so it failed; an outcome with no attempt
+/// implies the attempt that produced it. Successes are never rewritten
+/// and no recorded outcome is discarded (ARCHITECTURE, "Every attempt
+/// reaches exactly one outcome").
 fn reconcile_loaded_counters(state: &mut AccountState) {
     let outcomes = state.total_successes + state.total_failures;
     if state.total_requests > outcomes {
+        // Attempts with no outcome: they did not succeed, so they failed.
         state.total_failures += state.total_requests - outcomes;
+    } else if outcomes > state.total_requests {
+        // Outcomes with no attempt, written before the seam existed. An
+        // outcome implies an attempt, so the attempts rise to meet them —
+        // never the reverse, which would discard a recorded outcome.
+        state.total_requests = outcomes;
     }
     for day in state.days.values_mut() {
         let outcomes = day.successes + day.failures;
         if day.requests > outcomes {
             day.failures += day.requests - outcomes;
+        } else if outcomes > day.requests {
+            day.requests = outcomes;
         }
     }
     // A loaded account has no attempt in flight: whatever it was doing
