@@ -346,6 +346,7 @@ impl Drop for FileLock {
 /// This exists as a function because it did not: `login` and
 /// `register_provider` each carried their own copy, they drifted by one
 /// call, and the guard that runs first was the one missing it.
+#[must_use]
 pub fn normalize_base_url(url: &str) -> &str {
     url.trim().trim_end_matches('/').trim_end()
 }
