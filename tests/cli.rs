@@ -4046,3 +4046,34 @@ fn tree(root: &Path) -> Vec<String> {
     out.sort();
     out
 }
+
+/// An empty `--key` saved a credential with no secret in it, which then
+/// joined rotation and failed every request handed to it. Pre-existing on
+/// main; fixed here because this branch already owns this function's
+/// guards.
+#[test]
+fn an_empty_key_saves_no_credential() {
+    for key in ["", "   "] {
+        let tmp = tempdir().expect("tempdir");
+        write_config_with_providers(
+            tmp.path(),
+            "  groq:\n    base-url: https://api.groq.com/openai/v1\n",
+        );
+        let mut runtime = FakeRuntime::default();
+
+        let error = run_err(
+            &["login", "--provider", "groq", "--key", key],
+            tmp.path(),
+            &mut runtime,
+        );
+
+        assert!(
+            error.contains("--key is empty"),
+            "an empty key was not named: {error}"
+        );
+        assert!(
+            !tmp.path().join(".pengepul").join("groq").exists(),
+            "an empty key still wrote a credential"
+        );
+    }
+}

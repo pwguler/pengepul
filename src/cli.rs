@@ -865,6 +865,13 @@ fn login(
         );
     }
     let key = key.context(format!("{provider} takes a static API key; pass --key"))?;
+    // Pre-existing on main, fixed here because this function's guards are
+    // already this branch's: an empty key saved a credential with no
+    // secret in it, which then joined rotation and failed every request
+    // it was handed.
+    if key.trim().is_empty() {
+        bail!("{provider} takes a static API key; --key is empty");
+    }
     let label = format!("key-{}", &sha256_hex(key)[..8]);
     let provider_id = ProviderId::new(ProviderKind::Generic, provider);
     let token = TokenData {
