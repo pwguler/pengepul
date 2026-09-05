@@ -49,6 +49,18 @@ providers:
     base-url: https://openrouter.ai/api/v1
 ```
 
+Or register and authorize in one command, without touching the file:
+
+```sh
+pengepul login --provider openrouter \
+  --base-url https://openrouter.ai/api/v1 --key $OPENROUTER_API_KEY
+```
+
+Registration is for new providers only: an id already in the file with a
+different `base-url` is an error, so a mistyped flag cannot move a live
+provider's traffic. Changing an endpoint means editing the file. Restart
+the relay afterwards — providers are read at startup.
+
 ```sh
 pengepul login --provider groq --key $GROQ_API_KEY # save a key (repeat to pool more)
 curl -sS http://127.0.0.1:8317/v1/chat/completions \
@@ -148,6 +160,7 @@ curl -sS http://127.0.0.1:8317/v1/chat/completions \
 pengepul serve # start the relay (the default with no subcommand)
 pengepul login --provider anthropic # authorize an account in a browser (--provider codex for Codex)
 pengepul login --provider groq --key $KEY # save a static key for a configured provider
+pengepul login --provider groq --base-url $URL --key $KEY # register a new provider and save its key
 pengepul status # health of the running relay
 pengepul accounts # loaded accounts (--reload re-reads from disk)
 pengepul usage # the last 30 days of tokens, as a sparkline

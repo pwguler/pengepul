@@ -52,6 +52,9 @@ in files.
   pure JSON, no I/O.
 - **Config** (`config.rs`) — parses `config.yaml`, including the `providers:`
   section, which is the only Provider registry: there is no database table.
+  It also writes it: `register_provider` adds one entry for `login
+  --base-url`, and refuses an id already present with a different URL
+  rather than overwriting it.
 - **CLI + Runtime + Service** (`cli.rs`, `runtime.rs`, `service.rs`) — command
   parsing and dispatch (pure), the `CliRuntime` adapter that makes a verb touch
   the real world, and the per-user systemd/launchd unit — including the parser
@@ -112,6 +115,10 @@ in files.
   reload that sees a changed credential.
 - **The Provider registry is the `config.yaml` `providers:` section**, read at
   startup; there is no database and nothing on the serving path writes it.
+  One CLI verb does: `login --base-url` registers a new Provider, and only
+  a new one — an id already present with a different `base-url` is an
+  error naming the URL it kept, so a mistyped flag cannot move a live
+  Provider's traffic to another host. Changing an endpoint stays an edit.
 - **Usage counters survive a restart; Cooldown does not.** Requests, successes,
   failures and tokens per Account — per model within an Account for the
   successes, and per local calendar day — are written to `usage.json` after
