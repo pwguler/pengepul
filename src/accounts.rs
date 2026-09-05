@@ -402,6 +402,10 @@ impl AccountManager {
 
     #[must_use]
     pub fn snapshots(&self) -> Vec<Value> {
+        // The window bounds what is served, not only what is written: a
+        // process idle since the window moved would otherwise carry
+        // buckets its own file no longer holds.
+        let cutoff = retention_cutoff();
         let now = unix_now();
         self.accounts
             .values()
@@ -433,7 +437,7 @@ impl AccountManager {
                         "cacheReadInputTokens": usage.cache_read_input_tokens,
                         "reasoningOutputTokens": usage.reasoning_output_tokens
                     })).collect::<Vec<_>>(),
-                    "days": state.days.iter().map(|(date, day)| json!({
+                    "days": state.days.iter().filter(|(date, _)| **date >= cutoff).map(|(date, day)| json!({
                         "date": date,
                         "requests": day.requests,
                         "successes": day.successes,
@@ -577,6 +581,7 @@ impl AccountManager {
                 state.total_reasoning_output_tokens = usage.reasoning_output_tokens;
                 state.models = usage.models.clone();
                 state.days = usage.days.clone();
+                reconcile_loaded_counters(&mut state);
             }
             self.order.push(email.clone());
             self.accounts.insert(email, state);
@@ -604,6 +609,25 @@ fn unix_now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |duration| duration.as_secs_f64())
+}
+
+/// Close any attempt/outcome gap a file carries. Counters written before
+/// every path recorded an outcome hold attempts that reached neither
+/// success nor failure, and at load nothing is in flight, so the gap is
+/// knowable: a request that did not succeed failed. Attempts and
+/// successes are never rewritten — only the unaccounted remainder is
+/// named (ARCHITECTURE, "Every attempt reaches an outcome").
+fn reconcile_loaded_counters(state: &mut AccountState) {
+    let outcomes = state.total_successes + state.total_failures;
+    if state.total_requests > outcomes {
+        state.total_failures += state.total_requests - outcomes;
+    }
+    for day in state.days.values_mut() {
+        let outcomes = day.successes + day.failures;
+        if day.requests > outcomes {
+            day.failures += day.requests - outcomes;
+        }
+    }
 }
 
 /// The oldest local day a write keeps: today minus the retention window.

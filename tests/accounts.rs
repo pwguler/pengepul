@@ -799,3 +799,82 @@ async fn the_retention_window_is_ninety_days_inclusive() {
         "90 days back is outside a 90-day inclusive window: {days:?}"
     );
 }
+
+/// Counters written by an older binary can hold attempts that never
+/// reached an outcome. At load there is nothing in flight, so the gap is
+/// knowable: a request that did not succeed failed. Reconciling on load
+/// makes the panels add up instead of carrying the old leak forever.
+#[tokio::test]
+async fn a_historical_gap_is_reconciled_on_load() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let usage_file = tmp.path().join("commandcode").join("usage.json");
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    fs::create_dir_all(usage_file.parent().expect("parent")).expect("mkdir");
+    fs::write(
+        &usage_file,
+        json!({
+            "k@example.com": {
+                "total_requests": 1530,
+                "total_successes": 1524,
+                "total_failures": 0,
+                "days": {
+                    today.clone(): {"requests": 11, "successes": 10, "failures": 0}
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write");
+
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    let snapshot = &manager.snapshots()[0];
+
+    let requests = snapshot["totalRequests"].as_i64().expect("requests");
+    let ok = snapshot["totalSuccesses"].as_i64().expect("ok");
+    let failed = snapshot["totalFailures"].as_i64().expect("failed");
+    assert_eq!(requests, 1530, "attempts are not rewritten");
+    assert_eq!(ok, 1524, "successes are not invented");
+    assert_eq!(failed, 6, "the gap becomes what it was: failures");
+    assert_eq!(requests, ok + failed);
+
+    let day = &snapshot["days"][0];
+    assert_eq!(day["requests"], 11);
+    assert_eq!(day["successes"], 10);
+    assert_eq!(day["failures"], 1, "the bucket reconciles too");
+}
+
+/// The payload never serves a bucket outside the window, even on a
+/// process that has recorded nothing since the window moved past it.
+/// `today()` trims, but only a recorder calls it.
+#[tokio::test]
+async fn an_idle_process_does_not_serve_stale_buckets() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let usage_file = tmp.path().join("commandcode").join("usage.json");
+    let stale = (chrono::Local::now() - chrono::Duration::days(200))
+        .format("%Y-%m-%d")
+        .to_string();
+    fs::create_dir_all(usage_file.parent().expect("parent")).expect("mkdir");
+    fs::write(
+        &usage_file,
+        json!({"k@example.com": {"days": {stale.clone(): {"requests": 5, "failures": 5}}}})
+            .to_string(),
+    )
+    .expect("write");
+
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    // No recorder runs: the process is idle.
+    let dates: Vec<String> = manager.snapshots()[0]["days"]
+        .as_array()
+        .expect("days")
+        .iter()
+        .filter_map(|day| day["date"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !dates.contains(&stale),
+        "an idle process serves a bucket outside the window: {dates:?}"
+    );
+}

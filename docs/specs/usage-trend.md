@@ -181,6 +181,17 @@ before.
 - **A day of failures is history.** Emptiness was judged on tokens, so a
   day whose every request failed printed rows in plain and "no usage
   recorded yet" in rich. A day is history because it was recorded.
+- **The historical gap was reconstructable after all.** I called the six
+  leaked attempts unrecoverable twice. They are not: at load nothing is
+  in flight, so an attempt with neither outcome is a request that did not
+  succeed — a failure. `reconcile_loaded_counters` names the remainder
+  without rewriting attempts or inventing successes, cumulative and per
+  bucket. The panels now add up on the operator's real file, not only on
+  traffic recorded after the fix.
+- **An idle process served buckets its file no longer held.** `today()`
+  trims, but only a recorder calls it, so a process idle since the window
+  moved kept serving them. `snapshots()` filters to the window: what is
+  served is bounded by the same rule as what is written.
 - **A subset could exceed its superset.** A payload carrying buckets but
   no cumulative counters printed `all time 0` under `window 11.0K`.
   Clamped: `all time` is at least the window it contains.

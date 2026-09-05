@@ -2837,7 +2837,8 @@ fn usage_all_time_equals_the_status_total() {
     let usage = strip_ansi(&run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich).stdout);
     let status = strip_ansi(&run_style(&["status"], tmp.path(), &mut runtime, Style::Rich).stdout);
 
-    // The figure `status` calls `total`.
+    // Exact figures, not humanized ones: two different numbers that both
+    // render "292.6M" would pass a substring check.
     let status_total = status
         .lines()
         .find(|line| line.contains("│ total"))
@@ -2988,5 +2989,122 @@ fn a_day_of_failures_counts_as_history_in_both_styles() {
     assert!(
         !rich.contains("no usage recorded yet"),
         "rich and plain disagree that history exists: {rich}"
+    );
+}
+
+/// usage-trend AC-11: `all time` and `status`'s `total` are the same
+/// number, asserted on exact figures rather than humanized ones. Small
+/// values keep `format_count` exact, so a wrong sum cannot hide behind a
+/// rounded suffix.
+#[test]
+fn usage_all_time_matches_status_exactly_not_just_when_rounded() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let payload = json!({
+        "providers": {
+            "anthropic": {
+                "account_count": 1,
+                "accounts": [account(json!({
+                    "email": "a@x.com",
+                    "available": true,
+                    "totalRequests": 3,
+                    "totalSuccesses": 3,
+                    "totalInputTokens": 111,
+                    "totalOutputTokens": 222,
+                    "totalCacheReadInputTokens": 333,
+                    "totalCacheCreationInputTokens": 44,
+                    "days": [{
+                        "date": today,
+                        "requests": 1,
+                        "successes": 1,
+                        "failures": 0,
+                        "inputTokens": 10,
+                        "outputTokens": 20,
+                        "cacheReadInputTokens": 30,
+                        "cacheCreationInputTokens": 0,
+                        "reasoningOutputTokens": 0
+                    }]
+                }))]
+            }
+        }
+    });
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(payload),
+        ..FakeRuntime::default()
+    };
+
+    let usage = strip_ansi(&run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich).stdout);
+    let status = strip_ansi(&run_style(&["status"], tmp.path(), &mut runtime, Style::Rich).stdout);
+
+    // 111 + 222 + 333 + 44 = 710, printed exactly at this size.
+    let all_time = usage
+        .lines()
+        .find(|line| line.contains("all time"))
+        .expect("all time row");
+    assert!(all_time.contains("710"), "all time: {all_time}");
+    let total = status
+        .lines()
+        .find(|line| line.contains("│ total"))
+        .expect("status total");
+    assert!(total.contains("710"), "status total: {total}");
+    // And the window is its own, smaller figure: 10 + 20 + 30 = 60.
+    let window = usage
+        .lines()
+        .find(|line| line.contains("window"))
+        .expect("window row");
+    assert!(window.contains("60"), "window: {window}");
+}
+
+/// usage-trend AC-11: the clamp. A payload whose cumulative counters lag
+/// its buckets must not print an all-time total smaller than the window
+/// inside it — a superset cannot be smaller than its subset.
+#[test]
+fn all_time_is_never_smaller_than_the_window_it_contains() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        // Cumulative counters absent: a hand-edited file.
+                        "days": [{
+                            "date": today,
+                            "requests": 1,
+                            "successes": 1,
+                            "failures": 0,
+                            "inputTokens": 500,
+                            "outputTokens": 0,
+                            "cacheReadInputTokens": 0,
+                            "cacheCreationInputTokens": 0,
+                            "reasoningOutputTokens": 0
+                        }]
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let visible = strip_ansi(&run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich).stdout);
+    let window = visible
+        .lines()
+        .find(|line| line.contains("window"))
+        .expect("window row");
+    let all_time = visible
+        .lines()
+        .find(|line| line.contains("all time"))
+        .expect("all time row");
+    assert!(window.contains("500"), "window: {window}");
+    assert!(
+        all_time.contains("500"),
+        "a superset smaller than its subset: {all_time}"
     );
 }
