@@ -896,6 +896,13 @@ async fn an_idle_process_does_not_serve_stale_buckets() {
 /// prose invariant could not give.
 #[tokio::test]
 async fn no_sequence_of_outcomes_can_break_the_invariant() {
+    struct Case {
+        name: &'static str,
+        calls: Vec<&'static str>,
+        /// The counts the sequence must produce: requests, ok, failed.
+        want: (i64, i64, i64),
+    }
+
     let usage = UsageData {
         input_tokens: 1,
         output_tokens: 1,
@@ -905,33 +912,63 @@ async fn no_sequence_of_outcomes_can_break_the_invariant() {
     };
     // Each case is a sequence of calls, applied in order to a fresh
     // account. The names describe what the relay did.
-    let cases: Vec<(&str, Vec<&str>)> = vec![
-        ("attempt then success", vec!["attempt", "success"]),
-        ("attempt then failure", vec!["attempt", "failure"]),
-        ("attempt then refusal", vec!["attempt", "refusal"]),
-        ("attempt then reauth lockout", vec!["attempt", "exhausted"]),
-        // A billing rejection: an outcome, then health applied on top.
-        (
+    // Each case names its exact expected counts, not only that they
+    // balance: asserting balance alone cannot tell "counted correctly"
+    // from "attempt and outcome both dropped".
+    let case = |name, calls, want| Case { name, calls, want };
+    let cases = vec![
+        case(
+            "attempt then success",
+            vec!["attempt", "success"],
+            (1, 1, 0),
+        ),
+        case(
+            "attempt then failure",
+            vec!["attempt", "failure"],
+            (1, 0, 1),
+        ),
+        case(
+            "attempt then refusal",
+            vec!["attempt", "refusal"],
+            (1, 0, 1),
+        ),
+        case(
+            "attempt then reauth lockout",
+            vec!["attempt", "exhausted"],
+            (1, 0, 1),
+        ),
+        // A billing rejection: one outcome, then health applied on top.
+        case(
             "refusal then billing cooldown",
             vec!["attempt", "refusal", "billing"],
+            (1, 0, 1),
         ),
-        // The double-count that broke round 3.
-        (
-            "one attempt cannot yield two outcomes",
+        // Two outcomes for one attempt: the second implies its own.
+        case(
+            "a second outcome implies its own attempt",
             vec!["attempt", "refusal", "failure"],
+            (2, 0, 2),
         ),
         // An outcome with no attempt: the relay should never do this, but
         // the counters must stay coherent if it does.
-        ("outcome without an attempt", vec!["success"]),
-        ("failure without an attempt", vec!["failure"]),
+        case("outcome without an attempt", vec!["success"], (1, 1, 0)),
+        case("failure without an attempt", vec!["failure"], (1, 0, 1)),
         // Failover: two attempts, two outcomes.
-        (
+        case(
             "failover across two attempts",
             vec!["attempt", "failure", "attempt", "success"],
+            (2, 1, 1),
+        ),
+        // Two in flight at once, as an async relay produces.
+        case(
+            "two attempts in flight, two outcomes",
+            vec!["attempt", "attempt", "success", "success"],
+            (2, 2, 0),
         ),
     ];
 
-    for (name, calls) in cases {
+    for Case { name, calls, want } in cases {
+        let (want_requests, want_ok, want_failed) = want;
         let tmp = tempdir().expect("tempdir");
         save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
         let mut manager = never_refresh_manager(tmp.path().to_path_buf());
@@ -953,10 +990,11 @@ async fn no_sequence_of_outcomes_can_break_the_invariant() {
         let ok = snapshot["totalSuccesses"].as_i64().expect("ok");
         let failed = snapshot["totalFailures"].as_i64().expect("failed");
         assert_eq!(
-            requests,
-            ok + failed,
-            "{name}: {requests} requests, {ok} ok, {failed} failed"
+            (requests, ok, failed),
+            (want_requests, want_ok, want_failed),
+            "{name}: got {requests} requests, {ok} ok, {failed} failed"
         );
+        assert_eq!(requests, ok + failed, "{name}: unbalanced");
         let day = &snapshot["days"][0];
         assert_eq!(
             day["requests"].as_i64().expect("day requests"),

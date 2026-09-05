@@ -192,6 +192,13 @@ before.
   trims, but only a recorder calls it, so a process idle since the window
   moved kept serving them. `snapshots()` filters to the window: what is
   served is bounded by the same rule as what is written.
+- **An outcome belongs to its attempt's day.** With the in-flight count
+  fixed, a request spanning local midnight still booked its attempt on
+  one day and its outcome on the next, so both buckets were unbalanced
+  and load-time repair invented a failure on the first — nightly, for an
+  operator working 21:00–01:00. In-flight attempts carry the day they
+  opened on, and `settle` books the outcome there. Falsified by making it
+  book to today.
 - **A flag could not hold a per-attempt fact.** The seam's first cut used
   one `bool` per Account, which assumes one attempt in flight. Rotation
   is in-flight-blind and the manager lock is released before the upstream
@@ -217,7 +224,10 @@ before.
   arrives without one and refuses a second outcome for a settled attempt.
   Proof it is structural rather than another patch: re-introducing the
   double-count leaves the invariant intact, because the seam refuses it.
-  The test is a table over every public recorder, not one path.
+  The table asserts exact counts per sequence, not only that they
+  balance: balance alone cannot tell "counted correctly" from "attempt
+  and outcome both dropped". Ten sequences, including two attempts in
+  flight at once.
 - **A subset could exceed its superset.** A payload carrying buckets but
   no cumulative counters printed `all time 0` under `window 11.0K`.
   Clamped: `all time` is at least the window it contains.
