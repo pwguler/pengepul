@@ -77,7 +77,16 @@ before.
   first — parseable, no block characters, no box.
 - AC-8: A relay with no daily history prints the panel with an empty
   window and says so rather than rendering a flat line of `▁` that
-  would look like 30 idle days.
+  would look like 30 idle days. A **partial** window (fewer recorded
+  days than the window is wide) names how many days it actually has and
+  when daily history began; a full window drops that note.
+- AC-11: The numbers reconcile across verbs. `usage` prints `window`
+  (this window's tokens) beside `all time` (every token the relay has
+  counted), the latter computed by the same `account_tokens` sum that
+  `status` prints, over the same payload, so the two can never drift.
+  No verb prints a bare `total`: one word, one scope. `all time` is
+  never less than the `window` it contains, even when a payload's
+  cumulative counters are absent or lag its buckets.
 - AC-9: Days are summed across every account of every pool: the
   sparkline is relay-wide, matching what `status` totals. This requires
   `GET /admin/accounts` to carry a `days` array per account, in the same
@@ -92,6 +101,16 @@ before.
   `/admin/accounts`, but no criterion said the payload carries `days`.
   Found while implementing AC-1; folded into AC-9 rather than left
   implicit.
+- **`total` was three different scopes.** `status` said `total 353.4M`
+  (all time) and `usage` said `total 5.9M` (a 30-day window) with
+  nothing on screen relating them, so the operator compared the two and
+  reasonably concluded the trend was broken. It was merely new. The word
+  `total` is now gone from `usage`: `window` and `all time` name their
+  scopes, and `all time` is the figure `status` prints. Found by the
+  user asking why the numbers disagreed — AC-11 exists because of it.
+- **A subset could exceed its superset.** A payload carrying buckets but
+  no cumulative counters printed `all time 0` under `window 11.0K`.
+  Clamped: `all time` is at least the window it contains.
 - **The sparkline covers calendar days, not recorded days.** A window of
   30 columns needs a column per *calendar* day, so idle days are
   synthesised as zero rather than skipped. Without this the line would

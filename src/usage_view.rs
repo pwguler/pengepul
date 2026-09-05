@@ -841,28 +841,67 @@ pub(crate) fn print_trend_rich(payload: &Value, output: &mut Output, today: &str
         .max_by_key(|day| day.tokens)
         .expect("non-empty window");
     let total: i64 = values.iter().sum();
-    for line in fact_panel(
-        "usage ─ last 30 days",
-        &[
-            Fact::new("tokens", &sparkline(&values)),
-            Fact::new(
-                "peak",
-                &format!(
-                    "{} on {}",
-                    paint(BOLD, &format_count(peak.tokens)),
-                    peak.date
-                ),
+    // Only days that actually carry traffic are history; the rest of the
+    // window is drawn but was never recorded. Saying "across 30 days"
+    // when one day exists invites the reader to compare the total against
+    // `status` and conclude the trend is broken, when it is only new.
+    let recorded: Vec<&TrendDay> = days.iter().filter(|day| day.tokens > 0).collect();
+    // The all-time figure comes from the same sum `status` prints, over the
+    // same payload, so the two verbs cannot drift and the window is
+    // visibly a subset rather than a competing total.
+    let all_time: i64 = providers(payload)
+        .into_iter()
+        .flat_map(|(_provider_id, provider)| {
+            provider
+                .get("accounts")
+                .and_then(Value::as_array)
+                .map_or(&[][..], Vec::as_slice)
+        })
+        .map(account_tokens)
+        .sum();
+    // The window is a subset of all time by construction. A payload whose
+    // cumulative counters are missing or lag its buckets would otherwise
+    // print a total smaller than the subset inside it.
+    let all_time = all_time.max(total);
+    let mut facts = vec![
+        Fact::new("tokens", &sparkline(&values)),
+        Fact::new(
+            "peak",
+            &format!(
+                "{} on {}",
+                paint(BOLD, &format_count(peak.tokens)),
+                peak.date
             ),
-            Fact::new(
-                "total",
-                &format!(
-                    "{} across {} days",
-                    paint(BOLD, &format_count(total)),
-                    days.len()
-                ),
+        ),
+        Fact::new(
+            "window",
+            &format!(
+                "{} across {} {} recorded",
+                paint(BOLD, &format_count(total)),
+                recorded.len(),
+                if recorded.len() == 1 { "day" } else { "days" }
             ),
-        ],
-    ) {
+        ),
+        Fact::new(
+            "all time",
+            &format!(
+                "{} \u{2014} what status totals",
+                paint(BOLD, &format_count(all_time))
+            ),
+        ),
+    ];
+    // While the window is not yet full, name where recording began, so the
+    // empty bars read as "no data yet" rather than "no traffic", and the
+    // gap between window and all time is explained rather than puzzling.
+    if recorded.len() < days.len()
+        && let Some(first) = recorded.first()
+    {
+        facts.push(Fact::new(
+            "note",
+            &paint(DIM, &format!("daily history starts {}", first.date)),
+        ));
+    }
+    for line in fact_panel("usage ─ last 30 days", &facts) {
         output.line(&line);
     }
 }

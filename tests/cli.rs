@@ -2576,6 +2576,7 @@ fn usage_renders_a_thirty_day_sparkline() {
                     "accounts": [account(json!({
                         "email": "a@x.com",
                         "available": true,
+                        "totalInputTokens": 40_000,
                         "days": [day("2026-09-01", 1_000), day("2026-09-03", 9_000)]
                     }))]
                 },
@@ -2585,6 +2586,7 @@ fn usage_renders_a_thirty_day_sparkline() {
                     "accounts": [account(json!({
                         "email": "k@x.com",
                         "available": true,
+                        "totalInputTokens": 10_000,
                         "days": [day("2026-09-01", 1_000)]
                     }))]
                 }
@@ -2598,7 +2600,13 @@ fn usage_renders_a_thirty_day_sparkline() {
     assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
     let lines: Vec<&str> = visible.lines().collect();
-    assert_eq!(lines.len(), 5, "four rows in a box: {visible}");
+    assert_eq!(lines.len(), 7, "five rows and a note: {visible}");
+    // all time contains the window, never the other way round.
+    assert!(
+        lines[4].contains("50.0K"),
+        "all time sums both pools: {}",
+        lines[4]
+    );
     assert!(lines[0].contains("usage ─ last 30 days"), "{visible}");
     // AC-6: one character per day, oldest left, no blanks.
     let spark_row = lines[1];
@@ -2613,8 +2621,12 @@ fn usage_renders_a_thirty_day_sparkline() {
     assert!(lines[2].contains("peak"), "{visible}");
     assert!(lines[2].contains("9.0K"), "peak value: {}", lines[2]);
     assert!(lines[2].contains("2026-09-03"), "peak date: {}", lines[2]);
-    assert!(lines[3].contains("total"), "{visible}");
-    assert!(lines[3].contains("11.0K"), "total sums pools: {}", lines[3]);
+    assert!(lines[3].contains("window"), "{visible}");
+    assert!(
+        lines[3].contains("11.0K"),
+        "window sums pools: {}",
+        lines[3]
+    );
     for line in &lines {
         assert_eq!(line.chars().count(), 64, "off the fixed width: {line}");
     }
@@ -2703,4 +2715,183 @@ fn usage_plain_is_one_line_per_day() {
         "parseable row: {}",
         outcome.stdout
     );
+}
+
+/// usage-trend AC-8 (extended): a window holding one day of thirty must
+/// not claim "across 30 days". The reader compares that total against
+/// `status` and concludes the trend is broken, when it is only new.
+#[test]
+fn usage_says_how_much_history_it_actually_has() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "days": [{
+                            "date": "2026-09-05",
+                            "requests": 7,
+                            "inputTokens": 25,
+                            "outputTokens": 278,
+                            "cacheReadInputTokens": 2_980_150,
+                            "cacheCreationInputTokens": 0,
+                            "reasoningOutputTokens": 0
+                        }]
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    // The total names the history it has, not the window it drew.
+    assert!(
+        !visible.contains("across 30 days"),
+        "claims a full window it does not have: {visible}"
+    );
+    assert!(
+        visible.contains("1 day recorded"),
+        "must say how much history exists: {visible}"
+    );
+    // And it says why the earlier bars are empty, so the number can be
+    // reconciled against `status`.
+    assert!(
+        visible.contains("daily history starts") && visible.contains("2026-09-05"),
+        "must name where recording began: {visible}"
+    );
+    for line in visible.lines() {
+        assert_eq!(line.chars().count(), 64, "off the fixed width: {line}");
+    }
+}
+
+/// usage-trend AC-5: once the window is full the extra note disappears
+/// and the panel is the four-line shape that was chosen.
+#[test]
+fn usage_drops_the_note_once_the_window_is_full() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    // The window ends today, so the fixture must too: a fixed month would
+    // leave days outside it and the window would be partial by fixture,
+    // not by behaviour.
+    let today = chrono::Local::now().date_naive();
+    let days: Vec<Value> = (0..30)
+        .rev()
+        .map(|back| {
+            let date = today - chrono::Duration::days(back);
+            json!({
+                "date": date.format("%Y-%m-%d").to_string(),
+                "requests": 1,
+                "inputTokens": 1_000 * (30 - back),
+                "outputTokens": 0,
+                "cacheReadInputTokens": 0,
+                "cacheCreationInputTokens": 0,
+                "reasoningOutputTokens": 0
+            })
+        })
+        .collect();
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "days": days
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    assert_eq!(
+        visible.lines().count(),
+        6,
+        "four rows in a box once full, note gone: {visible}"
+    );
+    assert!(
+        !visible.contains("since"),
+        "note outstays its use: {visible}"
+    );
+    assert!(visible.contains("30 days recorded"), "{visible}");
+}
+
+/// usage-trend: the numbers reconcile across verbs. `usage` shows the
+/// all-time figure beside its window, and that figure is the one `status`
+/// prints — computed from the same payload by the same sum, so the two
+/// cannot drift and a reader can see the window is a subset.
+#[test]
+fn usage_all_time_equals_the_status_total() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let payload = json!({
+        "providers": {
+            "anthropic": {
+                "account_count": 1,
+                "accounts": [account(json!({
+                    "email": "a@x.com",
+                    "available": true,
+                    "totalRequests": 1_345,
+                    "totalInputTokens": 700_000,
+                    "totalOutputTokens": 900_000,
+                    "totalCacheReadInputTokens": 289_000_000,
+                    "totalCacheCreationInputTokens": 636_984,
+                    "days": [{
+                        "date": "2026-09-05",
+                        "requests": 7,
+                        "inputTokens": 25,
+                        "outputTokens": 278,
+                        "cacheReadInputTokens": 2_980_150,
+                        "cacheCreationInputTokens": 0,
+                        "reasoningOutputTokens": 0
+                    }]
+                }))]
+            }
+        }
+    });
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(payload.clone()),
+        ..FakeRuntime::default()
+    };
+
+    let usage = strip_ansi(&run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich).stdout);
+    let status = strip_ansi(&run_style(&["status"], tmp.path(), &mut runtime, Style::Rich).stdout);
+
+    // The figure `status` calls `total`.
+    let status_total = status
+        .lines()
+        .find(|line| line.contains("│ total"))
+        .expect("status total row")
+        .split_whitespace()
+        .nth(2)
+        .expect("status total value")
+        .to_string();
+    // The same figure, labelled `all time`, inside `usage`.
+    let all_time = usage
+        .lines()
+        .find(|line| line.contains("all time"))
+        .expect("usage all-time row");
+    assert!(
+        all_time.contains(&status_total),
+        "usage all-time {all_time:?} must carry status total {status_total:?}"
+    );
+    // And the window is visibly a subset, not a competing total.
+    assert!(usage.contains("window"), "{usage}");
+    assert!(!usage.contains("│ total"), "one word, one scope: {usage}");
 }
