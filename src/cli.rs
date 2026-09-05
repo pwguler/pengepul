@@ -4,7 +4,9 @@ use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use serde_json::Value;
 
-use crate::config::{Config, load_config, register_provider, selected_config_path};
+use crate::config::{
+    Config, load_config, register_provider, selected_config_path, validate_provider_id,
+};
 pub use crate::render::Style;
 use crate::render::{ActionGlyph, BOLD, DIM, Fact, Output, fact_panel, paint, status_glyph};
 use crate::service::service_status_panel;
@@ -826,6 +828,18 @@ fn login(
     // no account, which is the half-done state this flag exists to avoid.
     if base_url.is_some() && key.is_none() {
         bail!("--base-url registers {provider} and needs --key to be usable");
+    }
+    // Before any write. `save_token` builds its directory from the id
+    // verbatim (`ProviderId::storage_dir`), so an unvalidated id here
+    // writes a credential into another provider's pool — or, with `..`,
+    // outside the auth-dir entirely. This branch made the guard below
+    // conditional on `base_url.is_none()`, which is what opened that
+    // door.
+    if let Some(url) = base_url {
+        validate_provider_id(provider)?;
+        if url.trim().trim_end_matches('/').is_empty() {
+            bail!("providers: {provider} is missing base-url");
+        }
     }
     // A conflicting registration is refused before the credential is
     // written. The token-before-config order below rests on the orphan

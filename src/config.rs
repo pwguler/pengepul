@@ -277,18 +277,33 @@ pub fn load_config(
 /// The entry name becomes the provider id a client's model prefix must match, so
 /// it cannot collide with a built-in provider (anthropic, codex, or the claude
 /// spelling the glossary reserves) and cannot contain `/` (the prefix separator).
+/// Reject a Provider id the registry cannot hold.
+///
+/// A caller that writes anything keyed by the id — a credential
+/// directory, for instance — must apply this first: `storage_dir()`
+/// returns the id verbatim, so a `/` in it escapes the Account's
+/// directory and, with `..`, the auth-dir entirely.
+///
+/// # Errors
+///
+/// Returns an error when `id` names a built-in Provider or contains `/`.
+pub fn validate_provider_id(id: &str) -> Result<()> {
+    if matches!(id, "anthropic" | "codex" | "claude") {
+        bail!("providers: {id} is a built-in provider name");
+    }
+    if id.contains('/') {
+        bail!("providers: {id} must not contain '/'");
+    }
+    Ok(())
+}
+
 /// `base-url` is required; the keys for the endpoint live in the auth-dir, not here.
 fn validate_providers(
     raw: &BTreeMap<String, RawConfiguredProvider>,
 ) -> Result<BTreeMap<String, ConfiguredProvider>> {
     let mut providers = BTreeMap::new();
     for (id, entry) in raw {
-        if matches!(id.as_str(), "anthropic" | "codex" | "claude") {
-            bail!("providers: {id} is a built-in provider name");
-        }
-        if id.contains('/') {
-            bail!("providers: {id} must not contain '/'");
-        }
+        validate_provider_id(id)?;
         if entry.base_url.trim().is_empty() {
             bail!("providers: {id} is missing base-url");
         }
@@ -380,4 +395,56 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
 #[cfg(not(unix))]
 fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod register_tests {
+    use super::register_provider;
+    use std::fs;
+
+    /// The conflict rule lives here as well as in `login`, and `login`
+    /// short-circuits it on every integration path — so without this
+    /// test, deleting the check below breaks nothing. It is the backstop
+    /// for the window between a caller's read and this write.
+    #[test]
+    fn a_known_id_with_a_different_url_is_refused_here_too() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yaml");
+        fs::write(
+            &path,
+            "host: \"127.0.0.1\"\nport: 8317\napi-keys:\n  - sk-test\nproviders:\n  groq:\n    base-url: https://api.groq.com/openai/v1\n",
+        )
+        .expect("write config");
+
+        let error = register_provider(&path, "groq", "https://elsewhere.host/v1")
+            .expect_err("a conflicting URL was accepted");
+
+        assert!(
+            format!("{error:#}").contains("https://api.groq.com/openai/v1"),
+            "the error does not name the URL it kept: {error:#}"
+        );
+        let after = fs::read_to_string(&path).expect("read config");
+        assert!(
+            after.contains("https://api.groq.com/openai/v1") && !after.contains("elsewhere.host"),
+            "the live URL was overwritten: {after}"
+        );
+    }
+
+    /// The same URL is not a conflict, so a caller repeating itself is
+    /// safe.
+    #[test]
+    fn the_same_url_is_accepted_here_too() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yaml");
+        fs::write(
+            &path,
+            "host: \"127.0.0.1\"\nport: 8317\napi-keys:\n  - sk-test\nproviders:\n  groq:\n    base-url: https://api.groq.com/openai/v1\n",
+        )
+        .expect("write config");
+
+        register_provider(&path, "groq", "https://api.groq.com/openai/v1/").expect("same URL");
+
+        let after = fs::read_to_string(&path).expect("read config");
+        assert!(after.contains("https://api.groq.com/openai/v1"), "{after}");
+    }
 }
