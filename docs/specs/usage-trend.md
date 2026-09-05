@@ -192,6 +192,16 @@ before.
   trims, but only a recorder calls it, so a process idle since the window
   moved kept serving them. `snapshots()` filters to the window: what is
   served is bounded by the same rule as what is written.
+- **The invariant moved from prose into a seam.** Three review rounds
+  produced seven findings of one shape: a call site forgot that an
+  attempt takes exactly one outcome. Round 3's fixes caused round 3's
+  defects — recording a Refusal for 400/402 made the billing path count
+  twice. Twelve counter writes across five methods now route through
+  `AccountState::settle`, which counts an implied attempt when an outcome
+  arrives without one and refuses a second outcome for a settled attempt.
+  Proof it is structural rather than another patch: re-introducing the
+  double-count leaves the invariant intact, because the seam refuses it.
+  The test is a table over every public recorder, not one path.
 - **A subset could exceed its superset.** A payload carrying buckets but
   no cumulative counters printed `all time 0` under `window 11.0K`.
   Clamped: `all time` is at least the window it contains.

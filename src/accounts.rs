@@ -86,6 +86,11 @@ struct AccountState {
     /// Per-local-day traffic, keyed `YYYY-MM-DD`. Sorted by construction,
     /// which is also chronological for that format (usage-trend AC-1).
     days: BTreeMap<String, DayUsage>,
+    /// Whether the attempt in flight has already been settled. Set by
+    /// `settle`, cleared by `record_attempt`: it is what tells a second
+    /// outcome for one attempt from the first outcome of the next.
+    /// In-memory only — a restart begins with no attempt in flight.
+    settled_attempt: bool,
 }
 
 impl AccountState {
@@ -110,7 +115,49 @@ impl AccountState {
             total_reasoning_output_tokens: 0,
             models: BTreeMap::new(),
             days: BTreeMap::new(),
+            settled_attempt: false,
         }
+    }
+
+    /// Count one outcome, cumulative and in today's bucket, keeping
+    /// `requests == successes + failures` true by construction.
+    ///
+    /// Every recorder goes through here. Two properties hold whatever the
+    /// call sites do, so no future one has to remember them:
+    ///
+    /// - **An outcome implies an attempt.** If the outcomes would exceed
+    ///   the attempts (a recorder fired without `record_attempt`), the
+    ///   attempt is counted too rather than leaving `ok + failed > requests`
+    ///   — the direction load-time repair cannot fix.
+    /// - **One attempt, one outcome.** A second outcome for the same
+    ///   attempt is refused, so a path that records twice (as the billing
+    ///   rejection did) cannot double-count.
+    ///
+    /// Returns whether the outcome was counted, so a caller can skip the
+    /// work that belongs with it.
+    fn settle(&mut self, success: bool) -> bool {
+        // A second outcome for the attempt already settled: refuse it.
+        // The billing path records the rejection and then applies its
+        // cooldown; only the first call may count.
+        if self.settled_attempt {
+            return false;
+        }
+        // An outcome with no attempt: count the attempt it implies rather
+        // than leave `ok + failed > requests`, the direction load-time
+        // repair cannot fix.
+        if self.total_successes + self.total_failures >= self.total_requests {
+            self.total_requests += 1;
+            self.today().requests += 1;
+        }
+        if success {
+            self.total_successes += 1;
+            self.today().successes += 1;
+        } else {
+            self.total_failures += 1;
+            self.today().failures += 1;
+        }
+        self.settled_attempt = true;
+        true
     }
 
     /// Today's bucket, opened on first touch. Trims the window first, so
@@ -315,7 +362,12 @@ impl AccountManager {
         state.last_error = None;
         state.last_failure_at = None;
         state.last_success_at = Some(now_iso());
-        state.total_successes += 1;
+        if !state.settle(true) {
+            // A second outcome for one attempt: the request was already
+            // counted where it happened.
+            self.persist_usage();
+            return;
+        }
         // Keyed by the upstream model name: what the provider billed, not
         // what the client happened to ask for. A success with no usage
         // block (count-tokens, or a 2xx whose usage will not parse) still
@@ -329,12 +381,7 @@ impl AccountManager {
             state.total_cache_creation_input_tokens += usage.cache_creation_input_tokens;
             state.total_cache_read_input_tokens += usage.cache_read_input_tokens;
             state.total_reasoning_output_tokens += usage.reasoning_output_tokens;
-        }
-        // The same outcome, bucketed by local day (usage-trend AC-1).
-        let today = state.today();
-        today.successes += 1;
-        if let Some(usage) = usage {
-            today.add_tokens(usage);
+            state.today().add_tokens(usage);
         }
         self.persist_usage();
     }
@@ -345,8 +392,7 @@ impl AccountManager {
     /// no failure streak, nothing that would take it out of Rotation.
     pub fn record_refusal(&mut self, email: &str) {
         if let Some(state) = self.accounts.get_mut(email) {
-            state.total_failures += 1;
-            state.today().failures += 1;
+            state.settle(false);
         }
         // Like every other outcome: the attempt was already persisted, so
         // a refusal held only in memory would resurface as a permanent
@@ -373,6 +419,8 @@ impl AccountManager {
         if let Some(state) = self.accounts.get_mut(email) {
             state.total_requests += 1;
             state.today().requests += 1;
+            // A fresh attempt: the next outcome is its first.
+            state.settled_attempt = false;
             self.persist_usage();
         }
     }
@@ -382,8 +430,7 @@ impl AccountManager {
             return;
         };
         state.failure_count += 1;
-        state.total_failures += 1;
-        state.today().failures += 1;
+        state.settle(false);
         state.last_failure_kind = Some(kind.to_string());
         state.last_failure_at = Some(now_iso());
         state.last_error =
@@ -403,8 +450,7 @@ impl AccountManager {
             return;
         };
         state.failure_count += 1;
-        state.total_failures += 1;
-        state.today().failures += 1;
+        state.settle(false);
         state.last_failure_kind = Some("auth".to_string());
         state.last_failure_at = Some(now_iso());
         state.last_error = Some(format!(
@@ -643,6 +689,9 @@ fn reconcile_loaded_counters(state: &mut AccountState) {
             day.failures += day.requests - outcomes;
         }
     }
+    // A loaded account has no attempt in flight: whatever it was doing
+    // when the process died is over.
+    state.settled_attempt = false;
 }
 
 /// The oldest local day a write keeps: today minus the retention window.

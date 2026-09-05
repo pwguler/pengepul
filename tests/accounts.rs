@@ -329,9 +329,14 @@ async fn per_model_counters_accumulate_per_account() {
         cache_read_input_tokens: 2,
         reasoning_output_tokens: 3,
     };
+    // The relay interleaves: an attempt, then its outcome, then the next.
+    manager.record_attempt("a@example.com");
     manager.record_success("a@example.com", Some(&usage(100)), "claude-fable-5-1");
+    manager.record_attempt("a@example.com");
     manager.record_success("a@example.com", Some(&usage(200)), "claude-fable-5-1");
+    manager.record_attempt("a@example.com");
     manager.record_success("a@example.com", Some(&usage(400)), "claude-sonnet-4-5");
+    manager.record_attempt("b@example.com");
     manager.record_success("b@example.com", Some(&usage(800)), "claude-fable-5-1");
 
     let snapshots = manager.snapshots();
@@ -438,7 +443,9 @@ async fn a_success_without_usage_still_counts_against_its_model() {
     let mut manager = never_refresh_manager(tmp.path().to_path_buf());
     manager.load().expect("load");
 
+    manager.record_attempt("k@example.com");
     manager.record_success("k@example.com", None, "claude-fable-5-1");
+    manager.record_attempt("k@example.com");
     manager.record_success(
         "k@example.com",
         Some(&UsageData {
@@ -632,7 +639,10 @@ async fn a_reauth_lockout_lands_in_the_daily_bucket_too() {
     let mut manager = never_refresh_manager(tmp.path().to_path_buf());
     manager.load().expect("load");
 
+    // Two requests, two outcomes: the relay counts an attempt before each.
+    manager.record_attempt("k@example.com");
     manager.record_failure("k@example.com", "upstream", Some("boom"));
+    manager.record_attempt("k@example.com");
     manager.record_refresh_exhausted("k@example.com", "expired");
 
     let snapshot = &manager.snapshots()[0];
@@ -876,5 +886,125 @@ async fn an_idle_process_does_not_serve_stale_buckets() {
     assert!(
         !dates.contains(&stale),
         "an idle process serves a bucket outside the window: {dates:?}"
+    );
+}
+
+/// The invariant, over every public recorder rather than one path: no
+/// sequence of calls can make outcomes exceed attempts, and every outcome
+/// implies an attempt. Seven P1s across three review rounds were all one
+/// call site forgetting this; a table over the whole surface is what a
+/// prose invariant could not give.
+#[tokio::test]
+async fn no_sequence_of_outcomes_can_break_the_invariant() {
+    let usage = UsageData {
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        reasoning_output_tokens: 0,
+    };
+    // Each case is a sequence of calls, applied in order to a fresh
+    // account. The names describe what the relay did.
+    let cases: Vec<(&str, Vec<&str>)> = vec![
+        ("attempt then success", vec!["attempt", "success"]),
+        ("attempt then failure", vec!["attempt", "failure"]),
+        ("attempt then refusal", vec!["attempt", "refusal"]),
+        ("attempt then reauth lockout", vec!["attempt", "exhausted"]),
+        // A billing rejection: an outcome, then health applied on top.
+        (
+            "refusal then billing cooldown",
+            vec!["attempt", "refusal", "billing"],
+        ),
+        // The double-count that broke round 3.
+        (
+            "one attempt cannot yield two outcomes",
+            vec!["attempt", "refusal", "failure"],
+        ),
+        // An outcome with no attempt: the relay should never do this, but
+        // the counters must stay coherent if it does.
+        ("outcome without an attempt", vec!["success"]),
+        ("failure without an attempt", vec!["failure"]),
+        // Failover: two attempts, two outcomes.
+        (
+            "failover across two attempts",
+            vec!["attempt", "failure", "attempt", "success"],
+        ),
+    ];
+
+    for (name, calls) in cases {
+        let tmp = tempdir().expect("tempdir");
+        save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+        let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+        manager.load().expect("load");
+        for call in &calls {
+            match *call {
+                "attempt" => manager.record_attempt("k@example.com"),
+                "success" => manager.record_success("k@example.com", Some(&usage), "model-a"),
+                "failure" => manager.record_failure("k@example.com", "upstream", Some("boom")),
+                "refusal" => manager.record_refusal("k@example.com"),
+                "exhausted" => manager.record_refresh_exhausted("k@example.com", "expired"),
+                "billing" => manager.record_billing_cooldown("k@example.com", "insufficient"),
+                other => panic!("unknown call {other}"),
+            }
+        }
+
+        let snapshot = &manager.snapshots()[0];
+        let requests = snapshot["totalRequests"].as_i64().expect("requests");
+        let ok = snapshot["totalSuccesses"].as_i64().expect("ok");
+        let failed = snapshot["totalFailures"].as_i64().expect("failed");
+        assert_eq!(
+            requests,
+            ok + failed,
+            "{name}: {requests} requests, {ok} ok, {failed} failed"
+        );
+        let day = &snapshot["days"][0];
+        assert_eq!(
+            day["requests"].as_i64().expect("day requests"),
+            day["successes"].as_i64().expect("day ok")
+                + day["failures"].as_i64().expect("day failed"),
+            "{name}: the daily bucket disagrees: {day}"
+        );
+    }
+}
+
+/// The invariant survives a restart: a reloaded account settles its next
+/// outcome against its own attempt, not against the attempts it already
+/// closed before the process died.
+#[tokio::test]
+async fn the_invariant_holds_across_a_restart() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    manager.record_attempt("k@example.com");
+    manager.record_failure("k@example.com", "upstream", Some("boom"));
+
+    let mut rebuilt = never_refresh_manager(tmp.path().to_path_buf());
+    rebuilt.load().expect("reload");
+    // A fresh attempt and its outcome, after the restart.
+    rebuilt.record_attempt("k@example.com");
+    rebuilt.record_success("k@example.com", None, "model-a");
+    // A second outcome for that same attempt is refused, not counted.
+    rebuilt.record_refusal("k@example.com");
+
+    let snapshot = &rebuilt.snapshots()[0];
+    let requests = snapshot["totalRequests"].as_i64().expect("requests");
+    let ok = snapshot["totalSuccesses"].as_i64().expect("ok");
+    let failed = snapshot["totalFailures"].as_i64().expect("failed");
+    assert_eq!(requests, 2, "one attempt before the restart, one after");
+    assert_eq!(ok, 1);
+    assert_eq!(failed, 1);
+    assert_eq!(requests, ok + failed);
+
+    // An outcome with no attempt at all counts the attempt it implies.
+    rebuilt.record_refusal("k@example.com");
+    let snapshot = &rebuilt.snapshots()[0];
+    let requests = snapshot["totalRequests"].as_i64().expect("requests");
+    let ok = snapshot["totalSuccesses"].as_i64().expect("ok");
+    let failed = snapshot["totalFailures"].as_i64().expect("failed");
+    assert_eq!(
+        requests,
+        ok + failed,
+        "{requests} requests, {ok} ok, {failed} failed"
     );
 }

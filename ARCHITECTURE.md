@@ -114,10 +114,15 @@ in files.
   every outcome, Refusals included and reloaded at startup; a fresh process always retries every
   Account. Daily buckets are trimmed to 90 days on write. Deleting the file
   is the only reset.
-- **Every attempt reaches an outcome.** `requests` always equals
-  `successes + failures`, per Account and per day: the attempt is counted
-  when an Account is selected, so every path between selection and the
-  response records a success, a failure, or a Refusal — including a
+- **Every attempt reaches exactly one outcome.** `requests` always equals
+  `successes + failures`, per Account and per day — held by construction,
+  not by convention: every recorder settles through one private seam
+  (`AccountState::settle`) that counts an implied attempt when an outcome
+  arrives without one, and refuses a second outcome for an attempt
+  already settled. No call site can break it, which is why seven review
+  findings across three rounds were all one call site forgetting. Every
+  path between selection and the response records a success, a failure,
+  or a Refusal — including a
   client that hangs up mid-stream, whose outcome is paid by a `Drop`
   guard because the code after the stream loop never runs. A Refusal
   counts as a failed request but earns no Cooldown: a dialect the
