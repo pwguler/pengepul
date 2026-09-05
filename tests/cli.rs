@@ -1463,3 +1463,193 @@ fn a_command_level_config_wins_over_the_root_one() {
     assert_eq!(runtime.health_url.as_deref(), Some("http://127.0.0.1:8317"));
     assert_eq!(runtime.accounts_api_key.as_deref(), Some("sk-root"));
 }
+
+/// usage-by-model AC-5/AC-6/AC-8/AC-9: model lines under each account, a
+/// `by model` aggregate in the pool footer, both sorted by tokens.
+#[test]
+fn accounts_breaks_usage_down_per_model_on_a_tty() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 2,
+                    "accounts": [
+                        account(json!({
+                            "email": "a@x.com",
+                            "available": true,
+                            "totalRequests": 700,
+                            "totalSuccesses": 700,
+                            "totalInputTokens": 1_000,
+                            "totalOutputTokens": 2_000,
+                            "models": [
+                                // Deliberately not in display order: the
+                                // renderer sorts by tokens, not payload.
+                                {
+                                    "model": "claude-sonnet-4-5",
+                                    "successes": 67,
+                                    "inputTokens": 100,
+                                    "outputTokens": 200,
+                                    "cacheCreationInputTokens": 0,
+                                    "cacheReadInputTokens": 700,
+                                    "reasoningOutputTokens": 0
+                                },
+                                {
+                                    "model": "claude-fable-5-1",
+                                    "successes": 612,
+                                    "inputTokens": 300,
+                                    "outputTokens": 400,
+                                    "cacheCreationInputTokens": 500,
+                                    "cacheReadInputTokens": 8_000,
+                                    "reasoningOutputTokens": 42
+                                }
+                            ]
+                        })),
+                        account(json!({
+                            "email": "b@x.com",
+                            "available": true,
+                            "totalRequests": 3,
+                            "totalSuccesses": 3,
+                            "models": [{
+                                "model": "claude-fable-5-1",
+                                "successes": 3,
+                                "inputTokens": 10,
+                                "outputTokens": 20,
+                                "cacheCreationInputTokens": 0,
+                                "cacheReadInputTokens": 30,
+                                "reasoningOutputTokens": 0
+                            }]
+                        }))
+                    ]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    let lines: Vec<&str> = visible.lines().collect();
+
+    // AC-5: two lines per model, under the account row that served it.
+    let a_row = lines.iter().position(|l| l.contains("a@x.com")).expect("a");
+    let fable = lines
+        .iter()
+        .position(|l| l.contains("claude-fable-5-1"))
+        .expect("fable line");
+    let sonnet = lines
+        .iter()
+        .position(|l| l.contains("claude-sonnet-4-5"))
+        .expect("sonnet line");
+    assert!(fable > a_row, "model lines follow their account row");
+    // AC-5: sorted by total tokens descending — fable (9,200) before
+    // sonnet (1,000), despite the payload's order.
+    assert!(fable < sonnet, "sorted by tokens: {visible}");
+    assert!(lines[fable].contains("612 ok"));
+    assert!(lines[fable].contains("9.2K"), "total: {}", lines[fable]);
+    // AC-9: reasoning is excluded from the total, shown in the detail line.
+    assert!(lines[fable + 1].contains("in 300"));
+    assert!(lines[fable + 1].contains("out 400"));
+    assert!(lines[fable + 1].contains("cache 8.5K"));
+
+    // AC-6: the pool footer aggregates every account's models.
+    let by_model = lines
+        .iter()
+        .position(|l| l.contains("by model"))
+        .expect("by model section");
+    let footer_fable = lines[by_model..]
+        .iter()
+        .position(|l| l.contains("claude-fable-5-1"))
+        .expect("aggregated fable");
+    // 612 + 3 successes across the two accounts.
+    assert!(
+        lines[by_model + footer_fable].contains("615 ok"),
+        "aggregate: {}",
+        lines[by_model + footer_fable]
+    );
+
+    // AC-8: nothing escapes the panel width.
+    for line in &lines {
+        assert!(line.chars().count() <= 64, "too wide: {line}");
+    }
+}
+
+/// usage-by-model AC-7: the plain branch carries the same information.
+#[test]
+fn accounts_lists_models_in_plain_output() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalRequests": 10,
+                        "totalSuccesses": 10,
+                        "models": [{
+                            "model": "claude-fable-5-1",
+                            "successes": 10,
+                            "inputTokens": 300,
+                            "outputTokens": 400,
+                            "cacheCreationInputTokens": 0,
+                            "cacheReadInputTokens": 500,
+                            "reasoningOutputTokens": 7
+                        }]
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run(&["accounts"], tmp.path(), &mut runtime);
+
+    assert_eq!(outcome.code, 0);
+    assert!(outcome.stdout.contains("claude-fable-5-1"));
+    assert!(outcome.stdout.contains("10 ok"));
+    assert!(outcome.stdout.contains("in 300 out 400 cache 500"));
+    assert!(outcome.stdout.contains("by model"));
+}
+
+/// usage-by-model AC-5: an account with no per-model history prints no
+/// model lines — old counters are simply not attributed (no `untracked`).
+#[test]
+fn accounts_without_model_history_print_no_model_lines() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalRequests": 921,
+                        "totalSuccesses": 898,
+                        "totalInputTokens": 1_000,
+                        "models": []
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    assert!(!visible.contains("by model"), "no section: {visible}");
+    assert!(!visible.contains("untracked"));
+    // The account totals still show.
+    assert!(visible.contains("898 ok"));
+}

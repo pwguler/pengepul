@@ -6,7 +6,9 @@ use std::pin::Pin;
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use crate::tokens::{PersistedUsage, load_all_tokens, load_usage, save_token, save_usage};
+use crate::tokens::{
+    ModelUsage, PersistedUsage, load_all_tokens, load_usage, save_token, save_usage,
+};
 use crate::types::{
     AvailableAccount, ProviderId, ProviderKind, RefreshTokenExhaustedError, TokenData, UsageData,
 };
@@ -75,6 +77,11 @@ struct AccountState {
     total_cache_creation_input_tokens: i64,
     total_cache_read_input_tokens: i64,
     total_reasoning_output_tokens: i64,
+    /// Per-model successes and their tokens, keyed by upstream model name.
+    /// Sorted by construction (`BTreeMap`) so the payload order is stable.
+    /// Attempts and failures are not attributed: a model is only known once
+    /// the upstream served it.
+    models: BTreeMap<String, ModelUsage>,
 }
 
 impl AccountState {
@@ -97,6 +104,7 @@ impl AccountState {
             total_cache_creation_input_tokens: 0,
             total_cache_read_input_tokens: 0,
             total_reasoning_output_tokens: 0,
+            models: BTreeMap::new(),
         }
     }
 }
@@ -112,6 +120,7 @@ impl From<&AccountState> for PersistedUsage {
             cache_creation_input_tokens: state.total_cache_creation_input_tokens,
             cache_read_input_tokens: state.total_cache_read_input_tokens,
             reasoning_output_tokens: state.total_reasoning_output_tokens,
+            models: state.models.clone(),
         }
     }
 }
@@ -274,7 +283,7 @@ impl AccountManager {
         Ok(true)
     }
 
-    pub fn record_success(&mut self, email: &str, usage: Option<&UsageData>) {
+    pub fn record_success(&mut self, email: &str, usage: Option<&UsageData>, model: &str) {
         let Some(state) = self.accounts.get_mut(email) else {
             return;
         };
@@ -291,6 +300,13 @@ impl AccountManager {
             state.total_cache_creation_input_tokens += usage.cache_creation_input_tokens;
             state.total_cache_read_input_tokens += usage.cache_read_input_tokens;
             state.total_reasoning_output_tokens += usage.reasoning_output_tokens;
+            // Keyed by the upstream model name: what the provider billed,
+            // not what the client happened to ask for.
+            state
+                .models
+                .entry(model.to_string())
+                .or_default()
+                .add(usage);
         }
         self.persist_usage();
     }
@@ -362,6 +378,15 @@ impl AccountManager {
                     "totalCacheCreationInputTokens": state.total_cache_creation_input_tokens,
                     "totalCacheReadInputTokens": state.total_cache_read_input_tokens,
                     "totalReasoningOutputTokens": state.total_reasoning_output_tokens,
+                    "models": state.models.iter().map(|(model, usage)| json!({
+                        "model": model,
+                        "successes": usage.successes,
+                        "inputTokens": usage.input_tokens,
+                        "outputTokens": usage.output_tokens,
+                        "cacheCreationInputTokens": usage.cache_creation_input_tokens,
+                        "cacheReadInputTokens": usage.cache_read_input_tokens,
+                        "reasoningOutputTokens": usage.reasoning_output_tokens
+                    })).collect::<Vec<_>>(),
                     "expiresAt": state.token.expires_at,
                     "refreshing": false,
                     "planType": state.token.plan_type
@@ -486,6 +511,7 @@ impl AccountManager {
                 state.total_cache_creation_input_tokens = usage.cache_creation_input_tokens;
                 state.total_cache_read_input_tokens = usage.cache_read_input_tokens;
                 state.total_reasoning_output_tokens = usage.reasoning_output_tokens;
+                state.models = usage.models.clone();
             }
             self.order.push(email.clone());
             self.accounts.insert(email, state);

@@ -94,6 +94,49 @@ pub(crate) fn print_accounts(payload: &Value, output: &mut Output, now: f64) {
                     .expect("write to String cannot fail");
             }
             output.line(&detail);
+            // AC-7: the same per-model breakdown, plain.
+            for row in model_rows(account) {
+                output.line(&format!(
+                    "    {} {} ok {}",
+                    row.name,
+                    format_exact(row.successes),
+                    format_count(row.tokens())
+                ));
+                output.line(&format!(
+                    "      in {} out {} cache {}{}",
+                    format_count(row.input),
+                    format_count(row.output),
+                    format_count(row.cache),
+                    if row.reasoning == 0 {
+                        String::new()
+                    } else {
+                        format!(" reasoning {}", format_count(row.reasoning))
+                    }
+                ));
+            }
+        }
+        let pool_models = pool_model_rows(accounts);
+        if !pool_models.is_empty() {
+            output.line("  by model");
+            for row in pool_models {
+                output.line(&format!(
+                    "    {} {} ok {}",
+                    row.name,
+                    format_exact(row.successes),
+                    format_count(row.tokens())
+                ));
+                output.line(&format!(
+                    "      in {} out {} cache {}{}",
+                    format_count(row.input),
+                    format_count(row.output),
+                    format_count(row.cache),
+                    if row.reasoning == 0 {
+                        String::new()
+                    } else {
+                        format!(" reasoning {}", format_count(row.reasoning))
+                    }
+                ));
+            }
         }
     }
 }
@@ -181,6 +224,119 @@ pub(crate) fn glyph(available: bool, on_cooldown: bool) -> String {
     }
 }
 
+/// One model's usage on one account, as the payload carries it.
+pub(crate) struct ModelRow {
+    name: String,
+    successes: i64,
+    input: i64,
+    output: i64,
+    cache: i64,
+    reasoning: i64,
+}
+
+impl ModelRow {
+    /// The model's carried load, on the same definition as every other
+    /// total in the view: in + out + cache, reasoning excluded.
+    fn tokens(&self) -> i64 {
+        self.input + self.output + self.cache
+    }
+
+    /// `claude-fable-5-1        612 ok     9.2K`
+    fn headline(&self) -> String {
+        format!(
+            "{} {} {:>tokens$}",
+            pad(&self.name, MODEL_NAME_WIDTH),
+            ok_cell(self.successes),
+            format_count(self.tokens()),
+            tokens = POOL_TOKENS_WIDTH
+        )
+    }
+
+    /// `in 300  out 400  cache 8.5K` — plus reasoning when non-zero.
+    fn detail(&self) -> String {
+        let mut detail = format!(
+            "in {}  out {}  cache {}",
+            format_count(self.input),
+            format_count(self.output),
+            format_count(self.cache)
+        );
+        if self.reasoning != 0 {
+            write!(detail, "  reasoning {}", format_count(self.reasoning))
+                .expect("write to String cannot fail");
+        }
+        detail
+    }
+}
+
+/// The model name cell, sized so name + ok + tokens fits the inner width
+/// with room for the two-space indent the nested lines carry.
+const MODEL_NAME_WIDTH: usize = 22;
+
+/// The account's `models` array, heaviest first, ties broken by name so the
+/// order never wobbles between calls.
+pub(crate) fn model_rows(account: &Value) -> Vec<ModelRow> {
+    let mut rows: Vec<ModelRow> =
+        account
+            .get("models")
+            .and_then(Value::as_array)
+            .map_or_else(Vec::new, |models| {
+                models
+                    .iter()
+                    .map(|model| ModelRow {
+                        name: model
+                            .get("model")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        successes: i64_field(model, "successes"),
+                        input: i64_field(model, "inputTokens"),
+                        output: i64_field(model, "outputTokens"),
+                        cache: i64_field(model, "cacheReadInputTokens")
+                            + i64_field(model, "cacheCreationInputTokens"),
+                        reasoning: i64_field(model, "reasoningOutputTokens"),
+                    })
+                    .collect()
+            });
+    rows.sort_by(|left, right| {
+        right
+            .tokens()
+            .cmp(&left.tokens())
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    rows
+}
+
+/// Every account's models folded into one list for the pool footer.
+pub(crate) fn pool_model_rows(accounts: &[Value]) -> Vec<ModelRow> {
+    let mut merged: std::collections::BTreeMap<String, ModelRow> =
+        std::collections::BTreeMap::new();
+    for account in accounts {
+        for row in model_rows(account) {
+            let entry = merged.entry(row.name.clone()).or_insert_with(|| ModelRow {
+                name: row.name.clone(),
+                successes: 0,
+                input: 0,
+                output: 0,
+                cache: 0,
+                reasoning: 0,
+            });
+            entry.successes += row.successes;
+            entry.input += row.input;
+            entry.output += row.output;
+            entry.cache += row.cache;
+            entry.reasoning += row.reasoning;
+        }
+    }
+    let mut rows: Vec<ModelRow> = merged.into_values().collect();
+    rows.sort_by(|left, right| {
+        right
+            .tokens()
+            .cmp(&left.tokens())
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    rows
+}
+
 /// The rich pool view behind `accounts`: one panel per provider with rows,
 /// per-account token lines and a footer rollup. Pure over the payload and
 /// the clock value handed to it: the renderer reads no clock.
@@ -223,9 +379,24 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64) {
             for line in account_detail_lines(account) {
                 output.line(&panel_row(&line));
             }
+            // AC-5: the models this account served, heaviest first.
+            for row in model_rows(account) {
+                output.line(&panel_row(&format!("  {}", row.headline())));
+                output.line(&panel_row(&paint(DIM, &format!("    {}", row.detail()))));
+            }
         }
 
         output.line(&format!("├{}┤", "─".repeat(INNER_WIDTH + 2)));
+        // AC-6: the same breakdown, summed across the pool.
+        let pool_models = pool_model_rows(accounts);
+        if !pool_models.is_empty() {
+            output.line(&panel_row(&paint(DIM, "by model")));
+            for row in pool_models {
+                output.line(&panel_row(&row.headline()));
+                output.line(&panel_row(&paint(DIM, &format!("  {}", row.detail()))));
+            }
+            output.line(&format!("├{}┤", "─".repeat(INNER_WIDTH + 2)));
+        }
         for line in footer_lines(&totals) {
             output.line(&panel_row(&line));
         }
