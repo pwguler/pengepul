@@ -86,11 +86,14 @@ struct AccountState {
     /// Per-local-day traffic, keyed `YYYY-MM-DD`. Sorted by construction,
     /// which is also chronological for that format (usage-trend AC-1).
     days: BTreeMap<String, DayUsage>,
-    /// Whether the attempt in flight has already been settled. Set by
-    /// `settle`, cleared by `record_attempt`: it is what tells a second
-    /// outcome for one attempt from the first outcome of the next.
-    /// In-memory only — a restart begins with no attempt in flight.
-    settled_attempt: bool,
+    /// How many attempts are in flight: incremented by `record_attempt`,
+    /// decremented by `settle`. A count rather than a flag because the
+    /// relay is async and rotation is in-flight-blind, so one Account can
+    /// serve several requests at once — a per-account boolean cannot tell
+    /// the second request's first outcome from the first request's second,
+    /// and destroyed a real success. In-memory only: a restart begins with
+    /// nothing in flight.
+    in_flight: i64,
 }
 
 impl AccountState {
@@ -115,7 +118,7 @@ impl AccountState {
             total_reasoning_output_tokens: 0,
             models: BTreeMap::new(),
             days: BTreeMap::new(),
-            settled_attempt: false,
+            in_flight: 0,
         }
     }
 
@@ -136,16 +139,17 @@ impl AccountState {
     /// Returns whether the outcome was counted, so a caller can skip the
     /// work that belongs with it.
     fn settle(&mut self, success: bool) -> bool {
-        // A second outcome for the attempt already settled: refuse it.
-        // The billing path records the rejection and then applies its
-        // cooldown; only the first call may count.
-        if self.settled_attempt {
-            return false;
-        }
-        // An outcome with no attempt: count the attempt it implies rather
-        // than leave `ok + failed > requests`, the direction load-time
-        // repair cannot fix.
-        if self.total_successes + self.total_failures >= self.total_requests {
+        if self.in_flight > 0 {
+            // One of the attempts in flight reaches its outcome.
+            self.in_flight -= 1;
+        } else {
+            // No attempt is in flight, so this is either an outcome the
+            // relay recorded without one, or a second outcome for an
+            // attempt already settled. Both are answered the same way:
+            // count the attempt this outcome implies, so `ok + failed`
+            // can never exceed `requests` — the direction load-time repair
+            // cannot fix. A caller that must not double-count checks the
+            // return of its first settle instead.
             self.total_requests += 1;
             self.today().requests += 1;
         }
@@ -156,7 +160,6 @@ impl AccountState {
             self.total_failures += 1;
             self.today().failures += 1;
         }
-        self.settled_attempt = true;
         true
     }
 
@@ -429,8 +432,7 @@ impl AccountManager {
         if let Some(state) = self.accounts.get_mut(email) {
             state.total_requests += 1;
             state.today().requests += 1;
-            // A fresh attempt: the next outcome is its first.
-            state.settled_attempt = false;
+            state.in_flight += 1;
             self.persist_usage();
         }
     }
@@ -441,17 +443,23 @@ impl AccountManager {
         };
         state.failure_count += 1;
         state.settle(false);
-        state.last_failure_kind = Some(kind.to_string());
         state.last_failure_at = Some(now_iso());
-        state.last_error =
-            Some(detail.map_or_else(|| kind.to_string(), |detail| format!("{kind}: {detail}")));
         let (base, maximum) = if kind == "billing" {
             (BILLING_COOLDOWN_SECONDS, BILLING_COOLDOWN_SECONDS)
         } else {
             FAILURE_BACKOFF
         };
         let multiplier = 2_f64.powi(i32::try_from(state.failure_count - 1).unwrap_or(0));
-        state.cooldown_until = unix_now() + (base * multiplier).min(maximum);
+        let cooldown = unix_now() + (base * multiplier).min(maximum);
+        // A cooldown only ever grows. A reauth lockout is 24 hours; a
+        // failure recorded after it must not collapse the account back to
+        // seconds and re-select it into a failure loop.
+        if cooldown > state.cooldown_until {
+            state.cooldown_until = cooldown;
+            state.last_failure_kind = Some(kind.to_string());
+            state.last_error =
+                Some(detail.map_or_else(|| kind.to_string(), |detail| format!("{kind}: {detail}")));
+        }
         self.persist_usage();
     }
 
@@ -707,9 +715,9 @@ fn reconcile_loaded_counters(state: &mut AccountState) {
             day.requests = outcomes;
         }
     }
-    // A loaded account has no attempt in flight: whatever it was doing
-    // when the process died is over.
-    state.settled_attempt = false;
+    // A loaded account has nothing in flight: whatever it was doing when
+    // the process died is over.
+    state.in_flight = 0;
 }
 
 /// The oldest local day a write keeps: today minus the retention window.

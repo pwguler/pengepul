@@ -192,6 +192,22 @@ before.
   trims, but only a recorder calls it, so a process idle since the window
   moved kept serving them. `snapshots()` filters to the window: what is
   served is bounded by the same rule as what is written.
+- **A flag could not hold a per-attempt fact.** The seam's first cut used
+  one `bool` per Account, which assumes one attempt in flight. Rotation
+  is in-flight-blind and the manager lock is released before the upstream
+  call, so an Account serves several requests at once: two attempts, two
+  successes recorded `requests 2, ok 1` — a real success destroyed, its
+  tokens and model row lost, and load-time repair then relabelled it a
+  failure. Found by the landing judge in the one case I told it I could
+  not reason about. It is an in-flight **count** now; capping that count
+  at 1 fails the test.
+- **A reauth lockout collapsed to two seconds.** `record_refresh_exhausted`
+  sets a 24-hour lockout, and the caller then recorded a failure for the
+  same attempt — a call I added in round 2 for an outcome that was
+  already recorded. The 2-second backoff overwrote the lockout and the
+  operator's "re-run login" message, re-selecting a dead account into a
+  failure loop. The redundant call is gone, and a cooldown now only ever
+  grows.
 - **The invariant moved from prose into a seam.** Three review rounds
   produced seven findings of one shape: a call site forgot that an
   attempt takes exactly one outcome. Round 3's fixes caused round 3's

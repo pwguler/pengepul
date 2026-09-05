@@ -118,13 +118,16 @@ in files.
   every outcome, Refusals included and reloaded at startup; a fresh process always retries every
   Account. Daily buckets are trimmed to 90 days on write. Deleting the file
   is the only reset.
-- **Every attempt reaches exactly one outcome.** `requests` always equals
-  `successes + failures`, per Account and per day — held by construction,
-  not by convention: every recorder settles through one private seam
-  (`AccountState::settle`) that counts an implied attempt when an outcome
-  arrives without one, and refuses a second outcome for an attempt
-  already settled. No call site can break it, which is why seven review
-  findings across three rounds were all one call site forgetting. Every
+- **Outcomes never exceed attempts.** Every recorder settles through one
+  private seam (`AccountState::settle`), which decrements the Account's
+  in-flight count when an attempt is waiting and otherwise counts the
+  attempt the outcome implies — so `successes + failures` can never run
+  ahead of `requests`, the direction load-time repair cannot fix. The
+  count is per Account and not a flag because Rotation is in-flight-blind
+  and the manager lock is released before the upstream call: one Account
+  serves several requests at once. A caller that must not record twice
+  (the billing path) applies health without an outcome rather than
+  relying on the seam to refuse it. Every
   path between selection and the response records a success, a failure,
   or a Refusal — including a
   client that hangs up mid-stream, whose outcome is paid by a `Drop`
@@ -132,9 +135,10 @@ in files.
   counts as a failed request but earns no Cooldown: a dialect the
   Provider cannot serve, or a 400 the client malformed, is not the
   Account's fault. Counters written before this held — by a binary with
-  a leaking path — are repaired at load, where nothing is in flight: the
-  unaccounted remainder is named as failures, and attempts and successes
-  are never rewritten.
+  a leaking path — are repaired at load, where nothing is in flight, in
+  both directions: an attempt with no outcome is named a failure, and
+  outcomes exceeding their attempts raise the attempts to meet them.
+  Successes are never rewritten and no recorded outcome is discarded.
 - **A number the panels cannot attribute is named, never invented.** Tokens
   carried before per-model tracking belong to no model, and the account
   panel says so rather than leaving the model rows to silently under-sum

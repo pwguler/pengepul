@@ -984,16 +984,17 @@ async fn the_invariant_holds_across_a_restart() {
     // A fresh attempt and its outcome, after the restart.
     rebuilt.record_attempt("k@example.com");
     rebuilt.record_success("k@example.com", None, "model-a");
-    // A second outcome for that same attempt is refused, not counted.
+    // An outcome arriving with nothing in flight counts the attempt it
+    // implies, so outcomes can never exceed attempts.
     rebuilt.record_refusal("k@example.com");
 
     let snapshot = &rebuilt.snapshots()[0];
     let requests = snapshot["totalRequests"].as_i64().expect("requests");
     let ok = snapshot["totalSuccesses"].as_i64().expect("ok");
     let failed = snapshot["totalFailures"].as_i64().expect("failed");
-    assert_eq!(requests, 2, "one attempt before the restart, one after");
+    assert_eq!(requests, 3, "two recorded attempts, one implied");
     assert_eq!(ok, 1);
-    assert_eq!(failed, 1);
+    assert_eq!(failed, 2);
     assert_eq!(requests, ok + failed);
 
     // An outcome with no attempt at all counts the attempt it implies.
@@ -1077,4 +1078,72 @@ async fn the_repair_is_written_at_load_not_at_the_next_request() {
         "the file still disagrees with the panel: {entry}"
     );
     assert_eq!(entry["total_failures"], 31);
+}
+
+/// The invariant under two attempts in flight on one account — ordinary
+/// for an async relay, since rotation is in-flight-blind and the manager
+/// lock is released before the upstream call. A per-account flag cannot
+/// tell R2's first outcome from R1's second, so it destroyed a real
+/// success and its tokens.
+#[tokio::test]
+async fn two_attempts_in_flight_both_reach_an_outcome() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    let usage = UsageData {
+        input_tokens: 100,
+        output_tokens: 10,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        reasoning_output_tokens: 0,
+    };
+
+    manager.record_attempt("k@example.com");
+    manager.record_attempt("k@example.com");
+    manager.record_success("k@example.com", Some(&usage), "model-a");
+    manager.record_success("k@example.com", Some(&usage), "model-a");
+
+    let snapshot = &manager.snapshots()[0];
+    assert_eq!(snapshot["totalRequests"], 2);
+    assert_eq!(snapshot["totalSuccesses"], 2, "an outcome was destroyed");
+    assert_eq!(snapshot["totalFailures"], 0);
+    // The tokens and the model row of the second success must survive.
+    assert_eq!(snapshot["totalInputTokens"], 200, "billed tokens lost");
+    assert_eq!(snapshot["models"][0]["successes"], 2, "model row lost");
+}
+
+/// A reauth lockout must survive the failure its caller records
+/// afterwards: `record_refresh_exhausted` already settled that attempt
+/// with a 24-hour cooldown, and a 2-second one re-selects the account
+/// into a failure loop.
+#[tokio::test]
+async fn a_reauth_lockout_is_not_clobbered_by_the_paired_failure() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64())
+    };
+
+    manager.record_attempt("k@example.com");
+    manager.record_refresh_exhausted("k@example.com", "expired");
+    manager.record_failure("k@example.com", "auth", Some("token refresh declined"));
+
+    let snapshot = &manager.snapshots()[0];
+    let remaining = snapshot["cooldownUntil"].as_f64().unwrap_or(0.0) - now();
+    assert!(
+        remaining > 3_600.0,
+        "the 24h lockout collapsed to {remaining:.0}s"
+    );
+    assert!(
+        snapshot["lastError"]
+            .as_str()
+            .is_some_and(|e| e.contains("re-run login")),
+        "the operator's instruction was overwritten: {}",
+        snapshot["lastError"]
+    );
 }

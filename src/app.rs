@@ -1673,10 +1673,11 @@ async fn next_provider_account(
     match manager.refresh_if_due(&email).await {
         Ok(true) => {}
         Ok(false) => {
-            // An attempt that ends here is a failure, not a request that
-            // vanished: without this the panels report more requests than
-            // outcomes and the gap is unaccountable to the operator.
-            manager.record_failure(&email, "auth", Some("token refresh declined"));
+            // The outcome is already recorded: `refresh_if_due` reaches
+            // here only after `record_refresh_exhausted`, which settled
+            // the attempt and set the 24-hour reauth lockout. Recording a
+            // failure here would collapse that lockout to seconds and
+            // overwrite the operator's "re-run login" message.
             return Err(AppError::provider(
                 StatusCode::BAD_GATEWAY,
                 format!("failed to refresh {provider} account; re-run login for {provider}"),
