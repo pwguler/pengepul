@@ -79,9 +79,23 @@ before.
   window and says so rather than rendering a flat line of `▁` that
   would look like 30 idle days.
 - AC-9: Days are summed across every account of every pool: the
-  sparkline is relay-wide, matching what `status` totals.
+  sparkline is relay-wide, matching what `status` totals. This requires
+  `GET /admin/accounts` to carry a `days` array per account, in the same
+  camelCase shape as `models` — implied by AC-9 but stated by no
+  criterion when this spec was written, and found during implementation.
 - AC-10: The renderer stays pure — it takes the buckets and a `now`
   from the command layer, reads no clock and performs no I/O.
+
+## Revisions
+
+- **The payload gap.** AC-9 sums days relay-wide and the CLI reads
+  `/admin/accounts`, but no criterion said the payload carries `days`.
+  Found while implementing AC-1; folded into AC-9 rather than left
+  implicit.
+- **The sparkline covers calendar days, not recorded days.** A window of
+  30 columns needs a column per *calendar* day, so idle days are
+  synthesised as zero rather than skipped. Without this the line would
+  compress an idle week into nothing and misreport the shape.
 
 ## Verification
 
