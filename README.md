@@ -47,7 +47,8 @@ systemctl --user restart pengepul   # or: pengepul service restart
 ```
 
 A provider id becomes a directory name under the auth dir, so it may hold letters,
-digits, `.`, `-` and `_`. Providers are read at startup, so the relay needs a restart
+digits, `.`, `-` and `_`; `.` and `..` are refused, since a filesystem
+reads them as somewhere else. Providers are read at startup, so the relay needs a restart
 before it will serve a new one. Registration is for new providers only: an id already in
 the file with a different `base-url` is an error naming the URL it kept, so a mistyped
 flag cannot move a live provider's traffic to another host. Repeating the same command

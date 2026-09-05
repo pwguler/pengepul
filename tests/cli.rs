@@ -4262,14 +4262,17 @@ fn a_url_with_a_space_before_its_slash_is_stored_trimmed() {
         written.contains("base-url: https://openrouter.ai/api/v1\n"),
         "a trailing space survived into the file: {written}"
     );
-    // And so repeating it is accepted rather than refusing itself.
+    // Repeating the BYTE-IDENTICAL command, not the normalised form. The
+    // first version of this test re-ran with `https://openrouter.ai/api/v1`
+    // — the one input that cannot fail — so it passed while the same
+    // command run twice refused itself on the second run.
     run(
         &[
             "login",
             "--provider",
             "openrouter",
             "--base-url",
-            "https://openrouter.ai/api/v1",
+            "https://openrouter.ai/api/v1 /",
             "--key",
             "sk-test",
         ],

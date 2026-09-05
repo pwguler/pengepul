@@ -193,11 +193,7 @@ pub fn register_provider(path: &Path, id: &str, base_url: &str) -> Result<()> {
     // A trailing slash would make `{base_url}/chat/completions` a double
     // slash, which some hosts answer with a 404 that names nothing
     // (AC-5).
-    // Trimmed on both sides of the slash strip: `"https://h/v1 /"` would
-    // otherwise be stored with a trailing space that `validate_providers`
-    // trims on load, so the stored form and the loaded form disagree and
-    // repeating the command refuses itself.
-    let base_url = base_url.trim().trim_end_matches('/').trim_end();
+    let base_url = normalize_base_url(base_url);
     if base_url.is_empty() {
         bail!("providers: {id} is missing base-url");
     }
@@ -209,7 +205,7 @@ pub fn register_provider(path: &Path, id: &str, base_url: &str) -> Result<()> {
         serde_yaml::from_str(&text).with_context(|| format!("invalid config {}", path.display()))?
     };
     if let Some(existing) = raw.providers.get(id) {
-        let existing = existing.base_url.trim().trim_end_matches('/');
+        let existing = normalize_base_url(&existing.base_url);
         if existing != base_url {
             bail!("{id} already points at {existing}; edit the config to change it");
         }
@@ -291,9 +287,6 @@ pub fn load_config(
     })
 }
 
-/// Turn the raw `providers:` section into validated configured providers.
-///
-/// The entry name becomes the provider id a client's model prefix must match, so
 /// Exclusive ownership of a config file for the length of a
 /// read-modify-write, released on drop however the write ends.
 struct FileLock {
@@ -340,6 +333,21 @@ impl Drop for FileLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
+}
+
+/// The stored form of a `base-url`: what two callers must agree on.
+///
+/// A trailing slash would make `{base_url}/chat/completions` a double
+/// slash, which some hosts answer with a 404 that names nothing; the
+/// second trim catches a space *before* that slash, which would otherwise
+/// be stored and then trimmed again on load, so the stored and loaded
+/// forms disagree and repeating a command refuses itself.
+///
+/// This exists as a function because it did not: `login` and
+/// `register_provider` each carried their own copy, they drifted by one
+/// call, and the guard that runs first was the one missing it.
+pub fn normalize_base_url(url: &str) -> &str {
+    url.trim().trim_end_matches('/').trim_end()
 }
 
 /// Reject a Provider id the registry cannot hold.
@@ -616,7 +624,7 @@ mod register_tests {
         }
         assert!(after.contains("base:"), "the original provider was lost");
         assert!(
-            !path.with_extension("lock").exists(),
+            !dir.path().join("config.yaml.lock").exists(),
             "the lock outlived the registration"
         );
     }
@@ -663,5 +671,63 @@ mod register_tests {
 
         let after = fs::read_to_string(&path).expect("read config");
         assert!(after.contains("https://api.groq.com/openai/v1"), "{after}");
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::register_provider;
+    use std::fs;
+
+    fn config(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("config.yaml");
+        fs::write(
+            &path,
+            "host: \"127.0.0.1\"\nport: 8317\napi-keys:\n  - sk-test\nproviders: {}\n",
+        )
+        .expect("write config");
+        path
+    }
+
+    /// A killed registration cannot run `Drop`, so its lock outlives it.
+    /// README promises the next registration names the file and that
+    /// removing it is the whole recovery — the one failure an operator
+    /// actually meets, and nothing pinned it.
+    #[test]
+    fn a_stale_lock_names_itself_and_removing_it_is_the_recovery() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = config(dir.path());
+        let lock = dir.path().join("config.yaml.lock");
+        fs::write(&lock, "").expect("stale lock");
+
+        let error = register_provider(&path, "groq", "https://api.groq.com/openai/v1")
+            .expect_err("a held lock was ignored");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("config.yaml.lock"),
+            "the error does not name the file to remove: {error}"
+        );
+
+        fs::remove_file(&lock).expect("remove lock");
+        register_provider(&path, "groq", "https://api.groq.com/openai/v1")
+            .expect("removing the lock did not restore service");
+    }
+
+    /// And the lock is released by finishing, not only by the operator
+    /// deleting it: without this, a `Drop` that does nothing looks
+    /// exactly like a `Drop` that works until the second registration.
+    #[test]
+    fn a_finished_registration_releases_its_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = config(dir.path());
+
+        register_provider(&path, "groq", "https://api.groq.com/openai/v1").expect("first");
+        assert!(
+            !dir.path().join("config.yaml.lock").exists(),
+            "the lock outlived the registration that took it"
+        );
+        // The proof that matters: a second registration can still take it.
+        register_provider(&path, "other", "https://other.host/v1")
+            .expect("the lock was never released");
     }
 }

@@ -6,7 +6,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 use serde_json::Value;
 
 use crate::config::{
-    Config, load_config, register_provider, selected_config_path, validate_provider_id,
+    Config, load_config, normalize_base_url, register_provider, selected_config_path,
+    validate_provider_id,
 };
 pub use crate::render::Style;
 use crate::render::{ActionGlyph, BOLD, DIM, Fact, Output, fact_panel, paint, status_glyph};
@@ -838,7 +839,7 @@ fn login(
     // door.
     if let Some(url) = base_url {
         validate_provider_id(provider)?;
-        if url.trim().trim_end_matches('/').is_empty() {
+        if normalize_base_url(url).is_empty() {
             bail!("providers: {provider} is missing base-url");
         }
     }
@@ -848,8 +849,11 @@ fn login(
     // it IS configured and live, so a foreign key would join its pool at
     // the next reload and answer with 401s (AC-3).
     if let (Some(requested), Some(existing)) = (base_url, config.providers.get(provider)) {
-        let requested = requested.trim().trim_end_matches('/');
-        let existing = existing.base_url.trim().trim_end_matches('/');
+        // The same function `register_provider` stores with. Two copies of
+        // this rule drifted by one call and this guard, which runs first,
+        // was the one missing it.
+        let requested = normalize_base_url(requested);
+        let existing = normalize_base_url(&existing.base_url);
         if requested != existing {
             bail!("{provider} already points at {existing}; edit the config to change it");
         }
