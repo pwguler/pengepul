@@ -1165,7 +1165,9 @@ fn config_path_and_api_key_render_a_panel_when_rich_and_bare_when_piped() {
     let rich = run_style(&["config", "path"], tmp.path(), &mut runtime, Style::Rich);
     let visible = strip_ansi(&rich.stdout);
     assert!(visible.contains("┌─ config "), "{visible}");
-    assert!(visible.contains("config.yaml"));
+    // By label, not by path text: under a long TMPDIR the path is clipped
+    // to the box and its tail (`config.yaml`) is exactly what goes.
+    assert!(visible.contains("│ path"), "{visible}");
 
     let plain = run(&["config", "path"], tmp.path(), &mut runtime);
     assert_eq!(
@@ -2347,9 +2349,12 @@ fn a_value_too_wide_for_the_panel_is_marked_not_amputated() {
 
     assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
+    // Located by label: the path text is exactly what the clip removes, so
+    // a needle inside it survives only for short TMPDIRs (it panicked on
+    // macOS and under any TMPDIR past 22 chars).
     let config_row = visible
         .lines()
-        .find(|line| line.contains("production-relay") || line.contains("projects"))
+        .find(|line| line.contains("\u{2502} config"))
         .expect("config row");
     // The row still fits the box.
     assert_eq!(
@@ -2425,4 +2430,120 @@ fn version_prints_the_same_bytes_in_both_styles() {
     );
     // Same bytes under a rich terminal: a version string is machine-read.
     assert_eq!(plain, text(Style::Rich));
+}
+
+/// consistent-panels AC-9: an over-long *header* is marked when clipped,
+/// like every other truncation. Without the mark the header can cut an
+/// account count mid-digit and report `─ 1` for a pool holding 12.
+#[test]
+fn an_over_long_panel_header_is_marked_not_amputated() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let long_id = "p".repeat(49);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                long_id.clone(): {
+                    "account_count": 12,
+                    "accounts": (0..12).map(|n| account(json!({
+                        "email": format!("k{n}@x.com"),
+                        "available": true,
+                        "totalRequests": 1
+                    }))).collect::<Vec<_>>()
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    let header = visible.lines().next().expect("header");
+    assert_eq!(header.chars().count(), 64, "header width: {header}");
+    // The clip must be marked: a header reading "─ 1" for a 12-account
+    // pool is the same lie as a truncated token figure.
+    assert!(header.contains('\u{2026}'), "clip not marked: {header}");
+    assert!(
+        !header.contains("─ 1 ") || header.contains("─ 12"),
+        "count truncated mid-digit: {header}"
+    );
+}
+
+/// status-total-only AC-3 + usage-by-model AC-7: plain output is what a
+/// script parses, so it never clips a provider key. An ellipsis inside a
+/// pool name would be read as part of the id.
+#[test]
+fn plain_status_never_clips_a_pool_name() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "0.0.0.0", 8318);
+    let long_id = "openrouter-eu-west-frankfurt-1";
+    let mut runtime = FakeRuntime {
+        accounts_payload: Some(json!({
+            "providers": {
+                long_id: {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalRequests": 5
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run(&["status"], tmp.path(), &mut runtime);
+
+    assert_eq!(outcome.code, 0);
+    assert!(
+        outcome.stdout.contains(long_id),
+        "plain clipped the pool name:\n{}",
+        outcome.stdout
+    );
+    assert!(
+        !outcome.stdout.contains('\u{2026}'),
+        "ellipsis in script-parsed output:\n{}",
+        outcome.stdout
+    );
+}
+
+/// consistent-panels AC-8: a control character in an operator string must
+/// not split a panel row. A newline is legal in a Unix path, and a split
+/// row is neither 64 columns nor a box.
+#[test]
+fn a_control_character_cannot_split_a_panel_row() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "0.0.0.0", 8318);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "an\nthropic\tpool": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalRequests": 5
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["status"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    for line in visible.lines() {
+        assert_eq!(
+            line.chars().count(),
+            64,
+            "control character split the box: {line:?}"
+        );
+    }
 }

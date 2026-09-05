@@ -392,9 +392,12 @@ pub(crate) struct PoolLine {
 
 /// The pool line's column budget inside the 60 inner columns: name 18 +
 /// accounts 12 + requests 11 + tokens 9, single spaces between (53), the
-/// rest is slack. `pad` clips a longer pool name to the cell with an
-/// ellipsis rather than pushing the row right, so the token column stays
-/// aligned down the block.
+/// rest is slack. The name cell is a *minimum*, not a clamp: plain output
+/// is the surface a script parses and the one that can be trusted for a
+/// full provider key (usage-by-model AC-7), so a long name widens its row
+/// rather than losing characters to an ellipsis a parser would read as
+/// part of the id. Short names still align down the block. The rich
+/// branch carries the name as a fact label, where it does clip.
 const POOL_NAME_WIDTH: usize = 18;
 const POOL_ACCOUNTS_WIDTH: usize = 12;
 const POOL_REQUESTS_WIDTH: usize = 11;
@@ -405,9 +408,10 @@ impl PoolLine {
     /// branch's row, where the pool name leads the line.
     fn render(&self) -> String {
         format!(
-            "{} {}",
-            pad(&self.name, POOL_NAME_WIDTH),
-            self.render_value()
+            "{:<width$} {}",
+            self.name,
+            self.render_value(),
+            width = POOL_NAME_WIDTH
         )
     }
 

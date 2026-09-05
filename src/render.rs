@@ -92,15 +92,23 @@ pub(crate) fn panel_row(content: &str) -> String {
     let plain = strip_ansi(content);
     let visible = plain.chars().count();
     if visible > INNER_WIDTH {
-        format!("│ {} │", pad(&plain, INNER_WIDTH))
-    } else {
-        let tail = " ".repeat(INNER_WIDTH - visible);
-        format!("│ {content}{tail} │")
+        return format!("│ {} │", pad(&plain, INNER_WIDTH));
     }
+    // A control character would split the row in two, neither half a box.
+    // The sanitized text is the only safe thing to print, at the cost of
+    // this row's color — the same trade the clip branch makes.
+    let raw_control = content.chars().any(|c| c.is_control() && c != '\x1b');
+    let tail = " ".repeat(INNER_WIDTH - visible);
+    let body = if raw_control { &plain } else { content };
+    format!("│ {body}{tail} │")
 }
 
-/// Strip ANSI escape sequences, keeping the visible text. Lives with the
-/// render code so measurement and tests share one definition.
+/// Strip ANSI escape sequences, keeping the visible text, and neutralise
+/// control characters. A newline or tab is legal in an operator string (a
+/// `--config` path, a `providers:` key) and would otherwise split a panel
+/// row in two, neither half a box: `chars().count()` measures them as one
+/// column while the terminal acts on them. Lives with the render code so
+/// measurement and tests share one definition.
 pub(crate) fn strip_ansi(text: &str) -> String {
     let mut out = String::new();
     let mut chars = text.chars().peekable();
@@ -112,6 +120,8 @@ pub(crate) fn strip_ansi(text: &str) -> String {
                     break;
                 }
             }
+        } else if character.is_control() {
+            out.push(' ');
         } else {
             out.push(character);
         }
@@ -122,15 +132,17 @@ pub(crate) fn strip_ansi(text: &str) -> String {
 /// Top rule with a header inside: `┌─ <header> ─…┐`, filled to the same
 /// width as a panel row. Box integrity wins over content, as in
 /// `panel_row`: an oversized header (operator strings) is truncated to
-/// the fixed width instead of underflowing the fill.
+/// the fixed width — and, as in `panel_row`, the truncation is *marked*.
+/// An unmarked cut can land mid-number: `pool <49 chars> ─ 1` for a pool
+/// holding 12 accounts is the same lie as a truncated token figure.
 pub(crate) fn top_rule(header: &str) -> String {
-    let header: String = {
-        let characters: Vec<char> = header.chars().collect();
-        if characters.len() > INNER_WIDTH - 2 {
-            characters[..INNER_WIDTH - 2].iter().collect()
-        } else {
-            header.to_string()
-        }
+    // Sanitized first: a control character in an operator string would
+    // split the rule, and its width is measured here.
+    let header = strip_ansi(header);
+    let header: String = if header.chars().count() > INNER_WIDTH - 2 {
+        pad(&header, INNER_WIDTH - 2)
+    } else {
+        header
     };
     let fill = INNER_WIDTH.saturating_sub(header.chars().count() + 1);
     let mut top = format!("┌─ {header} ");

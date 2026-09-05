@@ -39,11 +39,13 @@ the total"*, then, choosing the shape: total **plus one line per pool**.
 - AC-3: The per-pool line reads `<pool>  <n> account(s)  <r> req  <t>` —
   pool name, account count (singular/plural), request count, and total
   tokens for that pool (in + out + cache-read + cache-creation), with the
-  token figure right-aligned. Pools appear **sorted by provider key**:
-  `serde_json` is built without `preserve_order`, so the payload is a
-  `BTreeMap` at both ends and "payload order" and "key order" are the
-  same thing. Say key order, so enabling `preserve_order` later cannot
-  silently change this.
+  token figure right-aligned. The plain name cell is a **minimum, not a
+  clamp**: a long provider key widens its row rather than losing
+  characters, because plain is what a script parses. Pools appear
+  **sorted by provider key**: `serde_json` is built without
+  `preserve_order`, so the payload is a `BTreeMap` at both ends and
+  "payload order" and "key order" are the same thing. Say key order, so
+  enabling `preserve_order` later cannot silently change this.
 - AC-4: Pools with zero accounts are omitted from the per-pool lines and
   from `P`, matching today's status behaviour; `A` counts loaded
   accounts.
