@@ -2928,3 +2928,92 @@ async fn an_upstream_400_reconciles_and_spares_the_account() {
         "a client's bad body opened a streak"
     );
 }
+
+/// AC-6, for real rather than in simulation: six requests in flight at
+/// once on one Account, driven concurrently through the router.
+///
+/// Every other test in this suite calls the recorders in sequence, which
+/// is exactly the shape that let a per-account `bool` pass five review
+/// rounds while destroying a concurrent success along with its tokens.
+/// The counters must show six requests and six successes, and no bucket
+/// may disagree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn six_concurrent_requests_each_count_exactly_once() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(
+        tmp.path(),
+        &TokenData {
+            access_token: "anthropic-access".to_string(),
+            refresh_token: "anthropic-refresh".to_string(),
+            email: "anthropic@example.com".to_string(),
+            expires_at: "2030-01-01T00:00:00Z".to_string(),
+            account_uuid: "acct-anthropic".to_string(),
+            provider: ProviderId::anthropic(),
+            id_token: None,
+            last_refresh_at: None,
+            plan_type: None,
+        },
+    )
+    .expect("save token");
+    let upstream = Arc::new(FakeUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream);
+
+    let mut inflight = Vec::new();
+    for _ in 0..6 {
+        let app = app.clone();
+        inflight.push(tokio::spawn(async move {
+            json_response(
+                app,
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("authorization", "Bearer sk-test")
+                    .header("content-type", "application/json")
+                    .header("content-length", "1")
+                    .body(Body::from(
+                        json!({
+                            "model": "claude-sonnet-4-6",
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+        }));
+    }
+    for task in inflight {
+        let (status, _) = task.await.expect("request panicked");
+        assert_eq!(status, 200, "a concurrent request did not succeed");
+    }
+
+    let usage: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join("anthropic").join("usage.json"))
+            .expect("usage file"),
+    )
+    .expect("usage json");
+    let account = usage
+        .as_object()
+        .expect("accounts")
+        .values()
+        .next()
+        .expect("one account");
+    let requests = account["total_requests"].as_i64().expect("requests");
+    let ok = account["total_successes"].as_i64().expect("ok");
+    let failed = account["total_failures"].as_i64().expect("failed");
+    assert_eq!(
+        (requests, ok, failed),
+        (6, 6, 0),
+        "six concurrent requests counted as {requests}/{ok}/{failed}"
+    );
+    for (date, day) in account["days"].as_object().expect("days") {
+        let day_requests = day["requests"].as_i64().expect("day requests");
+        let day_ok = day["successes"].as_i64().unwrap_or(0);
+        let day_failed = day["failures"].as_i64().unwrap_or(0);
+        assert_eq!(
+            day_requests,
+            day_ok + day_failed,
+            "bucket {date} disagrees: {day}"
+        );
+    }
+}
