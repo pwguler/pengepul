@@ -24,8 +24,13 @@ model at accounting time but throws it away.
   that served them, once.
 - **No backfill.** Counters accumulated before this change have no model
   attribution and stay only in the account totals (user's choice:
-  "diamkan saja"). Per-model lines therefore may sum to less than the
-  account total until old history is outgrown. No `untracked` line.
+  "diamkan saja"). **Revised:** the model rows sit under an account total
+  they do not sum to, and a reader cannot tell whether the difference is
+  a bug or history — the same shape that made the operator ask about
+  `requests` three times. The remainder is now named
+  (`unattributed 153.0M — before per-model tracking`) and shown only when
+  it is non-zero. Naming it is honest; inventing an attribution for it
+  would not be.
 - **No per-model cooldown, routing, or limits.** Display and accounting
   only; account selection is untouched.
 - **No new endpoint.** The existing `GET /admin/accounts` payload carries

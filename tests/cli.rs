@@ -3108,3 +3108,86 @@ fn all_time_is_never_smaller_than_the_window_it_contains() {
         "a superset smaller than its subset: {all_time}"
     );
 }
+
+/// The model rows sit under an account total they do not sum to: tokens
+/// spent before per-model attribution existed belong to no model. Naming
+/// the remainder is honest; leaving the reader to subtract is not, and
+/// inventing an attribution would be worse.
+#[test]
+fn an_account_names_the_tokens_no_model_claims() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalRequests": 100,
+                        "totalSuccesses": 100,
+                        "totalInputTokens": 1_000,
+                        "totalOutputTokens": 0,
+                        "totalCacheReadInputTokens": 0,
+                        "totalCacheCreationInputTokens": 0,
+                        "models": [{
+                            "model": "claude-opus-5",
+                            "successes": 40,
+                            "inputTokens": 400,
+                            "outputTokens": 0,
+                            "cacheCreationInputTokens": 0,
+                            "cacheReadInputTokens": 0,
+                            "reasoningOutputTokens": 0
+                        }]
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    // 1,000 on the account, 400 claimed by a model: 600 belong to none.
+    let row = visible
+        .lines()
+        .find(|line| line.contains("unattributed"))
+        .expect("the remainder is named");
+    assert!(row.contains("600"), "remainder: {row}");
+    // An account whose models account for everything says nothing extra.
+    let mut complete = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalInputTokens": 400,
+                        "models": [{
+                            "model": "claude-opus-5",
+                            "successes": 40,
+                            "inputTokens": 400,
+                            "outputTokens": 0,
+                            "cacheCreationInputTokens": 0,
+                            "cacheReadInputTokens": 0,
+                            "reasoningOutputTokens": 0
+                        }]
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+    let visible =
+        strip_ansi(&run_style(&["accounts"], tmp.path(), &mut complete, Style::Rich).stdout);
+    assert!(
+        !visible.contains("unattributed"),
+        "a fully attributed account needs no remainder row: {visible}"
+    );
+}

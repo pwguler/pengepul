@@ -96,6 +96,7 @@ pub(crate) fn print_accounts(payload: &Value, output: &mut Output, now: f64) {
             }
             output.line(&detail);
             // AC-7: the same per-model breakdown, plain.
+            let unattributed = unattributed_tokens(account);
             for row in model_rows(account) {
                 output.line(&format!(
                     "    {} {} ok {}",
@@ -114,6 +115,9 @@ pub(crate) fn print_accounts(payload: &Value, output: &mut Output, now: f64) {
                         format!(" reasoning {}", format_count(row.reasoning))
                     }
                 ));
+            }
+            if unattributed > 0 {
+                output.line(&format!("    unattributed {}", format_count(unattributed)));
             }
         }
     }
@@ -268,6 +272,15 @@ fn name_column(rows: &[ModelRow]) -> usize {
         .min(MODEL_NAME_WIDTH)
 }
 
+/// Tokens the account carried that no model claims: spent before
+/// per-model attribution existed, so nothing records which model spent
+/// them. Naming the remainder is honest; inventing an attribution is not
+/// (usage-by-model, no backfill).
+pub(crate) fn unattributed_tokens(account: &Value) -> i64 {
+    let claimed: i64 = model_rows(account).iter().map(ModelRow::tokens).sum();
+    (account_tokens(account) - claimed).max(0)
+}
+
 /// The account's `models` array, heaviest first, ties broken by name so the
 /// order never wobbles between calls.
 pub(crate) fn model_rows(account: &Value) -> Vec<ModelRow> {
@@ -361,6 +374,16 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64) {
             for row in model_rows(account) {
                 output.line(&panel_row(&format!("  {}", row.headline(width))));
                 output.line(&panel_row(&paint(DIM, &format!("    {}", row.detail()))));
+            }
+            let unattributed = unattributed_tokens(account);
+            if unattributed > 0 {
+                output.line(&panel_row(&paint(
+                    DIM,
+                    &format!(
+                        "  unattributed  {}  \u{2014} before per-model tracking",
+                        format_count(unattributed)
+                    ),
+                )));
             }
         }
 
