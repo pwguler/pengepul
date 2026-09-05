@@ -14,8 +14,10 @@ then *"consisten style"*.
 
 **Header** — `<subject>` alone, or `<subject> ─ <qualifier>`. No colons.
 The subject names the thing (`relay total`, `pool anthropic`, `service`,
-`login commandcode`, `update`, `config`); the qualifier counts or states
-it (`2 pools, 3 accounts`, `1 account, 1 available`, `active`).
+`login commandcode`, `update`, `config`). A qualifier must add a fact the
+rows do not carry: a count qualifies (`2 pools, 3 accounts`, `1 account,
+1 available`); a **state never does**, because a state always has its own
+row and the header would only repeat it, truncated and uncolored.
 
 **Row** — `<label>  <value>`, labels left-aligned in a column fitted to
 the panel's own labels. One row, one fact.
@@ -55,9 +57,10 @@ rows, indented for models.
   (glyph + health), one row per pool labelled by pool name, then
   `requests`, `tokens`, `reasoning` (only when non-zero), `total`.
 - AC-4: `service status` rows become labelled facts: `state` (glyph),
-  `enabled`, `pid`, `memory`, `cpu`, `tasks`, `uptime` — dropping
-  today's ad-hoc two-space pairs. The header carries the state as its
-  qualifier.
+  `enabled`, `pid`, `memory`, `cpu`, `tasks`, and `uptime` for a running
+  unit or `stopped` for a dead one — dropping today's ad-hoc two-space
+  pairs. The header is `service` with no qualifier: the state is already
+  a row.
 - AC-5: `service` actions, `login`, and `update` use `state` as the
   label of their glyph row, and name their subject in a second row:
   `state ● restarted`; `state ● saved` + `account key-90445c90`;
@@ -66,10 +69,35 @@ rows, indented for models.
   `api key`) under a `config` header, unchanged in content.
 - AC-7: Account rows and model rows keep their table shape and their
   fitted columns; they are not converted into fact rows.
-- AC-8: Every rich line is exactly 64 visible columns; every plain
-  output is byte-identical to before this spec.
+- AC-8: Every rich line is exactly 64 visible columns. Plain output is
+  unchanged by this spec: the surfaces whose plain bytes are stable
+  (`config path`, `config api-key`, `update --check`, `--version`) are
+  verified byte-identical against the pre-change binary, and the plain
+  assertions in the suite pass unedited. `status` and `accounts` carry
+  live counters, so their guard is those pinned assertions rather than a
+  byte diff.
 - AC-9: The label column is computed per panel, not per row or per
-  section, so values align down the whole box.
+  section, so values align down the whole box — including the `accounts`
+  panel, whose per-account token rows and footer rollup share one column.
+  A label longer than the cap clips; the value never does, because a
+  truncated number is a lie.
+
+## Revisions
+
+- **AC-4's header qualifier withdrawn.** The first cut headed the panel
+  `service ─ active`, repeating the `state ● active (running)` row and
+  repeating it worse — without the `(running)` detail and without the
+  glyph's color. The user caught it. The rule is now explicit in the
+  language above: a qualifier must add a fact the rows do not carry.
+- **AC-9 reached further than the first cut.** The `accounts` panel's
+  per-account token rows and footer rollup were still built by `format!`
+  with a single space, so one box held four different value columns
+  (13, 11, 14, 10). They are `Fact`s now, sharing the panel's column.
+- **`fact_row` clips its label.** It did not, despite a comment claiming
+  it did: a provider key of 16+ characters pushed the value column out of
+  line, and 26+ pushed the token figure past the box edge where
+  `panel_row` amputated it — a silently truncated number. Found by the
+  landing judge, reproduced with a 30-char pool name.
 
 ## Verification
 

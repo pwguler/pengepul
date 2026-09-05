@@ -50,11 +50,13 @@ the total"*, then, choosing the shape: total **plus one line per pool**.
 - AC-6: An empty relay (no pools with accounts) still prints the block
   with `relay total: 0 pools, 0 accounts`, no per-pool lines, and zeroed
   aggregates.
-- AC-7: `accounts` output is byte-identical to v0.10.2 for both styles
-  (guarded by the existing `accounts` tests, which must not need edits
-  for this spec). **Scope:** this AC binds this spec alone. The
-  `usage-by-model` spec, landing alongside, deliberately changes
-  `accounts` and edits those tests.
+- AC-7: **Superseded.** This spec does not change `accounts`, but the
+  paired `usage-by-model` spec deliberately does, and both land in the
+  same range — so "byte-identical `accounts` output" is not a property
+  the tree can be judged against, as the landing judge showed. What is
+  verified instead: this spec's own commit leaves `accounts` untouched,
+  and the plain `accounts` assertions in the suite pass unedited through
+  it.
 - AC-8: The renderer stays pure: no clock read beyond the `now` already
   passed in, no I/O.
 

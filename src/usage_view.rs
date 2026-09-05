@@ -7,8 +7,9 @@ use std::fmt::Write as _;
 use serde_json::Value;
 
 use crate::render::{
-    AMBER, ActionGlyph, BOLD, DIM, Fact, GREEN, INNER_WIDTH, Output, RED, fact_panel, format_count,
-    format_exact, pad, paint, panel_row, share_bar, status_glyph, top_rule,
+    AMBER, ActionGlyph, BOLD, DIM, Fact, GREEN, INNER_WIDTH, Output, RED, fact_panel, fact_row,
+    format_count, format_exact, label_column, pad, paint, panel_row, share_bar, status_glyph,
+    top_rule,
 };
 
 /// `"on cooldown 4m12s"` while a cooldown lasts, `""` once it has cleared or
@@ -344,10 +345,15 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64) {
                 .flat_map(model_rows)
                 .collect::<Vec<ModelRow>>(),
         );
+        // One label column for every fact in the panel -- the per-account
+        // token rows and the footer rollup align down the whole box.
+        let mut panel_facts: Vec<Fact> = accounts.iter().flat_map(account_detail_facts).collect();
+        panel_facts.extend(footer_facts(&totals));
+        let column = label_column(&panel_facts);
         for account in accounts {
             output.line(&panel_row(&account_row(account, pool_total, now)));
-            for line in account_detail_lines(account) {
-                output.line(&panel_row(&line));
+            for fact in account_detail_facts(account) {
+                output.line(&panel_row(&fact_row(&fact, column)));
             }
             // AC-5: the models this account served, heaviest first.
             for row in model_rows(account) {
@@ -357,8 +363,8 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64) {
         }
 
         output.line(&format!("├{}┤", "─".repeat(INNER_WIDTH + 2)));
-        for line in footer_lines(&totals) {
-            output.line(&panel_row(&line));
+        for fact in footer_facts(&totals) {
+            output.line(&panel_row(&fact_row(&fact, column)));
         }
         output.line(&format!("└{}┘", "─".repeat(INNER_WIDTH + 2)));
     }
@@ -369,8 +375,8 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64) {
 pub(crate) struct RelayTotals {
     pools: usize,
     accounts: usize,
-    requests: i64,
-    tokens: i64,
+    /// Every account of every pool, summed. The relay's request and token
+    /// figures both read from here: one accumulation, one source of truth.
     totals: PoolTotals,
     lines: Vec<PoolLine>,
 }
@@ -466,8 +472,6 @@ impl RelayTotals {
             for account in accounts {
                 let requests = i64_field(account, "totalRequests");
                 let tokens = account_tokens(account);
-                totals.requests += requests;
-                totals.tokens += tokens;
                 totals.totals.add(account);
                 pool.requests += requests;
                 pool.tokens += tokens;
@@ -586,7 +590,7 @@ pub(crate) fn print_relay_total_rich(
     }
     facts.push(Fact::new(
         "total",
-        &paint(BOLD, &format_count(totals.tokens)),
+        &paint(BOLD, &format_count(totals.totals.tokens())),
     ));
     for line in fact_panel(&relay_header_rich(&totals), &facts) {
         output.line(&line);
@@ -614,7 +618,7 @@ fn aggregate_lines(totals: &RelayTotals) -> Vec<String> {
     if pool.reasoning != 0 {
         lines.push(format!("reasoning {}", format_count(pool.reasoning)));
     }
-    lines.push(format!("total {}", format_count(totals.tokens)));
+    lines.push(format!("total {}", format_count(totals.totals.tokens())));
     lines
 }
 
@@ -672,57 +676,67 @@ pub(crate) fn account_row(account: &Value, pool_total: i64, now: f64) -> String 
     .join(" ")
 }
 
-/// The dim per-account token lines shown under `accounts`: in/out/cache,
-/// plus a reasoning line only when that total is non-zero.
-pub(crate) fn account_detail_lines(account: &Value) -> Vec<String> {
-    let mut lines = vec![paint(
-        DIM,
-        &format!(
-            "in {}  out {}  cache {}",
-            format_count(i64_field(account, "totalInputTokens")),
-            format_count(i64_field(account, "totalOutputTokens")),
-            format_count(
-                i64_field(account, "totalCacheReadInputTokens")
-                    + i64_field(account, "totalCacheCreationInputTokens")
+/// The per-account token facts shown under `accounts`: in/out/cache, plus
+/// reasoning only when that total is non-zero. Labelled like every other
+/// fact row so the panel has one column, not one per section.
+pub(crate) fn account_detail_facts(account: &Value) -> Vec<Fact> {
+    let mut facts = vec![Fact::new(
+        "tokens",
+        &paint(
+            DIM,
+            &format!(
+                "in {}  out {}  cache {}",
+                format_count(i64_field(account, "totalInputTokens")),
+                format_count(i64_field(account, "totalOutputTokens")),
+                format_count(
+                    i64_field(account, "totalCacheReadInputTokens")
+                        + i64_field(account, "totalCacheCreationInputTokens")
+                ),
             ),
         ),
     )];
     let reasoning = i64_field(account, "totalReasoningOutputTokens");
     if reasoning != 0 {
-        lines.push(paint(
-            DIM,
-            &format!("reasoning {}", format_count(reasoning)),
+        facts.push(Fact::new(
+            "reasoning",
+            &paint(DIM, &format_count(reasoning)),
         ));
     }
-    lines
+    facts
 }
 
-/// Footer rollup lines: requests, tokens, and reasoning when non-zero.
-pub(crate) fn footer_lines(totals: &PoolTotals) -> Vec<String> {
-    let mut lines = vec![format!(
-        "requests {}  ({} ok, {} failed)",
-        paint(BOLD, &format_exact(totals.requests)),
-        format_exact(totals.successes),
-        format_exact(totals.failures)
+/// Footer rollup facts: requests, tokens, and reasoning when non-zero.
+pub(crate) fn footer_facts(totals: &PoolTotals) -> Vec<Fact> {
+    let mut lines = vec![Fact::new(
+        "requests",
+        &format!(
+            "{}  ({} ok, {} failed)",
+            paint(BOLD, &format_exact(totals.requests)),
+            format_exact(totals.successes),
+            format_exact(totals.failures)
+        ),
     )];
-    lines.push(format!(
-        "tokens in {}  out {}  cache {}",
-        paint(BOLD, &format_count(totals.input)),
-        paint(BOLD, &format_count(totals.output)),
-        format_count(totals.cache_read + totals.cache_write),
+    lines.push(Fact::new(
+        "tokens",
+        &format!(
+            "in {}  out {}  cache {}",
+            paint(BOLD, &format_count(totals.input)),
+            paint(BOLD, &format_count(totals.output)),
+            format_count(totals.cache_read + totals.cache_write),
+        ),
     ));
-    // Reasoning totals get their own line only when non-zero; one row
-    // for all five fields cannot fit the fixed width.
+    // Reasoning totals get their own row only when non-zero; one row for
+    // all five fields cannot fit the fixed width.
     if totals.reasoning != 0 {
-        lines.push(format!(
-            "reasoning {}",
-            paint(BOLD, &format_count(totals.reasoning))
+        lines.push(Fact::new(
+            "reasoning",
+            &paint(BOLD, &format_count(totals.reasoning)),
         ));
     }
     // The pool total stands alone, separated like the relay block's.
-    lines.push(format!(
-        "total {}",
-        paint(BOLD, &format_count(totals.tokens()))
+    lines.push(Fact::new(
+        "total",
+        &paint(BOLD, &format_count(totals.tokens())),
     ));
     lines
 }

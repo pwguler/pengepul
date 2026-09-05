@@ -320,13 +320,11 @@ pub(crate) fn service_status_panel(text: &str) -> Vec<String> {
             facts.push(Fact::new("stopped", &format!("{since} ago")));
         }
     }
-    // The header carries the state as its qualifier (AC-4); the rows
-    // carry the detail.
-    let subject = state_text.split_whitespace().next().map_or_else(
-        || "service".to_string(),
-        |word| format!("service \u{2500} {word}"),
-    );
-    fact_panel(&subject, &facts)
+    // No state qualifier in the header: `state ● active (running)` is
+    // already a row, and says it better than a truncated repeat would.
+    // A qualifier must add a fact the rows do not carry — a count does,
+    // a state never does, because a state always has its own row.
+    fact_panel("service", &facts)
 }
 
 /// Parse systemd's relative time ("4min 28s ago", "3 days ago",

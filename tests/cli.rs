@@ -392,7 +392,7 @@ fn status_rolls_up_pool_health_and_token_totals_per_provider() {
     assert!(
         outcome
             .stdout
-            .contains("anthropic          3 accounts   1,204 req"),
+            .contains("anthropic          3 accounts   1,204 req      370.1M"),
         "pool line missing:\n{}",
         outcome.stdout
     );
@@ -476,11 +476,17 @@ fn status_renders_panels_on_a_tty() {
     // AC-1: no pool panel, no account row survives.
     assert!(!visible.contains("pool: anthropic"));
     assert!(!visible.contains("a@x.com"));
-    // AC-3: the pool summary line carries name, accounts, requests, tokens.
-    assert!(
-        visible.contains("anthropic") && visible.contains("3 accounts"),
-        "pool line: {visible}"
-    );
+    // AC-3: the pool summary row carries name, accounts, requests and the
+    // right-aligned token cell. Asserted against the row itself: the
+    // header also contains "3 accounts", so a panel-wide `contains` would
+    // pass even if the row printed nothing but the name.
+    let pool_row = visible
+        .lines()
+        .find(|line| line.contains("│ anthropic"))
+        .expect("pool row");
+    assert!(pool_row.contains("3 accounts"), "pool row: {pool_row}");
+    assert!(pool_row.contains("640 req"), "pool row: {pool_row}");
+    assert!(pool_row.contains("183.5M"), "token cell: {pool_row}");
     // AC-4: the empty pool is omitted from lines and from the header count.
     assert!(!visible.contains("deepseek"));
     // AC-2: every line is exactly the 64-column box width. `<= 64` would
@@ -544,11 +550,14 @@ fn accounts_renders_panels_with_detail_lines_on_a_tty() {
     assert!(visible.contains('└'));
     assert!(visible.contains("● available"));
     assert!(visible.contains("● unresponsive"));
-    // Per-account detail lines beneath each row (AC-6); reasoning gets its
-    // own line because five fields cannot fit the fixed width.
+    // Per-account token facts beneath each row (AC-6); reasoning gets its
+    // own row because five fields cannot fit the fixed width. Both now
+    // carry labels, like every other fact row (consistent-panels AC-2).
     assert!(visible.contains("in 22.1M  out 401.2K  cache 161.0M"));
-    assert!(visible.contains("reasoning 64.0K"));
-    // The no-reasoning account omits the reasoning line (AC-6).
+    assert!(visible.contains("│ tokens"));
+    assert!(visible.contains("│ reasoning"));
+    assert!(visible.contains("64.0K"));
+    // The no-reasoning account omits the reasoning row (AC-6).
     assert!(visible.contains("in 0  out 0  cache 0"));
     assert!(!visible.contains("reasoning 0"));
 }
@@ -2166,4 +2175,132 @@ fn action_and_service_panels_use_the_same_row_grammar() {
     let config = run_style(&["config", "path"], tmp.path(), &mut runtime, Style::Rich);
     let visible = strip_ansi(&config.stdout);
     assert!(visible.contains("│ path"), "{visible}");
+}
+
+/// consistent-panels AC-9 + status-total-only AC-3: an operator-chosen
+/// provider key can be long. The label must not push the value column out
+/// of line, and must never amputate the token figure.
+#[test]
+fn status_survives_a_long_pool_name() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "0.0.0.0", 8318);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "a-very-long-provider-name-here": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalRequests": 640,
+                        "totalInputTokens": 22_100_000,
+                        "totalOutputTokens": 401_200
+                    }))]
+                },
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "b@x.com",
+                        "available": true,
+                        "totalRequests": 10,
+                        "totalInputTokens": 10
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["status"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    // The token figure survives: a silently truncated number is a lie.
+    let long_row = visible
+        .lines()
+        .find(|line| line.contains("a-very-long"))
+        .expect("long pool row");
+    assert!(
+        long_row.contains("22.5M"),
+        "token figure amputated: {long_row}"
+    );
+    // AC-9: every value starts in the same column, long label included.
+    // Measured in visible columns, not bytes — the clip ellipsis is one
+    // column but three bytes, which byte offsets would count as three.
+    let value_column = |needle: &str| -> usize {
+        let line = visible
+            .lines()
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("row {needle:?}:\n{visible}"));
+        let body: Vec<char> = line.chars().skip(2).collect();
+        let gap = body
+            .windows(2)
+            .position(|pair| pair == [' ', ' '])
+            .expect("label/value gap");
+        body[gap..]
+            .iter()
+            .position(|c| !c.is_whitespace())
+            .expect("value")
+            + gap
+    };
+    assert_eq!(
+        value_column("a-very-long"),
+        value_column("config"),
+        "long label breaks the column:\n{visible}"
+    );
+}
+
+/// consistent-panels AC-2/AC-9: the `accounts` panel's footer facts obey
+/// the same grammar as every other panel — one label column, values
+/// aligned down the box.
+#[test]
+fn accounts_footer_rows_use_the_row_grammar() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalRequests": 640,
+                        "totalSuccesses": 638,
+                        "totalInputTokens": 22_100_000,
+                        "totalOutputTokens": 401_200,
+                        "totalReasoningOutputTokens": 64_000
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    let value_column = |label: &str| -> usize {
+        let needle = format!("│ {label}");
+        let line = visible
+            .lines()
+            .find(|line| line.contains(&needle))
+            .unwrap_or_else(|| panic!("row {label:?}:\n{visible}"));
+        let after = line.find(label).expect("label") + label.chars().count();
+        line[after..]
+            .find(|c: char| !c.is_whitespace())
+            .expect("value")
+            + after
+    };
+    let columns: Vec<usize> = ["requests", "tokens", "reasoning", "total"]
+        .into_iter()
+        .map(value_column)
+        .collect();
+    assert!(
+        columns.windows(2).all(|pair| pair[0] == pair[1]),
+        "footer values not aligned: {columns:?}\n{visible}"
+    );
 }

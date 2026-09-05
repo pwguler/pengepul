@@ -563,7 +563,7 @@ fn service_command(
                 match style {
                     Style::Rich if not_installed => {
                         for line in fact_panel(
-                            "service \u{2500} not installed",
+                            "service",
                             &[
                                 Fact::new(
                                     "state",

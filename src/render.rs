@@ -157,9 +157,9 @@ impl Fact {
 }
 
 /// The widest a label column may grow before the value column suffers.
-/// Labels are short nouns by construction; a pool name is the only one
-/// that can run long, and past this it clips rather than push the values
-/// off the box.
+/// Labels are short nouns by construction — except a pool name, which is
+/// an operator's config key and can be any length. Past this the label
+/// clips; the value never does, because a truncated number is a lie.
 const LABEL_WIDTH_CAP: usize = 14;
 
 /// The label column for one panel: the longest label present plus two
@@ -175,16 +175,14 @@ pub(crate) fn label_column(facts: &[Fact]) -> usize {
         + 2
 }
 
-/// One fact as a panel row: label padded to the panel's column, then the
-/// value. Measures visible columns, so a painted label still aligns.
+/// One fact as a panel row: the label clipped and padded to the panel's
+/// column, then the value. Clipping the label is what keeps the value
+/// column aligned and keeps an over-long label from pushing the value out
+/// of the box, where `panel_row` would amputate it. Labels are plain text
+/// by construction; the value carries the paint.
 pub(crate) fn fact_row(fact: &Fact, column: usize) -> String {
-    let visible = strip_ansi(&fact.label).chars().count();
-    let label = if visible >= column {
-        format!("{} ", fact.label)
-    } else {
-        format!("{}{}", fact.label, " ".repeat(column - visible))
-    };
-    format!("{label}{}", fact.value)
+    let label = pad(&strip_ansi(&fact.label), column.saturating_sub(2));
+    format!("{label}  {}", fact.value)
 }
 
 /// A panel of labelled facts: header, aligned rows, bottom rule.
