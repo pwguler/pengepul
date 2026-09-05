@@ -1067,6 +1067,53 @@ async fn load_repairs_outcomes_that_exceed_their_attempts() {
 /// The repair reaches disk at load, not at the next outcome: an account
 /// that serves nothing after a restart must not leave a stale file behind
 /// a corrected panel.
+/// AC-8: repair is a migration, not a running behaviour. A gap can no
+/// longer be created, so once an old file is repaired the next load of
+/// that same file must find nothing to do. A repair that fired every
+/// load would be a repair that could keep rewriting history.
+#[tokio::test]
+async fn a_repaired_file_is_not_repaired_again() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let usage_file = tmp.path().join("commandcode").join("usage.json");
+    fs::create_dir_all(usage_file.parent().expect("parent")).expect("mkdir");
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    // A file from the old scheme: attempts counted at dispatch, six of
+    // them never reaching an outcome. This is the operator's real file.
+    fs::write(
+        &usage_file,
+        json!({
+            "k@example.com": {
+                "total_requests": 1404,
+                "total_successes": 1398,
+                "total_failures": 0,
+                "days": {today.clone(): {"requests": 10, "successes": 7, "failures": 0}}
+            }
+        })
+        .to_string(),
+    )
+    .expect("write legacy");
+
+    let mut first = never_refresh_manager(tmp.path().to_path_buf());
+    first.load().expect("load");
+    let repaired = persisted(&usage_file);
+    let account = &repaired["k@example.com"];
+    assert_eq!(account["total_requests"], 1404);
+    assert_eq!(account["total_failures"], 6, "the gap was not closed");
+    assert_eq!(account["days"][&today]["failures"], 3);
+
+    // The same file, loaded again: nothing left to repair, and nothing
+    // changed. Byte-identical, not merely balanced.
+    let after_first = fs::read_to_string(&usage_file).expect("read");
+    let mut second = never_refresh_manager(tmp.path().to_path_buf());
+    second.load().expect("reload");
+    let after_second = fs::read_to_string(&usage_file).expect("read");
+    assert_eq!(
+        after_first, after_second,
+        "a repaired file was repaired again"
+    );
+}
+
 #[tokio::test]
 async fn the_repair_is_written_at_load_not_at_the_next_request() {
     let tmp = tempdir().expect("tempdir");

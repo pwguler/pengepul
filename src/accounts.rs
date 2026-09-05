@@ -113,26 +113,27 @@ impl AccountState {
         }
     }
 
-    /// Count one outcome, cumulative and in the bucket of the day its
-    /// attempt opened on, keeping `successes + failures <= requests` true
-    /// by construction.
+    /// Count one request and its outcome, cumulatively and in the day the
+    /// outcome arrived, keeping `requests == successes + failures` true by
+    /// construction.
     ///
-    /// Every recorder goes through here, and the one property that holds
-    /// whatever the call sites do is:
+    /// Every recorder goes through here, and the property that holds
+    /// whatever the call sites do is that both sides are written by the
+    /// same call. Nothing is counted at dispatch, so there is no window
+    /// between the two writes for an interleaving, a concurrent outcome
+    /// or a leaked attempt to open (ADR-0015).
     ///
-    /// - **An outcome implies an attempt.** When nothing is in flight — a
-    ///   recorder fired without `record_attempt`, or a path recorded a
-    ///   second outcome — the attempt is counted too, rather than leaving
-    ///   `ok + failed > requests`, the direction load-time repair cannot
-    ///   fix.
+    /// Two consequences worth stating, because both were bugs before:
     ///
-    /// It does **not** refuse a second outcome: with a count rather than a
-    /// flag it cannot tell one apart from the first outcome of another
-    /// attempt in flight, which is the bug a per-account flag caused. A
-    /// path that records twice therefore inflates `requests` by one rather
-    /// than corrupting the balance. A caller that must not record twice
-    /// applies its health without an outcome instead
-    /// (`record_billing_cooldown`).
+    /// - **It does not refuse a second outcome.** There is nothing to
+    ///   refuse against: a path that records twice counts two requests,
+    ///   inflating `requests` rather than corrupting the balance. A caller
+    ///   that must not record twice applies its health without an outcome
+    ///   instead (`record_billing_cooldown`).
+    /// - **A request in flight is counted nowhere**, and an attempt lost
+    ///   to a crash is never counted at all. The relay counts what it
+    ///   observed: a number it cannot justify is worse than one it does
+    ///   not have.
     ///
     fn settle(&mut self, success: bool) -> String {
         // A counter counts outcomes, never attempts (ADR-0015). The same
