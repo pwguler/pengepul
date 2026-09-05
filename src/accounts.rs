@@ -363,6 +363,7 @@ impl AccountManager {
         };
         state.failure_count += 1;
         state.total_failures += 1;
+        state.today().failures += 1;
         state.last_failure_kind = Some("auth".to_string());
         state.last_failure_at = Some(now_iso());
         state.last_error = Some(format!(

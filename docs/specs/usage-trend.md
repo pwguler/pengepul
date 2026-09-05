@@ -49,7 +49,8 @@ before.
 ## Acceptance criteria
 
 - AC-1: `AccountManager::record_success` / `record_attempt` /
-  `record_failure` add their outcome to a bucket keyed by the **local**
+  `record_failure` / `record_refresh_exhausted` — every writer of a
+  cumulative counter — add their outcome to a bucket keyed by the **local**
   calendar date (`%Y-%m-%d` in the host's timezone) in addition to the
   cumulative counters, for the account they already touch.
 - AC-2: A daily bucket holds the same eight counters as the cumulative
@@ -60,13 +61,14 @@ before.
   keyed by date string, written by the same atomic temp+rename with the
   same `0600`/`0700` modes. A file written before this change loads with
   cumulative counters intact and no daily history.
-- AC-4: Retention is **90 days**: on write, buckets older than 90 local
-  days are dropped. A file that somehow holds more loads fine and is
+- AC-4: Retention is **90 days inclusive of today**: on write, buckets
+  older than `today - 89` are dropped, so 90 distinct calendar days
+  survive. A file that somehow holds more loads fine and is
   trimmed on the next write.
 - AC-5: `pengepul usage` (rich) prints one panel: header
   `usage ─ last 30 days`, a `tokens` row carrying a 30-character
-  sparkline, a `peak` row naming the largest day and its date, and a
-  `total` row summing the window. Exactly 64 columns, in the panel
+  sparkline, a `peak` row naming the largest day and its date, a
+  `window` row summing the window and a `all time` row (see AC-11). Exactly 64 columns, in the panel
   grammar `consistent-panels` settled.
 - AC-6: The sparkline uses `▁▂▃▄▅▆▇█`, one character per day, oldest
   left. Height scales to the window's peak. A day with zero traffic
@@ -118,6 +120,25 @@ before.
   pool aggregate and the `service ─ active` header — each caught by the
   user, not by a test. The rule was already written for headers; it
   holds for rows.
+- **A time bomb in the tests.** Three of this branch's own tests pinned
+  hardcoded September dates against a rolling 30-day window: green today,
+  red on 2026-10-03 with no code change. Proved by shifting the fixtures
+  30 days back — all three failed — then fixed to compute dates from the
+  clock, the convention `tests/accounts.rs` already used. Found by the
+  landing judge.
+- **A fourth writer missed its bucket.** `record_refresh_exhausted`
+  incremented `total_failures` with no daily counterpart, so cumulative
+  and bucketed failures diverged permanently on every reauth lockout.
+  AC-1 named three methods; there were four.
+- **Emptiness was judged over the wrong set.** `trend_days` tested every
+  bucket in the payload, not the buckets in the window, so a relay whose
+  only traffic predated 30 days rendered 30 flat bars — the shape AC-8
+  exists to prevent.
+- **One sum, not two that agree.** AC-11 claimed `usage` and `status`
+  share a sum; they were two implementations enumerating the same four
+  fields. `PoolTotals` now accumulates through `account_tokens` itself,
+  with a debug assertion pinning the two paths equal, so a change to what
+  "carried load" means cannot silently move one view and not the other.
 - **A subset could exceed its superset.** A payload carrying buckets but
   no cumulative counters printed `all time 0` under `window 11.0K`.
   Clamped: `all time` is at least the window it contains.

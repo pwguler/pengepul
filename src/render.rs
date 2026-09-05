@@ -416,3 +416,29 @@ mod tests {
         assert_eq!(paint("\x1b[33m", "x"), "\x1b[33mx\x1b[0m");
     }
 }
+
+#[cfg(test)]
+mod sparkline_tests {
+    use super::sparkline;
+
+    #[test]
+    fn sparkline_scales_to_its_peak_and_never_blanks_a_zero() {
+        // A zero day is the shortest block, never a gap: a blank would
+        // read as missing data rather than an idle day.
+        assert_eq!(sparkline(&[0, 0, 0]), "▁▁▁");
+        // The peak is full height; the rest scale under it.
+        assert_eq!(sparkline(&[0, 7, 14]), "▁▄█");
+        assert_eq!(sparkline(&[100, 50, 0]), "█▄▁");
+        // One dominating value flattens the rest honestly, not to blanks.
+        assert_eq!(sparkline(&[1, 1, 1_000]), "▁▁█");
+    }
+
+    #[test]
+    fn sparkline_survives_a_corrupt_file() {
+        // Negative counters cannot come from the relay, only from a
+        // hand-edited file. They must not panic or index out of bounds.
+        assert_eq!(sparkline(&[-5, 10]), "▁█");
+        assert_eq!(sparkline(&[-5, -1]), "▁▁");
+        assert_eq!(sparkline(&[]), "");
+    }
+}

@@ -131,6 +131,9 @@ pub(crate) fn providers(payload: &Value) -> Vec<(&str, &Value)> {
 
 #[derive(Default)]
 pub(crate) struct PoolTotals {
+    /// The carried load, summed through `account_tokens` so every view
+    /// that reports a total reads one definition (AC-11).
+    account_tokens_sum: i64,
     requests: i64,
     successes: i64,
     failures: i64,
@@ -142,10 +145,17 @@ pub(crate) struct PoolTotals {
 }
 
 impl PoolTotals {
-    /// The pool's carried load: the same sum `account_tokens` computes per
-    /// account, so footer totals match the share bars exactly.
+    /// The pool's carried load. Accumulated by `add` from the same four
+    /// fields `account_tokens` reads, and asserted equal to their sum, so
+    /// `status`, the share bars and `usage`'s all-time row cannot drift
+    /// apart when the definition of "carried" changes.
     fn tokens(&self) -> i64 {
-        self.input + self.output + self.cache_read + self.cache_write
+        debug_assert_eq!(
+            self.input + self.output + self.cache_read + self.cache_write,
+            self.account_tokens_sum,
+            "PoolTotals drifted from account_tokens"
+        );
+        self.account_tokens_sum
     }
 
     fn add(&mut self, account: &Value) {
@@ -157,6 +167,9 @@ impl PoolTotals {
         self.cache_read += i64_field(account, "totalCacheReadInputTokens");
         self.cache_write += i64_field(account, "totalCacheCreationInputTokens");
         self.reasoning += i64_field(account, "totalReasoningOutputTokens");
+        // One definition of the carried load, not two that agree by
+        // inspection: `usage`'s all-time row sums the same function.
+        self.account_tokens_sum += account_tokens(account);
     }
 }
 
@@ -793,16 +806,20 @@ pub(crate) fn trend_days(payload: &Value, today: &str) -> Vec<TrendDay> {
             }
         }
     }
-    if totals.is_empty() {
-        return Vec::new();
-    }
-    window_dates(today, TREND_DAYS)
+    let window: Vec<TrendDay> = window_dates(today, TREND_DAYS)
         .into_iter()
         .map(|date| {
             let tokens = totals.get(&date).copied().unwrap_or(0);
             TrendDay { date, tokens }
         })
-        .collect()
+        .collect();
+    // Emptiness is judged over the *window*, not over every bucket the
+    // file holds: a relay whose only traffic predates the window would
+    // otherwise render 30 flat bars, the shape AC-8 exists to prevent.
+    if window.iter().all(|day| day.tokens == 0) {
+        return Vec::new();
+    }
+    window
 }
 
 /// The `count` calendar dates ending at `today`, oldest first. Date math

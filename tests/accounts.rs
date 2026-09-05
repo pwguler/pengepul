@@ -620,3 +620,32 @@ async fn daily_buckets_persist_and_are_trimmed_to_the_window() {
     assert_eq!(snapshot["totalRequests"], 7);
     assert_eq!(snapshot["days"].as_array().expect("array").len(), 0);
 }
+
+/// usage-trend AC-1: every writer of a cumulative counter writes its
+/// bucket too. `record_refresh_exhausted` is the fourth, and it was
+/// missed: cumulative failures and the sum of daily failures would
+/// diverge on every reauth lockout, permanently.
+#[tokio::test]
+async fn a_reauth_lockout_lands_in_the_daily_bucket_too() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+
+    manager.record_failure("k@example.com", "upstream", Some("boom"));
+    manager.record_refresh_exhausted("k@example.com", "expired");
+
+    let snapshot = &manager.snapshots()[0];
+    let cumulative = snapshot["totalFailures"].as_i64().expect("failures");
+    let bucketed: i64 = snapshot["days"]
+        .as_array()
+        .expect("days")
+        .iter()
+        .map(|day| day["failures"].as_i64().unwrap_or(0))
+        .sum();
+    assert_eq!(cumulative, 2, "both failures counted cumulatively");
+    assert_eq!(
+        bucketed, cumulative,
+        "daily failures must reconcile with the cumulative count"
+    );
+}

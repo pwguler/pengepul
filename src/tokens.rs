@@ -619,3 +619,58 @@ mod tests {
         assert_eq!(again, 0);
     }
 }
+
+#[cfg(test)]
+mod retention_tests {
+    use super::{DayUsage, trim_days};
+    use std::collections::BTreeMap;
+
+    fn days(dates: &[&str]) -> BTreeMap<String, DayUsage> {
+        dates
+            .iter()
+            .map(|date| {
+                (
+                    (*date).to_string(),
+                    DayUsage {
+                        requests: 1,
+                        ..DayUsage::default()
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// The window is inclusive of its cutoff: the boundary day survives,
+    /// the day before it does not. Pure over the cutoff, so this is
+    /// testable for any day rather than only today.
+    #[test]
+    fn trim_keeps_the_cutoff_day_and_drops_the_one_before() {
+        let kept = trim_days(
+            &days(&["2026-06-07", "2026-06-08", "2026-06-09"]),
+            "2026-06-08",
+        );
+        assert_eq!(
+            kept.keys().collect::<Vec<_>>(),
+            vec!["2026-06-08", "2026-06-09"]
+        );
+    }
+
+    #[test]
+    fn trim_crosses_a_year_boundary_by_date_not_by_number() {
+        // Lexicographic order on %Y-%m-%d is chronological, which is what
+        // makes the string compare correct across a year end.
+        let kept = trim_days(
+            &days(&["2025-12-30", "2025-12-31", "2026-01-01"]),
+            "2025-12-31",
+        );
+        assert_eq!(
+            kept.keys().collect::<Vec<_>>(),
+            vec!["2025-12-31", "2026-01-01"]
+        );
+    }
+
+    #[test]
+    fn trim_of_an_empty_map_is_empty_not_a_panic() {
+        assert!(trim_days(&BTreeMap::new(), "2026-06-08").is_empty());
+    }
+}

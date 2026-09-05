@@ -2567,6 +2567,14 @@ fn usage_renders_a_thirty_day_sparkline() {
             "reasoningOutputTokens": 0
         })
     };
+    // Dates relative to the clock the verb reads: a hardcoded month leaves
+    // the rolling window and the suite goes red on a fixed future date.
+    let ago = |back: i64| {
+        (chrono::Local::now() - chrono::Duration::days(back))
+            .format("%Y-%m-%d")
+            .to_string()
+    };
+    let (older, peak_day) = (ago(4), ago(2));
     let mut runtime = FakeRuntime {
         rich: true,
         accounts_payload: Some(json!({
@@ -2577,7 +2585,7 @@ fn usage_renders_a_thirty_day_sparkline() {
                         "email": "a@x.com",
                         "available": true,
                         "totalInputTokens": 40_000,
-                        "days": [day("2026-09-01", 1_000), day("2026-09-03", 9_000)]
+                        "days": [day(&older, 1_000), day(&peak_day, 9_000)]
                     }))]
                 },
                 // AC-9: a second pool's days sum into the same bars.
@@ -2587,7 +2595,7 @@ fn usage_renders_a_thirty_day_sparkline() {
                         "email": "k@x.com",
                         "available": true,
                         "totalInputTokens": 10_000,
-                        "days": [day("2026-09-01", 1_000)]
+                        "days": [day(&older, 1_000)]
                     }))]
                 }
             }
@@ -2624,7 +2632,7 @@ fn usage_renders_a_thirty_day_sparkline() {
     // AC-9: 09-03 is the peak and it sums both pools on 09-01.
     assert!(lines[2].contains("peak"), "{visible}");
     assert!(lines[2].contains("9.0K"), "peak value: {}", lines[2]);
-    assert!(lines[2].contains("2026-09-03"), "peak date: {}", lines[2]);
+    assert!(lines[2].contains(&peak_day), "peak date: {}", lines[2]);
     assert!(lines[3].contains("window"), "{visible}");
     assert!(
         lines[3].contains("11.0K"),
@@ -2667,9 +2675,12 @@ fn usage_says_so_when_no_history_exists() {
         visible.contains("no usage recorded yet"),
         "must not draw thirty idle bars: {visible}"
     );
-    assert!(
-        !visible.contains("▁▁▁"),
-        "flat line reads as thirty idle days: {visible}"
+    // Not `!contains("▁▁▁")`: this path returns before `sparkline` is
+    // called, so that assertion cannot fail. Pin the shape instead.
+    assert_eq!(
+        visible.lines().count(),
+        3,
+        "one row in a box, no bars: {visible}"
     );
 }
 
@@ -2679,6 +2690,9 @@ fn usage_says_so_when_no_history_exists() {
 fn usage_plain_is_one_line_per_day() {
     let tmp = tempdir().expect("tempdir");
     write_config(tmp.path(), "127.0.0.1", 8317);
+    let recorded = (chrono::Local::now() - chrono::Duration::days(2))
+        .format("%Y-%m-%d")
+        .to_string();
     let mut runtime = FakeRuntime {
         accounts_payload: Some(json!({
             "providers": {
@@ -2688,7 +2702,7 @@ fn usage_plain_is_one_line_per_day() {
                         "email": "a@x.com",
                         "available": true,
                         "days": [{
-                            "date": "2026-09-03",
+                            "date": recorded.clone(),
                             "requests": 7,
                             "successes": 6,
                             "failures": 1,
@@ -2715,7 +2729,9 @@ fn usage_plain_is_one_line_per_day() {
     );
     // date requests input output cache reasoning
     assert!(
-        outcome.stdout.contains("2026-09-03 7 100 200 30 5"),
+        outcome
+            .stdout
+            .contains(&format!("{recorded} 7 100 200 30 5")),
         "parseable row: {}",
         outcome.stdout
     );
@@ -2728,6 +2744,7 @@ fn usage_plain_is_one_line_per_day() {
 fn usage_says_how_much_history_it_actually_has() {
     let tmp = tempdir().expect("tempdir");
     write_config(tmp.path(), "127.0.0.1", 8317);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let mut runtime = FakeRuntime {
         rich: true,
         accounts_payload: Some(json!({
@@ -2738,7 +2755,7 @@ fn usage_says_how_much_history_it_actually_has() {
                         "email": "a@x.com",
                         "available": true,
                         "days": [{
-                            "date": "2026-09-05",
+                            "date": today.clone(),
                             "requests": 7,
                             "inputTokens": 25,
                             "outputTokens": 278,
@@ -2799,7 +2816,7 @@ fn usage_all_time_equals_the_status_total() {
                     "totalCacheReadInputTokens": 289_000_000,
                     "totalCacheCreationInputTokens": 636_984,
                     "days": [{
-                        "date": "2026-09-05",
+                        "date": chrono::Local::now().format("%Y-%m-%d").to_string(),
                         "requests": 7,
                         "inputTokens": 25,
                         "outputTokens": 278,
@@ -2841,4 +2858,51 @@ fn usage_all_time_equals_the_status_total() {
     // And the window is visibly a subset, not a competing total.
     assert!(usage.contains("window"), "{usage}");
     assert!(!usage.contains("│ total"), "one word, one scope: {usage}");
+}
+
+/// usage-trend AC-8: a relay whose only buckets predate the window is
+/// empty *for this view*, even though the file still holds them. Judging
+/// emptiness over every bucket would render 30 flat bars — the shape the
+/// criterion exists to prevent.
+#[test]
+fn usage_treats_an_out_of_window_history_as_empty() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    // Inside the 90-day retention, outside the 30-day window.
+    let old = (chrono::Local::now() - chrono::Duration::days(45))
+        .format("%Y-%m-%d")
+        .to_string();
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "days": [{
+                            "date": old,
+                            "requests": 9,
+                            "inputTokens": 5_000,
+                            "outputTokens": 0,
+                            "cacheReadInputTokens": 0,
+                            "cacheCreationInputTokens": 0,
+                            "reasoningOutputTokens": 0
+                        }]
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    assert!(
+        visible.contains("no usage recorded yet"),
+        "30 flat bars for out-of-window history: {visible}"
+    );
 }
