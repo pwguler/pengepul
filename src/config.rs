@@ -183,7 +183,12 @@ pub fn register_provider(path: &Path, id: &str, base_url: &str) -> Result<()> {
     //
     // `create_new` is atomic in the OS, so it needs no dependency: the
     // process that creates the lock owns the file until it removes it.
-    let lock_path = path.with_extension("lock");
+    // Appended, not `with_extension`: that replaces, so `--config x.lock`
+    // would lock the operator's own config and then advise deleting it.
+    let lock_path = path.with_file_name(format!(
+        "{}.lock",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
     let _lock = FileLock::acquire(&lock_path)?;
     // A trailing slash would make `{base_url}/chat/completions` a double
     // slash, which some hosts answer with a 404 that names nothing
@@ -289,8 +294,6 @@ pub fn load_config(
 /// Turn the raw `providers:` section into validated configured providers.
 ///
 /// The entry name becomes the provider id a client's model prefix must match, so
-/// it cannot collide with a built-in provider (anthropic, codex, or the claude
-/// spelling the glossary reserves) and cannot contain `/` (the prefix separator).
 /// Exclusive ownership of a config file for the length of a
 /// read-modify-write, released on drop however the write ends.
 struct FileLock {
@@ -380,7 +383,11 @@ pub fn validate_provider_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-/// `base-url` is required; the keys for the endpoint live in the auth-dir, not here.
+/// Turn the raw `providers:` section into validated configured
+/// providers.
+///
+/// Each id passes `validate_provider_id`, and `base-url` is required; the
+/// keys for the endpoint live in the auth-dir, not here.
 fn validate_providers(
     raw: &BTreeMap<String, RawConfiguredProvider>,
 ) -> Result<BTreeMap<String, ConfiguredProvider>> {
@@ -610,6 +617,32 @@ mod register_tests {
         assert!(after.contains("base:"), "the original provider was lost");
         assert!(
             !path.with_extension("lock").exists(),
+            "the lock outlived the registration"
+        );
+    }
+
+    /// `with_extension` replaces rather than appends, so a config named
+    /// `x.lock` derived a lock path identical to itself: the tool locked
+    /// the operator's own config and then advised deleting it.
+    #[test]
+    fn a_config_named_lock_is_not_its_own_lock_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("x.lock");
+        fs::write(
+            &path,
+            "host: \"127.0.0.1\"\nport: 8317\napi-keys:\n  - sk-test\nproviders: {}\n",
+        )
+        .expect("write config");
+
+        register_provider(&path, "groq", "https://api.groq.com/openai/v1").expect("register");
+
+        let after = fs::read_to_string(&path).expect("the config was consumed as a lock");
+        assert!(
+            after.contains("groq:"),
+            "the provider was not written: {after}"
+        );
+        assert!(
+            !dir.path().join("x.lock.lock").exists(),
             "the lock outlived the registration"
         );
     }

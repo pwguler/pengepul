@@ -17,7 +17,7 @@ use crate::usage_view::{
     Connection, print_accounts, print_pool_rich, print_relay_total_plain, print_relay_total_rich,
     print_trend_plain, print_trend_rich,
 };
-use crate::utils::{local_today, sha256_hex};
+use crate::utils::{local_today, sanitize_email, sha256_hex};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunOutcome {
@@ -890,11 +890,23 @@ fn login(
     // orphan token in the auth-dir, which is harmless because the
     // provider is still unconfigured. The other order leaves a registered
     // provider with no account (AC-9).
-    // Whether this command could have created the pool at all. The label
-    // is `key-<hash of the key>`, so re-running the same command
-    // overwrites the same filename: without this, a failed config write
-    // would roll back a credential that existed before the command ran.
-    let provider_is_new = !config.providers.contains_key(provider);
+    // What the rollback below is allowed to take back: only a file this
+    // command created. The label is `key-<hash of the key>`, so
+    // re-running the same command overwrites the same filename, and
+    // rolling that back would destroy a credential that predates the
+    // command.
+    //
+    // The question is about the filesystem, so it is asked of the
+    // filesystem. An earlier version asked whether the provider was in
+    // the config, which disagrees whenever a pool outlives its config
+    // entry — the normal state after a hand-removal, since removing a
+    // provider is not a verb this tool has.
+    let pool = config.auth_dir.join(provider);
+    // Named by the same function `save_token` names it with, so the two
+    // cannot drift apart.
+    let credential_is_new = !pool
+        .join(format!("{}.json", sanitize_email(&label)))
+        .exists();
     let written = save_token(&config.auth_dir, &token)?;
     let mut registered = false;
     if let Some(base_url) = base_url {
@@ -908,12 +920,11 @@ fn login(
             // itself fails the mirror problem appears: a credential in a
             // pool the config never gained, invisible to the operator.
             //
-            // Only for a provider this command was registering. Repeating
-            // the same command against a configured provider overwrites
-            // its existing credential file, and rolling that back would
-            // destroy a credential that predates the command — the
-            // opposite of the guarantee that repeating is safe (AC-4).
-            if provider_is_new {
+            // Only a credential this command created. Repeating a command
+            // overwrites an existing file, and rolling that back would
+            // destroy what predates the command — the opposite of the
+            // guarantee that repeating is safe (AC-4).
+            if credential_is_new {
                 if let Err(cleanup) = fs::remove_file(&written) {
                     return Err(error.context(format!(
                         "left a credential at {} that could not be removed: {cleanup}",

@@ -4277,3 +4277,97 @@ fn a_url_with_a_space_before_its_slash_is_stored_trimmed() {
         &mut runtime,
     );
 }
+
+/// A pool outlives its config entry whenever a provider is hand-removed,
+/// which is the only removal this tool has. Re-registering it with the
+/// same key, against a config that cannot be written, must not roll back
+/// the credential that was already there.
+///
+/// The earlier version of this guard asked the config whether the
+/// provider was new. That answer disagrees with the filesystem in exactly
+/// this state, so the rollback deleted a credential it had not created
+/// and then removed the emptied pool.
+#[test]
+fn a_pool_that_outlives_its_config_entry_is_not_rolled_back() {
+    let tmp = tempdir().expect("tempdir");
+    let config_path = tmp.path().join("cfg.yaml");
+    let auth_dir = tmp.path().join("auth");
+    let header = format!(
+        "host: \"127.0.0.1\"\nport: 8317\nauth-dir: {}\napi-keys:\n  - sk-test\n",
+        auth_dir.display()
+    );
+    std::fs::write(
+        &config_path,
+        format!("{header}providers:\n  groq:\n    base-url: https://api.groq.com/openai/v1\n"),
+    )
+    .expect("write config");
+    let mut runtime = FakeRuntime::default();
+    run_with_env(
+        &[
+            "--config",
+            config_path.to_str().expect("path"),
+            "login",
+            "--provider",
+            "groq",
+            "--key",
+            "sk-legit",
+        ],
+        tmp.path(),
+        tmp.path(),
+        &mut runtime,
+        Style::Plain,
+    )
+    .expect("seed the pool");
+    let seeded: Vec<_> = std::fs::read_dir(auth_dir.join("groq"))
+        .expect("read pool")
+        .filter_map(|entry| {
+            entry
+                .ok()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+        })
+        .collect();
+    assert_eq!(seeded.len(), 1, "the pool was not seeded: {seeded:?}");
+
+    // The provider is removed by hand; the pool stays, as the spec says.
+    std::fs::write(&config_path, format!("{header}providers: {{}}\n")).expect("rewrite config");
+    let mut permissions = std::fs::metadata(&config_path)
+        .expect("metadata")
+        .permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&config_path, permissions).expect("chmod");
+
+    let _ = run_with_env(
+        &[
+            "--config",
+            config_path.to_str().expect("path"),
+            "login",
+            "--provider",
+            "groq",
+            "--base-url",
+            "https://api.groq.com/openai/v1",
+            "--key",
+            "sk-legit",
+        ],
+        tmp.path(),
+        tmp.path(),
+        &mut runtime,
+        Style::Plain,
+    );
+
+    assert!(
+        auth_dir.join("groq").exists(),
+        "the rollback destroyed a pool it did not create"
+    );
+    let after: Vec<_> = std::fs::read_dir(auth_dir.join("groq"))
+        .expect("read pool")
+        .filter_map(|entry| {
+            entry
+                .ok()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+        })
+        .collect();
+    assert_eq!(
+        after, seeded,
+        "the rollback took a credential it did not create: {after:?}"
+    );
+}

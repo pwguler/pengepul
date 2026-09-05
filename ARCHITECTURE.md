@@ -30,7 +30,9 @@ in files.
   leaves on disk under the auth dir: the one credential it holds, and the
   provider's **Usage counters** file (`usage.json`), both at `0600`, the
   latter written atomically (temp + rename); knows nothing of selection.
-  (The only other file under the auth dir, `cloaking-versions.json`, is the
+  (With default paths `config.yaml` and, transiently during a
+  registration, `config.yaml.lock` sit there too. The only other
+  long-lived file under the auth dir, `cloaking-versions.json`, is the
   Upstream module's own cache — `cloaking_versions.rs`.)
 - **OAuth** (`oauth.rs`) — mints and Refreshes the anthropic and codex
   credential, and is the only place a rejected refresh token becomes **Reauth**.
@@ -54,7 +56,10 @@ in files.
   section, which is the only Provider registry: there is no database table.
   It also writes it: `register_provider` adds one entry for `login
   --base-url`, and refuses an id already present with a different URL
-  rather than overwriting it.
+  rather than overwriting it. The write is a read-modify-write on one
+  shared file, so it takes a `<config>.lock` beside the config for the
+  length of it; two registrations racing each other would otherwise lose
+  one silently.
 - **CLI + Runtime + Service** (`cli.rs`, `runtime.rs`, `service.rs`) — command
   parsing and dispatch (pure), the `CliRuntime` adapter that makes a verb touch
   the real world, and the per-user systemd/launchd unit — including the parser

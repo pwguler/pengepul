@@ -153,6 +153,17 @@ Setiap kriteria butuh tes yang gagal ketika perbaikannya dibalik.
   Sekarang rollback hanya jalan untuk provider yang memang baru
   didaftarkan perintah itu.
 
+- **Pendaftaran mengunci file config.** Dua pendaftaran serentak
+  masing-masing membaca file, menyisipkan entri, lalu menulis ulang
+  seluruhnya — jadi yang lebih lambat menghapus provider milik yang lebih
+  cepat sementara keduanya melapor sukses. Diuji: delapan pendaftaran
+  serentak meninggalkan delapan pool dan **satu** provider. Sekarang
+  `register_provider` membuat `<config>.lock` di sebelah file config
+  (`config.yaml.lock` pada jalur default) dan menghapusnya saat selesai,
+  termasuk saat gagal. `SIGKILL` tidak menjalankan pembersihan itu: kalau
+  lock tertinggal, pendaftaran berikutnya menunggu satu detik lalu
+  berhenti dengan pesan yang menyebut jalurnya — hapus file itu.
+
 ## Not yet specified
 
 - **Tabrakan id yang hanya beda huruf besar-kecil.** `providers:` adalah
