@@ -57,7 +57,8 @@ model at accounting time but throws it away.
   by name. Accounts with no per-model history print no model lines.
 - AC-6: The same pool panel gains a `by model` section in its footer,
   aggregating every account in that pool, in the same two-line shape and
-  the same sort order.
+  the same sort order. **Revised:** the section prints only when more
+  than one account contributed model usage — see Revisions.
 - AC-7: `Style::Plain` `accounts` carries the same information in plain
   form, indented under the account and under a `by model` heading in the
   pool footer.
@@ -78,6 +79,13 @@ model at accounting time but throws it away.
   aggregated per pool. The pool aggregate is derived in the renderer by
   summing the accounts' maps, so the payload keeps a single source of
   truth.
+- **AC-6 narrowed after seeing it live:** with one contributing account
+  the `by model` section repeats that account's own lines verbatim (the
+  live `anthropic` pool showed `claude-opus-5  2 ok  330.4K` twice in one
+  panel). The section now prints only when **two or more accounts**
+  contributed model usage. The test is the count of contributors, not of
+  accounts, so a pool like `commandcode` — two accounts, one of them with
+  no successful request — also omits it.
 
 ## Verification
 

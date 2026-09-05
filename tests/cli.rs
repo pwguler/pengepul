@@ -1587,22 +1587,41 @@ fn accounts_lists_models_in_plain_output() {
         accounts_payload: Some(json!({
             "providers": {
                 "anthropic": {
-                    "account_count": 1,
-                    "accounts": [account(json!({
-                        "email": "a@x.com",
-                        "available": true,
-                        "totalRequests": 10,
-                        "totalSuccesses": 10,
-                        "models": [{
-                            "model": "claude-fable-5-1",
-                            "successes": 10,
-                            "inputTokens": 300,
-                            "outputTokens": 400,
-                            "cacheCreationInputTokens": 0,
-                            "cacheReadInputTokens": 500,
-                            "reasoningOutputTokens": 7
-                        }]
-                    }))]
+                    "account_count": 2,
+                    "accounts": [
+                        account(json!({
+                            "email": "a@x.com",
+                            "available": true,
+                            "totalRequests": 10,
+                            "totalSuccesses": 10,
+                            "models": [{
+                                "model": "claude-fable-5-1",
+                                "successes": 10,
+                                "inputTokens": 300,
+                                "outputTokens": 400,
+                                "cacheCreationInputTokens": 0,
+                                "cacheReadInputTokens": 500,
+                                "reasoningOutputTokens": 7
+                            }]
+                        })),
+                        // A second contributor, so the pool aggregate earns
+                        // its place (AC-6, revised).
+                        account(json!({
+                            "email": "b@x.com",
+                            "available": true,
+                            "totalRequests": 2,
+                            "totalSuccesses": 2,
+                            "models": [{
+                                "model": "claude-sonnet-4-5",
+                                "successes": 2,
+                                "inputTokens": 5,
+                                "outputTokens": 6,
+                                "cacheCreationInputTokens": 0,
+                                "cacheReadInputTokens": 0,
+                                "reasoningOutputTokens": 0
+                            }]
+                        }))
+                    ]
                 }
             }
         })),
@@ -1652,4 +1671,80 @@ fn accounts_without_model_history_print_no_model_lines() {
     assert!(!visible.contains("untracked"));
     // The account totals still show.
     assert!(visible.contains("898 ok"));
+}
+
+/// usage-by-model AC-6 (revised): with a single contributing account the
+/// pool aggregate repeats that account's own lines verbatim, so the
+/// section is suppressed — including when a pool has several accounts but
+/// only one of them ever served a model.
+#[test]
+fn accounts_omits_the_by_model_section_for_a_single_contributor() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let models = json!([{
+        "model": "claude-fable-5-1",
+        "successes": 12,
+        "inputTokens": 300,
+        "outputTokens": 400,
+        "cacheCreationInputTokens": 0,
+        "cacheReadInputTokens": 500,
+        "reasoningOutputTokens": 0
+    }]);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            // One account: the aggregate would duplicate it.
+            "anthropic_like": {},
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalSuccesses": 12,
+                        "models": models
+                    }))]
+                },
+                // Two accounts, but only one ever served a model — the
+                // aggregate would still just repeat that one.
+                "commandcode": {
+                    "account_count": 2,
+                    "accounts": [
+                        account(json!({
+                            "email": "k1",
+                            "available": true,
+                            "totalSuccesses": 12,
+                            "models": models
+                        })),
+                        account(json!({
+                            "email": "k2",
+                            "available": true,
+                            "totalSuccesses": 0,
+                            "models": []
+                        }))
+                    ]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    assert!(
+        !visible.contains("by model"),
+        "duplicated section: {visible}"
+    );
+    // The per-account breakdown itself stays.
+    assert_eq!(
+        visible.matches("claude-fable-5-1").count(),
+        2,
+        "one line per contributing account, no aggregate: {visible}"
+    );
+
+    // Plain carries the same rule.
+    let plain = run(&["accounts"], tmp.path(), &mut runtime);
+    assert!(!plain.stdout.contains("by model"));
 }

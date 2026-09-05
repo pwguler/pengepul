@@ -307,11 +307,21 @@ pub(crate) fn model_rows(account: &Value) -> Vec<ModelRow> {
 }
 
 /// Every account's models folded into one list for the pool footer.
+/// Every account's models folded into one list for the pool footer —
+/// empty unless more than one account contributed. With a single
+/// contributor the aggregate repeats that account's own list verbatim, so
+/// the section earns nothing and the caller omits it.
 pub(crate) fn pool_model_rows(accounts: &[Value]) -> Vec<ModelRow> {
     let mut merged: std::collections::BTreeMap<String, ModelRow> =
         std::collections::BTreeMap::new();
+    let mut contributors = 0;
     for account in accounts {
-        for row in model_rows(account) {
+        let rows = model_rows(account);
+        if rows.is_empty() {
+            continue;
+        }
+        contributors += 1;
+        for row in rows {
             let entry = merged.entry(row.name.clone()).or_insert_with(|| ModelRow {
                 name: row.name.clone(),
                 successes: 0,
@@ -326,6 +336,9 @@ pub(crate) fn pool_model_rows(accounts: &[Value]) -> Vec<ModelRow> {
             entry.cache += row.cache;
             entry.reasoning += row.reasoning;
         }
+    }
+    if contributors < 2 {
+        return Vec::new();
     }
     let mut rows: Vec<ModelRow> = merged.into_values().collect();
     rows.sort_by(|left, right| {
