@@ -122,7 +122,15 @@ in files.
   guard because the code after the stream loop never runs. A Refusal
   counts as a failed request but earns no Cooldown: a dialect the
   Provider cannot serve, or a 400 the client malformed, is not the
-  Account's fault.
+  Account's fault. Counters written before this held — by a binary with
+  a leaking path — are repaired at load, where nothing is in flight: the
+  unaccounted remainder is named as failures, and attempts and successes
+  are never rewritten.
+- **A number the panels cannot attribute is named, never invented.** Tokens
+  carried before per-model tracking belong to no model, and the account
+  panel says so rather than leaving the model rows to silently under-sum
+  their account. Where a gap is reconstructable it is closed; where it is
+  not, it is labelled.
 - **One word, one scope.** Two verbs never print the same label for different
   spans: `status` totals all time, `usage` names its `window` and its
   `all time` separately, and the all-time figure both print comes from one
