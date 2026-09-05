@@ -863,7 +863,7 @@ pub(crate) fn print_trend_rich(payload: &Value, output: &mut Output, today: &str
     // cumulative counters are missing or lag its buckets would otherwise
     // print a total smaller than the subset inside it.
     let all_time = all_time.max(total);
-    let mut facts = vec![
+    let facts = vec![
         Fact::new("tokens", &sparkline(&values)),
         Fact::new(
             "peak",
@@ -882,25 +882,8 @@ pub(crate) fn print_trend_rich(payload: &Value, output: &mut Output, today: &str
                 if recorded.len() == 1 { "day" } else { "days" }
             ),
         ),
-        Fact::new(
-            "all time",
-            &format!(
-                "{} \u{2014} what status totals",
-                paint(BOLD, &format_count(all_time))
-            ),
-        ),
+        Fact::new("all time", &paint(BOLD, &format_count(all_time))),
     ];
-    // While the window is not yet full, name where recording began, so the
-    // empty bars read as "no data yet" rather than "no traffic", and the
-    // gap between window and all time is explained rather than puzzling.
-    if recorded.len() < days.len()
-        && let Some(first) = recorded.first()
-    {
-        facts.push(Fact::new(
-            "note",
-            &paint(DIM, &format!("daily history starts {}", first.date)),
-        ));
-    }
     for line in fact_panel("usage ─ last 30 days", &facts) {
         output.line(&line);
     }

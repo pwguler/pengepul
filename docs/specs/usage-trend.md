@@ -77,16 +77,18 @@ before.
   first — parseable, no block characters, no box.
 - AC-8: A relay with no daily history prints the panel with an empty
   window and says so rather than rendering a flat line of `▁` that
-  would look like 30 idle days. A **partial** window (fewer recorded
-  days than the window is wide) names how many days it actually has and
-  when daily history began; a full window drops that note.
+  would look like 30 idle days. A **partial** window names how many days
+  it actually holds in its `window` row — no second row explains the
+  empty bars, because that row already does.
 - AC-11: The numbers reconcile across verbs. `usage` prints `window`
   (this window's tokens) beside `all time` (every token the relay has
   counted), the latter computed by the same `account_tokens` sum that
   `status` prints, over the same payload, so the two can never drift.
-  No verb prints a bare `total`: one word, one scope. `all time` is
-  never less than the `window` it contains, even when a payload's
-  cumulative counters are absent or lag its buckets.
+  No verb prints a bare `total`: one word, one scope, and neither row
+  narrates the other — the two figures sit on screen and the reader sees
+  they agree. `all time` is never less than the `window` it contains,
+  even when a payload's cumulative counters are absent or lag its
+  buckets.
 - AC-9: Days are summed across every account of every pool: the
   sparkline is relay-wide, matching what `status` totals. This requires
   `GET /admin/accounts` to carry a `days` array per account, in the same
@@ -108,6 +110,14 @@ before.
   `total` is now gone from `usage`: `window` and `all time` name their
   scopes, and `all time` is the figure `status` prints. Found by the
   user asking why the numbers disagreed — AC-11 exists because of it.
+- **Two rows narrated instead of reporting.** `all time 361.1M — what
+  status totals` footnoted another verb, and `note daily history starts
+  …` repeated `window … across 1 day recorded`. Both were cut: a row
+  reports a fact the panel does not already carry. This was the third
+  time in one session I added a restating row — after the `by model`
+  pool aggregate and the `service ─ active` header — each caught by the
+  user, not by a test. The rule was already written for headers; it
+  holds for rows.
 - **A subset could exceed its superset.** A payload carrying buckets but
   no cumulative counters printed `all time 0` under `window 11.0K`.
   Clamped: `all time` is at least the window it contains.

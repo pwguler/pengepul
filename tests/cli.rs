@@ -2600,12 +2600,16 @@ fn usage_renders_a_thirty_day_sparkline() {
     assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
     let lines: Vec<&str> = visible.lines().collect();
-    assert_eq!(lines.len(), 7, "five rows and a note: {visible}");
+    assert_eq!(lines.len(), 6, "four rows in a box: {visible}");
     // all time contains the window, never the other way round.
     assert!(
         lines[4].contains("50.0K"),
         "all time sums both pools: {}",
         lines[4]
+    );
+    assert!(
+        !visible.contains("what status"),
+        "a row reports a fact, it does not footnote another verb: {visible}"
     );
     assert!(lines[0].contains("usage ─ last 30 days"), "{visible}");
     // AC-6: one character per day, oldest left, no blanks.
@@ -2758,77 +2762,20 @@ fn usage_says_how_much_history_it_actually_has() {
         !visible.contains("across 30 days"),
         "claims a full window it does not have: {visible}"
     );
+    // The window row carries how much history exists; the empty bars need
+    // no second row explaining themselves.
     assert!(
         visible.contains("1 day recorded"),
         "must say how much history exists: {visible}"
     );
-    // And it says why the earlier bars are empty, so the number can be
-    // reconciled against `status`.
-    assert!(
-        visible.contains("daily history starts") && visible.contains("2026-09-05"),
-        "must name where recording began: {visible}"
+    assert_eq!(
+        visible.lines().count(),
+        6,
+        "four rows whatever the history: {visible}"
     );
     for line in visible.lines() {
         assert_eq!(line.chars().count(), 64, "off the fixed width: {line}");
     }
-}
-
-/// usage-trend AC-5: once the window is full the extra note disappears
-/// and the panel is the four-line shape that was chosen.
-#[test]
-fn usage_drops_the_note_once_the_window_is_full() {
-    let tmp = tempdir().expect("tempdir");
-    write_config(tmp.path(), "127.0.0.1", 8317);
-    // The window ends today, so the fixture must too: a fixed month would
-    // leave days outside it and the window would be partial by fixture,
-    // not by behaviour.
-    let today = chrono::Local::now().date_naive();
-    let days: Vec<Value> = (0..30)
-        .rev()
-        .map(|back| {
-            let date = today - chrono::Duration::days(back);
-            json!({
-                "date": date.format("%Y-%m-%d").to_string(),
-                "requests": 1,
-                "inputTokens": 1_000 * (30 - back),
-                "outputTokens": 0,
-                "cacheReadInputTokens": 0,
-                "cacheCreationInputTokens": 0,
-                "reasoningOutputTokens": 0
-            })
-        })
-        .collect();
-    let mut runtime = FakeRuntime {
-        rich: true,
-        accounts_payload: Some(json!({
-            "providers": {
-                "anthropic": {
-                    "account_count": 1,
-                    "accounts": [account(json!({
-                        "email": "a@x.com",
-                        "available": true,
-                        "days": days
-                    }))]
-                }
-            }
-        })),
-        ..FakeRuntime::default()
-    };
-
-    let outcome = run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich);
-
-    assert_eq!(outcome.code, 0);
-    let visible = strip_ansi(&outcome.stdout);
-    assert_eq!(
-        visible.lines().count(),
-        6,
-        "four rows in a box once full, note gone: {visible}"
-    );
-    assert!(
-        !visible.contains("since"),
-        "note outstays its use: {visible}"
-    );
-    assert!(visible.contains("30 days recorded"), "{visible}");
 }
 
 /// usage-trend: the numbers reconcile across verbs. `usage` shows the
