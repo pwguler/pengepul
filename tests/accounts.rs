@@ -204,8 +204,6 @@ async fn usage_counters_survive_a_manager_rebuild() {
     let mut manager = never_refresh_manager(tmp.path().to_path_buf());
     manager.load().expect("load");
 
-    manager.record_attempt("k@example.com");
-    manager.record_attempt("k@example.com");
     manager.record_success(
         "k@example.com",
         Some(&UsageData {
@@ -261,7 +259,7 @@ async fn usage_file_lies_per_provider_and_ignores_strangers() {
     assert!(manager.account("ghost@example.com").is_none());
 
     // ...and the next write drops the stranger instead of keeping it.
-    manager.record_attempt("k@example.com");
+    manager.record_success("k@example.com", None, "claude-fable-5-1");
     let stored = persisted(&usage_path);
     assert!(stored.get("ghost@example.com").is_none());
 }
@@ -281,7 +279,7 @@ async fn corrupted_usage_file_starts_from_zero() {
     assert_eq!(snapshot["totalRequests"], 0);
 
     // The next write replaces the junk with valid JSON.
-    manager.record_attempt("k@example.com");
+    manager.record_success("k@example.com", None, "claude-fable-5-1");
     assert_eq!(
         persisted(&provider_dir.join("usage.json"))["k@example.com"]["total_requests"],
         1
@@ -294,7 +292,6 @@ async fn token_refresh_keeps_the_counters() {
     save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
     let mut manager = never_refresh_manager(tmp.path().to_path_buf());
     manager.load().expect("load");
-    manager.record_attempt("k@example.com");
     manager.record_success("k@example.com", None, "claude-fable-5-1");
     assert_eq!(manager.snapshots()[0]["totalRequests"], 1);
 
@@ -329,14 +326,10 @@ async fn per_model_counters_accumulate_per_account() {
         cache_read_input_tokens: 2,
         reasoning_output_tokens: 3,
     };
-    // The relay interleaves: an attempt, then its outcome, then the next.
-    manager.record_attempt("a@example.com");
+    // Each outcome counts its own request (ADR-0015).
     manager.record_success("a@example.com", Some(&usage(100)), "claude-fable-5-1");
-    manager.record_attempt("a@example.com");
     manager.record_success("a@example.com", Some(&usage(200)), "claude-fable-5-1");
-    manager.record_attempt("a@example.com");
     manager.record_success("a@example.com", Some(&usage(400)), "claude-sonnet-4-5");
-    manager.record_attempt("b@example.com");
     manager.record_success("b@example.com", Some(&usage(800)), "claude-fable-5-1");
 
     let snapshots = manager.snapshots();
@@ -443,9 +436,7 @@ async fn a_success_without_usage_still_counts_against_its_model() {
     let mut manager = never_refresh_manager(tmp.path().to_path_buf());
     manager.load().expect("load");
 
-    manager.record_attempt("k@example.com");
     manager.record_success("k@example.com", None, "claude-fable-5-1");
-    manager.record_attempt("k@example.com");
     manager.record_success(
         "k@example.com",
         Some(&UsageData {
@@ -506,7 +497,6 @@ async fn outcomes_accumulate_into_one_bucket_per_local_day() {
     let mut manager = never_refresh_manager(tmp.path().to_path_buf());
     manager.load().expect("load");
 
-    manager.record_attempt("k@example.com");
     manager.record_success(
         "k@example.com",
         Some(&UsageData {
@@ -518,7 +508,6 @@ async fn outcomes_accumulate_into_one_bucket_per_local_day() {
         }),
         "claude-fable-5-1",
     );
-    manager.record_attempt("k@example.com");
     manager.record_success(
         "k@example.com",
         Some(&UsageData {
@@ -530,7 +519,6 @@ async fn outcomes_accumulate_into_one_bucket_per_local_day() {
         }),
         "claude-fable-5-1",
     );
-    manager.record_attempt("k@example.com");
     manager.record_failure("k@example.com", "upstream", Some("boom"));
 
     let days = manager.snapshots()[0]["days"].clone();
@@ -565,8 +553,8 @@ async fn daily_buckets_persist_and_are_trimmed_to_the_window() {
     // AC-3: a bucket survives a manager rebuild.
     let mut manager = never_refresh_manager(tmp.path().to_path_buf());
     manager.load().expect("load");
-    manager.record_attempt("k@example.com");
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    manager.record_success("k@example.com", None, "model-a");
     let stored = persisted(&usage_file);
     assert_eq!(stored["k@example.com"]["days"][&today]["requests"], 1);
 
@@ -603,7 +591,7 @@ async fn daily_buckets_persist_and_are_trimmed_to_the_window() {
     let mut trimmed = never_refresh_manager(tmp.path().to_path_buf());
     trimmed.load().expect("load");
     // Both load; the window is applied when the file is next written.
-    trimmed.record_attempt("k@example.com");
+    trimmed.record_success("k@example.com", None, "model-a");
     let stored = persisted(&usage_file);
     let days = stored["k@example.com"]["days"]
         .as_object()
@@ -640,9 +628,7 @@ async fn a_reauth_lockout_lands_in_the_daily_bucket_too() {
     manager.load().expect("load");
 
     // Two requests, two outcomes: the relay counts an attempt before each.
-    manager.record_attempt("k@example.com");
     manager.record_failure("k@example.com", "upstream", Some("boom"));
-    manager.record_attempt("k@example.com");
     manager.record_refresh_exhausted("k@example.com", "expired");
 
     let snapshot = &manager.snapshots()[0];
@@ -681,7 +667,6 @@ async fn in_memory_buckets_are_trimmed_not_only_the_written_copy() {
 
     let mut manager = never_refresh_manager(tmp.path().to_path_buf());
     manager.load().expect("load");
-    manager.record_attempt("k@example.com");
 
     let dates: Vec<String> = manager.snapshots()[0]["days"]
         .as_array()
@@ -695,7 +680,7 @@ async fn in_memory_buckets_are_trimmed_not_only_the_written_copy() {
     );
 }
 
-/// Every attempt reaches an outcome: `requests` must equal
+/// A counter counts outcomes: `requests` must equal
 /// `successes + failures`, or the three panels report a gap the operator
 /// cannot account for ("1,404 requests, 1,398 ok, 0 failed").
 #[tokio::test]
@@ -708,11 +693,8 @@ async fn requests_reconcile_with_successes_and_failures() {
     // Every attempt the relay makes reaches an outcome: a success, a
     // failure, or a reauth lockout. The counters must add up for all of
     // them, and the daily buckets must agree with the cumulative ones.
-    manager.record_attempt("k@example.com");
     manager.record_success("k@example.com", None, "claude-fable-5-1");
-    manager.record_attempt("k@example.com");
     manager.record_failure("k@example.com", "upstream", Some("boom"));
-    manager.record_attempt("k@example.com");
     manager.record_refresh_exhausted("k@example.com", "expired");
 
     let snapshot = &manager.snapshots()[0];
@@ -734,10 +716,9 @@ async fn requests_reconcile_with_successes_and_failures() {
     );
 }
 
-/// A refusal must survive a restart like every other outcome. Its
-/// `record_attempt` is persisted; if the refusal is not, the reloaded
-/// state shows a request with no outcome — the permanent gap this seam
-/// was written to close.
+/// A refusal must survive a restart like every other outcome: it counts
+/// its own request, so a refusal lost to a restart would take its request
+/// with it and leave the reloaded totals short.
 #[tokio::test]
 async fn a_refusal_survives_a_restart() {
     let tmp = tempdir().expect("tempdir");
@@ -745,7 +726,6 @@ async fn a_refusal_survives_a_restart() {
     let mut manager = never_refresh_manager(tmp.path().to_path_buf());
     manager.load().expect("load");
 
-    manager.record_attempt("k@example.com");
     manager.record_refusal("k@example.com");
 
     let mut rebuilt = never_refresh_manager(tmp.path().to_path_buf());
@@ -796,7 +776,6 @@ async fn the_retention_window_is_ninety_days_inclusive() {
 
     let mut manager = never_refresh_manager(tmp.path().to_path_buf());
     manager.load().expect("load");
-    manager.record_attempt("k@example.com");
 
     let stored = persisted(&usage_file);
     let days = stored["k@example.com"]["days"]
@@ -889,11 +868,11 @@ async fn an_idle_process_does_not_serve_stale_buckets() {
     );
 }
 
-/// The invariant, over every public recorder rather than one path: no
-/// sequence of calls can make outcomes exceed attempts, and every outcome
-/// implies an attempt. Seven P1s across three review rounds were all one
-/// call site forgetting this; a table over the whole surface is what a
-/// prose invariant could not give.
+/// AC-5, over every public recorder rather than one path: no sequence of
+/// calls can put `requests` and `successes + failures` out of step,
+/// cumulatively or in any bucket. Eight P1s and one P0 across five review
+/// rounds were all one call site forgetting this; a table over the whole
+/// surface is what a prose invariant could not give.
 #[tokio::test]
 async fn no_sequence_of_outcomes_can_break_the_invariant() {
     struct Case {
@@ -916,55 +895,52 @@ async fn no_sequence_of_outcomes_can_break_the_invariant() {
     // balance: asserting balance alone cannot tell "counted correctly"
     // from "attempt and outcome both dropped".
     let case = |name, calls, want| Case { name, calls, want };
+    // A counter counts outcomes (ADR-0015): each recorder below counts
+    // the request it is reporting on, so the expected counts are simply
+    // how many outcomes the sequence produced.
     let cases = vec![
-        case(
-            "attempt then success",
-            vec!["attempt", "success"],
-            (1, 1, 0),
-        ),
-        case(
-            "attempt then failure",
-            vec!["attempt", "failure"],
-            (1, 0, 1),
-        ),
-        case(
-            "attempt then refusal",
-            vec!["attempt", "refusal"],
-            (1, 0, 1),
-        ),
-        case(
-            "attempt then reauth lockout",
-            vec!["attempt", "exhausted"],
-            (1, 0, 1),
-        ),
+        case("one success", vec!["success"], (1, 1, 0)),
+        case("one failure", vec!["failure"], (1, 0, 1)),
+        case("one refusal", vec!["refusal"], (1, 0, 1)),
+        case("one reauth lockout", vec!["exhausted"], (1, 0, 1)),
         // A billing rejection: one outcome, then health applied on top.
+        // `record_billing_cooldown` must not count a second request.
         case(
             "refusal then billing cooldown",
-            vec!["attempt", "refusal", "billing"],
+            vec!["refusal", "billing"],
             (1, 0, 1),
         ),
-        // Two outcomes for one attempt: the second implies its own.
+        // A path that records twice inflates `requests` rather than
+        // corrupting the balance: with nothing to refuse against, the
+        // seam counts both (AC-7).
         case(
-            "a second outcome implies its own attempt",
-            vec!["attempt", "refusal", "failure"],
+            "a double-recording path counts twice",
+            vec!["refusal", "failure"],
             (2, 0, 2),
         ),
-        // An outcome with no attempt: the relay should never do this, but
-        // the counters must stay coherent if it does.
-        case("outcome without an attempt", vec!["success"], (1, 1, 0)),
-        case("failure without an attempt", vec!["failure"], (1, 0, 1)),
-        // Failover: two attempts, two outcomes.
+        // Failover: two outcomes on one account.
         case(
-            "failover across two attempts",
-            vec!["attempt", "failure", "attempt", "success"],
+            "failover across two outcomes",
+            vec!["failure", "success"],
             (2, 1, 1),
         ),
-        // Two in flight at once, as an async relay produces.
+        // Concurrent, as an async relay produces: both count, neither is
+        // refused. This is the round-4 P0, which a per-account flag lost
+        // (AC-6).
         case(
-            "two attempts in flight, two outcomes",
-            vec!["attempt", "attempt", "success", "success"],
+            "two concurrent successes",
+            vec!["success", "success"],
             (2, 2, 0),
         ),
+        case(
+            "a burst of six concurrent outcomes",
+            vec![
+                "success", "success", "failure", "success", "refusal", "success",
+            ],
+            (6, 4, 2),
+        ),
+        // Health applied with no outcome at all counts nothing.
+        case("billing cooldown alone", vec!["billing"], (0, 0, 0)),
     ];
 
     for Case { name, calls, want } in cases {
@@ -975,7 +951,6 @@ async fn no_sequence_of_outcomes_can_break_the_invariant() {
         manager.load().expect("load");
         for call in &calls {
             match *call {
-                "attempt" => manager.record_attempt("k@example.com"),
                 "success" => manager.record_success("k@example.com", Some(&usage), "model-a"),
                 "failure" => manager.record_failure("k@example.com", "upstream", Some("boom")),
                 "refusal" => manager.record_refusal("k@example.com"),
@@ -1017,28 +992,24 @@ async fn the_invariant_holds_across_a_restart() {
     save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
     let mut manager = never_refresh_manager(tmp.path().to_path_buf());
     manager.load().expect("load");
-    manager.record_attempt("k@example.com");
     manager.record_failure("k@example.com", "upstream", Some("boom"));
 
     let mut rebuilt = never_refresh_manager(tmp.path().to_path_buf());
     rebuilt.load().expect("reload");
-    // A fresh attempt and its outcome, after the restart.
-    rebuilt.record_attempt("k@example.com");
+    // Fresh outcomes after the restart, each counting its own request.
     rebuilt.record_success("k@example.com", None, "model-a");
-    // An outcome arriving with nothing in flight counts the attempt it
-    // implies, so outcomes can never exceed attempts.
     rebuilt.record_refusal("k@example.com");
 
     let snapshot = &rebuilt.snapshots()[0];
     let requests = snapshot["totalRequests"].as_i64().expect("requests");
     let ok = snapshot["totalSuccesses"].as_i64().expect("ok");
     let failed = snapshot["totalFailures"].as_i64().expect("failed");
-    assert_eq!(requests, 3, "two recorded attempts, one implied");
+    assert_eq!(requests, 3, "three outcomes, three requests");
     assert_eq!(ok, 1);
     assert_eq!(failed, 2);
     assert_eq!(requests, ok + failed);
 
-    // An outcome with no attempt at all counts the attempt it implies.
+    // Each outcome counts its own request (ADR-0015).
     rebuilt.record_refusal("k@example.com");
     let snapshot = &rebuilt.snapshots()[0];
     let requests = snapshot["totalRequests"].as_i64().expect("requests");
@@ -1096,6 +1067,53 @@ async fn load_repairs_outcomes_that_exceed_their_attempts() {
 /// The repair reaches disk at load, not at the next outcome: an account
 /// that serves nothing after a restart must not leave a stale file behind
 /// a corrected panel.
+/// AC-8: repair is a migration, not a running behaviour. A gap can no
+/// longer be created, so once an old file is repaired the next load of
+/// that same file must find nothing to do. A repair that fired every
+/// load would be a repair that could keep rewriting history.
+#[tokio::test]
+async fn a_repaired_file_is_not_repaired_again() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let usage_file = tmp.path().join("commandcode").join("usage.json");
+    fs::create_dir_all(usage_file.parent().expect("parent")).expect("mkdir");
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    // A file from the old scheme: attempts counted at dispatch, six of
+    // them never reaching an outcome. This is the operator's real file.
+    fs::write(
+        &usage_file,
+        json!({
+            "k@example.com": {
+                "total_requests": 1404,
+                "total_successes": 1398,
+                "total_failures": 0,
+                "days": {today.clone(): {"requests": 10, "successes": 7, "failures": 0}}
+            }
+        })
+        .to_string(),
+    )
+    .expect("write legacy");
+
+    let mut first = never_refresh_manager(tmp.path().to_path_buf());
+    first.load().expect("load");
+    let repaired = persisted(&usage_file);
+    let account = &repaired["k@example.com"];
+    assert_eq!(account["total_requests"], 1404);
+    assert_eq!(account["total_failures"], 6, "the gap was not closed");
+    assert_eq!(account["days"][&today]["failures"], 3);
+
+    // The same file, loaded again: nothing left to repair, and nothing
+    // changed. Byte-identical, not merely balanced.
+    let after_first = fs::read_to_string(&usage_file).expect("read");
+    let mut second = never_refresh_manager(tmp.path().to_path_buf());
+    second.load().expect("reload");
+    let after_second = fs::read_to_string(&usage_file).expect("read");
+    assert_eq!(
+        after_first, after_second,
+        "a repaired file was repaired again"
+    );
+}
+
 #[tokio::test]
 async fn the_repair_is_written_at_load_not_at_the_next_request() {
     let tmp = tempdir().expect("tempdir");
@@ -1140,8 +1158,6 @@ async fn two_attempts_in_flight_both_reach_an_outcome() {
         reasoning_output_tokens: 0,
     };
 
-    manager.record_attempt("k@example.com");
-    manager.record_attempt("k@example.com");
     manager.record_success("k@example.com", Some(&usage), "model-a");
     manager.record_success("k@example.com", Some(&usage), "model-a");
 
@@ -1170,7 +1186,6 @@ async fn a_reauth_lockout_is_not_clobbered_by_the_paired_failure() {
             .map_or(0.0, |d| d.as_secs_f64())
     };
 
-    manager.record_attempt("k@example.com");
     manager.record_refresh_exhausted("k@example.com", "expired");
     manager.record_failure("k@example.com", "auth", Some("token refresh declined"));
 

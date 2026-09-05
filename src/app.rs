@@ -126,11 +126,12 @@ struct StreamAccounting {
     account: AvailableAccount,
     /// The upstream model name: what per-model counters are keyed by.
     model: String,
-    /// Cleared once an outcome is recorded. While set, the attempt is
+    /// Cleared once an outcome is recorded. While set, this request is
     /// still owed one, and `Drop` pays it: a client that hangs up
     /// mid-stream drops the generator at its last `yield`, so the code
-    /// after the loop never runs (ARCHITECTURE, "Every attempt reaches an
-    /// outcome").
+    /// after the loop never runs. Without the guard the request is not
+    /// counted at all (ARCHITECTURE, "A counter counts outcomes, never
+    /// attempts").
     owed: Arc<AtomicBool>,
 }
 
@@ -1090,10 +1091,11 @@ async fn route_provider_request(
                     )
                     .await
                 } else {
-                    // The attempt was already counted when the account was
-                    // selected; refusing here without recording an outcome
-                    // would leave requests > ok + failed. A refusal is not
-                    // the account's fault, so it earns no cooldown.
+                    // A Refusal is an outcome: it counts its own request
+                    // (ADR-0015). Returning without recording one would
+                    // lose the request entirely, not merely unbalance the
+                    // counters. It earns no cooldown: a dialect the
+                    // provider cannot serve is not the account's fault.
                     record_provider_refusal(state, &provider, &account).await;
                     return AppError::provider(
                         StatusCode::NOT_IMPLEMENTED,
@@ -1669,7 +1671,8 @@ async fn next_provider_account(
         ));
     };
     let email = account.token.email.clone();
-    manager.record_attempt(&email);
+    // Dispatch counts nothing: the call that records this request's
+    // outcome is the call that counts it (ADR-0015).
     match manager.refresh_if_due(&email).await {
         Ok(true) => {}
         Ok(false) => {

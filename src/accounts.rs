@@ -86,17 +86,6 @@ struct AccountState {
     /// Per-local-day traffic, keyed `YYYY-MM-DD`. Sorted by construction,
     /// which is also chronological for that format (usage-trend AC-1).
     days: BTreeMap<String, DayUsage>,
-    /// The local day each in-flight attempt opened on, oldest first. A
-    /// list rather than a count because an outcome belongs to the bucket
-    /// its attempt opened: a request spanning local midnight would
-    /// otherwise leave one day short an outcome and the next short an
-    /// attempt, which load-time repair then turns into an invented
-    /// failure — nightly, for an operator working across midnight. A list
-    /// rather than a flag because Rotation is in-flight-blind and the
-    /// manager lock is released before the upstream call, so one Account
-    /// serves several requests at once. In-memory only: a restart begins
-    /// with nothing in flight.
-    in_flight: Vec<String>,
 }
 
 impl AccountState {
@@ -121,65 +110,50 @@ impl AccountState {
             total_reasoning_output_tokens: 0,
             models: BTreeMap::new(),
             days: BTreeMap::new(),
-            in_flight: Vec::new(),
         }
     }
 
-    /// Count one outcome, cumulative and in the bucket of the day its
-    /// attempt opened on, keeping `successes + failures <= requests` true
-    /// by construction.
+    /// Count one request and its outcome, cumulatively and in the day the
+    /// outcome arrived, keeping `requests == successes + failures` true by
+    /// construction.
     ///
-    /// Every recorder goes through here, and the one property that holds
-    /// whatever the call sites do is:
+    /// Every recorder goes through here, and the property that holds
+    /// whatever the call sites do is that both sides are written by the
+    /// same call. Nothing is counted at dispatch, so there is no window
+    /// between the two writes for an interleaving, a concurrent outcome
+    /// or a leaked attempt to open (ADR-0015).
     ///
-    /// - **An outcome implies an attempt.** When nothing is in flight — a
-    ///   recorder fired without `record_attempt`, or a path recorded a
-    ///   second outcome — the attempt is counted too, rather than leaving
-    ///   `ok + failed > requests`, the direction load-time repair cannot
-    ///   fix.
+    /// Two consequences worth stating, because both were bugs before:
     ///
-    /// It does **not** refuse a second outcome: with a count rather than a
-    /// flag it cannot tell one apart from the first outcome of another
-    /// attempt in flight, which is the bug a per-account flag caused. A
-    /// path that records twice therefore inflates `requests` by one rather
-    /// than corrupting the balance. A caller that must not record twice
-    /// applies its health without an outcome instead
-    /// (`record_billing_cooldown`).
+    /// - **It does not refuse a second outcome.** There is nothing to
+    ///   refuse against: a path that records twice counts two requests,
+    ///   inflating `requests` rather than corrupting the balance. A caller
+    ///   that must not record twice applies its health without an outcome
+    ///   instead (`record_billing_cooldown`).
+    /// - **A request in flight is counted nowhere**, and an attempt lost
+    ///   to a crash is never counted at all. The relay counts what it
+    ///   observed: a number it cannot justify is worse than one it does
+    ///   not have.
     ///
     fn settle(&mut self, success: bool) -> String {
-        // The oldest attempt in flight reaches its outcome, booked to the
-        // day it opened on rather than the day it finished: a request
-        // spanning local midnight would otherwise leave one bucket short
-        // an outcome and the next short an attempt.
-        let day = if self.in_flight.is_empty() {
-            // Nothing in flight: an outcome the relay recorded without an
-            // attempt, or a second outcome for one already settled. Both
-            // are answered the same way — count the attempt this outcome
-            // implies, so `ok + failed` can never exceed `requests`, the
-            // direction load-time repair cannot fix. A caller that must
-            // not record twice applies its health without an outcome
-            // instead (`record_billing_cooldown`).
-            let today = local_today();
-            self.total_requests += 1;
-            self.day(&today).requests += 1;
-            today
-        } else {
-            // Clamped to the window: an attempt that opened before the
-            // retention edge would otherwise settle into a bucket `day()`
-            // trims on touch, leaving the outcome counted cumulatively and
-            // absent from every bucket the file and the payload show.
-            let opened = self.in_flight.remove(0);
-            let cutoff = retention_cutoff();
-            if opened < cutoff { cutoff } else { opened }
-        };
+        // A counter counts outcomes, never attempts (ADR-0015). The same
+        // call writes both sides, in the day the outcome arrived, so
+        // `requests == successes + failures` holds cumulatively and per
+        // day by construction: no interleaving, no concurrent outcome and
+        // no future call site can put them out of step. A request still in
+        // flight is counted nowhere.
+        let today = local_today();
+        self.total_requests += 1;
+        let day = self.day(&today);
+        day.requests += 1;
         if success {
+            day.successes += 1;
             self.total_successes += 1;
-            self.day(&day).successes += 1;
         } else {
+            day.failures += 1;
             self.total_failures += 1;
-            self.day(&day).failures += 1;
         }
-        day
+        today
     }
 
     /// One day's bucket, opened on first touch. Trims the window first,
@@ -440,16 +414,6 @@ impl AccountManager {
         state.last_error = Some(format!("billing: {detail}"));
         state.cooldown_until = unix_now() + BILLING_COOLDOWN_SECONDS;
         self.persist_usage();
-    }
-
-    pub fn record_attempt(&mut self, email: &str) {
-        if let Some(state) = self.accounts.get_mut(email) {
-            let today = local_today();
-            state.total_requests += 1;
-            state.day(&today).requests += 1;
-            state.in_flight.push(today);
-            self.persist_usage();
-        }
     }
 
     pub fn record_failure(&mut self, email: &str, kind: &str, detail: Option<&str>) {
@@ -730,9 +694,6 @@ fn reconcile_loaded_counters(state: &mut AccountState) {
             day.requests = outcomes;
         }
     }
-    // A loaded account has nothing in flight: whatever it was doing when
-    // the process died is over.
-    state.in_flight.clear();
 }
 
 /// The oldest local day a write keeps: today minus the retention window.
@@ -767,39 +728,25 @@ mod settle_tests {
         state.days.get(date).cloned().unwrap_or_default()
     }
 
-    /// An outcome whose attempt opened before the retention window must
-    /// still land in a bucket that survives. Otherwise `day()` trims the
-    /// stale key, re-opens it empty, writes the outcome into it, and both
-    /// `persist_usage` and `snapshots` then filter it out — the outcome
-    /// is counted cumulatively and missing from every bucket.
+    /// AC-1/AC-2: the counting rule. A request that has been dispatched
+    /// but not finished is counted nowhere; the call that records its
+    /// outcome is the same call that counts the request (ADR-0015).
     #[test]
-    fn an_outcome_settling_past_the_window_still_lands_in_a_kept_bucket() {
-        let opened_long_ago = day_offset(-200);
+    fn a_dispatched_request_counts_nothing_until_it_settles() {
         let mut state = state();
-        state.total_requests += 1;
-        state.in_flight.push(opened_long_ago);
-        // A live bucket, so `day()` actually trims when the stale one is
-        // touched.
-        state.day(&day_offset(0)).requests += 0;
 
-        let settled_on = state.settle(true);
+        // Dispatch is not a recorded event: nothing to call, and nothing
+        // counted. The relay counts what it observed (ADR-0015).
+        assert_eq!(state.total_requests, 0);
+        assert!(state.days.is_empty(), "a bucket exists before any outcome");
 
-        assert!(
-            settled_on >= super::retention_cutoff(),
-            "settled into a bucket outside the window: {settled_on}"
-        );
-        assert!(
-            state.days.contains_key(&settled_on),
-            "the bucket was dropped after the outcome was written"
-        );
-        assert_eq!(bucket(&state, &settled_on).successes, 1);
-        let visible: i64 = state
-            .days
-            .iter()
-            .filter(|(date, _)| **date >= super::retention_cutoff())
-            .map(|(_, day)| day.successes)
-            .sum();
-        assert_eq!(visible, 1, "the outcome is missing from every bucket");
+        state.settle(true);
+
+        assert_eq!(state.total_requests, 1);
+        assert_eq!(state.total_successes, 1);
+        let today = bucket(&state, &crate::utils::local_today());
+        assert_eq!(today.requests, 1, "the outcome did not count its request");
+        assert_eq!(today.successes, 1);
     }
 
     /// A local date `offset` days from today, as the store keys them.
@@ -809,71 +756,46 @@ mod settle_tests {
             .to_string()
     }
 
-    /// An outcome is booked to the day its attempt opened on, not the day
-    /// it finished. A request spanning local midnight would otherwise
-    /// leave one bucket short an outcome and the next short an attempt,
-    /// which load-time repair turns into an invented failure — nightly,
-    /// for an operator working across midnight.
+    /// AC-1/AC-4: an outcome books to the day it arrived, so a request
+    /// spanning local midnight counts once, on the day it finished. This
+    /// is what removes the need for attempt identity: the seam never
+    /// books to another day, so it never needs to know which attempt it
+    /// is settling (ADR-0015).
     #[test]
-    fn an_outcome_settles_in_the_day_its_attempt_opened() {
-        // Dates from the clock, not literals: a fixed date eventually
-        // falls outside the retention window, `day()` trims the bucket it
-        // just wrote, and the suite goes red with no code change.
-        let opened_on = day_offset(-1);
-        let today = day_offset(0);
+    fn an_outcome_books_to_the_day_it_arrived() {
+        let yesterday = day_offset(-1);
+        let today = crate::utils::local_today();
         let mut state = state();
-        // An attempt that opened yesterday, still in flight at midnight.
-        state.total_requests += 1;
-        state.day(&opened_on).requests += 1;
-        state.in_flight.push(opened_on.clone());
+        // Yesterday saw traffic of its own.
+        state.day(&yesterday).requests += 1;
+        state.day(&yesterday).successes += 1;
 
-        // Its outcome arrives after the date has rolled over.
+        // A request dispatched yesterday, finishing today.
         let settled_on = state.settle(true);
 
-        assert_eq!(settled_on, opened_on, "the outcome left its attempt");
-        assert!(
-            state.days.contains_key(&opened_on),
-            "the bucket was dropped"
-        );
-        let opened = bucket(&state, &opened_on);
-        assert_eq!(opened.requests, 1);
-        assert_eq!(opened.successes, 1, "the bucket is unbalanced");
-        // And nothing was booked to the new day.
-        assert!(
-            !state.days.contains_key(&today) || bucket(&state, &today).successes == 0,
-            "the outcome leaked into the new day"
-        );
+        assert_eq!(settled_on, today, "booked to a day it did not arrive in");
+        let arrived = bucket(&state, &today);
+        assert_eq!(arrived.requests, 1);
+        assert_eq!(arrived.successes, 1);
+        // Yesterday is untouched: the outcome did not reach back.
+        let earlier = bucket(&state, &yesterday);
+        assert_eq!(earlier.requests, 1, "an earlier day was rewritten");
+        assert_eq!(earlier.successes, 1);
     }
 
-    /// Attempts settle oldest-first, so two in flight across a midnight
-    /// each keep their own day.
+    /// AC-5: every bucket balances, whatever the order of outcomes.
     #[test]
-    fn two_attempts_across_midnight_keep_their_own_days() {
-        let (first, second) = (day_offset(-1), day_offset(0));
+    fn concurrent_outcomes_each_count_their_own_request() {
         let mut state = state();
-        for date in [&first, &second] {
-            state.total_requests += 1;
-            state.day(date).requests += 1;
-            state.in_flight.push(date.clone());
-        }
+        state.settle(true);
+        state.settle(false);
+        state.settle(true);
 
-        assert_eq!(state.settle(true), first);
-        assert_eq!(state.settle(false), second);
-
-        for date in [&first, &second] {
-            assert!(state.days.contains_key(date), "bucket {date} was dropped");
-        }
-        assert_eq!(bucket(&state, &first).successes, 1);
-        assert_eq!(bucket(&state, &first).failures, 0);
-        assert_eq!(bucket(&state, &second).successes, 0);
-        assert_eq!(bucket(&state, &second).failures, 1);
-        for date in [&first, &second] {
-            let day = bucket(&state, date);
-            assert_eq!(
-                day.requests,
-                day.successes + day.failures,
-                "bucket {date} is unbalanced"
-            );
-        }
+        assert_eq!(state.total_requests, 3);
+        assert_eq!(state.total_successes, 2);
+        assert_eq!(state.total_failures, 1);
+        let today = bucket(&state, &crate::utils::local_today());
+        assert_eq!(today.requests, 3);
+        assert_eq!(today.requests, today.successes + today.failures);
     }
 }
