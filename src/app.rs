@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
@@ -125,6 +126,42 @@ struct StreamAccounting {
     account: AvailableAccount,
     /// The upstream model name: what per-model counters are keyed by.
     model: String,
+    /// Cleared once an outcome is recorded. While set, the attempt is
+    /// still owed one, and `Drop` pays it: a client that hangs up
+    /// mid-stream drops the generator at its last `yield`, so the code
+    /// after the loop never runs (ARCHITECTURE, "Every attempt reaches an
+    /// outcome").
+    owed: Arc<AtomicBool>,
+}
+
+impl StreamAccounting {
+    /// Mark the outcome settled, so `Drop` does not record a second one.
+    fn settle(&self) {
+        self.owed.store(false, Ordering::SeqCst);
+    }
+}
+
+impl Drop for StreamAccounting {
+    fn drop(&mut self) {
+        if !self.owed.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        // Drop is sync and the recorders are async: hand the work to the
+        // runtime rather than blocking here.
+        let state = self.state.clone();
+        let provider = self.provider.clone();
+        let account = self.account.clone();
+        tokio::spawn(async move {
+            record_provider_failure_kind(
+                &state,
+                provider,
+                &account,
+                "disconnected",
+                Some("client disconnected before the stream completed"),
+            )
+            .await;
+        });
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1438,6 +1475,7 @@ async fn stream_accounting(
             provider,
             account: account.clone(),
             model: model.to_string(),
+            owed: Arc::new(AtomicBool::new(true)),
         })
     } else {
         record_provider_failure(state, provider, account, status, None).await;
@@ -1709,8 +1747,11 @@ async fn record_provider_failure(
 ) {
     // 400/402 by themselves say nothing about account health — a malformed request is
     // the client's fault, and a drained balance is recorded by the failover path with
-    // the billing kind instead. Recording both would double-count the backoff.
+    // the billing kind instead. Recording both would double-count the backoff. The
+    // request still happened, though: count it as a refusal so it reaches an outcome
+    // without touching the account's health.
     if status == StatusCode::BAD_REQUEST || status == StatusCode::PAYMENT_REQUIRED {
+        record_provider_refusal(state, &provider, account).await;
         return;
     }
     record_provider_failure_kind(state, provider, account, classify_status(status), detail).await;
@@ -2013,6 +2054,7 @@ fn transformed_sse_stream(
 
 async fn record_stream_success(accounting: Option<&StreamAccounting>, usage: &UsageData) {
     if let Some(accounting) = accounting {
+        accounting.settle();
         record_provider_success(
             &accounting.state,
             accounting.provider.clone(),
@@ -2026,6 +2068,7 @@ async fn record_stream_success(accounting: Option<&StreamAccounting>, usage: &Us
 
 async fn record_stream_failure(accounting: Option<&StreamAccounting>, detail: &str) {
     if let Some(accounting) = accounting {
+        accounting.settle();
         record_provider_failure(
             &accounting.state,
             accounting.provider.clone(),

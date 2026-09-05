@@ -2642,3 +2642,83 @@ async fn a_fetch_that_parses_to_nothing_keeps_the_known_versions() {
     assert_eq!(kept.claude, "2.1.200".parse().ok());
     assert_eq!(kept.codex, "0.140.0".parse().ok());
 }
+
+/// ARCHITECTURE, "Every attempt reaches an outcome": a client that hangs
+/// up mid-stream still made a request. The outcome is recorded after the
+/// yield loop, so dropping the body skips it and the attempt leaks.
+#[tokio::test]
+async fn a_client_disconnect_mid_stream_still_reaches_an_outcome() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(
+        tmp.path(),
+        &TokenData {
+            access_token: "anthropic-access".to_string(),
+            refresh_token: "anthropic-refresh".to_string(),
+            email: "a@example.com".to_string(),
+            expires_at: "2030-01-01T00:00:00Z".to_string(),
+            account_uuid: "acct-a".to_string(),
+            provider: ProviderId::anthropic(),
+            id_token: None,
+            last_refresh_at: None,
+            plan_type: None,
+        },
+    )
+    .expect("save token");
+    let upstream = Arc::new(FakeUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream);
+
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("authorization", "Bearer sk-test")
+                .header("content-type", "application/json")
+                .header("content-length", "1")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-sonnet-4-5",
+                        "stream": true,
+                        "max_tokens": 16,
+                        "messages": [{"role": "user", "content": "hi"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), 200);
+
+    // Read one frame, then hang up — the client is gone before the
+    // stream completes.
+    let mut body = response.into_body().into_data_stream();
+    let _first = futures_util::StreamExt::next(&mut body).await;
+    drop(body);
+    // Let any drop-time accounting run.
+    tokio::task::yield_now().await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let (status, snapshot) = json_response(
+        app,
+        axum::http::Request::builder()
+            .method("GET")
+            .uri("/admin/accounts")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let account = &snapshot["providers"]["anthropic"]["accounts"][0];
+    let requests = account["totalRequests"].as_i64().expect("requests");
+    let ok = account["totalSuccesses"].as_i64().expect("ok");
+    let failed = account["totalFailures"].as_i64().expect("failed");
+    assert_eq!(
+        requests,
+        ok + failed,
+        "a disconnected stream leaked its attempt: \
+         {requests} requests, {ok} ok, {failed} failed"
+    );
+}

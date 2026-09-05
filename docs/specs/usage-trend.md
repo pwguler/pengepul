@@ -86,8 +86,8 @@ before.
   (this window's tokens) beside `all time` (every token the relay has
   counted), the latter computed by the same `account_tokens` sum that
   `status` prints, over the same payload, so the two can never drift.
-  No verb prints a bare `total`: one word, one scope, and neither row
-  narrates the other — the two figures sit on screen and the reader sees
+  `status` prints `total` for the relay and nothing else does: one word,
+  one scope, and neither row narrates the other — the two figures sit on screen and the reader sees
   they agree. `all time` is never less than the `window` it contains,
   even when a payload's cumulative counters are absent or lag its
   buckets.
@@ -161,6 +161,26 @@ before.
   earns, because a dialect the Provider cannot serve is not the
   Account's fault; an existing test caught that distinction by going 503
   when the first attempt put the account on cooldown.
+- **Three more leaks after the first three.** A second landing judge
+  found the reconciliation work incomplete: `record_refusal` — the seam
+  written to close the gap — forgot to persist, so a refusal vanished on
+  restart and re-created the permanent gap it was built to fix; upstream
+  400/402 returned without recording anything, the largest remaining
+  hole, and the branch had already built the right seam for it; and a
+  client hanging up mid-stream dropped the generator at its last `yield`,
+  so the code after the loop never ran. The third was reproduced by
+  dropping a response body mid-stream and reading the counters: `1
+  requests, 0 ok, 0 failed`. A `Drop` guard on `StreamAccounting` pays
+  the owed outcome.
+- **The `debug_assert` was ceremony.** `PoolTotals` carried a redundant
+  accumulator plus a `debug_assert_eq!` pinning it to the field sum — and
+  `debug_assert` compiles out of release, the binary the operator runs.
+  It proved nothing where it mattered and added a fifth thing that could
+  drift. Replaced with `carried_tokens`, one function both
+  `account_tokens` and `PoolTotals::tokens` call.
+- **A day of failures is history.** Emptiness was judged on tokens, so a
+  day whose every request failed printed rows in plain and "no usage
+  recorded yet" in rich. A day is history because it was recorded.
 - **A subset could exceed its superset.** A payload carrying buckets but
   no cumulative counters printed `all time 0` under `window 11.0K`.
   Clamped: `all time` is at least the window it contains.

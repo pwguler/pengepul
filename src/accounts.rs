@@ -348,6 +348,10 @@ impl AccountManager {
             state.total_failures += 1;
             state.today().failures += 1;
         }
+        // Like every other outcome: the attempt was already persisted, so
+        // a refusal held only in memory would resurface as a permanent
+        // gap after a restart.
+        self.persist_usage();
     }
 
     pub fn record_attempt(&mut self, email: &str) {

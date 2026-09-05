@@ -723,3 +723,79 @@ async fn requests_reconcile_with_successes_and_failures() {
         "daily buckets must reconcile too: {day}"
     );
 }
+
+/// A refusal must survive a restart like every other outcome. Its
+/// `record_attempt` is persisted; if the refusal is not, the reloaded
+/// state shows a request with no outcome — the permanent gap this seam
+/// was written to close.
+#[tokio::test]
+async fn a_refusal_survives_a_restart() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+
+    manager.record_attempt("k@example.com");
+    manager.record_refusal("k@example.com");
+
+    let mut rebuilt = never_refresh_manager(tmp.path().to_path_buf());
+    rebuilt.load().expect("reload");
+    let snapshot = &rebuilt.snapshots()[0];
+    let requests = snapshot["totalRequests"].as_i64().expect("requests");
+    let ok = snapshot["totalSuccesses"].as_i64().expect("ok");
+    let failed = snapshot["totalFailures"].as_i64().expect("failed");
+    assert_eq!(
+        requests,
+        ok + failed,
+        "a refusal lost on restart leaves a permanent gap: \
+         {requests} requests, {ok} ok, {failed} failed"
+    );
+}
+
+/// AC-4's window is 90 days inclusive of today. Nothing pinned the size
+/// itself: `RETENTION_DAYS` could move to 80 or 100 and every test stayed
+/// green, because the others test the comparison, not the span.
+#[tokio::test]
+async fn the_retention_window_is_ninety_days_inclusive() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let usage_file = tmp.path().join("commandcode").join("usage.json");
+    let day = |back: i64| {
+        (chrono::Local::now() - chrono::Duration::days(back))
+            .format("%Y-%m-%d")
+            .to_string()
+    };
+    // 89 back is the oldest day inside a 90-day inclusive window; 90 is
+    // the first one outside it.
+    let (inside, edge, outside) = (day(88), day(89), day(90));
+    fs::create_dir_all(usage_file.parent().expect("parent")).expect("mkdir");
+    fs::write(
+        &usage_file,
+        json!({
+            "k@example.com": {
+                "days": {
+                    inside.clone(): {"requests": 1},
+                    edge.clone(): {"requests": 1},
+                    outside.clone(): {"requests": 1}
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write");
+
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    manager.record_attempt("k@example.com");
+
+    let stored = persisted(&usage_file);
+    let days = stored["k@example.com"]["days"]
+        .as_object()
+        .expect("days map");
+    assert!(days.contains_key(&inside), "88 days back must survive");
+    assert!(days.contains_key(&edge), "89 days back is the window edge");
+    assert!(
+        !days.contains_key(&outside),
+        "90 days back is outside a 90-day inclusive window: {days:?}"
+    );
+}

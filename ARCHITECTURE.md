@@ -111,15 +111,18 @@ in files.
 - **Usage counters survive a restart; Cooldown does not.** Requests, successes,
   failures and tokens per Account — per model within an Account for the
   successes, and per local calendar day — are written to `usage.json` after
-  every outcome and reloaded at startup; a fresh process always retries every
+  every outcome, Refusals included and reloaded at startup; a fresh process always retries every
   Account. Daily buckets are trimmed to 90 days on write. Deleting the file
   is the only reset.
 - **Every attempt reaches an outcome.** `requests` always equals
   `successes + failures`, per Account and per day: the attempt is counted
   when an Account is selected, so every path between selection and the
-  response records a success, a failure, or a refusal. A refusal (a
-  dialect the Provider cannot serve) counts as a failed request but earns
-  no Cooldown — it is not the Account's fault.
+  response records a success, a failure, or a Refusal — including a
+  client that hangs up mid-stream, whose outcome is paid by a `Drop`
+  guard because the code after the stream loop never runs. A Refusal
+  counts as a failed request but earns no Cooldown: a dialect the
+  Provider cannot serve, or a 400 the client malformed, is not the
+  Account's fault.
 - **One word, one scope.** Two verbs never print the same label for different
   spans: `status` totals all time, `usage` names its `window` and its
   `all time` separately, and the all-time figure both print comes from one

@@ -131,9 +131,6 @@ pub(crate) fn providers(payload: &Value) -> Vec<(&str, &Value)> {
 
 #[derive(Default)]
 pub(crate) struct PoolTotals {
-    /// The carried load, summed through `account_tokens` so every view
-    /// that reports a total reads one definition (AC-11).
-    account_tokens_sum: i64,
     requests: i64,
     successes: i64,
     failures: i64,
@@ -145,17 +142,12 @@ pub(crate) struct PoolTotals {
 }
 
 impl PoolTotals {
-    /// The pool's carried load. Accumulated by `add` from the same four
-    /// fields `account_tokens` reads, and asserted equal to their sum, so
-    /// `status`, the share bars and `usage`'s all-time row cannot drift
-    /// apart when the definition of "carried" changes.
+    /// The pool's carried load, through the one function that defines it.
+    /// `account_tokens` reads the same four fields off an account; both
+    /// call `carried_tokens`, so a change to what "carried" means moves
+    /// every view at once rather than one of them silently.
     fn tokens(&self) -> i64 {
-        debug_assert_eq!(
-            self.input + self.output + self.cache_read + self.cache_write,
-            self.account_tokens_sum,
-            "PoolTotals drifted from account_tokens"
-        );
-        self.account_tokens_sum
+        carried_tokens(self.input, self.output, self.cache_read, self.cache_write)
     }
 
     fn add(&mut self, account: &Value) {
@@ -167,9 +159,6 @@ impl PoolTotals {
         self.cache_read += i64_field(account, "totalCacheReadInputTokens");
         self.cache_write += i64_field(account, "totalCacheCreationInputTokens");
         self.reasoning += i64_field(account, "totalReasoningOutputTokens");
-        // One definition of the carried load, not two that agree by
-        // inspection: `usage`'s all-time row sums the same function.
-        self.account_tokens_sum += account_tokens(account);
     }
 }
 
@@ -763,10 +752,21 @@ pub(crate) fn footer_facts(totals: &PoolTotals) -> Vec<Fact> {
 /// The account's carried load: every token that crossed it. This is what the
 /// share bar divides; there is no quota in the domain to fill one with.
 pub(crate) fn account_tokens(account: &Value) -> i64 {
-    i64_field(account, "totalInputTokens")
-        + i64_field(account, "totalOutputTokens")
-        + i64_field(account, "totalCacheReadInputTokens")
-        + i64_field(account, "totalCacheCreationInputTokens")
+    carried_tokens(
+        i64_field(account, "totalInputTokens"),
+        i64_field(account, "totalOutputTokens"),
+        i64_field(account, "totalCacheReadInputTokens"),
+        i64_field(account, "totalCacheCreationInputTokens"),
+    )
+}
+
+/// What "carried load" means, in one place: input, output and both cache
+/// directions. Reasoning is excluded — it is already inside output. Every
+/// total the CLI prints resolves through here, so `status`, the pool
+/// footers, the share bars and `usage`'s all-time row cannot disagree
+/// about what they are summing (AC-11).
+pub(crate) fn carried_tokens(input: i64, output: i64, cache_read: i64, cache_write: i64) -> i64 {
+    input + output + cache_read + cache_write
 }
 
 /// How many local days the trend shows. The file keeps more (the store's
@@ -804,6 +804,8 @@ pub(crate) fn trend_days(payload: &Value, today: &str) -> Vec<TrendDay> {
                     + i64_field(day, "outputTokens")
                     + i64_field(day, "cacheReadInputTokens")
                     + i64_field(day, "cacheCreationInputTokens");
+                // The entry exists because the day was recorded; its value
+                // may be zero.
                 *totals.entry(date.to_string()).or_default() += tokens;
             }
         }
@@ -818,7 +820,11 @@ pub(crate) fn trend_days(payload: &Value, today: &str) -> Vec<TrendDay> {
     // Emptiness is judged over the *window*, not over every bucket the
     // file holds: a relay whose only traffic predates the window would
     // otherwise render 30 flat bars, the shape AC-8 exists to prevent.
-    if window.iter().all(|day| day.tokens == 0) {
+    // A day is history because it was *recorded*, not because it spent
+    // tokens — a day of failures is history, and plain prints it, so rich
+    // must not call it empty.
+    let recorded: std::collections::BTreeSet<&String> = totals.keys().collect();
+    if !window.iter().any(|day| recorded.contains(&day.date)) {
         return Vec::new();
     }
     window

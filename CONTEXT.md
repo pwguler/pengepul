@@ -62,6 +62,10 @@ _Avoid_: account list, fleet, grouping
 One 64-column box of rich CLI output. Its header is `<subject>` or `<subject> ─ <qualifier>` and never carries a colon; a qualifier must add a fact the rows do not carry. Its fact rows are `<label>  <value>` with the label column fitted to that panel; it may also carry list rows — account and model tables with their own fitted columns. The status glyph marks a state value only. Plain output is not a panel and follows a separate, byte-stable contract.
 _Avoid_: card, box, widget
 
+**Refusal**:
+A request the relay accepted and then declined to serve without asking upstream — a dialect the Provider cannot serve, or a body the upstream rejected as malformed. It counts as a failed request so `requests` still equals `successes + failures`, but it never touches the Account's health: no Cooldown, no failure streak, no change to Rotation. It is the relay's or the client's fault, not the Account's.
+_Avoid_: rejection, refused request, bad request
+
 **Usage counters**:
 The running per-account totals — requests, successes, failures, tokens in/out/cache/reasoning — broken down per model for the successes and bucketed per **local calendar day**, summed relay-wide in `status`, shown per account in `accounts`, shown as a 30-day trend in `usage`, and persisted to `usage.json` in the provider's auth directory so they survive restarts and upgrades. Counters recorded before per-model attribution or daily bucketing existed stay only in the account totals. Daily buckets are kept for 90 days. Cooldowns and failure streaks are not persisted: a fresh process always retries.
 _Avoid_: stats file, metrics, telemetry

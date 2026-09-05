@@ -2629,7 +2629,7 @@ fn usage_renders_a_thirty_day_sparkline() {
         .collect();
     assert_eq!(spark.chars().count(), 30, "one bar per day: {spark_row}");
     assert!(spark.ends_with('▁'), "today is idle here: {spark_row}");
-    // AC-9: 09-03 is the peak and it sums both pools on 09-01.
+    // AC-9: the later day is the peak, and both pools sum into the earlier one.
     assert!(lines[2].contains("peak"), "{visible}");
     assert!(lines[2].contains("9.0K"), "peak value: {}", lines[2]);
     assert!(lines[2].contains(&peak_day), "peak date: {}", lines[2]);
@@ -2943,5 +2943,50 @@ fn a_pool_footer_names_its_scope_rather_than_saying_total() {
     assert!(
         visible.contains("│ pool"),
         "footer names its scope: {visible}"
+    );
+}
+
+/// A day of failed requests is history: rich and plain must agree that it
+/// exists. Judging emptiness on tokens alone made rich say "no usage
+/// recorded yet" for a day plain still printed.
+#[test]
+fn a_day_of_failures_counts_as_history_in_both_styles() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let payload = json!({
+        "providers": {
+            "anthropic": {
+                "account_count": 1,
+                "accounts": [account(json!({
+                    "email": "a@x.com",
+                    "available": true,
+                    "days": [{
+                        "date": today,
+                        "requests": 9,
+                        "successes": 0,
+                        "failures": 9,
+                        "inputTokens": 0,
+                        "outputTokens": 0,
+                        "cacheReadInputTokens": 0,
+                        "cacheCreationInputTokens": 0,
+                        "reasoningOutputTokens": 0
+                    }]
+                }))]
+            }
+        }
+    });
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(payload.clone()),
+        ..FakeRuntime::default()
+    };
+    let rich = strip_ansi(&run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich).stdout);
+    let plain = run(&["usage"], tmp.path(), &mut runtime).stdout;
+
+    assert!(!plain.trim().is_empty(), "plain prints the day: {plain:?}");
+    assert!(
+        !rich.contains("no usage recorded yet"),
+        "rich and plain disagree that history exists: {rich}"
     );
 }
