@@ -35,80 +35,6 @@ pub(crate) fn cooldown_label(now: f64, cooldown_until: f64) -> String {
     }
 }
 
-/// The per-provider pool view under `status`: availability header (with
-/// cooldown detail), summed request outcomes, summed token totals. Reads only
-/// what `GET /admin/accounts` already serves; the server is untouched. An
-/// empty pool prints only its bare header, matching the old count line.
-pub(crate) fn print_pool_inner(payload: &Value, output: &mut Output, now: f64) {
-    let mut first = true;
-    for (provider_id, provider) in providers(payload) {
-        let accounts = provider
-            .get("accounts")
-            .and_then(Value::as_array)
-            .map_or(&[][..], Vec::as_slice);
-        let count = provider
-            .get("account_count")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        let suffix = if count == 1 { "account" } else { "accounts" };
-        // An empty pool says nothing the relay total block doesn't; skip it.
-        if accounts.is_empty() {
-            continue;
-        }
-        if first && !output.is_empty() {
-            output.line("");
-        }
-        first = false;
-        let available = accounts
-            .iter()
-            .filter(|account| {
-                account
-                    .get("available")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-            })
-            .count();
-        let mut header = format!("{provider_id}: {count} {suffix} ({available} available)");
-        let cooling: Vec<String> = accounts
-            .iter()
-            .filter_map(|account| {
-                let available = account
-                    .get("available")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let until = account
-                    .get("cooldownUntil")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0);
-                (!available && until > now)
-                    .then(|| format!("{} {}", email(account), cooldown_label(now, until)))
-            })
-            .collect();
-        if !cooling.is_empty() {
-            write!(header, ", {}", cooling.join(", ")).expect("write to String cannot fail");
-        }
-        output.line(&header);
-
-        let mut totals = PoolTotals::default();
-        for account in accounts {
-            totals.add(account);
-        }
-        output.line(&format!(
-            "  requests {}  ({} ok, {} failed)",
-            format_exact(totals.requests),
-            format_exact(totals.successes),
-            format_exact(totals.failures)
-        ));
-        output.line(&format!(
-            "  tokens in {}  out {}  cache {}  reasoning {}",
-            format_count(totals.input),
-            format_count(totals.output),
-            format_count(totals.cache_read + totals.cache_write),
-            format_count(totals.reasoning)
-        ));
-    }
-}
-
 pub(crate) fn print_accounts(payload: &Value, output: &mut Output, now: f64) {
     for (provider_id, provider) in providers(payload) {
         let count = provider
@@ -255,11 +181,10 @@ pub(crate) fn glyph(available: bool, on_cooldown: bool) -> String {
     }
 }
 
-/// The rich pool view: one panel per provider with rows and a footer rollup.
-/// Pure over the payload and the clock value handed to it; `with_detail`
-/// adds the per-account token line the `accounts` command shows. `now` is
-/// handed in by the command layer: the renderer reads no clock (AC-7).
-pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, with_detail: bool, now: f64) {
+/// The rich pool view behind `accounts`: one panel per provider with rows,
+/// per-account token lines and a footer rollup. Pure over the payload and
+/// the clock value handed to it: the renderer reads no clock.
+pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64) {
     for (provider_id, provider) in providers(payload) {
         let accounts = provider
             .get("accounts")
@@ -295,10 +220,8 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, with_detail:
         }
         for account in accounts {
             output.line(&panel_row(&account_row(account, pool_total, now)));
-            if with_detail {
-                for line in account_detail_lines(account) {
-                    output.line(&panel_row(&line));
-                }
+            for line in account_detail_lines(account) {
+                output.line(&panel_row(&line));
             }
         }
 
@@ -317,19 +240,69 @@ pub(crate) struct RelayTotals {
     accounts: usize,
     requests: i64,
     tokens: i64,
+    totals: PoolTotals,
+    lines: Vec<PoolLine>,
+}
+
+/// One pool's summary row in the relay block: what `status` shows now that
+/// the per-pool panels are gone.
+pub(crate) struct PoolLine {
+    name: String,
+    accounts: i64,
+    requests: i64,
+    tokens: i64,
+}
+
+/// The pool line's column budget inside the 60 inner columns: name 13 +
+/// accounts 12 + requests 11 + tokens 9, single spaces between (48), the
+/// rest is slack. Names longer than the cell keep their own width and push
+/// the row right; `panel_row` truncates if that overflows.
+const POOL_NAME_WIDTH: usize = 13;
+const POOL_ACCOUNTS_WIDTH: usize = 12;
+const POOL_REQUESTS_WIDTH: usize = 11;
+const POOL_TOKENS_WIDTH: usize = 9;
+
+impl PoolLine {
+    /// `anthropic     3 accounts    1,204 req    143.4M`
+    fn render(&self) -> String {
+        let accounts = format!(
+            "{} {}",
+            self.accounts,
+            if self.accounts == 1 {
+                "account"
+            } else {
+                "accounts"
+            }
+        );
+        let requests = format!("{} req", format_exact(self.requests));
+        let requests = if requests.chars().count() <= POOL_REQUESTS_WIDTH {
+            requests
+        } else {
+            format!("{} req", format_count(self.requests))
+        };
+        let tokens = format_count(self.tokens);
+        format!(
+            "{} {} {} {:>width$}",
+            pad(&self.name, POOL_NAME_WIDTH),
+            pad(&accounts, POOL_ACCOUNTS_WIDTH),
+            pad(&requests, POOL_REQUESTS_WIDTH),
+            tokens,
+            width = POOL_TOKENS_WIDTH
+        )
+    }
 }
 
 impl RelayTotals {
     fn from_payload(payload: &Value) -> Self {
         let mut totals = Self::default();
-        for (_provider_id, provider) in providers(payload) {
-            // Pools with no loaded accounts are hidden from the status
-            // output; the header must not count what it does not show.
-            let has_accounts = provider
+        for (provider_id, provider) in providers(payload) {
+            let accounts = provider
                 .get("accounts")
                 .and_then(Value::as_array)
-                .is_some_and(|accounts| !accounts.is_empty());
-            if has_accounts {
+                .map_or(&[][..], Vec::as_slice);
+            // Pools with no loaded accounts are hidden from the status
+            // output; the header must not count what it does not show.
+            if !accounts.is_empty() {
                 totals.pools += 1;
             }
             totals.accounts += usize::try_from(
@@ -340,13 +313,26 @@ impl RelayTotals {
                     .max(0),
             )
             .unwrap_or(0);
-            let accounts = provider
-                .get("accounts")
-                .and_then(Value::as_array)
-                .map_or(&[][..], Vec::as_slice);
+            let mut pool = PoolLine {
+                name: provider_id.to_string(),
+                accounts: provider
+                    .get("account_count")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+                requests: 0,
+                tokens: 0,
+            };
             for account in accounts {
-                totals.requests += i64_field(account, "totalRequests");
-                totals.tokens += account_tokens(account);
+                let requests = i64_field(account, "totalRequests");
+                let tokens = account_tokens(account);
+                totals.requests += requests;
+                totals.tokens += tokens;
+                totals.totals.add(account);
+                pool.requests += requests;
+                pool.tokens += tokens;
+            }
+            if !accounts.is_empty() {
+                totals.lines.push(pool);
             }
         }
         totals
@@ -368,33 +354,97 @@ pub(crate) fn relay_header(totals: &RelayTotals) -> String {
     )
 }
 
-/// The `Style::Plain` relay-total block: header, two totals, nothing else.
+/// The same facts as the box panel's header, where the separator is the
+/// panel's own rule rather than a colon.
+fn relay_header_rich(totals: &RelayTotals) -> String {
+    relay_header(totals).replacen(": ", " ─ ", 1)
+}
+
+/// The `Style::Plain` relay block: header, connection, one line per pool,
+/// then the relay-wide aggregate. This is the whole of `status` now.
 pub(crate) fn print_relay_total_plain(payload: &Value, output: &mut Output, connection: &[String]) {
     let totals = RelayTotals::from_payload(payload);
-    output.line("");
     output.line(&relay_header(&totals));
     for line in connection {
         output.line(line);
     }
-    output.line(&format!("total requests {}", format_exact(totals.requests)));
-    output.line(&format!("total tokens {}", format_count(totals.tokens)));
+    for pool in &totals.lines {
+        output.line(pool.render().trim_end());
+    }
+    for line in aggregate_lines(&totals) {
+        output.line(&line);
+    }
 }
 
-/// The `Style::Rich` relay-total block: a 64-wide rule with the header
-/// inside, then the same two totals.
+/// The `Style::Rich` relay block: the same content as one 64-column box.
 pub(crate) fn print_relay_total_rich(payload: &Value, output: &mut Output, connection: &[String]) {
     let totals = RelayTotals::from_payload(payload);
-    let header = relay_header(&totals);
-    let fill = INNER_WIDTH.saturating_sub(header.chars().count() + 2);
-    let mut rule = format!("──── {header} ");
-    rule.extend(std::iter::repeat_n('─', fill));
-    output.line(&rule);
-    // Bare lines like the totals: the relay block is a rule, not a box.
+    output.line(&top_rule(&relay_header_rich(&totals)));
     for line in connection {
-        output.line(&paint(DIM, line));
+        output.line(&panel_row(&paint(DIM, line)));
     }
-    output.line(&format!("total requests {}", format_exact(totals.requests)));
-    output.line(&format!("total tokens {}", format_count(totals.tokens)));
+    for pool in &totals.lines {
+        output.line(&panel_row(&pool.render()));
+    }
+    for line in aggregate_lines_rich(&totals) {
+        output.line(&panel_row(&line));
+    }
+    output.line(&format!("└{}┘", "─".repeat(INNER_WIDTH + 2)));
+}
+
+/// The relay-wide rollup, plain: requests, tokens, reasoning when non-zero,
+/// and the carried-load total.
+fn aggregate_lines(totals: &RelayTotals) -> Vec<String> {
+    let pool = &totals.totals;
+    let mut lines = vec![
+        format!(
+            "requests {}  ({} ok, {} failed)",
+            format_exact(pool.requests),
+            format_exact(pool.successes),
+            format_exact(pool.failures)
+        ),
+        format!(
+            "tokens in {}  out {}  cache {}",
+            format_count(pool.input),
+            format_count(pool.output),
+            format_count(pool.cache_read + pool.cache_write)
+        ),
+    ];
+    if pool.reasoning != 0 {
+        lines.push(format!("reasoning {}", format_count(pool.reasoning)));
+    }
+    lines.push(format!("total {}", format_count(totals.tokens)));
+    lines
+}
+
+/// The same rollup with the block's bold numbers.
+fn aggregate_lines_rich(totals: &RelayTotals) -> Vec<String> {
+    let pool = &totals.totals;
+    let mut lines = vec![
+        format!(
+            "requests {}  ({} ok, {} failed)",
+            paint(BOLD, &format_exact(pool.requests)),
+            format_exact(pool.successes),
+            format_exact(pool.failures)
+        ),
+        format!(
+            "tokens in {}  out {}  cache {}",
+            paint(BOLD, &format_count(pool.input)),
+            paint(BOLD, &format_count(pool.output)),
+            format_count(pool.cache_read + pool.cache_write)
+        ),
+    ];
+    if pool.reasoning != 0 {
+        lines.push(format!(
+            "reasoning {}",
+            paint(BOLD, &format_count(pool.reasoning))
+        ));
+    }
+    lines.push(format!(
+        "total {}",
+        paint(BOLD, &format_count(totals.tokens))
+    ));
+    lines
 }
 
 /// One colored account row: email, glyph + state, ok count, share bar.
@@ -572,7 +622,7 @@ mod tests {
             }
         });
         let mut output = Output::default();
-        print_pool_rich(&payload, &mut output, false, 1_000_000.0);
+        print_pool_rich(&payload, &mut output, 1_000_000.0);
         for line in output.stdout.lines() {
             assert_eq!(
                 strip_ansi(line).chars().count(),
@@ -601,7 +651,7 @@ mod tests {
             }
         });
         let mut output = Output::default();
-        print_pool_rich(&payload, &mut output, false, 1_000_000.0);
+        print_pool_rich(&payload, &mut output, 1_000_000.0);
         for line in output.stdout.lines() {
             assert_eq!(
                 strip_ansi(line).chars().count(),

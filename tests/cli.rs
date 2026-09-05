@@ -271,9 +271,16 @@ fn status_reports_health_and_account_counts() {
             .contains("url http://127.0.0.1:8318 \u{2014} server ok")
     );
 
-    assert!(outcome.stdout.contains("anthropic: 1 account"));
-    // Empty pools are hidden (AC-7, revised): codex has no loaded accounts.
-    assert!(!outcome.stdout.contains("codex:"));
+    // status-total-only AC-3: the pool appears as one summary line, not a
+    // panel with its own request/token rollup.
+    assert!(outcome.stdout.contains("anthropic"));
+    assert!(
+        !outcome
+            .stdout
+            .contains("anthropic: 1 account (1 available)")
+    );
+    // Empty pools are hidden (AC-4): codex has no loaded accounts.
+    assert!(!outcome.stdout.contains("codex"));
     assert_eq!(runtime.health_url.as_deref(), Some("http://127.0.0.1:8318"));
     assert_eq!(runtime.accounts_api_key.as_deref(), Some("sk-test"));
 }
@@ -380,12 +387,17 @@ fn status_rolls_up_pool_health_and_token_totals_per_provider() {
     let outcome = run(&["status"], tmp.path(), &mut runtime);
 
     assert_eq!(outcome.code, 0);
+    // status-total-only AC-3: one line per pool — name, accounts, requests,
+    // tokens — and no per-pool request/token rollup lines.
     assert!(
         outcome
             .stdout
-            .contains("anthropic: 3 accounts (2 available)")
+            .contains("anthropic     3 accounts   1,204 req"),
+        "pool line missing:\n{}",
+        outcome.stdout
     );
-    assert!(outcome.stdout.contains("on cooldown"));
+    assert!(outcome.stdout.contains("groq          1 account"));
+    // AC-1: the aggregate is relay-wide, printed once.
     assert!(
         outcome
             .stdout
@@ -394,24 +406,19 @@ fn status_rolls_up_pool_health_and_token_totals_per_provider() {
     assert!(
         outcome
             .stdout
-            .contains("tokens in 45.2M  out 812.3K  cache 324.1M  reasoning 96.0K")
+            .contains("tokens in 45.2M  out 812.3K  cache 324.1M")
     );
-    // A provider whose account omits every total rolls up as zeros (AC-4).
-    assert!(outcome.stdout.contains("groq: 1 account (1 available)"));
-    assert!(outcome.stdout.contains("requests 0  (0 ok, 0 failed)"));
-    assert!(
-        outcome
-            .stdout
-            .contains("tokens in 0  out 0  cache 0  reasoning 0")
-    );
-    // An empty pool is hidden entirely, not even a bare header (AC-7,
-    // revised: the user asked for empty pools not to be shown).
+    assert!(outcome.stdout.contains("reasoning 96.0K"));
+    // AC-4: an empty pool is hidden entirely.
     assert!(!outcome.stdout.contains("deepseek"));
-    // Each rollup block opens on its own line after a blank one (AC-1).
+    // AC-1: no per-account row survives in status.
+    assert!(!outcome.stdout.contains("a@x.com"));
+    assert!(!outcome.stdout.contains("on cooldown"));
+    // AC-1: the block opens the output; nothing precedes the header.
     assert!(
         outcome
             .stdout
-            .starts_with("anthropic: 3 accounts (2 available")
+            .starts_with("relay total: 2 pools, 4 accounts")
     );
 }
 
@@ -459,35 +466,34 @@ fn status_renders_panels_on_a_tty() {
     assert_eq!(outcome.code, 0);
     let stdout = outcome.stdout.clone();
     let visible = strip_ansi(&stdout);
-    // Color is present in the raw bytes: green glyph, amber cooldown glyph,
-    // bold numbers (AC-5).
-    assert!(stdout.contains("\x1b[32m●\x1b[0m"));
-    assert!(stdout.contains("\x1b[33m●\x1b[0m"));
+    // status-total-only AC-2: one box panel, headed by the relay total.
     assert!(stdout.contains("\x1b[1m"));
-    // Panel rules with the pool header inside the top rule (AC-3).
-    assert!(visible.contains("┌─ pool: anthropic"));
-    assert!(visible.contains("─ 3 accounts, 1 available"));
+    assert!(
+        visible.contains("┌─ relay total ─ 1 pool, 3 accounts"),
+        "panel header: {visible}"
+    );
     assert!(visible.contains('└'));
-    // Rows: email, glyph, state, ok count, share bar, percentage (AC-3/5).
-    assert!(visible.contains('│'));
-    assert!(visible.contains("a@x.com"));
-    assert!(visible.contains("● available"));
-    assert!(visible.contains("638 ok"));
-    // Row state drops the plain branch's leading "on"; the glyph carries it.
-    assert!(visible.contains("● cooldown 4m12s"));
-    assert!(visible.contains("100%"));
-    assert!(visible.contains("█"));
-    assert!(visible.contains("░"));
-    // Footer carries this fixture's summed rollup (AC-3).
-    assert!(visible.contains("requests 640"));
-    assert!(visible.contains("tokens in 22.1M"));
-    assert!(visible.contains("reasoning 64.0K"));
-    // Empty pool is hidden entirely, not a note and not a box (AC-3,
-    // revised: the user asked for empty pools not to be shown).
+    // AC-1: no pool panel, no account row survives.
+    assert!(!visible.contains("pool: anthropic"));
+    assert!(!visible.contains("a@x.com"));
+    // AC-3: the pool summary line carries name, accounts, requests, tokens.
+    assert!(
+        visible.contains("anthropic     3 accounts"),
+        "pool line: {visible}"
+    );
+    // AC-4: the empty pool is omitted from lines and from the header count.
     assert!(!visible.contains("deepseek"));
-    // Every panel line fits the fixed width, ANSI excluded (AC-3/AC-7).
+    // AC-2: every line fits the 64-column box.
     for line in visible.lines() {
-        assert!(line.chars().count() <= 64, "panel line too wide: {line}");
+        assert!(line.chars().count() <= 64, "too wide: {line}");
+    }
+    let borders: Vec<&str> = visible
+        .lines()
+        .filter(|line| line.starts_with('┌') || line.starts_with('└'))
+        .collect();
+    assert_eq!(borders.len(), 2, "exactly one panel: {visible}");
+    for border in borders {
+        assert_eq!(border.chars().count(), 64, "border width: {border}");
     }
 }
 
@@ -952,16 +958,20 @@ fn status_ends_with_relay_total_block_in_plain() {
     let outcome = run(&["status"], tmp.path(), &mut runtime);
 
     assert_eq!(outcome.code, 0);
-    // AC-1: blank line, header, two totals.
+    // AC-1: the block is the whole output — header, connection, pool lines,
+    // aggregate.
     assert!(
         outcome
             .stdout
-            .contains("\nrelay total: 2 pools, 2 accounts\n")
+            .starts_with("relay total: 2 pools, 2 accounts\n")
     );
-    assert!(outcome.stdout.contains("total requests 650\n"));
-    assert!(outcome.stdout.contains("total tokens 175\n"));
-    // The block is last: nothing after `total tokens`.
-    assert!(outcome.stdout.trim_end().ends_with("total tokens 175"));
+    assert!(outcome.stdout.contains("requests 650  (0 ok, 0 failed)\n"));
+    assert!(outcome.stdout.contains("total 175\n"));
+    // AC-3: one line per pool.
+    assert!(outcome.stdout.contains("anthropic"));
+    assert!(outcome.stdout.contains("commandcode"));
+    // The aggregate is last: nothing after `total`.
+    assert!(outcome.stdout.trim_end().ends_with("total 175"));
 }
 
 #[test]
@@ -991,24 +1001,21 @@ fn status_relay_total_block_in_rich_has_64_wide_rule() {
 
     assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
-    // AC-2: rule of exactly 64 with the header inside, then the two totals.
+    // AC-2: a single 64-wide box panel headed by the relay total.
     let lines: Vec<&str> = visible.lines().collect();
-    let rule_index = lines
+    let top = lines
         .iter()
-        .position(|line| line.contains("relay total:"))
-        .expect("relay total rule present");
-    let last_panel = lines
+        .position(|line| line.starts_with('┌'))
+        .expect("panel top");
+    assert!(lines[top].contains("relay total ─ 1 pool, 1 account"));
+    assert_eq!(lines[top].chars().count(), 64, "top rule: {}", lines[top]);
+    let bottom = lines
         .iter()
         .rposition(|line| line.starts_with('└'))
-        .expect("panel bottom rule present");
-    // AC-2: the block sits after the panels, not before them.
-    assert!(rule_index > last_panel);
-    let rule = lines[rule_index];
-    assert_eq!(rule.chars().count(), 64, "rule line: {rule}");
-    assert!(rule.starts_with('─'));
-    assert!(visible.contains("total requests 640"));
-    assert!(visible.contains("total tokens 153"));
-    assert!(visible.trim_end().ends_with("total tokens 153"));
+        .expect("panel bottom");
+    assert_eq!(bottom, lines.len() - 1, "panel closes the output");
+    assert!(visible.contains("requests 640"));
+    assert!(visible.contains("total 153"));
 }
 
 #[test]
@@ -1037,11 +1044,13 @@ fn status_relay_total_covers_empty_pools_and_zero_relay() {
     let outcome = run(&["status"], tmp.path(), &mut runtime);
 
     assert_eq!(outcome.code, 0);
-    // AC-4: block prints even at a zero relay; AC-5: empty pools count.
-    // Empty pools are hidden, so the header counts only shown pools.
+    // AC-6: block prints even at a zero relay; empty pools are hidden, so
+    // the header counts only shown pools.
     assert!(outcome.stdout.contains("relay total: 1 pool, 1 account\n"));
-    assert!(outcome.stdout.contains("total requests 0\n"));
-    assert!(outcome.stdout.contains("total tokens 0\n"));
+    assert!(outcome.stdout.contains("requests 0  (0 ok, 0 failed)\n"));
+    assert!(outcome.stdout.contains("total 0\n"));
+    assert!(!outcome.stdout.contains("codex"));
+    assert!(!outcome.stdout.contains("commandcode"));
 }
 
 #[test]
@@ -1255,28 +1264,25 @@ fn status_moves_the_header_facts_into_the_relay_block() {
     write_config(tmp.path(), "0.0.0.0", 8318);
     let mut runtime = FakeRuntime::default();
 
-    // Rich: no header lines before the first panel.
+    // Rich: the relay panel is the only block, and the facts live in it.
     let rich = run_style(&["status"], tmp.path(), &mut runtime, Style::Rich);
     let visible = strip_ansi(&rich.stdout);
     let first_panel = visible.find('\u{250c}').expect("panel present");
     assert!(
         !visible[..first_panel].contains("config:"),
-        "header must not precede panels: {}",
+        "header must not precede the panel: {}",
         &visible[..first_panel]
     );
     assert!(!visible[..first_panel].contains("url:"));
     assert!(!visible[..first_panel].contains("server:"));
-    // Facts live in the relay block.
-    assert!(visible.contains("relay total:"));
+    assert!(visible.contains("relay total"));
     assert!(visible.contains("server ok"));
     assert!(visible.contains("url http://127.0.0.1:8318 \u{2014} server ok"));
 
     // Plain: same facts, same place.
     let plain = run(&["status"], tmp.path(), &mut runtime);
     let body = plain.stdout;
-    let first_pool = body.find("anthropic:").expect("pool line");
-    assert!(!body[..first_pool].contains("config:"));
-    assert!(body.contains("relay total:"));
+    assert!(body.starts_with("relay total:"));
     assert!(body.contains("url http://127.0.0.1:8318 \u{2014} server ok"));
 }
 

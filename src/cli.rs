@@ -11,8 +11,7 @@ use crate::service::service_status_panel;
 use crate::tokens::save_token;
 use crate::types::{ProviderId, ProviderKind, TokenData};
 use crate::usage_view::{
-    print_accounts, print_pool_inner, print_pool_rich, print_relay_total_plain,
-    print_relay_total_rich,
+    print_accounts, print_pool_rich, print_relay_total_plain, print_relay_total_rich,
 };
 use crate::utils::sha256_hex;
 
@@ -410,16 +409,11 @@ fn status(
         format!("url {base_url} \u{2014} server {server}"),
     ];
     let accounts = runtime.accounts(&base_url, &first_api_key(&config)?)?;
-    let now = unix_now();
+    // status-total-only: the relay block is the whole view; per-pool and
+    // per-account detail lives in `accounts`.
     match style {
-        Style::Plain => {
-            print_pool_inner(&accounts, output, now);
-            print_relay_total_plain(&accounts, output, &connection);
-        }
-        Style::Rich => {
-            print_pool_rich(&accounts, output, false, now);
-            print_relay_total_rich(&accounts, output, &connection);
-        }
+        Style::Plain => print_relay_total_plain(&accounts, output, &connection),
+        Style::Rich => print_relay_total_rich(&accounts, output, &connection),
     }
     Ok(())
 }
@@ -442,7 +436,7 @@ fn accounts(
     let now = unix_now();
     match style {
         Style::Plain => print_accounts(&accounts, output, now),
-        Style::Rich => print_pool_rich(&accounts, output, true, now),
+        Style::Rich => print_pool_rich(&accounts, output, now),
     }
     Ok(())
 }

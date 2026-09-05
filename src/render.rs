@@ -233,12 +233,6 @@ impl Output {
         self.stdout.push_str(value);
         self.stdout.push('\n');
     }
-
-    /// Whether nothing has been printed yet, so leading blank separators
-    /// can be skipped.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.stdout.is_empty()
-    }
 }
 
 #[cfg(test)]
