@@ -7,8 +7,8 @@ use std::fmt::Write as _;
 use serde_json::Value;
 
 use crate::render::{
-    AMBER, BOLD, DIM, GREEN, INNER_WIDTH, Output, RED, format_count, format_exact, pad, paint,
-    panel_row, share_bar, top_rule,
+    AMBER, ActionGlyph, BOLD, DIM, Fact, GREEN, INNER_WIDTH, Output, RED, fact_panel, format_count,
+    format_exact, pad, paint, panel_row, share_bar, status_glyph, top_rule,
 };
 
 /// `"on cooldown 4m12s"` while a cooldown lasts, `""` once it has cleared or
@@ -328,7 +328,7 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64) {
             .count();
 
         output.line(&top_rule(&format!(
-            "pool: {provider_id} ─ {count} {suffix}, {available} available"
+            "pool {provider_id} ─ {count} {suffix}, {available} available"
         )));
 
         let pool_total: i64 = accounts.iter().map(account_tokens).sum();
@@ -395,8 +395,19 @@ const POOL_REQUESTS_WIDTH: usize = 11;
 const POOL_TOKENS_WIDTH: usize = 9;
 
 impl PoolLine {
-    /// `anthropic     3 accounts    1,204 req    143.4M`
+    /// `anthropic     3 accounts    1,204 req    143.4M` — the plain
+    /// branch's row, where the pool name leads the line.
     fn render(&self) -> String {
+        format!(
+            "{} {}",
+            pad(&self.name, POOL_NAME_WIDTH),
+            self.render_value()
+        )
+    }
+
+    /// The same row without its name: rich carries the name as the fact
+    /// label, so the value starts at the accounts count.
+    fn render_value(&self) -> String {
         let accounts = format!(
             "{} {}",
             self.accounts,
@@ -412,13 +423,11 @@ impl PoolLine {
         } else {
             format!("{} req", format_count(self.requests))
         };
-        let tokens = format_count(self.tokens);
         format!(
-            "{} {} {} {:>width$}",
-            pad(&self.name, POOL_NAME_WIDTH),
+            "{} {} {:>width$}",
             pad(&accounts, POOL_ACCOUNTS_WIDTH),
             pad(&requests, POOL_REQUESTS_WIDTH),
-            tokens,
+            format_count(self.tokens),
             width = POOL_TOKENS_WIDTH
         )
     }
@@ -492,14 +501,30 @@ fn relay_header_rich(totals: &RelayTotals) -> String {
     relay_header(totals).replacen(": ", " ─ ", 1)
 }
 
+/// Where the relay is and whether it answered: the facts `status` shows
+/// above its numbers. Kept structured rather than pre-formatted so plain
+/// can join `url` and `server` on one line (its bytes are load-bearing
+/// for scripts) while rich gives each its own labelled row.
+pub(crate) struct Connection {
+    pub(crate) config: String,
+    pub(crate) url: String,
+    pub(crate) server: String,
+}
+
 /// The `Style::Plain` relay block: header, connection, one line per pool,
 /// then the relay-wide aggregate. This is the whole of `status` now.
-pub(crate) fn print_relay_total_plain(payload: &Value, output: &mut Output, connection: &[String]) {
+pub(crate) fn print_relay_total_plain(
+    payload: &Value,
+    output: &mut Output,
+    connection: &Connection,
+) {
     let totals = RelayTotals::from_payload(payload);
     output.line(&relay_header(&totals));
-    for line in connection {
-        output.line(line);
-    }
+    output.line(&format!("config {}", connection.config));
+    output.line(&format!(
+        "url {} \u{2014} server {}",
+        connection.url, connection.server
+    ));
     for pool in &totals.lines {
         output.line(pool.render().trim_end());
     }
@@ -508,20 +533,64 @@ pub(crate) fn print_relay_total_plain(payload: &Value, output: &mut Output, conn
     }
 }
 
-/// The `Style::Rich` relay block: the same content as one 64-column box.
-pub(crate) fn print_relay_total_rich(payload: &Value, output: &mut Output, connection: &[String]) {
+/// The `Style::Rich` relay block: the same content as one 64-column box
+/// of labelled facts (`consistent-panels`).
+pub(crate) fn print_relay_total_rich(
+    payload: &Value,
+    output: &mut Output,
+    connection: &Connection,
+) {
     let totals = RelayTotals::from_payload(payload);
-    output.line(&top_rule(&relay_header_rich(&totals)));
-    for line in connection {
-        output.line(&panel_row(&paint(DIM, line)));
+    let pool = &totals.totals;
+    // The glyph marks a state, never a plain fact: `server` earns one,
+    // `config` and `url` do not.
+    let health = if connection.server == "ok" {
+        ActionGlyph::Ok
+    } else {
+        ActionGlyph::Attention
+    };
+    let mut facts = vec![
+        Fact::new("config", &paint(DIM, &connection.config)),
+        Fact::new("url", &paint(DIM, &connection.url)),
+        Fact::new(
+            "server",
+            &format!("{} {}", status_glyph(health), connection.server),
+        ),
+    ];
+    for line in &totals.lines {
+        facts.push(Fact::new(&line.name, &line.render_value()));
     }
-    for pool in &totals.lines {
-        output.line(&panel_row(&pool.render()));
+    facts.push(Fact::new(
+        "requests",
+        &format!(
+            "{}  ({} ok, {} failed)",
+            paint(BOLD, &format_exact(pool.requests)),
+            format_exact(pool.successes),
+            format_exact(pool.failures)
+        ),
+    ));
+    facts.push(Fact::new(
+        "tokens",
+        &format!(
+            "in {}  out {}  cache {}",
+            paint(BOLD, &format_count(pool.input)),
+            paint(BOLD, &format_count(pool.output)),
+            format_count(pool.cache_read + pool.cache_write)
+        ),
+    ));
+    if pool.reasoning != 0 {
+        facts.push(Fact::new(
+            "reasoning",
+            &paint(BOLD, &format_count(pool.reasoning)),
+        ));
     }
-    for line in aggregate_lines_rich(&totals) {
-        output.line(&panel_row(&line));
+    facts.push(Fact::new(
+        "total",
+        &paint(BOLD, &format_count(totals.tokens)),
+    ));
+    for line in fact_panel(&relay_header_rich(&totals), &facts) {
+        output.line(&line);
     }
-    output.line(&format!("└{}┘", "─".repeat(INNER_WIDTH + 2)));
 }
 
 /// The relay-wide rollup, plain: requests, tokens, reasoning when non-zero,
@@ -546,36 +615,6 @@ fn aggregate_lines(totals: &RelayTotals) -> Vec<String> {
         lines.push(format!("reasoning {}", format_count(pool.reasoning)));
     }
     lines.push(format!("total {}", format_count(totals.tokens)));
-    lines
-}
-
-/// The same rollup with the block's bold numbers.
-fn aggregate_lines_rich(totals: &RelayTotals) -> Vec<String> {
-    let pool = &totals.totals;
-    let mut lines = vec![
-        format!(
-            "requests {}  ({} ok, {} failed)",
-            paint(BOLD, &format_exact(pool.requests)),
-            format_exact(pool.successes),
-            format_exact(pool.failures)
-        ),
-        format!(
-            "tokens in {}  out {}  cache {}",
-            paint(BOLD, &format_count(pool.input)),
-            paint(BOLD, &format_count(pool.output)),
-            format_count(pool.cache_read + pool.cache_write)
-        ),
-    ];
-    if pool.reasoning != 0 {
-        lines.push(format!(
-            "reasoning {}",
-            paint(BOLD, &format_count(pool.reasoning))
-        ));
-    }
-    lines.push(format!(
-        "total {}",
-        paint(BOLD, &format_count(totals.tokens))
-    ));
     lines
 }
 

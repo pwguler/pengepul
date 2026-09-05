@@ -139,13 +139,60 @@ pub(crate) fn top_rule(header: &str) -> String {
     top
 }
 
-/// The one panel every action command shares: a header rule, one row per
-/// fact (`<label>  <glyphed outcome>`), and the bottom rule. Pure over
-/// its inputs; printing is the caller's job.
-pub(crate) fn action_panel(subject: &str, rows: &[String]) -> Vec<String> {
+/// One labelled fact: the row shape every rich panel uses. The label is
+/// the constant, the value the variable — a reader learns one grammar and
+/// carries it across every verb (`consistent-panels`).
+pub(crate) struct Fact {
+    pub(crate) label: String,
+    pub(crate) value: String,
+}
+
+impl Fact {
+    pub(crate) fn new(label: &str, value: &str) -> Self {
+        Self {
+            label: label.to_string(),
+            value: value.to_string(),
+        }
+    }
+}
+
+/// The widest a label column may grow before the value column suffers.
+/// Labels are short nouns by construction; a pool name is the only one
+/// that can run long, and past this it clips rather than push the values
+/// off the box.
+const LABEL_WIDTH_CAP: usize = 14;
+
+/// The label column for one panel: the longest label present plus two
+/// columns of air, capped. Computed once per panel so values align down
+/// the whole box rather than per section (AC-9).
+pub(crate) fn label_column(facts: &[Fact]) -> usize {
+    facts
+        .iter()
+        .map(|fact| strip_ansi(&fact.label).chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(LABEL_WIDTH_CAP)
+        + 2
+}
+
+/// One fact as a panel row: label padded to the panel's column, then the
+/// value. Measures visible columns, so a painted label still aligns.
+pub(crate) fn fact_row(fact: &Fact, column: usize) -> String {
+    let visible = strip_ansi(&fact.label).chars().count();
+    let label = if visible >= column {
+        format!("{} ", fact.label)
+    } else {
+        format!("{}{}", fact.label, " ".repeat(column - visible))
+    };
+    format!("{label}{}", fact.value)
+}
+
+/// A panel of labelled facts: header, aligned rows, bottom rule.
+pub(crate) fn fact_panel(subject: &str, facts: &[Fact]) -> Vec<String> {
+    let column = label_column(facts);
     let mut lines = vec![top_rule(subject)];
-    for row in rows {
-        lines.push(panel_row(row));
+    for fact in facts {
+        lines.push(panel_row(&fact_row(fact, column)));
     }
     lines.push(format!("└{}┘", "─".repeat(INNER_WIDTH + 2)));
     lines

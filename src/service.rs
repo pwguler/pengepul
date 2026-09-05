@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
-use crate::render::{ActionGlyph, action_panel, format_duration, status_glyph};
+use crate::render::{ActionGlyph, Fact, fact_panel, format_duration, status_glyph};
 use anyhow::{Context, Result, bail};
 
 pub const SYSTEMD_UNIT_NAME: &str = "pengepul.service";
@@ -293,34 +293,40 @@ pub(crate) fn service_status_panel(text: &str) -> Vec<String> {
     } else {
         status_glyph(ActionGlyph::Attention)
     };
-    let mut rows = vec![format!("{glyph} {state_text}")];
+    let mut facts = vec![Fact::new("state", &format!("{glyph} {state_text}"))];
     if let Some(enabled) = enabled {
-        rows.push(enabled);
+        facts.push(Fact::new("enabled", &enabled));
     }
     // systemd keeps printing the last Main PID of a dead unit
     // (`code=killed`); a pid row for a stopped service would mislead.
     if let (Some(pid), true) = (pid, active) {
-        rows.push(format!("pid  {pid}"));
+        facts.push(Fact::new("pid", &pid));
     }
     if let Some(memory) = memory {
-        rows.push(format!("memory  {memory}"));
+        facts.push(Fact::new("memory", &memory));
     }
     if let Some(cpu) = cpu {
-        rows.push(format!("cpu  {cpu}"));
+        facts.push(Fact::new("cpu", &cpu));
     }
     if let Some(tasks) = tasks {
-        rows.push(format!("tasks  {tasks}"));
+        facts.push(Fact::new("tasks", &tasks));
     }
     if let Some(since) = since {
         // The same "since" reads as uptime for a running unit and as
         // downtime for a stopped one.
-        rows.push(if active {
-            format!("uptime  {since}")
+        if active {
+            facts.push(Fact::new("uptime", &since));
         } else {
-            format!("stopped  {since} ago")
-        });
+            facts.push(Fact::new("stopped", &format!("{since} ago")));
+        }
     }
-    action_panel("service", &rows)
+    // The header carries the state as its qualifier (AC-4); the rows
+    // carry the detail.
+    let subject = state_text.split_whitespace().next().map_or_else(
+        || "service".to_string(),
+        |word| format!("service \u{2500} {word}"),
+    );
+    fact_panel(&subject, &facts)
 }
 
 /// Parse systemd's relative time ("4min 28s ago", "3 days ago",

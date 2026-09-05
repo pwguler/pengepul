@@ -478,7 +478,7 @@ fn status_renders_panels_on_a_tty() {
     assert!(!visible.contains("a@x.com"));
     // AC-3: the pool summary line carries name, accounts, requests, tokens.
     assert!(
-        visible.contains("anthropic          3 accounts"),
+        visible.contains("anthropic") && visible.contains("3 accounts"),
         "pool line: {visible}"
     );
     // AC-4: the empty pool is omitted from lines and from the header count.
@@ -540,7 +540,7 @@ fn accounts_renders_panels_with_detail_lines_on_a_tty() {
     let stdout = outcome.stdout.clone();
     let visible = strip_ansi(&stdout);
     // Same panel frame as status (AC-6).
-    assert!(visible.contains("┌─ pool: anthropic"));
+    assert!(visible.contains("┌─ pool anthropic"));
     assert!(visible.contains('└'));
     assert!(visible.contains("● available"));
     assert!(visible.contains("● unresponsive"));
@@ -1015,8 +1015,10 @@ fn status_relay_total_block_in_rich_has_64_wide_rule() {
         .rposition(|line| line.starts_with('└'))
         .expect("panel bottom");
     assert_eq!(bottom, lines.len() - 1, "panel closes the output");
-    assert!(visible.contains("requests 640"));
-    assert!(visible.contains("total 153"));
+    assert!(visible.contains("│ requests"));
+    assert!(visible.contains("640"));
+    assert!(visible.contains("│ total"));
+    assert!(visible.contains("153"));
 }
 
 #[test]
@@ -1100,7 +1102,7 @@ fn login_renders_a_panel_when_rich_and_plain_bytes_when_piped() {
     );
     assert_eq!(rich.code, 0);
     let visible = strip_ansi(&rich.stdout);
-    assert!(visible.contains("┌─ login: commandcode "), "{visible}");
+    assert!(visible.contains("┌─ login commandcode "), "{visible}");
     assert!(visible.contains("key-"));
     assert!(visible.contains("●"));
     assert!(visible.contains("saved"));
@@ -1189,7 +1191,8 @@ fn service_status_parses_systemctl_into_a_panel_when_rich() {
     assert!(visible.contains("3162166"));
     assert!(visible.contains("2.3M"));
     assert!(visible.contains("2.614s"));
-    assert!(visible.contains("tasks  7"));
+    assert!(visible.contains("tasks"), "{visible}");
+    assert!(visible.contains("│ tasks    7"), "{visible}");
     assert!(visible.contains("4m28s"));
     for line in visible.lines() {
         assert!(line.chars().count() <= 64, "too wide: {line}");
@@ -1278,8 +1281,9 @@ fn status_moves_the_header_facts_into_the_relay_block() {
     assert!(!visible[..first_panel].contains("url:"));
     assert!(!visible[..first_panel].contains("server:"));
     assert!(visible.contains("relay total"));
-    assert!(visible.contains("server ok"));
-    assert!(visible.contains("url http://127.0.0.1:8318 \u{2014} server ok"));
+    assert!(visible.contains("│ server"));
+    assert!(visible.contains("│ url"));
+    assert!(visible.contains("http://127.0.0.1:8318"));
 
     // Plain: same facts, same place.
     let plain = run(&["status"], tmp.path(), &mut runtime);
@@ -1374,7 +1378,8 @@ fn action_panels_hold_the_width_and_paint_the_glyph() {
     assert!(login.stdout.contains("\u{1b}[32m●"));
     assert!(update.stdout.contains("\u{1b}[32m●"));
     assert!(update_check.stdout.contains("\u{1b}[33m●"));
-    assert!(strip_ansi(&update.stdout).contains("updated v99.0.0"));
+    assert!(strip_ansi(&update.stdout).contains("updated"));
+    assert!(strip_ansi(&update.stdout).contains("v99.0.0"));
 }
 
 #[test]
@@ -1945,4 +1950,220 @@ fn accounts_shares_one_model_column_across_a_pool() {
         column("claude-opus-5"),
         "columns disagree inside one panel:\n{visible}"
     );
+}
+
+/// consistent-panels AC-1: one header grammar for every rich panel —
+/// `<subject>` or `<subject> ─ <qualifier>`, never a colon.
+#[test]
+fn every_rich_header_uses_one_grammar() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "
+  commandcode:
+    base-url: https://api.commandcode.ai/v1",
+    );
+    let mut runtime = FakeRuntime {
+        rich: true,
+        ..FakeRuntime::default()
+    };
+
+    let mut headers = Vec::new();
+    let mut collect = |argv: &[&str], runtime: &mut FakeRuntime| {
+        let outcome = run_style(argv, tmp.path(), runtime, Style::Rich);
+        assert_eq!(outcome.code, 0, "{argv:?} failed");
+        for line in strip_ansi(&outcome.stdout).lines() {
+            if let Some(rest) = line.strip_prefix("┌─ ") {
+                headers.push(rest.trim_end_matches(['─', '┐', ' ']).trim().to_string());
+            }
+        }
+    };
+    collect(&["status"], &mut runtime);
+    collect(&["accounts"], &mut runtime);
+    collect(&["service", "status"], &mut runtime);
+    collect(&["service", "restart"], &mut runtime);
+    collect(&["update", "--check"], &mut runtime);
+    collect(&["config", "path"], &mut runtime);
+    collect(
+        &["login", "--provider", "commandcode", "--key", "sk-secret"],
+        &mut runtime,
+    );
+
+    assert!(headers.len() >= 7, "collected: {headers:?}");
+    for header in &headers {
+        assert!(
+            !header.contains(':'),
+            "header keeps a colon: {header:?} (all: {headers:?})"
+        );
+    }
+    // The qualifier, when present, is separated by the same rule glyph.
+    assert!(
+        headers.iter().any(|h| h.contains(" ─ ")),
+        "no qualified header: {headers:?}"
+    );
+}
+
+/// consistent-panels AC-3/AC-9: `status` rows are labelled facts, values
+/// aligned in one column down the whole box.
+#[test]
+fn status_rows_are_labelled_facts_in_one_column() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "0.0.0.0", 8318);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalRequests": 907,
+                        "totalSuccesses": 900,
+                        "totalInputTokens": 1_000,
+                        "totalOutputTokens": 2_000
+                    }))]
+                },
+                "commandcode": {
+                    "account_count": 2,
+                    "accounts": [account(json!({
+                        "email": "k@x.com",
+                        "available": true,
+                        "totalRequests": 239,
+                        "totalSuccesses": 212
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["status"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    let value_column = |label: &str| -> usize {
+        let line = visible
+            .lines()
+            .find(|line| line.contains(&format!("│ {label}")))
+            .unwrap_or_else(|| panic!("row {label:?} missing:\n{visible}"));
+        // Column where the value starts: past "│ " + label + padding.
+        let after_label = line.find(label).expect("label") + label.chars().count();
+        line[after_label..]
+            .find(|c: char| !c.is_whitespace())
+            .expect("value")
+            + after_label
+    };
+
+    // AC-3: the facts status reports, each on a labelled row.
+    for label in ["config", "url", "server", "requests", "tokens", "total"] {
+        assert!(
+            visible.contains(&format!("│ {label}")),
+            "missing labelled row {label:?}:\n{visible}"
+        );
+    }
+    // AC-3: one row per pool, labelled by pool name.
+    assert!(visible.contains("│ anthropic"));
+    assert!(visible.contains("│ commandcode"));
+    // AC-9: every value starts in the same column.
+    let columns: Vec<usize> = ["config", "url", "server", "anthropic", "requests", "total"]
+        .into_iter()
+        .map(value_column)
+        .collect();
+    assert!(
+        columns.windows(2).all(|pair| pair[0] == pair[1]),
+        "values not aligned: {columns:?}\n{visible}"
+    );
+    // AC-2: the glyph marks the state value, not a plain fact.
+    let server_row = visible
+        .lines()
+        .find(|line| line.contains("│ server"))
+        .expect("server row");
+    assert!(server_row.contains('●'), "no glyph: {server_row}");
+    let url_row = visible
+        .lines()
+        .find(|line| line.contains("│ url"))
+        .expect("url row");
+    assert!(!url_row.contains('●'), "glyph on a plain fact: {url_row}");
+}
+
+/// consistent-panels AC-4/AC-5: `service status`, the action panels,
+/// `login`, `update` and `config` all speak the same row grammar.
+#[test]
+fn action_and_service_panels_use_the_same_row_grammar() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "
+  commandcode:
+    base-url: https://api.commandcode.ai/v1",
+    );
+    let mut runtime = FakeRuntime {
+        rich: true,
+        service_status_text: Some(
+            "● pengepul.service - pengepul API relay\n     Loaded: loaded (/x/pengepul.service; enabled; preset: enabled)\n     Active: active (running) since Sat 2026-09-05 14:48:16 WIB; 22min ago\n   Main PID: 3477298 (pengepul)\n      Tasks: 7 (limit: 14306)\n     Memory: 48.6M (peak: 49.9M)\n        CPU: 11.417s\n"
+                .to_string(),
+        ),
+        ..FakeRuntime::default()
+    };
+
+    // AC-4: service status facts are labelled rows.
+    let status = run_style(
+        &["service", "status"],
+        tmp.path(),
+        &mut runtime,
+        Style::Rich,
+    );
+    let visible = strip_ansi(&status.stdout);
+    for label in [
+        "state", "enabled", "pid", "memory", "cpu", "tasks", "uptime",
+    ] {
+        assert!(
+            visible.contains(&format!("│ {label}")),
+            "service status missing {label:?}:\n{visible}"
+        );
+    }
+    assert!(
+        visible
+            .lines()
+            .find(|l| l.contains("│ state"))
+            .expect("state row")
+            .contains('●')
+    );
+
+    // AC-5: an action names its state, then its subject.
+    let restart = run_style(
+        &["service", "restart"],
+        tmp.path(),
+        &mut runtime,
+        Style::Rich,
+    );
+    let visible = strip_ansi(&restart.stdout);
+    assert!(visible.contains("│ state"), "{visible}");
+    assert!(visible.contains("restarted"), "{visible}");
+
+    let update = run_style(
+        &["update", "--check"],
+        tmp.path(),
+        &mut runtime,
+        Style::Rich,
+    );
+    let visible = strip_ansi(&update.stdout);
+    assert!(visible.contains("│ state"), "{visible}");
+    assert!(visible.contains("│ version"), "{visible}");
+
+    let login = run_style(
+        &["login", "--provider", "commandcode", "--key", "sk-secret"],
+        tmp.path(),
+        &mut runtime,
+        Style::Rich,
+    );
+    let visible = strip_ansi(&login.stdout);
+    assert!(visible.contains("│ state"), "{visible}");
+    assert!(visible.contains("│ account"), "{visible}");
+
+    // AC-6: config facts keep their content under the same grammar.
+    let config = run_style(&["config", "path"], tmp.path(), &mut runtime, Style::Rich);
+    let visible = strip_ansi(&config.stdout);
+    assert!(visible.contains("│ path"), "{visible}");
 }
