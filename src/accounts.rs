@@ -164,7 +164,13 @@ impl AccountState {
             self.day(&today).requests += 1;
             today
         } else {
-            self.in_flight.remove(0)
+            // Clamped to the window: an attempt that opened before the
+            // retention edge would otherwise settle into a bucket `day()`
+            // trims on touch, leaving the outcome counted cumulatively and
+            // absent from every bucket the file and the payload show.
+            let opened = self.in_flight.remove(0);
+            let cutoff = retention_cutoff();
+            if opened < cutoff { cutoff } else { opened }
         };
         if success {
             self.total_successes += 1;
@@ -759,6 +765,41 @@ mod settle_tests {
 
     fn bucket(state: &AccountState, date: &str) -> DayUsage {
         state.days.get(date).cloned().unwrap_or_default()
+    }
+
+    /// An outcome whose attempt opened before the retention window must
+    /// still land in a bucket that survives. Otherwise `day()` trims the
+    /// stale key, re-opens it empty, writes the outcome into it, and both
+    /// `persist_usage` and `snapshots` then filter it out — the outcome
+    /// is counted cumulatively and missing from every bucket.
+    #[test]
+    fn an_outcome_settling_past_the_window_still_lands_in_a_kept_bucket() {
+        let opened_long_ago = day_offset(-200);
+        let mut state = state();
+        state.total_requests += 1;
+        state.in_flight.push(opened_long_ago);
+        // A live bucket, so `day()` actually trims when the stale one is
+        // touched.
+        state.day(&day_offset(0)).requests += 0;
+
+        let settled_on = state.settle(true);
+
+        assert!(
+            settled_on >= super::retention_cutoff(),
+            "settled into a bucket outside the window: {settled_on}"
+        );
+        assert!(
+            state.days.contains_key(&settled_on),
+            "the bucket was dropped after the outcome was written"
+        );
+        assert_eq!(bucket(&state, &settled_on).successes, 1);
+        let visible: i64 = state
+            .days
+            .iter()
+            .filter(|(date, _)| **date >= super::retention_cutoff())
+            .map(|(_, day)| day.successes)
+            .sum();
+        assert_eq!(visible, 1, "the outcome is missing from every bucket");
     }
 
     /// A local date `offset` days from today, as the store keys them.
