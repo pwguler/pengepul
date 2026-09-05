@@ -129,3 +129,22 @@ Setiap kriteria butuh tes yang gagal ketika perbaikannya dibalik.
   itu, yang akan ikut rotasi setelah reload dan menjawab 401. Pengecekan
   konflik karena itu naik ke depan `save_token`, memakai `config.providers`
   yang sudah dimuat. Ditemukan oleh judge; direproduksi sebelum diperbaiki.
+- **Id validasi jadi allowlist, bukan denylist.** Ronde 2 menolak `/`
+  saja. Menguji binary hasil build dengan 18 bentuk id menunjukkan dua
+  belas yang lain tetap menulis kredensial — `..` ke luar auth-dir, id
+  kosong ke akarnya, `\` dan spasi dan baris baru masing-masing ke
+  direktorinya sendiri — dan semuanya **terdaftar** di config, jadi ikut
+  dimuat setiap start. Suite hijau selama itu. Aturannya sekarang:
+  huruf, angka, `.`, `-`, `_`, dengan `.` dan `..` ditolak by name.
+  Ditemukan dengan menjalankan, bukan dengan membaca.
+
+## Not yet specified
+
+- **Tabrakan id yang hanya beda huruf besar-kecil.** `providers:` adalah
+  peta case-sensitive dan `storage_dir()` mengembalikan id apa adanya,
+  jadi `GROQ` dan `groq` adalah dua Provider dengan dua direktori — benar
+  di Linux. Di filesystem case-insensitive (default macOS) keduanya
+  berbagi satu direktori, sehingga tiap pool memuat kunci milik yang
+  lain. Ini milik model Provider yang sudah ada, bukan verb ini:
+  mengedit config dengan tangan sudah bisa melakukannya sejak dulu.
+  Dicatat, tidak diperbaiki di sini.

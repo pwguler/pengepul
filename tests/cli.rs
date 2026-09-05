@@ -3963,3 +3963,86 @@ fn an_empty_base_url_is_refused_before_the_credential() {
         "an empty URL still wrote a credential"
     );
 }
+
+/// The round-2 fix rejected `/` and nothing else, so twelve other ids
+/// still wrote a credential — `..` outside the auth-dir, an empty id into
+/// its root — and registered themselves into the config, where they
+/// loaded on every start. Found by probing the built binary; the suite
+/// was green throughout. This walks the same list through the CLI and
+/// checks the filesystem, not only the error.
+#[test]
+fn no_id_shape_can_write_a_credential_anywhere_unexpected() {
+    for id in [
+        "",
+        " ",
+        ".",
+        "..",
+        "/",
+        "//",
+        "/etc/pengepul",
+        "\\",
+        "..\\..\\x",
+        "groq ",
+        " groq",
+        "groq/../groq",
+        "a\nb",
+        "x\tb",
+    ] {
+        let tmp = tempdir().expect("tempdir");
+        write_config_with_providers(
+            tmp.path(),
+            "  groq:\n    base-url: https://api.groq.com/openai/v1\n",
+        );
+        let pool = tmp.path().join(".pengepul").join("groq");
+        std::fs::create_dir_all(&pool).expect("pool");
+        std::fs::write(pool.join("key-legit.json"), "{}").expect("legit key");
+        let before = tree(tmp.path());
+        let mut runtime = FakeRuntime::default();
+
+        let error = run_err(
+            &[
+                "login",
+                "--provider",
+                id,
+                "--base-url",
+                "https://x/v1",
+                "--key",
+                "sk-probe",
+            ],
+            tmp.path(),
+            &mut runtime,
+        );
+
+        assert!(
+            error.contains("providers:"),
+            "id {id:?} was not refused by the id rule: {error}"
+        );
+        assert_eq!(
+            tree(tmp.path()),
+            before,
+            "id {id:?} wrote something before it was refused"
+        );
+    }
+}
+
+/// Every file under `root`, sorted: what the command must not change when
+/// it refuses.
+fn tree(root: &Path) -> Vec<String> {
+    fn walk(dir: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else {
+                out.push(path.to_string_lossy().to_string());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, &mut out);
+    out.sort();
+    out
+}

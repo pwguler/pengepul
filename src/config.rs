@@ -291,8 +291,29 @@ pub fn validate_provider_id(id: &str) -> Result<()> {
     if matches!(id, "anthropic" | "codex" | "claude") {
         bail!("providers: {id} is a built-in provider name");
     }
-    if id.contains('/') {
-        bail!("providers: {id} must not contain '/'");
+    // An allowlist, not a denylist. This id becomes a directory name
+    // verbatim (`ProviderId::storage_dir`), and a denylist of separators
+    // let `..`, `\`, an empty id, and whitespace through — each one a
+    // credential written somewhere the operator did not name. Letters,
+    // digits, dot, dash and underscore are what a provider id has ever
+    // needed; `.` and `..` are excluded by name because they are legal
+    // under that rule and mean something else to a filesystem.
+    if id.is_empty() {
+        bail!("providers: an id cannot be empty");
+    }
+    if matches!(id, "." | "..") {
+        bail!("providers: {id} is not a usable name");
+    }
+    if let Some(bad) = id
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')))
+    {
+        let shown = if bad.is_control() {
+            format!("{}", bad.escape_debug())
+        } else {
+            bad.to_string()
+        };
+        bail!("providers: {id} must not contain '{shown}'; use letters, digits, '.', '-' or '_'");
     }
     Ok(())
 }
@@ -395,6 +416,68 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
 #[cfg(not(unix))]
 fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod id_tests {
+    use super::validate_provider_id;
+
+    /// The id becomes a directory name verbatim, so the rule is an
+    /// allowlist. A denylist of `/` let every one of these through, each
+    /// writing a credential somewhere the operator did not name — found
+    /// by probing the built binary, not by the suite.
+    #[test]
+    fn no_id_can_escape_its_own_directory() {
+        for id in [
+            "",
+            " ",
+            ".",
+            "..",
+            "/",
+            "//",
+            "/etc/pengepul",
+            "\\",
+            "..\\..\\x",
+            "groq ",
+            " groq",
+            "groq/../groq",
+            "a\nb",
+            "x\tb",
+            "a\0b",
+            "üñïçø∂é",
+        ] {
+            assert!(
+                validate_provider_id(id).is_err(),
+                "an id that cannot be a directory name was accepted: {id:?}"
+            );
+        }
+    }
+
+    /// And the ids an operator actually types still work.
+    #[test]
+    fn ordinary_ids_are_accepted() {
+        for id in [
+            "openrouter",
+            "groq",
+            "open-router",
+            "open_router",
+            "openrouter2",
+            "open.router",
+            "GROQ",
+        ] {
+            validate_provider_id(id).unwrap_or_else(|error| {
+                panic!("a usable id was refused: {id:?}: {error:#}");
+            });
+        }
+    }
+
+    /// A built-in is refused by name, not by shape.
+    #[test]
+    fn built_in_names_stay_refused() {
+        for id in ["anthropic", "codex", "claude"] {
+            assert!(validate_provider_id(id).is_err(), "{id} was accepted");
+        }
+    }
 }
 
 #[cfg(test)]
