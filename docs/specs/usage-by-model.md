@@ -27,10 +27,11 @@ model at accounting time but throws it away.
   "diamkan saja"). **Revised:** the model rows sit under an account total
   they do not sum to, and a reader cannot tell whether the difference is
   a bug or history — the same shape that made the operator ask about
-  `requests` three times. The remainder is now named
+  `requests` three times. The remainder was named
   (`unattributed 153.0M — before per-model tracking`) and shown only when
-  it is non-zero. Naming it is honest; inventing an attribution for it
-  would not be.
+  it was non-zero. Naming it is honest; inventing an attribution for it
+  would not be. **Superseded — see Revisions:** the operator migrated the
+  historical remainder into its model row and removed the display.
 - **No per-model cooldown, routing, or limits.** Display and accounting
   only; account selection is untouched.
 - **No new endpoint.** The existing `GET /admin/accounts` payload carries
@@ -64,9 +65,10 @@ model at accounting time but throws it away.
   a `models` map per email; a manager built over that file restores the
   per-model counters. A file written before this change (no `models`
   key) loads with empty per-model history and intact account totals.
-- AC-5: `pengepul accounts` (rich) prints, under each account row and
+- AC-5: ~~`pengepul accounts` (rich) prints, under each account row and
   after its model lines, an `unattributed` row naming the tokens no model
-  claims when that remainder is non-zero. Model lines are one model per
+  claims when that remainder is non-zero.~~ **Withdrawn — see Revisions.**
+  Model lines are one model per
   two lines: `<model>  <n> ok  <total>` then indented
   `in X  out Y  cache Z`, sorted by total tokens descending, ties broken
   by name. Accounts with no per-model history print no model lines.
@@ -137,3 +139,17 @@ cargo fmt --check
 
 Manual: drive a real request through the relay for two different models,
 then `pengepul accounts` and `cat ~/.pengepul/anthropic/usage.json`.
+
+- **The unattributed row is withdrawn (AC-5, and the AC-7 plain
+  equivalent).** It named tokens recorded before per-model tracking
+  existed. The operator assigned those tokens to each account's heaviest
+  model directly on `usage.json` — a one-time migration, with the relay
+  stopped, totals verified unchanged before and after. That is the
+  operator supplying a fact the relay never captured, which is a
+  different act from the panel inventing one; the relay itself still
+  never guesses an attribution. With the remainder at zero everywhere and
+  every success now opening a model counter, the row could only fire
+  again on a restored pre-migration file. The operator chose silence over
+  a row that would otherwise never appear. Cost, stated plainly: restore
+  such a file and the model rows under-sum their account with nothing on
+  screen saying why.

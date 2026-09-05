@@ -3114,7 +3114,7 @@ fn all_time_is_never_smaller_than_the_window_it_contains() {
 /// the remainder is honest; leaving the reader to subtract is not, and
 /// inventing an attribution would be worse.
 #[test]
-fn an_account_names_the_tokens_no_model_claims() {
+fn an_account_is_silent_about_tokens_no_model_claims() {
     let tmp = tempdir().expect("tempdir");
     write_config(tmp.path(), "127.0.0.1", 8317);
     let mut runtime = FakeRuntime {
@@ -3152,12 +3152,14 @@ fn an_account_names_the_tokens_no_model_claims() {
 
     assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
-    // 1,000 on the account, 400 claimed by a model: 600 belong to none.
-    let row = visible
-        .lines()
-        .find(|line| line.contains("unattributed"))
-        .expect("the remainder is named");
-    assert!(row.contains("600"), "remainder: {row}");
+    // 1,000 on the account, 400 claimed by a model: 600 belong to none,
+    // and the panel says nothing about them. The operator migrated the
+    // historical gap into its model row and asked for the row gone; a gap
+    // is now silent by choice (usage-by-model, Revisions).
+    assert!(
+        !visible.contains("unattributed"),
+        "the remainder row was not removed: {visible}"
+    );
     // An account whose models account for everything says nothing extra.
     let mut complete = FakeRuntime {
         rich: true,

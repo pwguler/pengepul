@@ -139,11 +139,14 @@ in files.
   Account's fault. Counters written by the earlier scheme, which counted
   at dispatch, are repaired once at load and never again: a gap can no
   longer be created, so the repair is a migration with an end.
-- **A number the panels cannot attribute is named, never invented.** Tokens
-  carried before per-model tracking belong to no model, and the account
-  panel says so rather than leaving the model rows to silently under-sum
-  their account. Where a gap is reconstructable it is closed; where it is
-  not, it is labelled.
+- **A number the panels cannot attribute is not invented.** Every success
+  opens a per-model counter, so the relay cannot create an unattributed
+  gap: the model rows sum to their account by construction. Tokens
+  recorded before per-model tracking existed were assigned by the
+  operator, once, on the file — an operator supplying a fact the relay
+  never captured, not the panel guessing one. The panel no longer names a
+  remainder: a gap can now only come from restoring a pre-migration file,
+  and it is silent by the operator's choice.
 - **One word, one scope.** Two verbs never print the same label for different
   spans: `status` totals all time, `usage` names its `window` and its
   `all time` separately, and the all-time figure both print comes from one
