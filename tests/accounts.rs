@@ -684,3 +684,42 @@ async fn in_memory_buckets_are_trimmed_not_only_the_written_copy() {
         "the payload serves a bucket the file no longer holds: {dates:?}"
     );
 }
+
+/// Every attempt reaches an outcome: `requests` must equal
+/// `successes + failures`, or the three panels report a gap the operator
+/// cannot account for ("1,404 requests, 1,398 ok, 0 failed").
+#[tokio::test]
+async fn requests_reconcile_with_successes_and_failures() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+
+    // Every attempt the relay makes reaches an outcome: a success, a
+    // failure, or a reauth lockout. The counters must add up for all of
+    // them, and the daily buckets must agree with the cumulative ones.
+    manager.record_attempt("k@example.com");
+    manager.record_success("k@example.com", None, "claude-fable-5-1");
+    manager.record_attempt("k@example.com");
+    manager.record_failure("k@example.com", "upstream", Some("boom"));
+    manager.record_attempt("k@example.com");
+    manager.record_refresh_exhausted("k@example.com", "expired");
+
+    let snapshot = &manager.snapshots()[0];
+    let requests = snapshot["totalRequests"].as_i64().expect("requests");
+    let ok = snapshot["totalSuccesses"].as_i64().expect("successes");
+    let failed = snapshot["totalFailures"].as_i64().expect("failures");
+    assert_eq!(
+        requests,
+        ok + failed,
+        "an attempt with no outcome leaves an unaccountable gap: \
+         {requests} requests, {ok} ok, {failed} failed"
+    );
+    // The same reconciliation inside the daily buckets.
+    let day = &snapshot["days"][0];
+    assert_eq!(
+        day["requests"].as_i64().expect("day requests"),
+        day["successes"].as_i64().expect("day ok") + day["failures"].as_i64().expect("day failed"),
+        "daily buckets must reconcile too: {day}"
+    );
+}

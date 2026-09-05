@@ -1056,6 +1056,11 @@ async fn route_provider_request(
                     )
                     .await
                 } else {
+                    // The attempt was already counted when the account was
+                    // selected; refusing here without recording an outcome
+                    // would leave requests > ok + failed. A refusal is not
+                    // the account's fault, so it earns no cooldown.
+                    record_provider_refusal(state, &provider, &account).await;
                     return AppError::provider(
                         StatusCode::NOT_IMPLEMENTED,
                         format!(
@@ -1631,6 +1636,10 @@ async fn next_provider_account(
     match manager.refresh_if_due(&email).await {
         Ok(true) => {}
         Ok(false) => {
+            // An attempt that ends here is a failure, not a request that
+            // vanished: without this the panels report more requests than
+            // outcomes and the gap is unaccountable to the operator.
+            manager.record_failure(&email, "auth", Some("token refresh declined"));
             return Err(AppError::provider(
                 StatusCode::BAD_GATEWAY,
                 format!("failed to refresh {provider} account; re-run login for {provider}"),
@@ -1669,6 +1678,26 @@ async fn record_provider_success(
         }
     };
     manager.record_success(account.token.email.as_str(), usage.as_ref(), model);
+}
+
+/// Count a routing refusal against the account that was selected, without
+/// the cooldown a real failure earns.
+async fn record_provider_refusal(
+    state: &AppState,
+    provider: &ProviderId,
+    account: &AvailableAccount,
+) {
+    let mut manager = match provider.kind {
+        ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
+        ProviderKind::Codex => state.account_managers.codex.lock().await,
+        ProviderKind::Generic => {
+            let Some(manager) = state.account_managers.generic.get(provider.id.as_ref()) else {
+                return;
+            };
+            manager.lock().await
+        }
+    };
+    manager.record_refusal(account.token.email.as_str());
 }
 
 async fn record_provider_failure(

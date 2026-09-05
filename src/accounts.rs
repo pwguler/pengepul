@@ -339,6 +339,17 @@ impl AccountManager {
         self.persist_usage();
     }
 
+    /// An attempt the relay refused before reaching upstream — a dialect
+    /// this Provider cannot serve. It counts as a failed request so the
+    /// panels reconcile, but it is not the Account's fault: no cooldown,
+    /// no failure streak, nothing that would take it out of Rotation.
+    pub fn record_refusal(&mut self, email: &str) {
+        if let Some(state) = self.accounts.get_mut(email) {
+            state.total_failures += 1;
+            state.today().failures += 1;
+        }
+    }
+
     pub fn record_attempt(&mut self, email: &str) {
         if let Some(state) = self.accounts.get_mut(email) {
             state.total_requests += 1;

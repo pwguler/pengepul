@@ -149,6 +149,18 @@ before.
   life of the process, so a relay up past the window served an admin
   payload holding more history than its own file. `today()` trims before
   it opens a bucket.
+- **`requests` did not equal `ok + failed`.** The operator flagged it
+  twice — first on a dashboard (`504 ≠ 501 + 0`), then across all three
+  panels (1,404 vs 1,398 + 0). I answered "in-flight, probably" the first
+  time and moved on; it was not. `record_attempt` fires when an Account
+  is **selected**, and three paths returned between selection and any
+  outcome: a declined token refresh, its retry `continue`, and the 501
+  dialect refusal. Each left a request with no outcome, permanently. All
+  three record one now. The 501 needed a new seam — `record_refusal`,
+  which counts the failed request without the cooldown a real failure
+  earns, because a dialect the Provider cannot serve is not the
+  Account's fault; an existing test caught that distinction by going 503
+  when the first attempt put the account on cooldown.
 - **A subset could exceed its superset.** A payload carrying buckets but
   no cumulative counters printed `all time 0` under `window 11.0K`.
   Clamped: `all time` is at least the window it contains.
