@@ -24,8 +24,13 @@ model at accounting time but throws it away.
   that served them, once.
 - **No backfill.** Counters accumulated before this change have no model
   attribution and stay only in the account totals (user's choice:
-  "diamkan saja"). Per-model lines therefore may sum to less than the
-  account total until old history is outgrown. No `untracked` line.
+  "diamkan saja"). **Revised:** the model rows sit under an account total
+  they do not sum to, and a reader cannot tell whether the difference is
+  a bug or history — the same shape that made the operator ask about
+  `requests` three times. The remainder is now named
+  (`unattributed 153.0M — before per-model tracking`) and shown only when
+  it is non-zero. Naming it is honest; inventing an attribution for it
+  would not be.
 - **No per-model cooldown, routing, or limits.** Display and accounting
   only; account selection is untouched.
 - **No new endpoint.** The existing `GET /admin/accounts` payload carries
@@ -59,8 +64,10 @@ model at accounting time but throws it away.
   a `models` map per email; a manager built over that file restores the
   per-model counters. A file written before this change (no `models`
   key) loads with empty per-model history and intact account totals.
-- AC-5: `pengepul accounts` (rich) prints under each account row, one
-  model per two lines: `<model>  <n> ok  <total>` then indented
+- AC-5: `pengepul accounts` (rich) prints, under each account row and
+  after its model lines, an `unattributed` row naming the tokens no model
+  claims when that remainder is non-zero. Model lines are one model per
+  two lines: `<model>  <n> ok  <total>` then indented
   `in X  out Y  cache Z`, sorted by total tokens descending, ties broken
   by name. Accounts with no per-model history print no model lines.
 - AC-6: **Withdrawn.** The pool footer carries no `by model` aggregate —

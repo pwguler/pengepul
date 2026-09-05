@@ -8,8 +8,8 @@ use serde_json::Value;
 
 use crate::render::{
     AMBER, ActionGlyph, BOLD, DIM, Fact, GREEN, INNER_WIDTH, Output, RED, fact_panel, fact_row,
-    format_count, format_exact, label_column, pad, paint, panel_row, share_bar, status_glyph,
-    top_rule,
+    format_count, format_exact, label_column, pad, paint, panel_row, share_bar, sparkline,
+    status_glyph, top_rule,
 };
 
 /// `"on cooldown 4m12s"` while a cooldown lasts, `""` once it has cleared or
@@ -96,6 +96,7 @@ pub(crate) fn print_accounts(payload: &Value, output: &mut Output, now: f64) {
             }
             output.line(&detail);
             // AC-7: the same per-model breakdown, plain.
+            let unattributed = unattributed_tokens(account);
             for row in model_rows(account) {
                 output.line(&format!(
                     "    {} {} ok {}",
@@ -114,6 +115,9 @@ pub(crate) fn print_accounts(payload: &Value, output: &mut Output, now: f64) {
                         format!(" reasoning {}", format_count(row.reasoning))
                     }
                 ));
+            }
+            if unattributed > 0 {
+                output.line(&format!("    unattributed {}", format_count(unattributed)));
             }
         }
     }
@@ -142,10 +146,12 @@ pub(crate) struct PoolTotals {
 }
 
 impl PoolTotals {
-    /// The pool's carried load: the same sum `account_tokens` computes per
-    /// account, so footer totals match the share bars exactly.
+    /// The pool's carried load, through the one function that defines it.
+    /// `account_tokens` reads the same four fields off an account; both
+    /// call `carried_tokens`, so a change to what "carried" means moves
+    /// every view at once rather than one of them silently.
     fn tokens(&self) -> i64 {
-        self.input + self.output + self.cache_read + self.cache_write
+        carried_tokens(self.input, self.output, self.cache_read, self.cache_write)
     }
 
     fn add(&mut self, account: &Value) {
@@ -266,6 +272,15 @@ fn name_column(rows: &[ModelRow]) -> usize {
         .min(MODEL_NAME_WIDTH)
 }
 
+/// Tokens the account carried that no model claims: spent before
+/// per-model attribution existed, so nothing records which model spent
+/// them. Naming the remainder is honest; inventing an attribution is not
+/// (usage-by-model, no backfill).
+pub(crate) fn unattributed_tokens(account: &Value) -> i64 {
+    let claimed: i64 = model_rows(account).iter().map(ModelRow::tokens).sum();
+    (account_tokens(account) - claimed).max(0)
+}
+
 /// The account's `models` array, heaviest first, ties broken by name so the
 /// order never wobbles between calls.
 pub(crate) fn model_rows(account: &Value) -> Vec<ModelRow> {
@@ -359,6 +374,19 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64) {
             for row in model_rows(account) {
                 output.line(&panel_row(&format!("  {}", row.headline(width))));
                 output.line(&panel_row(&paint(DIM, &format!("    {}", row.detail()))));
+            }
+            let unattributed = unattributed_tokens(account);
+            if unattributed > 0 {
+                // On the model rows' column, not a third alignment: it is
+                // a row in that list, naming what the list does not claim.
+                output.line(&panel_row(&paint(
+                    DIM,
+                    &format!(
+                        "  {}{}  \u{2014} before per-model tracking",
+                        pad("unattributed", width),
+                        format_count(unattributed)
+                    ),
+                )));
             }
         }
 
@@ -737,9 +765,11 @@ pub(crate) fn footer_facts(totals: &PoolTotals) -> Vec<Fact> {
             &paint(BOLD, &format_count(totals.reasoning)),
         ));
     }
-    // The pool total stands alone, separated like the relay block's.
+    // Named for its scope: `status` prints `total` for the whole relay,
+    // and one word must not mean two spans (ARCHITECTURE, "One word, one
+    // scope").
     lines.push(Fact::new(
-        "total",
+        "pool",
         &paint(BOLD, &format_count(totals.tokens())),
     ));
     lines
@@ -748,10 +778,213 @@ pub(crate) fn footer_facts(totals: &PoolTotals) -> Vec<Fact> {
 /// The account's carried load: every token that crossed it. This is what the
 /// share bar divides; there is no quota in the domain to fill one with.
 pub(crate) fn account_tokens(account: &Value) -> i64 {
-    i64_field(account, "totalInputTokens")
-        + i64_field(account, "totalOutputTokens")
-        + i64_field(account, "totalCacheReadInputTokens")
-        + i64_field(account, "totalCacheCreationInputTokens")
+    carried_tokens(
+        i64_field(account, "totalInputTokens"),
+        i64_field(account, "totalOutputTokens"),
+        i64_field(account, "totalCacheReadInputTokens"),
+        i64_field(account, "totalCacheCreationInputTokens"),
+    )
+}
+
+/// What "carried load" means, in one place: input, output and both cache
+/// directions. Reasoning is excluded — it is already inside output. Every
+/// total the CLI prints resolves through here, so `status`, the pool
+/// footers, the share bars and `usage`'s all-time row cannot disagree
+/// about what they are summing (AC-11).
+pub(crate) fn carried_tokens(input: i64, output: i64, cache_read: i64, cache_write: i64) -> i64 {
+    input + output + cache_read + cache_write
+}
+
+/// How many local days the trend shows. The file keeps more (the store's
+/// retention); the panel shows this many (usage-trend AC-5).
+const TREND_DAYS: usize = 30;
+
+/// One day of relay-wide traffic: every account of every pool, summed.
+pub(crate) struct TrendDay {
+    date: String,
+    tokens: i64,
+    /// Whether the relay held a bucket for this day. Carried rather than
+    /// re-derived from `tokens > 0`: a day whose every request failed is
+    /// history with no tokens, and two rules for one word drift.
+    recorded: bool,
+}
+
+/// The payload's per-account `days` arrays folded into one relay-wide
+/// series, oldest first, covering the `TREND_DAYS` window that ends on
+/// `today`. Days with no traffic are present with zero, so the sparkline
+/// has one column per calendar day rather than one per recorded day.
+/// Pure over the payload and the date handed in (AC-9, AC-10).
+pub(crate) fn trend_days(payload: &Value, today: &str) -> Vec<TrendDay> {
+    let mut totals: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    for (_provider_id, provider) in providers(payload) {
+        let accounts = provider
+            .get("accounts")
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
+        for account in accounts {
+            let days = account
+                .get("days")
+                .and_then(Value::as_array)
+                .map_or(&[][..], Vec::as_slice);
+            for day in days {
+                let Some(date) = day.get("date").and_then(Value::as_str) else {
+                    continue;
+                };
+                let tokens = i64_field(day, "inputTokens")
+                    + i64_field(day, "outputTokens")
+                    + i64_field(day, "cacheReadInputTokens")
+                    + i64_field(day, "cacheCreationInputTokens");
+                // The entry exists because the day was recorded; its value
+                // may be zero.
+                *totals.entry(date.to_string()).or_default() += tokens;
+            }
+        }
+    }
+    let window: Vec<TrendDay> = window_dates(today, TREND_DAYS)
+        .into_iter()
+        .map(|date| {
+            let tokens = totals.get(&date).copied().unwrap_or(0);
+            let recorded = totals.contains_key(&date);
+            TrendDay {
+                date,
+                tokens,
+                recorded,
+            }
+        })
+        .collect();
+    // Emptiness is judged over the *window*, not over every bucket the
+    // file holds: a relay whose only traffic predates the window would
+    // otherwise render 30 flat bars, the shape AC-8 exists to prevent.
+    // A day is history because it was *recorded*, not because it spent
+    // tokens — a day of failures is history, and plain prints it, so rich
+    // must not call it empty.
+    if !window.iter().any(|day| day.recorded) {
+        return Vec::new();
+    }
+    window
+}
+
+/// The `count` calendar dates ending at `today`, oldest first. Date math
+/// on the `YYYY-MM-DD` string so the renderer stays clock-free.
+fn window_dates(today: &str, count: usize) -> Vec<String> {
+    let Ok(end) = chrono::NaiveDate::parse_from_str(today, "%Y-%m-%d") else {
+        return Vec::new();
+    };
+    let span = i64::try_from(count).unwrap_or(0);
+    (0..span)
+        .rev()
+        .map(|back| {
+            (end - chrono::Duration::days(back))
+                .format("%Y-%m-%d")
+                .to_string()
+        })
+        .collect()
+}
+
+/// The `Style::Rich` trend: one panel, four rows (AC-5).
+pub(crate) fn print_trend_rich(payload: &Value, output: &mut Output, today: &str) {
+    let days = trend_days(payload, today);
+    if days.is_empty() {
+        // AC-8: thirty flat bars would read as thirty idle days.
+        for line in fact_panel(
+            "usage ─ last 30 days",
+            &[Fact::new("tokens", &paint(DIM, "no usage recorded yet"))],
+        ) {
+            output.line(&line);
+        }
+        return;
+    }
+    let values: Vec<i64> = days.iter().map(|day| day.tokens).collect();
+    let peak = days
+        .iter()
+        .max_by_key(|day| day.tokens)
+        .expect("non-empty window");
+    let total: i64 = values.iter().sum();
+    // Only days that actually carry traffic are history; the rest of the
+    // window is drawn but was never recorded. Saying "across 30 days"
+    // when one day exists invites the reader to compare the total against
+    // `status` and conclude the trend is broken, when it is only new.
+    let recorded: Vec<&TrendDay> = days.iter().filter(|day| day.recorded).collect();
+    // The all-time figure comes from the same sum `status` prints, over the
+    // same payload, so the two verbs cannot drift and the window is
+    // visibly a subset rather than a competing total.
+    let all_time: i64 = providers(payload)
+        .into_iter()
+        .flat_map(|(_provider_id, provider)| {
+            provider
+                .get("accounts")
+                .and_then(Value::as_array)
+                .map_or(&[][..], Vec::as_slice)
+        })
+        .map(account_tokens)
+        .sum();
+    // The window is a subset of all time by construction. A payload whose
+    // cumulative counters are missing or lag its buckets would otherwise
+    // print a total smaller than the subset inside it.
+    let all_time = all_time.max(total);
+    let facts = vec![
+        Fact::new("tokens", &sparkline(&values)),
+        Fact::new(
+            "peak",
+            &format!(
+                "{} on {}",
+                paint(BOLD, &format_count(peak.tokens)),
+                peak.date
+            ),
+        ),
+        Fact::new(
+            "window",
+            &format!(
+                "{} across {} {} recorded",
+                paint(BOLD, &format_count(total)),
+                recorded.len(),
+                if recorded.len() == 1 { "day" } else { "days" }
+            ),
+        ),
+        Fact::new("all time", &paint(BOLD, &format_count(all_time))),
+    ];
+    for line in fact_panel("usage ─ last 30 days", &facts) {
+        output.line(&line);
+    }
+}
+
+/// The `Style::Plain` trend: one parseable row per recorded day, oldest
+/// first, no block characters (AC-7).
+pub(crate) fn print_trend_plain(payload: &Value, output: &mut Output, today: &str) {
+    let mut rows: std::collections::BTreeMap<String, (i64, i64, i64, i64, i64)> =
+        std::collections::BTreeMap::new();
+    for (_provider_id, provider) in providers(payload) {
+        let accounts = provider
+            .get("accounts")
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
+        for account in accounts {
+            let days = account
+                .get("days")
+                .and_then(Value::as_array)
+                .map_or(&[][..], Vec::as_slice);
+            for day in days {
+                let Some(date) = day.get("date").and_then(Value::as_str) else {
+                    continue;
+                };
+                let row = rows.entry(date.to_string()).or_default();
+                row.0 += i64_field(day, "requests");
+                row.1 += i64_field(day, "inputTokens");
+                row.2 += i64_field(day, "outputTokens");
+                row.3 += i64_field(day, "cacheReadInputTokens")
+                    + i64_field(day, "cacheCreationInputTokens");
+                row.4 += i64_field(day, "reasoningOutputTokens");
+            }
+        }
+    }
+    let window: std::collections::BTreeSet<String> =
+        window_dates(today, TREND_DAYS).into_iter().collect();
+    for (date, row) in rows.iter().filter(|(date, _)| window.contains(*date)) {
+        output.line(&format!(
+            "{date} {} {} {} {} {}",
+            row.0, row.1, row.2, row.3, row.4
+        ));
+    }
 }
 
 #[cfg(test)]

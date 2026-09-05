@@ -262,6 +262,27 @@ pub(crate) struct PersistedUsage {
     /// Per-model successes and their tokens, keyed by upstream model name.
     /// Absent in files written before usage-by-model: those load empty.
     pub(crate) models: BTreeMap<String, ModelUsage>,
+    /// Per-local-day traffic, keyed `YYYY-MM-DD`. Absent in files written
+    /// before usage-trend: those load empty and start bucketing now.
+    pub(crate) days: BTreeMap<String, DayUsage>,
+}
+
+/// How many local days of buckets survive a write. Bounded on purpose: the
+/// file is rewritten after every outcome, and days x accounts grows without
+/// one (usage-trend AC-4).
+pub(crate) const RETENTION_DAYS: i64 = 90;
+
+/// Drop every bucket older than `cutoff` (a `YYYY-MM-DD` date). Pure over
+/// its inputs so the window is testable for any day, not only today: the
+/// format sorts lexicographically, which is also chronologically.
+pub(crate) fn trim_days(
+    days: &BTreeMap<String, DayUsage>,
+    cutoff: &str,
+) -> BTreeMap<String, DayUsage> {
+    days.iter()
+        .filter(|(date, _)| date.as_str() >= cutoff)
+        .map(|(date, day)| (date.clone(), day.clone()))
+        .collect()
 }
 
 /// What one model cost on one account. Successes only, by construction:
@@ -274,6 +295,34 @@ pub(crate) struct ModelUsage {
     pub(crate) cache_creation_input_tokens: i64,
     pub(crate) cache_read_input_tokens: i64,
     pub(crate) reasoning_output_tokens: i64,
+}
+
+/// One local calendar day of an account's traffic. Carries the same eight
+/// counters as the cumulative record so a later view — requests per day,
+/// failures per day — needs no backfill; the trend renders tokens
+/// (usage-trend AC-2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DayUsage {
+    pub(crate) requests: i64,
+    pub(crate) successes: i64,
+    pub(crate) failures: i64,
+    pub(crate) input_tokens: i64,
+    pub(crate) output_tokens: i64,
+    pub(crate) cache_creation_input_tokens: i64,
+    pub(crate) cache_read_input_tokens: i64,
+    pub(crate) reasoning_output_tokens: i64,
+}
+
+impl DayUsage {
+    /// Fold one success's tokens into the day. The success itself is
+    /// counted by the caller, which also counts the usage-less ones.
+    pub(crate) fn add_tokens(&mut self, usage: &crate::types::UsageData) {
+        self.input_tokens += usage.input_tokens;
+        self.output_tokens += usage.output_tokens;
+        self.cache_creation_input_tokens += usage.cache_creation_input_tokens;
+        self.cache_read_input_tokens += usage.cache_read_input_tokens;
+        self.reasoning_output_tokens += usage.reasoning_output_tokens;
+    }
 }
 
 impl ModelUsage {
@@ -330,7 +379,36 @@ fn parse_persisted_usage(entry: &Value) -> Option<PersistedUsage> {
         cache_read_input_tokens: field("total_cache_read_input_tokens"),
         reasoning_output_tokens: field("total_reasoning_output_tokens"),
         models: parse_persisted_models(object.get("models")),
+        days: parse_persisted_days(object.get("days")),
     })
+}
+
+/// The `days` map of a usage entry. Missing (files written before
+/// usage-trend) or malformed yields an empty map: the account totals still
+/// load, and bucketing simply starts from here.
+fn parse_persisted_days(entry: Option<&Value>) -> BTreeMap<String, DayUsage> {
+    let Some(Value::Object(days)) = entry else {
+        return BTreeMap::new();
+    };
+    days.iter()
+        .filter_map(|(date, day)| {
+            let object = day.as_object()?;
+            let field = |key: &str| object.get(key).and_then(Value::as_i64).unwrap_or(0);
+            Some((
+                date.clone(),
+                DayUsage {
+                    requests: field("requests"),
+                    successes: field("successes"),
+                    failures: field("failures"),
+                    input_tokens: field("input_tokens"),
+                    output_tokens: field("output_tokens"),
+                    cache_creation_input_tokens: field("cache_creation_input_tokens"),
+                    cache_read_input_tokens: field("cache_read_input_tokens"),
+                    reasoning_output_tokens: field("reasoning_output_tokens"),
+                },
+            ))
+        })
+        .collect()
 }
 
 /// The `models` map of a usage entry. Missing (files written before
@@ -389,6 +467,22 @@ pub(crate) fn save_usage(
                 }),
             );
         }
+        let mut days = serde_json::Map::new();
+        for (date, day) in &usage.days {
+            days.insert(
+                date.clone(),
+                json!({
+                    "requests": day.requests,
+                    "successes": day.successes,
+                    "failures": day.failures,
+                    "input_tokens": day.input_tokens,
+                    "output_tokens": day.output_tokens,
+                    "cache_creation_input_tokens": day.cache_creation_input_tokens,
+                    "cache_read_input_tokens": day.cache_read_input_tokens,
+                    "reasoning_output_tokens": day.reasoning_output_tokens,
+                }),
+            );
+        }
         entries.insert(
             email.clone(),
             json!({
@@ -401,6 +495,7 @@ pub(crate) fn save_usage(
                 "total_cache_read_input_tokens": usage.cache_read_input_tokens,
                 "total_reasoning_output_tokens": usage.reasoning_output_tokens,
                 "models": models,
+                "days": days,
             }),
         );
     }
@@ -522,5 +617,60 @@ mod tests {
         // Idempotent: second call moves nothing.
         let again = migrate_legacy_layout(auth).expect("migrate again");
         assert_eq!(again, 0);
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::{DayUsage, trim_days};
+    use std::collections::BTreeMap;
+
+    fn days(dates: &[&str]) -> BTreeMap<String, DayUsage> {
+        dates
+            .iter()
+            .map(|date| {
+                (
+                    (*date).to_string(),
+                    DayUsage {
+                        requests: 1,
+                        ..DayUsage::default()
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// The window is inclusive of its cutoff: the boundary day survives,
+    /// the day before it does not. Pure over the cutoff, so this is
+    /// testable for any day rather than only today.
+    #[test]
+    fn trim_keeps_the_cutoff_day_and_drops_the_one_before() {
+        let kept = trim_days(
+            &days(&["2026-06-07", "2026-06-08", "2026-06-09"]),
+            "2026-06-08",
+        );
+        assert_eq!(
+            kept.keys().collect::<Vec<_>>(),
+            vec!["2026-06-08", "2026-06-09"]
+        );
+    }
+
+    #[test]
+    fn trim_crosses_a_year_boundary_by_date_not_by_number() {
+        // Lexicographic order on %Y-%m-%d is chronological, which is what
+        // makes the string compare correct across a year end.
+        let kept = trim_days(
+            &days(&["2025-12-30", "2025-12-31", "2026-01-01"]),
+            "2025-12-31",
+        );
+        assert_eq!(
+            kept.keys().collect::<Vec<_>>(),
+            vec!["2025-12-31", "2026-01-01"]
+        );
+    }
+
+    #[test]
+    fn trim_of_an_empty_map_is_empty_not_a_panic() {
+        assert!(trim_days(&BTreeMap::new(), "2026-06-08").is_empty());
     }
 }

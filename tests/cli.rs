@@ -2305,7 +2305,7 @@ fn accounts_footer_rows_use_the_row_grammar() {
             .expect("value")
             + after
     };
-    let columns: Vec<usize> = ["requests", "tokens", "reasoning", "total"]
+    let columns: Vec<usize> = ["requests", "tokens", "reasoning", "pool"]
         .into_iter()
         .map(value_column)
         .collect();
@@ -2546,4 +2546,701 @@ fn a_control_character_cannot_split_a_panel_row() {
             "control character split the box: {line:?}"
         );
     }
+}
+
+/// usage-trend AC-5/AC-6/AC-9: one panel, a 30-character sparkline of
+/// relay-wide daily tokens, a peak row naming its day, and a total.
+#[test]
+fn usage_renders_a_thirty_day_sparkline() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let day = |date: &str, input: i64| {
+        json!({
+            "date": date,
+            "requests": 1,
+            "successes": 1,
+            "failures": 0,
+            "inputTokens": input,
+            "outputTokens": 0,
+            "cacheCreationInputTokens": 0,
+            "cacheReadInputTokens": 0,
+            "reasoningOutputTokens": 0
+        })
+    };
+    // Dates relative to the clock the verb reads: a hardcoded month leaves
+    // the rolling window and the suite goes red on a fixed future date.
+    let ago = |back: i64| {
+        (chrono::Local::now() - chrono::Duration::days(back))
+            .format("%Y-%m-%d")
+            .to_string()
+    };
+    let (older, peak_day) = (ago(4), ago(2));
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalInputTokens": 40_000,
+                        "days": [day(&older, 1_000), day(&peak_day, 9_000)]
+                    }))]
+                },
+                // AC-9: a second pool's days sum into the same bars.
+                "commandcode": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "k@x.com",
+                        "available": true,
+                        "totalInputTokens": 10_000,
+                        "days": [day(&older, 1_000)]
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    let lines: Vec<&str> = visible.lines().collect();
+    assert_eq!(lines.len(), 6, "four rows in a box: {visible}");
+    // all time contains the window, never the other way round.
+    assert!(
+        lines[4].contains("50.0K"),
+        "all time sums both pools: {}",
+        lines[4]
+    );
+    assert!(
+        !visible.contains("what status"),
+        "a row reports a fact, it does not footnote another verb: {visible}"
+    );
+    assert!(lines[0].contains("usage ─ last 30 days"), "{visible}");
+    // AC-6: one character per day, oldest left, no blanks.
+    let spark_row = lines[1];
+    assert!(spark_row.contains("│ tokens"), "{visible}");
+    let spark: String = spark_row
+        .chars()
+        .filter(|c| "▁▂▃▄▅▆▇█".contains(*c))
+        .collect();
+    assert_eq!(spark.chars().count(), 30, "one bar per day: {spark_row}");
+    assert!(spark.ends_with('▁'), "today is idle here: {spark_row}");
+    // AC-9: the later day is the peak, and both pools sum into the earlier one.
+    assert!(lines[2].contains("peak"), "{visible}");
+    assert!(lines[2].contains("9.0K"), "peak value: {}", lines[2]);
+    assert!(lines[2].contains(&peak_day), "peak date: {}", lines[2]);
+    assert!(lines[3].contains("window"), "{visible}");
+    assert!(
+        lines[3].contains("11.0K"),
+        "window sums pools: {}",
+        lines[3]
+    );
+    for line in &lines {
+        assert_eq!(line.chars().count(), 64, "off the fixed width: {line}");
+    }
+}
+
+/// usage-trend AC-8: with no history the panel says so rather than
+/// drawing thirty flat bars that would read as thirty idle days.
+#[test]
+fn usage_says_so_when_no_history_exists() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "days": []
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    assert!(
+        visible.contains("no usage recorded yet"),
+        "must not draw thirty idle bars: {visible}"
+    );
+    // Not `!contains("▁▁▁")`: this path returns before `sparkline` is
+    // called, so that assertion cannot fail. Pin the shape instead.
+    assert_eq!(
+        visible.lines().count(),
+        3,
+        "one row in a box, no bars: {visible}"
+    );
+}
+
+/// usage-trend AC-7: plain is one parseable line per day, no block
+/// characters — a sparkline in a pipe is hostile to a script.
+#[test]
+fn usage_plain_is_one_line_per_day() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let recorded = (chrono::Local::now() - chrono::Duration::days(2))
+        .format("%Y-%m-%d")
+        .to_string();
+    let mut runtime = FakeRuntime {
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "days": [{
+                            "date": recorded.clone(),
+                            "requests": 7,
+                            "successes": 6,
+                            "failures": 1,
+                            "inputTokens": 100,
+                            "outputTokens": 200,
+                            "cacheCreationInputTokens": 10,
+                            "cacheReadInputTokens": 20,
+                            "reasoningOutputTokens": 5
+                        }]
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run(&["usage"], tmp.path(), &mut runtime);
+
+    assert_eq!(outcome.code, 0);
+    assert!(
+        !outcome.stdout.contains('▁') && !outcome.stdout.contains('█'),
+        "block characters in a pipe: {}",
+        outcome.stdout
+    );
+    // date requests input output cache reasoning
+    assert!(
+        outcome
+            .stdout
+            .contains(&format!("{recorded} 7 100 200 30 5")),
+        "parseable row: {}",
+        outcome.stdout
+    );
+}
+
+/// usage-trend AC-8 (extended): a window holding one day of thirty must
+/// not claim "across 30 days". The reader compares that total against
+/// `status` and concludes the trend is broken, when it is only new.
+#[test]
+fn usage_says_how_much_history_it_actually_has() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "days": [{
+                            "date": today.clone(),
+                            "requests": 7,
+                            "inputTokens": 25,
+                            "outputTokens": 278,
+                            "cacheReadInputTokens": 2_980_150,
+                            "cacheCreationInputTokens": 0,
+                            "reasoningOutputTokens": 0
+                        }]
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    // The total names the history it has, not the window it drew.
+    assert!(
+        !visible.contains("across 30 days"),
+        "claims a full window it does not have: {visible}"
+    );
+    // The window row carries how much history exists; the empty bars need
+    // no second row explaining themselves.
+    assert!(
+        visible.contains("1 day recorded"),
+        "must say how much history exists: {visible}"
+    );
+    assert_eq!(
+        visible.lines().count(),
+        6,
+        "four rows whatever the history: {visible}"
+    );
+    for line in visible.lines() {
+        assert_eq!(line.chars().count(), 64, "off the fixed width: {line}");
+    }
+}
+
+/// usage-trend: the numbers reconcile across verbs. `usage` shows the
+/// all-time figure beside its window, and that figure is the one `status`
+/// prints — computed from the same payload by the same sum, so the two
+/// cannot drift and a reader can see the window is a subset.
+#[test]
+fn usage_all_time_equals_the_status_total() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let payload = json!({
+        "providers": {
+            "anthropic": {
+                "account_count": 1,
+                "accounts": [account(json!({
+                    "email": "a@x.com",
+                    "available": true,
+                    "totalRequests": 1_345,
+                    "totalInputTokens": 700_000,
+                    "totalOutputTokens": 900_000,
+                    "totalCacheReadInputTokens": 289_000_000,
+                    "totalCacheCreationInputTokens": 636_984,
+                    "days": [{
+                        "date": chrono::Local::now().format("%Y-%m-%d").to_string(),
+                        "requests": 7,
+                        "inputTokens": 25,
+                        "outputTokens": 278,
+                        "cacheReadInputTokens": 2_980_150,
+                        "cacheCreationInputTokens": 0,
+                        "reasoningOutputTokens": 0
+                    }]
+                }))]
+            }
+        }
+    });
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(payload.clone()),
+        ..FakeRuntime::default()
+    };
+
+    let usage = strip_ansi(&run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich).stdout);
+    let status = strip_ansi(&run_style(&["status"], tmp.path(), &mut runtime, Style::Rich).stdout);
+
+    // Exact figures, not humanized ones: two different numbers that both
+    // render "292.6M" would pass a substring check.
+    let status_total = status
+        .lines()
+        .find(|line| line.contains("│ total"))
+        .expect("status total row")
+        .split_whitespace()
+        .nth(2)
+        .expect("status total value")
+        .to_string();
+    // The same figure, labelled `all time`, inside `usage`.
+    let all_time = usage
+        .lines()
+        .find(|line| line.contains("all time"))
+        .expect("usage all-time row");
+    assert!(
+        all_time.contains(&status_total),
+        "usage all-time {all_time:?} must carry status total {status_total:?}"
+    );
+    // And the window is visibly a subset, not a competing total.
+    assert!(usage.contains("window"), "{usage}");
+    assert!(!usage.contains("│ total"), "one word, one scope: {usage}");
+}
+
+/// usage-trend AC-8: a relay whose only buckets predate the window is
+/// empty *for this view*, even though the file still holds them. Judging
+/// emptiness over every bucket would render 30 flat bars — the shape the
+/// criterion exists to prevent.
+#[test]
+fn usage_treats_an_out_of_window_history_as_empty() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    // Inside the 90-day retention, outside the 30-day window.
+    let old = (chrono::Local::now() - chrono::Duration::days(45))
+        .format("%Y-%m-%d")
+        .to_string();
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "days": [{
+                            "date": old,
+                            "requests": 9,
+                            "inputTokens": 5_000,
+                            "outputTokens": 0,
+                            "cacheReadInputTokens": 0,
+                            "cacheCreationInputTokens": 0,
+                            "reasoningOutputTokens": 0
+                        }]
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    assert!(
+        visible.contains("no usage recorded yet"),
+        "30 flat bars for out-of-window history: {visible}"
+    );
+}
+
+/// ARCHITECTURE, "One word, one scope": three panels printed `total` for
+/// three different spans — one pool, another pool, and the whole relay.
+/// A pool footer names its own scope.
+#[test]
+fn a_pool_footer_names_its_scope_rather_than_saying_total() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalRequests": 10,
+                        "totalInputTokens": 1_000
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    assert!(
+        !visible.contains("│ total"),
+        "a pool total is not the relay total: {visible}"
+    );
+    assert!(
+        visible.contains("│ pool"),
+        "footer names its scope: {visible}"
+    );
+}
+
+/// A day of failed requests is history: rich and plain must agree that it
+/// exists. Judging emptiness on tokens alone made rich say "no usage
+/// recorded yet" for a day plain still printed.
+#[test]
+fn a_day_of_failures_counts_as_history_in_both_styles() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let payload = json!({
+        "providers": {
+            "anthropic": {
+                "account_count": 1,
+                "accounts": [account(json!({
+                    "email": "a@x.com",
+                    "available": true,
+                    "days": [{
+                        "date": today,
+                        "requests": 9,
+                        "successes": 0,
+                        "failures": 9,
+                        "inputTokens": 0,
+                        "outputTokens": 0,
+                        "cacheReadInputTokens": 0,
+                        "cacheCreationInputTokens": 0,
+                        "reasoningOutputTokens": 0
+                    }]
+                }))]
+            }
+        }
+    });
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(payload.clone()),
+        ..FakeRuntime::default()
+    };
+    let rich = strip_ansi(&run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich).stdout);
+    let plain = run(&["usage"], tmp.path(), &mut runtime).stdout;
+
+    assert!(!plain.trim().is_empty(), "plain prints the day: {plain:?}");
+    assert!(
+        !rich.contains("no usage recorded yet"),
+        "rich and plain disagree that history exists: {rich}"
+    );
+}
+
+/// usage-trend AC-11: `all time` and `status`'s `total` are the same
+/// number, asserted on exact figures rather than humanized ones. Small
+/// values keep `format_count` exact, so a wrong sum cannot hide behind a
+/// rounded suffix.
+#[test]
+fn usage_all_time_matches_status_exactly_not_just_when_rounded() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let payload = json!({
+        "providers": {
+            "anthropic": {
+                "account_count": 1,
+                "accounts": [account(json!({
+                    "email": "a@x.com",
+                    "available": true,
+                    "totalRequests": 3,
+                    "totalSuccesses": 3,
+                    "totalInputTokens": 111,
+                    "totalOutputTokens": 222,
+                    "totalCacheReadInputTokens": 333,
+                    "totalCacheCreationInputTokens": 44,
+                    "days": [{
+                        "date": today,
+                        "requests": 1,
+                        "successes": 1,
+                        "failures": 0,
+                        "inputTokens": 10,
+                        "outputTokens": 20,
+                        "cacheReadInputTokens": 30,
+                        "cacheCreationInputTokens": 0,
+                        "reasoningOutputTokens": 0
+                    }]
+                }))]
+            }
+        }
+    });
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(payload),
+        ..FakeRuntime::default()
+    };
+
+    let usage = strip_ansi(&run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich).stdout);
+    let status = strip_ansi(&run_style(&["status"], tmp.path(), &mut runtime, Style::Rich).stdout);
+
+    // 111 + 222 + 333 + 44 = 710, printed exactly at this size.
+    let all_time = usage
+        .lines()
+        .find(|line| line.contains("all time"))
+        .expect("all time row");
+    assert!(all_time.contains("710"), "all time: {all_time}");
+    let total = status
+        .lines()
+        .find(|line| line.contains("│ total"))
+        .expect("status total");
+    assert!(total.contains("710"), "status total: {total}");
+    // And the window is its own, smaller figure: 10 + 20 + 30 = 60.
+    let window = usage
+        .lines()
+        .find(|line| line.contains("window"))
+        .expect("window row");
+    assert!(window.contains("60"), "window: {window}");
+}
+
+/// usage-trend AC-11: the clamp. A payload whose cumulative counters lag
+/// its buckets must not print an all-time total smaller than the window
+/// inside it — a superset cannot be smaller than its subset.
+#[test]
+fn all_time_is_never_smaller_than_the_window_it_contains() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        // Cumulative counters absent: a hand-edited file.
+                        "days": [{
+                            "date": today,
+                            "requests": 1,
+                            "successes": 1,
+                            "failures": 0,
+                            "inputTokens": 500,
+                            "outputTokens": 0,
+                            "cacheReadInputTokens": 0,
+                            "cacheCreationInputTokens": 0,
+                            "reasoningOutputTokens": 0
+                        }]
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let visible = strip_ansi(&run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich).stdout);
+    let window = visible
+        .lines()
+        .find(|line| line.contains("window"))
+        .expect("window row");
+    let all_time = visible
+        .lines()
+        .find(|line| line.contains("all time"))
+        .expect("all time row");
+    assert!(window.contains("500"), "window: {window}");
+    assert!(
+        all_time.contains("500"),
+        "a superset smaller than its subset: {all_time}"
+    );
+}
+
+/// The model rows sit under an account total they do not sum to: tokens
+/// spent before per-model attribution existed belong to no model. Naming
+/// the remainder is honest; leaving the reader to subtract is not, and
+/// inventing an attribution would be worse.
+#[test]
+fn an_account_names_the_tokens_no_model_claims() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalRequests": 100,
+                        "totalSuccesses": 100,
+                        "totalInputTokens": 1_000,
+                        "totalOutputTokens": 0,
+                        "totalCacheReadInputTokens": 0,
+                        "totalCacheCreationInputTokens": 0,
+                        "models": [{
+                            "model": "claude-opus-5",
+                            "successes": 40,
+                            "inputTokens": 400,
+                            "outputTokens": 0,
+                            "cacheCreationInputTokens": 0,
+                            "cacheReadInputTokens": 0,
+                            "reasoningOutputTokens": 0
+                        }]
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    // 1,000 on the account, 400 claimed by a model: 600 belong to none.
+    let row = visible
+        .lines()
+        .find(|line| line.contains("unattributed"))
+        .expect("the remainder is named");
+    assert!(row.contains("600"), "remainder: {row}");
+    // An account whose models account for everything says nothing extra.
+    let mut complete = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalInputTokens": 400,
+                        "models": [{
+                            "model": "claude-opus-5",
+                            "successes": 40,
+                            "inputTokens": 400,
+                            "outputTokens": 0,
+                            "cacheCreationInputTokens": 0,
+                            "cacheReadInputTokens": 0,
+                            "reasoningOutputTokens": 0
+                        }]
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+    let visible =
+        strip_ansi(&run_style(&["accounts"], tmp.path(), &mut complete, Style::Rich).stdout);
+    assert!(
+        !visible.contains("unattributed"),
+        "a fully attributed account needs no remainder row: {visible}"
+    );
+}
+
+/// usage-trend AC-8: a day whose every request failed is one day of
+/// history, not zero. `window` must say so, and the bars must not read as
+/// thirty idle days.
+#[test]
+fn a_day_of_failures_is_one_day_recorded_not_zero() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalRequests": 9,
+                        "totalFailures": 9,
+                        "days": [{
+                            "date": today.clone(),
+                            "requests": 9,
+                            "successes": 0,
+                            "failures": 9,
+                            "inputTokens": 0,
+                            "outputTokens": 0,
+                            "cacheReadInputTokens": 0,
+                            "cacheCreationInputTokens": 0,
+                            "reasoningOutputTokens": 0
+                        }]
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let visible = strip_ansi(&run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich).stdout);
+    let window = visible
+        .lines()
+        .find(|line| line.contains("window"))
+        .expect("window row");
+    assert!(
+        window.contains("1 day recorded"),
+        "a day of failures counted as zero: {window}"
+    );
+    let peak = visible
+        .lines()
+        .find(|line| line.contains("peak"))
+        .expect("peak row");
+    assert!(peak.contains(&today), "peak names the recorded day: {peak}");
 }

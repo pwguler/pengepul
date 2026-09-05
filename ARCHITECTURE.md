@@ -21,7 +21,11 @@ in files.
 - **Account** (`accounts.rs`) — `AccountManager`: holds every Account of one
   Provider and picks who serves next; **Rotation**, **Cooldown** and due
   **Refresh** live here, and every request outcome updates the Account's
-  Usage counters, which it hands to the Credential store to persist.
+  Usage counters, which it hands to the Credential store to persist. Every
+  outcome passes through one private seam (`AccountState::settle`), so the
+  attempt/outcome invariant holds by construction rather than by each
+  recorder remembering it; counters read from disk are repaired at load,
+  where nothing is in flight.
 - **Credential store** (`tokens.rs`) — reads and writes what an Account
   leaves on disk under the auth dir: the one credential it holds, and the
   provider's **Usage counters** file (`usage.json`), both at `0600`, the
@@ -60,9 +64,9 @@ in files.
   Accounts, or the admin payload.
 - **Usage view** (`usage_view.rs`) — the admin payload turned into the relay
   total block for `status` (one block: pool summary lines and the relay-wide
-  aggregate) and pool panels with account rows, per-model lines and footers
-  for `accounts`, in both styles. Pure over the payload and a `now` the verb
-  hands in.
+  aggregate), pool panels with account rows, per-model lines and footers for
+  `accounts`, and the 30-day sparkline for `usage`, in both styles. Pure over
+  the payload and a `now` or a date the verb hands in.
 
 ## Seams
 
@@ -109,10 +113,43 @@ in files.
 - **The Provider registry is the `config.yaml` `providers:` section**, read at
   startup; there is no database and nothing on the serving path writes it.
 - **Usage counters survive a restart; Cooldown does not.** Requests, successes,
-  failures and tokens per Account — and per model within an Account, for the
-  successes — are written to `usage.json` after every outcome and reloaded at
-  startup; a fresh process always retries every Account. Deleting the file is
-  the only reset.
+  failures and tokens per Account — per model within an Account for the
+  successes, and per local calendar day — are written to `usage.json` after
+  every outcome, Refusals included and reloaded at startup; a fresh process always retries every
+  Account. Daily buckets are trimmed to 90 days on write. Deleting the file
+  is the only reset.
+- **Outcomes never exceed attempts.** Every recorder settles through one
+  private seam (`AccountState::settle`), which decrements the Account's
+  in-flight count when an attempt is waiting and otherwise counts the
+  attempt the outcome implies — so `successes + failures` can never run
+  ahead of `requests`, the direction load-time repair cannot fix. The
+  count is per Account and not a flag because Rotation is in-flight-blind
+  and the manager lock is released before the upstream call: one Account
+  serves several requests at once. A caller that must not record twice
+  (the billing path) applies health without an outcome rather than
+  relying on the seam to refuse it. Every
+  path between selection and the response records a success, a failure,
+  or a Refusal — including a
+  client that hangs up mid-stream, whose outcome is paid by a `Drop`
+  guard because the code after the stream loop never runs. A Refusal
+  counts as a failed request but earns no Cooldown: a dialect the
+  Provider cannot serve, or a 400 the client malformed, is not the
+  Account's fault. Counters written before this held — by a binary with
+  a leaking path — are repaired at load, where nothing is in flight, in
+  both directions: an attempt with no outcome is named a failure, and
+  outcomes exceeding their attempts raise the attempts to meet them.
+  Successes are never rewritten and no recorded outcome is discarded.
+- **A number the panels cannot attribute is named, never invented.** Tokens
+  carried before per-model tracking belong to no model, and the account
+  panel says so rather than leaving the model rows to silently under-sum
+  their account. Where a gap is reconstructable it is closed; where it is
+  not, it is labelled.
+- **One word, one scope.** Two verbs never print the same label for different
+  spans: `status` totals all time, `usage` names its `window` and its
+  `all time` separately, and the all-time figure both print comes from one
+  sum over one payload, so they cannot drift. A row reports a fact the panel
+  does not already carry — it never restates another row or narrates another
+  verb.
 - **Every rich panel speaks one grammar.** Header is `<subject>` or
   `<subject> ─ <qualifier>`, never a colon, and a qualifier must add a
   fact the rows do not carry. Fact rows are `<label>  <value>` with the

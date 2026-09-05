@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
@@ -125,6 +126,39 @@ struct StreamAccounting {
     account: AvailableAccount,
     /// The upstream model name: what per-model counters are keyed by.
     model: String,
+    /// Cleared once an outcome is recorded. While set, the attempt is
+    /// still owed one, and `Drop` pays it: a client that hangs up
+    /// mid-stream drops the generator at its last `yield`, so the code
+    /// after the loop never runs (ARCHITECTURE, "Every attempt reaches an
+    /// outcome").
+    owed: Arc<AtomicBool>,
+}
+
+impl StreamAccounting {
+    /// Mark the outcome settled, so `Drop` does not record a second one.
+    fn settle(&self) {
+        self.owed.store(false, Ordering::SeqCst);
+    }
+}
+
+impl Drop for StreamAccounting {
+    fn drop(&mut self) {
+        if !self.owed.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        // Drop is sync and the recorders are async: hand the work to the
+        // runtime rather than blocking here.
+        let state = self.state.clone();
+        let provider = self.provider.clone();
+        let account = self.account.clone();
+        // A Refusal, not a failure: the account was serving a 2xx stream
+        // when the client hung up. Cooling it down would walk a healthy
+        // account up the backoff every time a harness cancels a
+        // generation (CONTEXT.md, Refusal).
+        tokio::spawn(async move {
+            record_provider_refusal(&state, &provider, &account).await;
+        });
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1056,6 +1090,11 @@ async fn route_provider_request(
                     )
                     .await
                 } else {
+                    // The attempt was already counted when the account was
+                    // selected; refusing here without recording an outcome
+                    // would leave requests > ok + failed. A refusal is not
+                    // the account's fault, so it earns no cooldown.
+                    record_provider_refusal(state, &provider, &account).await;
                     return AppError::provider(
                         StatusCode::NOT_IMPLEMENTED,
                         format!(
@@ -1185,12 +1224,14 @@ async fn record_billing_scoped_failure(
         .iter()
         .any(|marker| text.contains(marker));
     if billing {
-        record_provider_failure_kind(
+        // The 400/402 was already recorded as a Refusal by
+        // `record_provider_failure`; this only adds the account health the
+        // marker justifies, so one attempt keeps one outcome.
+        record_billing_cooldown(
             state,
-            provider,
+            &provider,
             account,
-            "billing",
-            Some(&String::from_utf8_lossy(&buffered)),
+            &String::from_utf8_lossy(&buffered),
         )
         .await;
     }
@@ -1433,6 +1474,7 @@ async fn stream_accounting(
             provider,
             account: account.clone(),
             model: model.to_string(),
+            owed: Arc::new(AtomicBool::new(true)),
         })
     } else {
         record_provider_failure(state, provider, account, status, None).await;
@@ -1631,6 +1673,11 @@ async fn next_provider_account(
     match manager.refresh_if_due(&email).await {
         Ok(true) => {}
         Ok(false) => {
+            // The outcome is already recorded: `refresh_if_due` reaches
+            // here only after `record_refresh_exhausted`, which settled
+            // the attempt and set the 24-hour reauth lockout. Recording a
+            // failure here would collapse that lockout to seconds and
+            // overwrite the operator's "re-run login" message.
             return Err(AppError::provider(
                 StatusCode::BAD_GATEWAY,
                 format!("failed to refresh {provider} account; re-run login for {provider}"),
@@ -1671,6 +1718,48 @@ async fn record_provider_success(
     manager.record_success(account.token.email.as_str(), usage.as_ref(), model);
 }
 
+/// Count a routing refusal against the account that was selected, without
+/// the cooldown a real failure earns.
+async fn record_provider_refusal(
+    state: &AppState,
+    provider: &ProviderId,
+    account: &AvailableAccount,
+) {
+    let mut manager = match provider.kind {
+        ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
+        ProviderKind::Codex => state.account_managers.codex.lock().await,
+        ProviderKind::Generic => {
+            let Some(manager) = state.account_managers.generic.get(provider.id.as_ref()) else {
+                return;
+            };
+            manager.lock().await
+        }
+    };
+    manager.record_refusal(account.token.email.as_str());
+}
+
+/// Put an account on the billing cooldown without counting a second
+/// outcome: the request that revealed the drained balance was already
+/// recorded where it happened.
+async fn record_billing_cooldown(
+    state: &AppState,
+    provider: &ProviderId,
+    account: &AvailableAccount,
+    detail: &str,
+) {
+    let mut manager = match provider.kind {
+        ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
+        ProviderKind::Codex => state.account_managers.codex.lock().await,
+        ProviderKind::Generic => {
+            let Some(manager) = state.account_managers.generic.get(provider.id.as_ref()) else {
+                return;
+            };
+            manager.lock().await
+        }
+    };
+    manager.record_billing_cooldown(account.token.email.as_str(), detail);
+}
+
 async fn record_provider_failure(
     state: &AppState,
     provider: ProviderId,
@@ -1680,8 +1769,14 @@ async fn record_provider_failure(
 ) {
     // 400/402 by themselves say nothing about account health — a malformed request is
     // the client's fault, and a drained balance is recorded by the failover path with
-    // the billing kind instead. Recording both would double-count the backoff.
+    // the billing kind instead. Recording both would double-count the backoff. The
+    // request still happened, though: count it as a refusal so it reaches an outcome
+    // without touching the account's health.
     if status == StatusCode::BAD_REQUEST || status == StatusCode::PAYMENT_REQUIRED {
+        // The request reached an outcome here. If the body turns out to be
+        // billing-scoped, the failover path adds the cooldown without
+        // recording a second outcome (`record_billing_cooldown`).
+        record_provider_refusal(state, &provider, account).await;
         return;
     }
     record_provider_failure_kind(state, provider, account, classify_status(status), detail).await;
@@ -1984,6 +2079,7 @@ fn transformed_sse_stream(
 
 async fn record_stream_success(accounting: Option<&StreamAccounting>, usage: &UsageData) {
     if let Some(accounting) = accounting {
+        accounting.settle();
         record_provider_success(
             &accounting.state,
             accounting.provider.clone(),
@@ -1997,6 +2093,7 @@ async fn record_stream_success(accounting: Option<&StreamAccounting>, usage: &Us
 
 async fn record_stream_failure(accounting: Option<&StreamAccounting>, detail: &str) {
     if let Some(accounting) = accounting {
+        accounting.settle();
         record_provider_failure(
             &accounting.state,
             accounting.provider.clone(),

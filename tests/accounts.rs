@@ -329,9 +329,14 @@ async fn per_model_counters_accumulate_per_account() {
         cache_read_input_tokens: 2,
         reasoning_output_tokens: 3,
     };
+    // The relay interleaves: an attempt, then its outcome, then the next.
+    manager.record_attempt("a@example.com");
     manager.record_success("a@example.com", Some(&usage(100)), "claude-fable-5-1");
+    manager.record_attempt("a@example.com");
     manager.record_success("a@example.com", Some(&usage(200)), "claude-fable-5-1");
+    manager.record_attempt("a@example.com");
     manager.record_success("a@example.com", Some(&usage(400)), "claude-sonnet-4-5");
+    manager.record_attempt("b@example.com");
     manager.record_success("b@example.com", Some(&usage(800)), "claude-fable-5-1");
 
     let snapshots = manager.snapshots();
@@ -438,7 +443,9 @@ async fn a_success_without_usage_still_counts_against_its_model() {
     let mut manager = never_refresh_manager(tmp.path().to_path_buf());
     manager.load().expect("load");
 
+    manager.record_attempt("k@example.com");
     manager.record_success("k@example.com", None, "claude-fable-5-1");
+    manager.record_attempt("k@example.com");
     manager.record_success(
         "k@example.com",
         Some(&UsageData {
@@ -487,4 +494,697 @@ async fn a_corrupt_models_block_loads_as_no_attribution() {
     let snapshot = &manager.snapshots()[0];
     assert_eq!(snapshot["totalRequests"], 5);
     assert_eq!(snapshot["models"].as_array().expect("array").len(), 0);
+}
+
+/// usage-trend AC-1/AC-2: outcomes land in a bucket keyed by the local
+/// calendar day, carrying the same eight counters as the cumulative
+/// record. Two outcomes on one day accumulate into one bucket.
+#[tokio::test]
+async fn outcomes_accumulate_into_one_bucket_per_local_day() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+
+    manager.record_attempt("k@example.com");
+    manager.record_success(
+        "k@example.com",
+        Some(&UsageData {
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_creation_input_tokens: 1,
+            cache_read_input_tokens: 2,
+            reasoning_output_tokens: 3,
+        }),
+        "claude-fable-5-1",
+    );
+    manager.record_attempt("k@example.com");
+    manager.record_success(
+        "k@example.com",
+        Some(&UsageData {
+            input_tokens: 100,
+            output_tokens: 200,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            reasoning_output_tokens: 0,
+        }),
+        "claude-fable-5-1",
+    );
+    manager.record_attempt("k@example.com");
+    manager.record_failure("k@example.com", "upstream", Some("boom"));
+
+    let days = manager.snapshots()[0]["days"].clone();
+    let days = days.as_array().expect("days array");
+    // AC-1: one bucket, not one per outcome.
+    assert_eq!(days.len(), 1, "one bucket per day: {days:?}");
+    let today = &days[0];
+    // AC-2: the same eight counters as the cumulative record.
+    assert_eq!(today["requests"], 3);
+    assert_eq!(today["successes"], 2);
+    assert_eq!(today["failures"], 1);
+    assert_eq!(today["inputTokens"], 110);
+    assert_eq!(today["outputTokens"], 220);
+    assert_eq!(today["cacheCreationInputTokens"], 1);
+    assert_eq!(today["cacheReadInputTokens"], 2);
+    assert_eq!(today["reasoningOutputTokens"], 3);
+    // The key is a local calendar date.
+    let date = today["date"].as_str().expect("date string");
+    assert_eq!(date.len(), 10, "YYYY-MM-DD: {date}");
+    assert_eq!(date, chrono::Local::now().format("%Y-%m-%d").to_string());
+}
+
+/// usage-trend AC-3/AC-4: buckets persist and reload, a file written
+/// before this change loads with none, and buckets past the 90-day
+/// window are dropped on write.
+#[tokio::test]
+async fn daily_buckets_persist_and_are_trimmed_to_the_window() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let usage_file = tmp.path().join("commandcode").join("usage.json");
+
+    // AC-3: a bucket survives a manager rebuild.
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    manager.record_attempt("k@example.com");
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let stored = persisted(&usage_file);
+    assert_eq!(stored["k@example.com"]["days"][&today]["requests"], 1);
+
+    let mut rebuilt = never_refresh_manager(tmp.path().to_path_buf());
+    rebuilt.load().expect("reload");
+    let days = rebuilt.snapshots()[0]["days"].clone();
+    assert_eq!(days.as_array().expect("array").len(), 1);
+    assert_eq!(days[0]["date"], today);
+    assert_eq!(days[0]["requests"], 1);
+
+    // AC-4: a file holding an ancient bucket and a recent one keeps only
+    // what falls inside the window, once a write happens.
+    let stale = (chrono::Local::now() - chrono::Duration::days(120))
+        .format("%Y-%m-%d")
+        .to_string();
+    let recent = (chrono::Local::now() - chrono::Duration::days(10))
+        .format("%Y-%m-%d")
+        .to_string();
+    fs::write(
+        &usage_file,
+        json!({
+            "k@example.com": {
+                "total_requests": 9,
+                "days": {
+                    stale.clone(): {"requests": 5, "input_tokens": 500},
+                    recent.clone(): {"requests": 3, "input_tokens": 300}
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write");
+
+    let mut trimmed = never_refresh_manager(tmp.path().to_path_buf());
+    trimmed.load().expect("load");
+    // Both load; the window is applied when the file is next written.
+    trimmed.record_attempt("k@example.com");
+    let stored = persisted(&usage_file);
+    let days = stored["k@example.com"]["days"]
+        .as_object()
+        .expect("days map");
+    assert!(!days.contains_key(&stale), "stale bucket kept: {days:?}");
+    assert!(
+        days.contains_key(&recent),
+        "recent bucket dropped: {days:?}"
+    );
+    assert_eq!(days[&recent]["requests"], 3);
+
+    // AC-3 second half: a file with no `days` key loads with none.
+    fs::write(
+        &usage_file,
+        json!({"k@example.com": {"total_requests": 7, "total_successes": 7}}).to_string(),
+    )
+    .expect("write legacy");
+    let mut legacy = never_refresh_manager(tmp.path().to_path_buf());
+    legacy.load().expect("load legacy");
+    let snapshot = &legacy.snapshots()[0];
+    assert_eq!(snapshot["totalRequests"], 7);
+    assert_eq!(snapshot["days"].as_array().expect("array").len(), 0);
+}
+
+/// usage-trend AC-1: every writer of a cumulative counter writes its
+/// bucket too. `record_refresh_exhausted` is the fourth, and it was
+/// missed: cumulative failures and the sum of daily failures would
+/// diverge on every reauth lockout, permanently.
+#[tokio::test]
+async fn a_reauth_lockout_lands_in_the_daily_bucket_too() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+
+    // Two requests, two outcomes: the relay counts an attempt before each.
+    manager.record_attempt("k@example.com");
+    manager.record_failure("k@example.com", "upstream", Some("boom"));
+    manager.record_attempt("k@example.com");
+    manager.record_refresh_exhausted("k@example.com", "expired");
+
+    let snapshot = &manager.snapshots()[0];
+    let cumulative = snapshot["totalFailures"].as_i64().expect("failures");
+    let bucketed: i64 = snapshot["days"]
+        .as_array()
+        .expect("days")
+        .iter()
+        .map(|day| day["failures"].as_i64().unwrap_or(0))
+        .sum();
+    assert_eq!(cumulative, 2, "both failures counted cumulatively");
+    assert_eq!(
+        bucketed, cumulative,
+        "daily failures must reconcile with the cumulative count"
+    );
+}
+
+/// usage-trend AC-4: the window bounds memory too, not only the file.
+/// `persist_usage` trimmed the copy it wrote while `state.days` kept every
+/// bucket for the life of the process, so a long-lived relay served an
+/// admin payload holding more history than its own file.
+#[tokio::test]
+async fn in_memory_buckets_are_trimmed_not_only_the_written_copy() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let usage_file = tmp.path().join("commandcode").join("usage.json");
+    let stale = (chrono::Local::now() - chrono::Duration::days(200))
+        .format("%Y-%m-%d")
+        .to_string();
+    fs::create_dir_all(usage_file.parent().expect("parent")).expect("mkdir");
+    fs::write(
+        &usage_file,
+        json!({"k@example.com": {"days": {stale.clone(): {"requests": 5}}}}).to_string(),
+    )
+    .expect("write");
+
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    manager.record_attempt("k@example.com");
+
+    let dates: Vec<String> = manager.snapshots()[0]["days"]
+        .as_array()
+        .expect("days")
+        .iter()
+        .filter_map(|day| day["date"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !dates.contains(&stale),
+        "the payload serves a bucket the file no longer holds: {dates:?}"
+    );
+}
+
+/// Every attempt reaches an outcome: `requests` must equal
+/// `successes + failures`, or the three panels report a gap the operator
+/// cannot account for ("1,404 requests, 1,398 ok, 0 failed").
+#[tokio::test]
+async fn requests_reconcile_with_successes_and_failures() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+
+    // Every attempt the relay makes reaches an outcome: a success, a
+    // failure, or a reauth lockout. The counters must add up for all of
+    // them, and the daily buckets must agree with the cumulative ones.
+    manager.record_attempt("k@example.com");
+    manager.record_success("k@example.com", None, "claude-fable-5-1");
+    manager.record_attempt("k@example.com");
+    manager.record_failure("k@example.com", "upstream", Some("boom"));
+    manager.record_attempt("k@example.com");
+    manager.record_refresh_exhausted("k@example.com", "expired");
+
+    let snapshot = &manager.snapshots()[0];
+    let requests = snapshot["totalRequests"].as_i64().expect("requests");
+    let ok = snapshot["totalSuccesses"].as_i64().expect("successes");
+    let failed = snapshot["totalFailures"].as_i64().expect("failures");
+    assert_eq!(
+        requests,
+        ok + failed,
+        "an attempt with no outcome leaves an unaccountable gap: \
+         {requests} requests, {ok} ok, {failed} failed"
+    );
+    // The same reconciliation inside the daily buckets.
+    let day = &snapshot["days"][0];
+    assert_eq!(
+        day["requests"].as_i64().expect("day requests"),
+        day["successes"].as_i64().expect("day ok") + day["failures"].as_i64().expect("day failed"),
+        "daily buckets must reconcile too: {day}"
+    );
+}
+
+/// A refusal must survive a restart like every other outcome. Its
+/// `record_attempt` is persisted; if the refusal is not, the reloaded
+/// state shows a request with no outcome — the permanent gap this seam
+/// was written to close.
+#[tokio::test]
+async fn a_refusal_survives_a_restart() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+
+    manager.record_attempt("k@example.com");
+    manager.record_refusal("k@example.com");
+
+    let mut rebuilt = never_refresh_manager(tmp.path().to_path_buf());
+    rebuilt.load().expect("reload");
+    let snapshot = &rebuilt.snapshots()[0];
+    let requests = snapshot["totalRequests"].as_i64().expect("requests");
+    let ok = snapshot["totalSuccesses"].as_i64().expect("ok");
+    let failed = snapshot["totalFailures"].as_i64().expect("failed");
+    assert_eq!(
+        requests,
+        ok + failed,
+        "a refusal lost on restart leaves a permanent gap: \
+         {requests} requests, {ok} ok, {failed} failed"
+    );
+}
+
+/// AC-4's window is 90 days inclusive of today. Nothing pinned the size
+/// itself: `RETENTION_DAYS` could move to 80 or 100 and every test stayed
+/// green, because the others test the comparison, not the span.
+#[tokio::test]
+async fn the_retention_window_is_ninety_days_inclusive() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let usage_file = tmp.path().join("commandcode").join("usage.json");
+    let day = |back: i64| {
+        (chrono::Local::now() - chrono::Duration::days(back))
+            .format("%Y-%m-%d")
+            .to_string()
+    };
+    // 89 back is the oldest day inside a 90-day inclusive window; 90 is
+    // the first one outside it.
+    let (inside, edge, outside) = (day(88), day(89), day(90));
+    fs::create_dir_all(usage_file.parent().expect("parent")).expect("mkdir");
+    fs::write(
+        &usage_file,
+        json!({
+            "k@example.com": {
+                "days": {
+                    inside.clone(): {"requests": 1},
+                    edge.clone(): {"requests": 1},
+                    outside.clone(): {"requests": 1}
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write");
+
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    manager.record_attempt("k@example.com");
+
+    let stored = persisted(&usage_file);
+    let days = stored["k@example.com"]["days"]
+        .as_object()
+        .expect("days map");
+    assert!(days.contains_key(&inside), "88 days back must survive");
+    assert!(days.contains_key(&edge), "89 days back is the window edge");
+    assert!(
+        !days.contains_key(&outside),
+        "90 days back is outside a 90-day inclusive window: {days:?}"
+    );
+}
+
+/// Counters written by an older binary can hold attempts that never
+/// reached an outcome. At load there is nothing in flight, so the gap is
+/// knowable: a request that did not succeed failed. Reconciling on load
+/// makes the panels add up instead of carrying the old leak forever.
+#[tokio::test]
+async fn a_historical_gap_is_reconciled_on_load() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let usage_file = tmp.path().join("commandcode").join("usage.json");
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    fs::create_dir_all(usage_file.parent().expect("parent")).expect("mkdir");
+    fs::write(
+        &usage_file,
+        json!({
+            "k@example.com": {
+                "total_requests": 1530,
+                "total_successes": 1524,
+                "total_failures": 0,
+                "days": {
+                    today.clone(): {"requests": 11, "successes": 10, "failures": 0}
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write");
+
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    let snapshot = &manager.snapshots()[0];
+
+    let requests = snapshot["totalRequests"].as_i64().expect("requests");
+    let ok = snapshot["totalSuccesses"].as_i64().expect("ok");
+    let failed = snapshot["totalFailures"].as_i64().expect("failed");
+    assert_eq!(requests, 1530, "attempts are not rewritten");
+    assert_eq!(ok, 1524, "successes are not invented");
+    assert_eq!(failed, 6, "the gap becomes what it was: failures");
+    assert_eq!(requests, ok + failed);
+
+    let day = &snapshot["days"][0];
+    assert_eq!(day["requests"], 11);
+    assert_eq!(day["successes"], 10);
+    assert_eq!(day["failures"], 1, "the bucket reconciles too");
+}
+
+/// The payload never serves a bucket outside the window, even on a
+/// process that has recorded nothing since the window moved past it.
+/// `today()` trims, but only a recorder calls it.
+#[tokio::test]
+async fn an_idle_process_does_not_serve_stale_buckets() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let usage_file = tmp.path().join("commandcode").join("usage.json");
+    let stale = (chrono::Local::now() - chrono::Duration::days(200))
+        .format("%Y-%m-%d")
+        .to_string();
+    fs::create_dir_all(usage_file.parent().expect("parent")).expect("mkdir");
+    fs::write(
+        &usage_file,
+        json!({"k@example.com": {"days": {stale.clone(): {"requests": 5, "failures": 5}}}})
+            .to_string(),
+    )
+    .expect("write");
+
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    // No recorder runs: the process is idle.
+    let dates: Vec<String> = manager.snapshots()[0]["days"]
+        .as_array()
+        .expect("days")
+        .iter()
+        .filter_map(|day| day["date"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !dates.contains(&stale),
+        "an idle process serves a bucket outside the window: {dates:?}"
+    );
+}
+
+/// The invariant, over every public recorder rather than one path: no
+/// sequence of calls can make outcomes exceed attempts, and every outcome
+/// implies an attempt. Seven P1s across three review rounds were all one
+/// call site forgetting this; a table over the whole surface is what a
+/// prose invariant could not give.
+#[tokio::test]
+async fn no_sequence_of_outcomes_can_break_the_invariant() {
+    struct Case {
+        name: &'static str,
+        calls: Vec<&'static str>,
+        /// The counts the sequence must produce: requests, ok, failed.
+        want: (i64, i64, i64),
+    }
+
+    let usage = UsageData {
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        reasoning_output_tokens: 0,
+    };
+    // Each case is a sequence of calls, applied in order to a fresh
+    // account. The names describe what the relay did.
+    // Each case names its exact expected counts, not only that they
+    // balance: asserting balance alone cannot tell "counted correctly"
+    // from "attempt and outcome both dropped".
+    let case = |name, calls, want| Case { name, calls, want };
+    let cases = vec![
+        case(
+            "attempt then success",
+            vec!["attempt", "success"],
+            (1, 1, 0),
+        ),
+        case(
+            "attempt then failure",
+            vec!["attempt", "failure"],
+            (1, 0, 1),
+        ),
+        case(
+            "attempt then refusal",
+            vec!["attempt", "refusal"],
+            (1, 0, 1),
+        ),
+        case(
+            "attempt then reauth lockout",
+            vec!["attempt", "exhausted"],
+            (1, 0, 1),
+        ),
+        // A billing rejection: one outcome, then health applied on top.
+        case(
+            "refusal then billing cooldown",
+            vec!["attempt", "refusal", "billing"],
+            (1, 0, 1),
+        ),
+        // Two outcomes for one attempt: the second implies its own.
+        case(
+            "a second outcome implies its own attempt",
+            vec!["attempt", "refusal", "failure"],
+            (2, 0, 2),
+        ),
+        // An outcome with no attempt: the relay should never do this, but
+        // the counters must stay coherent if it does.
+        case("outcome without an attempt", vec!["success"], (1, 1, 0)),
+        case("failure without an attempt", vec!["failure"], (1, 0, 1)),
+        // Failover: two attempts, two outcomes.
+        case(
+            "failover across two attempts",
+            vec!["attempt", "failure", "attempt", "success"],
+            (2, 1, 1),
+        ),
+        // Two in flight at once, as an async relay produces.
+        case(
+            "two attempts in flight, two outcomes",
+            vec!["attempt", "attempt", "success", "success"],
+            (2, 2, 0),
+        ),
+    ];
+
+    for Case { name, calls, want } in cases {
+        let (want_requests, want_ok, want_failed) = want;
+        let tmp = tempdir().expect("tempdir");
+        save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+        let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+        manager.load().expect("load");
+        for call in &calls {
+            match *call {
+                "attempt" => manager.record_attempt("k@example.com"),
+                "success" => manager.record_success("k@example.com", Some(&usage), "model-a"),
+                "failure" => manager.record_failure("k@example.com", "upstream", Some("boom")),
+                "refusal" => manager.record_refusal("k@example.com"),
+                "exhausted" => manager.record_refresh_exhausted("k@example.com", "expired"),
+                "billing" => manager.record_billing_cooldown("k@example.com", "insufficient"),
+                other => panic!("unknown call {other}"),
+            }
+        }
+
+        let snapshot = &manager.snapshots()[0];
+        let requests = snapshot["totalRequests"].as_i64().expect("requests");
+        let ok = snapshot["totalSuccesses"].as_i64().expect("ok");
+        let failed = snapshot["totalFailures"].as_i64().expect("failed");
+        assert_eq!(
+            (requests, ok, failed),
+            (want_requests, want_ok, want_failed),
+            "{name}: got {requests} requests, {ok} ok, {failed} failed"
+        );
+        assert_eq!(requests, ok + failed, "{name}: unbalanced");
+        // Every bucket, not only the first: a sequence producing two, the
+        // second unbalanced, would otherwise pass.
+        for day in snapshot["days"].as_array().expect("days") {
+            assert_eq!(
+                day["requests"].as_i64().expect("day requests"),
+                day["successes"].as_i64().expect("day ok")
+                    + day["failures"].as_i64().expect("day failed"),
+                "{name}: bucket disagrees: {day}"
+            );
+        }
+    }
+}
+
+/// The invariant survives a restart: a reloaded account settles its next
+/// outcome against its own attempt, not against the attempts it already
+/// closed before the process died.
+#[tokio::test]
+async fn the_invariant_holds_across_a_restart() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    manager.record_attempt("k@example.com");
+    manager.record_failure("k@example.com", "upstream", Some("boom"));
+
+    let mut rebuilt = never_refresh_manager(tmp.path().to_path_buf());
+    rebuilt.load().expect("reload");
+    // A fresh attempt and its outcome, after the restart.
+    rebuilt.record_attempt("k@example.com");
+    rebuilt.record_success("k@example.com", None, "model-a");
+    // An outcome arriving with nothing in flight counts the attempt it
+    // implies, so outcomes can never exceed attempts.
+    rebuilt.record_refusal("k@example.com");
+
+    let snapshot = &rebuilt.snapshots()[0];
+    let requests = snapshot["totalRequests"].as_i64().expect("requests");
+    let ok = snapshot["totalSuccesses"].as_i64().expect("ok");
+    let failed = snapshot["totalFailures"].as_i64().expect("failed");
+    assert_eq!(requests, 3, "two recorded attempts, one implied");
+    assert_eq!(ok, 1);
+    assert_eq!(failed, 2);
+    assert_eq!(requests, ok + failed);
+
+    // An outcome with no attempt at all counts the attempt it implies.
+    rebuilt.record_refusal("k@example.com");
+    let snapshot = &rebuilt.snapshots()[0];
+    let requests = snapshot["totalRequests"].as_i64().expect("requests");
+    let ok = snapshot["totalSuccesses"].as_i64().expect("ok");
+    let failed = snapshot["totalFailures"].as_i64().expect("failed");
+    assert_eq!(
+        requests,
+        ok + failed,
+        "{requests} requests, {ok} ok, {failed} failed"
+    );
+}
+
+/// A file written before the seam existed can hold more outcomes than
+/// attempts — the direction the first repair did not cover. An outcome
+/// implies an attempt, so the attempts rise to meet them: never the
+/// reverse, which would discard a recorded outcome.
+#[tokio::test]
+async fn load_repairs_outcomes_that_exceed_their_attempts() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let usage_file = tmp.path().join("commandcode").join("usage.json");
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    fs::create_dir_all(usage_file.parent().expect("parent")).expect("mkdir");
+    fs::write(
+        &usage_file,
+        json!({
+            "k@example.com": {
+                "total_requests": 30,
+                "total_successes": 0,
+                "total_failures": 31,
+                "days": {
+                    today.clone(): {"requests": 2, "successes": 0, "failures": 3}
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write");
+
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    let snapshot = &manager.snapshots()[0];
+
+    assert_eq!(
+        snapshot["totalRequests"], 31,
+        "attempts rise to the outcomes"
+    );
+    assert_eq!(snapshot["totalFailures"], 31, "no outcome is discarded");
+    assert_eq!(snapshot["totalSuccesses"], 0);
+    let day = &snapshot["days"][0];
+    assert_eq!(day["requests"], 3, "the bucket rises too");
+    assert_eq!(day["failures"], 3);
+}
+
+/// The repair reaches disk at load, not at the next outcome: an account
+/// that serves nothing after a restart must not leave a stale file behind
+/// a corrected panel.
+#[tokio::test]
+async fn the_repair_is_written_at_load_not_at_the_next_request() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let usage_file = tmp.path().join("commandcode").join("usage.json");
+    fs::create_dir_all(usage_file.parent().expect("parent")).expect("mkdir");
+    fs::write(
+        &usage_file,
+        json!({"k@example.com": {"total_requests": 30, "total_successes": 0, "total_failures": 31}})
+            .to_string(),
+    )
+    .expect("write");
+
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    // No request served since the restart.
+    let stored = persisted(&usage_file);
+    let entry = &stored["k@example.com"];
+    assert_eq!(
+        entry["total_requests"], 31,
+        "the file still disagrees with the panel: {entry}"
+    );
+    assert_eq!(entry["total_failures"], 31);
+}
+
+/// The invariant under two attempts in flight on one account — ordinary
+/// for an async relay, since rotation is in-flight-blind and the manager
+/// lock is released before the upstream call. A per-account flag cannot
+/// tell R2's first outcome from R1's second, so it destroyed a real
+/// success and its tokens.
+#[tokio::test]
+async fn two_attempts_in_flight_both_reach_an_outcome() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    let usage = UsageData {
+        input_tokens: 100,
+        output_tokens: 10,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        reasoning_output_tokens: 0,
+    };
+
+    manager.record_attempt("k@example.com");
+    manager.record_attempt("k@example.com");
+    manager.record_success("k@example.com", Some(&usage), "model-a");
+    manager.record_success("k@example.com", Some(&usage), "model-a");
+
+    let snapshot = &manager.snapshots()[0];
+    assert_eq!(snapshot["totalRequests"], 2);
+    assert_eq!(snapshot["totalSuccesses"], 2, "an outcome was destroyed");
+    assert_eq!(snapshot["totalFailures"], 0);
+    // The tokens and the model row of the second success must survive.
+    assert_eq!(snapshot["totalInputTokens"], 200, "billed tokens lost");
+    assert_eq!(snapshot["models"][0]["successes"], 2, "model row lost");
+}
+
+/// A reauth lockout must survive the failure its caller records
+/// afterwards: `record_refresh_exhausted` already settled that attempt
+/// with a 24-hour cooldown, and a 2-second one re-selects the account
+/// into a failure loop.
+#[tokio::test]
+async fn a_reauth_lockout_is_not_clobbered_by_the_paired_failure() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64())
+    };
+
+    manager.record_attempt("k@example.com");
+    manager.record_refresh_exhausted("k@example.com", "expired");
+    manager.record_failure("k@example.com", "auth", Some("token refresh declined"));
+
+    let snapshot = &manager.snapshots()[0];
+    let remaining = snapshot["cooldownUntil"].as_f64().unwrap_or(0.0) - now();
+    assert!(
+        remaining > 3_600.0,
+        "the 24h lockout collapsed to {remaining:.0}s"
+    );
+    assert!(
+        snapshot["lastError"]
+            .as_str()
+            .is_some_and(|e| e.contains("re-run login")),
+        "the operator's instruction was overwritten: {}",
+        snapshot["lastError"]
+    );
 }

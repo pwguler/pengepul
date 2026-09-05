@@ -62,8 +62,12 @@ _Avoid_: account list, fleet, grouping
 One 64-column box of rich CLI output. Its header is `<subject>` or `<subject> ─ <qualifier>` and never carries a colon; a qualifier must add a fact the rows do not carry. Its fact rows are `<label>  <value>` with the label column fitted to that panel; it may also carry list rows — account and model tables with their own fitted columns. The status glyph marks a state value only. Plain output is not a panel and follows a separate, byte-stable contract.
 _Avoid_: card, box, widget
 
+**Refusal**:
+A request that reached an outcome no Account is at fault for: a dialect the Provider cannot serve, a body the upstream rejected as malformed, or a client that hung up before its stream completed. It counts as a failed request so `requests` still equals `successes + failures`, but it never touches the Account's health: no Cooldown, no failure streak, no change to Rotation. Defined by its effect, not by whether the relay asked upstream first.
+_Avoid_: rejection, refused request, bad request
+
 **Usage counters**:
-The running per-account totals — requests, successes, failures, tokens in/out/cache/reasoning — broken down per model for the successes, summed relay-wide in `status` and shown per account in `accounts`, and persisted to `usage.json` in the provider's auth directory so they survive restarts and upgrades. Counters recorded before per-model attribution existed stay only in the account totals. Cooldowns and failure streaks are not persisted: a fresh process always retries.
+The running per-account totals — requests, successes, failures, tokens in/out/cache/reasoning — broken down per model for the successes and bucketed per **local calendar day**, summed relay-wide in `status`, shown per account in `accounts`, shown as a 30-day trend in `usage`, and persisted to `usage.json` in the provider's auth directory so they survive restarts and upgrades. Counters recorded before per-model attribution or daily bucketing existed stay only in the account totals. Daily buckets are kept for 90 days. Cooldowns and failure streaks are not persisted: a fresh process always retries.
 _Avoid_: stats file, metrics, telemetry
 
 ### Access and billing identity

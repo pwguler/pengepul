@@ -197,6 +197,31 @@ pub(crate) fn fact_row(fact: &Fact, column: usize) -> String {
     format!("{label}  {}", fact.value)
 }
 
+/// The eight heights a sparkline column can take. A zero day renders the
+/// shortest block, never a blank: a gap in the line would read as missing
+/// data rather than an idle day (usage-trend AC-6).
+const SPARK_BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+/// One character per value, scaled to the largest. Pure over its input:
+/// the caller decides which days and in which order.
+pub(crate) fn sparkline(values: &[i64]) -> String {
+    let peak = values.iter().copied().max().unwrap_or(0);
+    values
+        .iter()
+        .map(|value| {
+            if peak <= 0 {
+                return SPARK_BLOCKS[0];
+            }
+            // Scaled into 0..=7 by integer math, so a non-zero day never
+            // renders as the same height as an idle one unless it rounds
+            // there honestly.
+            let index = (value.max(&0) * 7).div_euclid(peak);
+            let index = usize::try_from(index).unwrap_or(0).min(7);
+            SPARK_BLOCKS[index]
+        })
+        .collect()
+}
+
 /// A panel of labelled facts: header, aligned rows, bottom rule.
 pub(crate) fn fact_panel(subject: &str, facts: &[Fact]) -> Vec<String> {
     let column = label_column(facts);
@@ -389,5 +414,31 @@ mod tests {
     #[test]
     fn paint_wraps_the_span_and_resets() {
         assert_eq!(paint("\x1b[33m", "x"), "\x1b[33mx\x1b[0m");
+    }
+}
+
+#[cfg(test)]
+mod sparkline_tests {
+    use super::sparkline;
+
+    #[test]
+    fn sparkline_scales_to_its_peak_and_never_blanks_a_zero() {
+        // A zero day is the shortest block, never a gap: a blank would
+        // read as missing data rather than an idle day.
+        assert_eq!(sparkline(&[0, 0, 0]), "▁▁▁");
+        // The peak is full height; the rest scale under it.
+        assert_eq!(sparkline(&[0, 7, 14]), "▁▄█");
+        assert_eq!(sparkline(&[100, 50, 0]), "█▄▁");
+        // One dominating value flattens the rest honestly, not to blanks.
+        assert_eq!(sparkline(&[1, 1, 1_000]), "▁▁█");
+    }
+
+    #[test]
+    fn sparkline_survives_a_corrupt_file() {
+        // Negative counters cannot come from the relay, only from a
+        // hand-edited file. They must not panic or index out of bounds.
+        assert_eq!(sparkline(&[-5, 10]), "▁█");
+        assert_eq!(sparkline(&[-5, -1]), "▁▁");
+        assert_eq!(sparkline(&[]), "");
     }
 }

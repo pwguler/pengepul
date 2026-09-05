@@ -7,12 +7,13 @@ use anyhow::Result;
 use serde_json::{Value, json};
 
 use crate::tokens::{
-    ModelUsage, PersistedUsage, load_all_tokens, load_usage, save_token, save_usage,
+    DayUsage, ModelUsage, PersistedUsage, RETENTION_DAYS, load_all_tokens, load_usage, save_token,
+    save_usage, trim_days,
 };
 use crate::types::{
     AvailableAccount, ProviderId, ProviderKind, RefreshTokenExhaustedError, TokenData, UsageData,
 };
-use crate::utils::{now_iso, sha256_hex};
+use crate::utils::{local_today, now_iso, sha256_hex};
 
 pub type RefreshFuture = Pin<Box<dyn Future<Output = Result<TokenData>> + Send>>;
 
@@ -82,6 +83,20 @@ struct AccountState {
     /// Attempts and failures are not attributed: a model is only known once
     /// the upstream served it.
     models: BTreeMap<String, ModelUsage>,
+    /// Per-local-day traffic, keyed `YYYY-MM-DD`. Sorted by construction,
+    /// which is also chronological for that format (usage-trend AC-1).
+    days: BTreeMap<String, DayUsage>,
+    /// The local day each in-flight attempt opened on, oldest first. A
+    /// list rather than a count because an outcome belongs to the bucket
+    /// its attempt opened: a request spanning local midnight would
+    /// otherwise leave one day short an outcome and the next short an
+    /// attempt, which load-time repair then turns into an invented
+    /// failure — nightly, for an operator working across midnight. A list
+    /// rather than a flag because Rotation is in-flight-blind and the
+    /// manager lock is released before the upstream call, so one Account
+    /// serves several requests at once. In-memory only: a restart begins
+    /// with nothing in flight.
+    in_flight: Vec<String>,
 }
 
 impl AccountState {
@@ -105,7 +120,82 @@ impl AccountState {
             total_cache_read_input_tokens: 0,
             total_reasoning_output_tokens: 0,
             models: BTreeMap::new(),
+            days: BTreeMap::new(),
+            in_flight: Vec::new(),
         }
+    }
+
+    /// Count one outcome, cumulative and in the bucket of the day its
+    /// attempt opened on, keeping `successes + failures <= requests` true
+    /// by construction.
+    ///
+    /// Every recorder goes through here, and the one property that holds
+    /// whatever the call sites do is:
+    ///
+    /// - **An outcome implies an attempt.** When nothing is in flight — a
+    ///   recorder fired without `record_attempt`, or a path recorded a
+    ///   second outcome — the attempt is counted too, rather than leaving
+    ///   `ok + failed > requests`, the direction load-time repair cannot
+    ///   fix.
+    ///
+    /// It does **not** refuse a second outcome: with a count rather than a
+    /// flag it cannot tell one apart from the first outcome of another
+    /// attempt in flight, which is the bug a per-account flag caused. A
+    /// path that records twice therefore inflates `requests` by one rather
+    /// than corrupting the balance. A caller that must not record twice
+    /// applies its health without an outcome instead
+    /// (`record_billing_cooldown`).
+    ///
+    fn settle(&mut self, success: bool) -> String {
+        // The oldest attempt in flight reaches its outcome, booked to the
+        // day it opened on rather than the day it finished: a request
+        // spanning local midnight would otherwise leave one bucket short
+        // an outcome and the next short an attempt.
+        let day = if self.in_flight.is_empty() {
+            // Nothing in flight: an outcome the relay recorded without an
+            // attempt, or a second outcome for one already settled. Both
+            // are answered the same way — count the attempt this outcome
+            // implies, so `ok + failed` can never exceed `requests`, the
+            // direction load-time repair cannot fix. A caller that must
+            // not record twice applies its health without an outcome
+            // instead (`record_billing_cooldown`).
+            let today = local_today();
+            self.total_requests += 1;
+            self.day(&today).requests += 1;
+            today
+        } else {
+            // Clamped to the window: an attempt that opened before the
+            // retention edge would otherwise settle into a bucket `day()`
+            // trims on touch, leaving the outcome counted cumulatively and
+            // absent from every bucket the file and the payload show.
+            let opened = self.in_flight.remove(0);
+            let cutoff = retention_cutoff();
+            if opened < cutoff { cutoff } else { opened }
+        };
+        if success {
+            self.total_successes += 1;
+            self.day(&day).successes += 1;
+        } else {
+            self.total_failures += 1;
+            self.day(&day).failures += 1;
+        }
+        day
+    }
+
+    /// One day's bucket, opened on first touch. Trims the window first,
+    /// so a long-lived process cannot serve an admin payload holding more
+    /// history than its own file (usage-trend AC-4).
+    fn day(&mut self, date: &str) -> &mut DayUsage {
+        let cutoff = retention_cutoff();
+        if self
+            .days
+            .keys()
+            .next()
+            .is_some_and(|oldest| *oldest < cutoff)
+        {
+            self.days = trim_days(&self.days, &cutoff);
+        }
+        self.days.entry(date.to_string()).or_default()
     }
 }
 
@@ -121,6 +211,7 @@ impl From<&AccountState> for PersistedUsage {
             cache_read_input_tokens: state.total_cache_read_input_tokens,
             reasoning_output_tokens: state.total_reasoning_output_tokens,
             models: state.models.clone(),
+            days: state.days.clone(),
         }
     }
 }
@@ -169,10 +260,20 @@ impl AccountManager {
     /// # Errors
     ///
     /// Returns an error when the auth directory exists but cannot be read.
+    /// Read every token from the auth dir, merge persisted usage, and
+    /// repair any attempt/outcome gap the files carry. The repair is
+    /// written back immediately: an account that serves nothing after a
+    /// restart would otherwise keep a stale file behind a correct panel.
     pub fn load(&mut self) -> Result<()> {
         self.persisted_usage = load_usage(&self.auth_dir, &self.provider);
         for token in load_all_tokens(&self.auth_dir, Some(&self.provider))? {
             self.upsert_loaded_token(token);
+        }
+        // Write the repair back now. An account that serves nothing after
+        // a restart would otherwise leave a stale file behind a correct
+        // panel, and the two would disagree until its next request.
+        if !self.accounts.is_empty() {
+            self.persist_usage();
         }
         Ok(())
     }
@@ -293,7 +394,7 @@ impl AccountManager {
         state.last_error = None;
         state.last_failure_at = None;
         state.last_success_at = Some(now_iso());
-        state.total_successes += 1;
+        let day = state.settle(true);
         // Keyed by the upstream model name: what the provider billed, not
         // what the client happened to ask for. A success with no usage
         // block (count-tokens, or a 2xx whose usage will not parse) still
@@ -307,13 +408,46 @@ impl AccountManager {
             state.total_cache_creation_input_tokens += usage.cache_creation_input_tokens;
             state.total_cache_read_input_tokens += usage.cache_read_input_tokens;
             state.total_reasoning_output_tokens += usage.reasoning_output_tokens;
+            state.day(&day).add_tokens(usage);
         }
+        self.persist_usage();
+    }
+
+    /// An attempt the relay refused before reaching upstream — a dialect
+    /// this Provider cannot serve. It counts as a failed request so the
+    /// panels reconcile, but it is not the Account's fault: no cooldown,
+    /// no failure streak, nothing that would take it out of Rotation.
+    pub fn record_refusal(&mut self, email: &str) {
+        if let Some(state) = self.accounts.get_mut(email) {
+            let _ = state.settle(false);
+        }
+        // Like every other outcome: the attempt was already persisted, so
+        // a refusal held only in memory would resurface as a permanent
+        // gap after a restart.
+        self.persist_usage();
+    }
+
+    /// Apply the billing cooldown and its failure streak to an account
+    /// whose request already reached an outcome. Counts no new outcome:
+    /// `requests` must keep equalling `successes + failures`.
+    pub fn record_billing_cooldown(&mut self, email: &str, detail: &str) {
+        let Some(state) = self.accounts.get_mut(email) else {
+            return;
+        };
+        state.failure_count += 1;
+        state.last_failure_kind = Some("billing".to_string());
+        state.last_failure_at = Some(now_iso());
+        state.last_error = Some(format!("billing: {detail}"));
+        state.cooldown_until = unix_now() + BILLING_COOLDOWN_SECONDS;
         self.persist_usage();
     }
 
     pub fn record_attempt(&mut self, email: &str) {
         if let Some(state) = self.accounts.get_mut(email) {
+            let today = local_today();
             state.total_requests += 1;
+            state.day(&today).requests += 1;
+            state.in_flight.push(today);
             self.persist_usage();
         }
     }
@@ -323,18 +457,24 @@ impl AccountManager {
             return;
         };
         state.failure_count += 1;
-        state.total_failures += 1;
-        state.last_failure_kind = Some(kind.to_string());
+        let _ = state.settle(false);
         state.last_failure_at = Some(now_iso());
-        state.last_error =
-            Some(detail.map_or_else(|| kind.to_string(), |detail| format!("{kind}: {detail}")));
         let (base, maximum) = if kind == "billing" {
             (BILLING_COOLDOWN_SECONDS, BILLING_COOLDOWN_SECONDS)
         } else {
             FAILURE_BACKOFF
         };
         let multiplier = 2_f64.powi(i32::try_from(state.failure_count - 1).unwrap_or(0));
-        state.cooldown_until = unix_now() + (base * multiplier).min(maximum);
+        let cooldown = unix_now() + (base * multiplier).min(maximum);
+        // A cooldown only ever grows. A reauth lockout is 24 hours; a
+        // failure recorded after it must not collapse the account back to
+        // seconds and re-select it into a failure loop.
+        if cooldown > state.cooldown_until {
+            state.cooldown_until = cooldown;
+            state.last_failure_kind = Some(kind.to_string());
+            state.last_error =
+                Some(detail.map_or_else(|| kind.to_string(), |detail| format!("{kind}: {detail}")));
+        }
         self.persist_usage();
     }
 
@@ -343,7 +483,7 @@ impl AccountManager {
             return;
         };
         state.failure_count += 1;
-        state.total_failures += 1;
+        let _ = state.settle(false);
         state.last_failure_kind = Some("auth".to_string());
         state.last_failure_at = Some(now_iso());
         state.last_error = Some(format!(
@@ -356,6 +496,10 @@ impl AccountManager {
 
     #[must_use]
     pub fn snapshots(&self) -> Vec<Value> {
+        // The window bounds what is served, not only what is written: a
+        // process idle since the window moved would otherwise carry
+        // buckets its own file no longer holds.
+        let cutoff = retention_cutoff();
         let now = unix_now();
         self.accounts
             .values()
@@ -386,6 +530,17 @@ impl AccountManager {
                         "cacheCreationInputTokens": usage.cache_creation_input_tokens,
                         "cacheReadInputTokens": usage.cache_read_input_tokens,
                         "reasoningOutputTokens": usage.reasoning_output_tokens
+                    })).collect::<Vec<_>>(),
+                    "days": state.days.iter().filter(|(date, _)| **date >= cutoff).map(|(date, day)| json!({
+                        "date": date,
+                        "requests": day.requests,
+                        "successes": day.successes,
+                        "failures": day.failures,
+                        "inputTokens": day.input_tokens,
+                        "outputTokens": day.output_tokens,
+                        "cacheCreationInputTokens": day.cache_creation_input_tokens,
+                        "cacheReadInputTokens": day.cache_read_input_tokens,
+                        "reasoningOutputTokens": day.reasoning_output_tokens
                     })).collect::<Vec<_>>(),
                     "expiresAt": state.token.expires_at,
                     "refreshing": false,
@@ -483,10 +638,17 @@ impl AccountManager {
     fn persist_usage(&self) {
         // Only loaded accounts are written: entries in the file for
         // unknown emails are dropped rather than carried forever.
+        // One cutoff for the whole write, so every account's window ends on
+        // the same day (usage-trend AC-4).
+        let cutoff = retention_cutoff();
         let usage: BTreeMap<String, PersistedUsage> = self
             .accounts
             .iter()
-            .map(|(email, state)| (email.clone(), PersistedUsage::from(state)))
+            .map(|(email, state)| {
+                let mut persisted = PersistedUsage::from(state);
+                persisted.days = trim_days(&persisted.days, &cutoff);
+                (email.clone(), persisted)
+            })
             .collect();
         // Write failures are swallowed: losing an increment of
         // observability must never fail the request that produced it.
@@ -512,6 +674,8 @@ impl AccountManager {
                 state.total_cache_read_input_tokens = usage.cache_read_input_tokens;
                 state.total_reasoning_output_tokens = usage.reasoning_output_tokens;
                 state.models = usage.models.clone();
+                state.days = usage.days.clone();
+                reconcile_loaded_counters(&mut state);
             }
             self.order.push(email.clone());
             self.accounts.insert(email, state);
@@ -539,4 +703,177 @@ fn unix_now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |duration| duration.as_secs_f64())
+}
+
+/// Close any attempt/outcome gap a file carries, in either direction. At
+/// load nothing is in flight, so both gaps are knowable: an attempt with
+/// no outcome did not succeed, so it failed; an outcome with no attempt
+/// implies the attempt that produced it. Successes are never rewritten
+/// and no recorded outcome is discarded (ARCHITECTURE, "Every attempt
+/// reaches its outcome").
+fn reconcile_loaded_counters(state: &mut AccountState) {
+    let outcomes = state.total_successes + state.total_failures;
+    if state.total_requests > outcomes {
+        // Attempts with no outcome: they did not succeed, so they failed.
+        state.total_failures += state.total_requests - outcomes;
+    } else if outcomes > state.total_requests {
+        // Outcomes with no attempt, written before the seam existed. An
+        // outcome implies an attempt, so the attempts rise to meet them —
+        // never the reverse, which would discard a recorded outcome.
+        state.total_requests = outcomes;
+    }
+    for day in state.days.values_mut() {
+        let outcomes = day.successes + day.failures;
+        if day.requests > outcomes {
+            day.failures += day.requests - outcomes;
+        } else if outcomes > day.requests {
+            day.requests = outcomes;
+        }
+    }
+    // A loaded account has nothing in flight: whatever it was doing when
+    // the process died is over.
+    state.in_flight.clear();
+}
+
+/// The oldest local day a write keeps: today minus the retention window.
+/// The clock reach lives here, at the edge that writes the file; the trim
+/// itself is pure over this value (usage-trend AC-4).
+fn retention_cutoff() -> String {
+    (chrono::Local::now() - chrono::Duration::days(RETENTION_DAYS - 1))
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+#[cfg(test)]
+mod settle_tests {
+    use super::{AccountState, DayUsage};
+    use crate::types::{ProviderId, TokenData};
+
+    fn state() -> AccountState {
+        AccountState::new(TokenData {
+            access_token: "a".to_string(),
+            refresh_token: String::new(),
+            email: "k@example.com".to_string(),
+            expires_at: "2030-01-01T00:00:00Z".to_string(),
+            account_uuid: "acct".to_string(),
+            provider: ProviderId::generic("commandcode"),
+            id_token: None,
+            last_refresh_at: None,
+            plan_type: None,
+        })
+    }
+
+    fn bucket(state: &AccountState, date: &str) -> DayUsage {
+        state.days.get(date).cloned().unwrap_or_default()
+    }
+
+    /// An outcome whose attempt opened before the retention window must
+    /// still land in a bucket that survives. Otherwise `day()` trims the
+    /// stale key, re-opens it empty, writes the outcome into it, and both
+    /// `persist_usage` and `snapshots` then filter it out — the outcome
+    /// is counted cumulatively and missing from every bucket.
+    #[test]
+    fn an_outcome_settling_past_the_window_still_lands_in_a_kept_bucket() {
+        let opened_long_ago = day_offset(-200);
+        let mut state = state();
+        state.total_requests += 1;
+        state.in_flight.push(opened_long_ago);
+        // A live bucket, so `day()` actually trims when the stale one is
+        // touched.
+        state.day(&day_offset(0)).requests += 0;
+
+        let settled_on = state.settle(true);
+
+        assert!(
+            settled_on >= super::retention_cutoff(),
+            "settled into a bucket outside the window: {settled_on}"
+        );
+        assert!(
+            state.days.contains_key(&settled_on),
+            "the bucket was dropped after the outcome was written"
+        );
+        assert_eq!(bucket(&state, &settled_on).successes, 1);
+        let visible: i64 = state
+            .days
+            .iter()
+            .filter(|(date, _)| **date >= super::retention_cutoff())
+            .map(|(_, day)| day.successes)
+            .sum();
+        assert_eq!(visible, 1, "the outcome is missing from every bucket");
+    }
+
+    /// A local date `offset` days from today, as the store keys them.
+    fn day_offset(offset: i64) -> String {
+        (chrono::Local::now() + chrono::Duration::days(offset))
+            .format("%Y-%m-%d")
+            .to_string()
+    }
+
+    /// An outcome is booked to the day its attempt opened on, not the day
+    /// it finished. A request spanning local midnight would otherwise
+    /// leave one bucket short an outcome and the next short an attempt,
+    /// which load-time repair turns into an invented failure — nightly,
+    /// for an operator working across midnight.
+    #[test]
+    fn an_outcome_settles_in_the_day_its_attempt_opened() {
+        // Dates from the clock, not literals: a fixed date eventually
+        // falls outside the retention window, `day()` trims the bucket it
+        // just wrote, and the suite goes red with no code change.
+        let opened_on = day_offset(-1);
+        let today = day_offset(0);
+        let mut state = state();
+        // An attempt that opened yesterday, still in flight at midnight.
+        state.total_requests += 1;
+        state.day(&opened_on).requests += 1;
+        state.in_flight.push(opened_on.clone());
+
+        // Its outcome arrives after the date has rolled over.
+        let settled_on = state.settle(true);
+
+        assert_eq!(settled_on, opened_on, "the outcome left its attempt");
+        assert!(
+            state.days.contains_key(&opened_on),
+            "the bucket was dropped"
+        );
+        let opened = bucket(&state, &opened_on);
+        assert_eq!(opened.requests, 1);
+        assert_eq!(opened.successes, 1, "the bucket is unbalanced");
+        // And nothing was booked to the new day.
+        assert!(
+            !state.days.contains_key(&today) || bucket(&state, &today).successes == 0,
+            "the outcome leaked into the new day"
+        );
+    }
+
+    /// Attempts settle oldest-first, so two in flight across a midnight
+    /// each keep their own day.
+    #[test]
+    fn two_attempts_across_midnight_keep_their_own_days() {
+        let (first, second) = (day_offset(-1), day_offset(0));
+        let mut state = state();
+        for date in [&first, &second] {
+            state.total_requests += 1;
+            state.day(date).requests += 1;
+            state.in_flight.push(date.clone());
+        }
+
+        assert_eq!(state.settle(true), first);
+        assert_eq!(state.settle(false), second);
+
+        for date in [&first, &second] {
+            assert!(state.days.contains_key(date), "bucket {date} was dropped");
+        }
+        assert_eq!(bucket(&state, &first).successes, 1);
+        assert_eq!(bucket(&state, &first).failures, 0);
+        assert_eq!(bucket(&state, &second).successes, 0);
+        assert_eq!(bucket(&state, &second).failures, 1);
+        for date in [&first, &second] {
+            let day = bucket(&state, date);
+            assert_eq!(
+                day.requests,
+                day.successes + day.failures,
+                "bucket {date} is unbalanced"
+            );
+        }
+    }
 }
