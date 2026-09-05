@@ -488,3 +488,135 @@ async fn a_corrupt_models_block_loads_as_no_attribution() {
     assert_eq!(snapshot["totalRequests"], 5);
     assert_eq!(snapshot["models"].as_array().expect("array").len(), 0);
 }
+
+/// usage-trend AC-1/AC-2: outcomes land in a bucket keyed by the local
+/// calendar day, carrying the same eight counters as the cumulative
+/// record. Two outcomes on one day accumulate into one bucket.
+#[tokio::test]
+async fn outcomes_accumulate_into_one_bucket_per_local_day() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+
+    manager.record_attempt("k@example.com");
+    manager.record_success(
+        "k@example.com",
+        Some(&UsageData {
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_creation_input_tokens: 1,
+            cache_read_input_tokens: 2,
+            reasoning_output_tokens: 3,
+        }),
+        "claude-fable-5-1",
+    );
+    manager.record_attempt("k@example.com");
+    manager.record_success(
+        "k@example.com",
+        Some(&UsageData {
+            input_tokens: 100,
+            output_tokens: 200,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            reasoning_output_tokens: 0,
+        }),
+        "claude-fable-5-1",
+    );
+    manager.record_attempt("k@example.com");
+    manager.record_failure("k@example.com", "upstream", Some("boom"));
+
+    let days = manager.snapshots()[0]["days"].clone();
+    let days = days.as_array().expect("days array");
+    // AC-1: one bucket, not one per outcome.
+    assert_eq!(days.len(), 1, "one bucket per day: {days:?}");
+    let today = &days[0];
+    // AC-2: the same eight counters as the cumulative record.
+    assert_eq!(today["requests"], 3);
+    assert_eq!(today["successes"], 2);
+    assert_eq!(today["failures"], 1);
+    assert_eq!(today["inputTokens"], 110);
+    assert_eq!(today["outputTokens"], 220);
+    assert_eq!(today["cacheCreationInputTokens"], 1);
+    assert_eq!(today["cacheReadInputTokens"], 2);
+    assert_eq!(today["reasoningOutputTokens"], 3);
+    // The key is a local calendar date.
+    let date = today["date"].as_str().expect("date string");
+    assert_eq!(date.len(), 10, "YYYY-MM-DD: {date}");
+    assert_eq!(date, chrono::Local::now().format("%Y-%m-%d").to_string());
+}
+
+/// usage-trend AC-3/AC-4: buckets persist and reload, a file written
+/// before this change loads with none, and buckets past the 90-day
+/// window are dropped on write.
+#[tokio::test]
+async fn daily_buckets_persist_and_are_trimmed_to_the_window() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let usage_file = tmp.path().join("commandcode").join("usage.json");
+
+    // AC-3: a bucket survives a manager rebuild.
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    manager.record_attempt("k@example.com");
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let stored = persisted(&usage_file);
+    assert_eq!(stored["k@example.com"]["days"][&today]["requests"], 1);
+
+    let mut rebuilt = never_refresh_manager(tmp.path().to_path_buf());
+    rebuilt.load().expect("reload");
+    let days = rebuilt.snapshots()[0]["days"].clone();
+    assert_eq!(days.as_array().expect("array").len(), 1);
+    assert_eq!(days[0]["date"], today);
+    assert_eq!(days[0]["requests"], 1);
+
+    // AC-4: a file holding an ancient bucket and a recent one keeps only
+    // what falls inside the window, once a write happens.
+    let stale = (chrono::Local::now() - chrono::Duration::days(120))
+        .format("%Y-%m-%d")
+        .to_string();
+    let recent = (chrono::Local::now() - chrono::Duration::days(10))
+        .format("%Y-%m-%d")
+        .to_string();
+    fs::write(
+        &usage_file,
+        json!({
+            "k@example.com": {
+                "total_requests": 9,
+                "days": {
+                    stale.clone(): {"requests": 5, "input_tokens": 500},
+                    recent.clone(): {"requests": 3, "input_tokens": 300}
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write");
+
+    let mut trimmed = never_refresh_manager(tmp.path().to_path_buf());
+    trimmed.load().expect("load");
+    // Both load; the window is applied when the file is next written.
+    trimmed.record_attempt("k@example.com");
+    let stored = persisted(&usage_file);
+    let days = stored["k@example.com"]["days"]
+        .as_object()
+        .expect("days map");
+    assert!(!days.contains_key(&stale), "stale bucket kept: {days:?}");
+    assert!(
+        days.contains_key(&recent),
+        "recent bucket dropped: {days:?}"
+    );
+    assert_eq!(days[&recent]["requests"], 3);
+
+    // AC-3 second half: a file with no `days` key loads with none.
+    fs::write(
+        &usage_file,
+        json!({"k@example.com": {"total_requests": 7, "total_successes": 7}}).to_string(),
+    )
+    .expect("write legacy");
+    let mut legacy = never_refresh_manager(tmp.path().to_path_buf());
+    legacy.load().expect("load legacy");
+    let snapshot = &legacy.snapshots()[0];
+    assert_eq!(snapshot["totalRequests"], 7);
+    assert_eq!(snapshot["days"].as_array().expect("array").len(), 0);
+}

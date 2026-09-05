@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use chrono::{SecondsFormat, Utc};
+use chrono::{Local, SecondsFormat, Utc};
 use rand::RngCore;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -12,6 +12,14 @@ use crate::types::PkceCodes;
 #[must_use]
 pub fn now_iso() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+/// Today's date in the host's timezone, `YYYY-MM-DD`. Usage buckets key on
+/// the **local** day, not the UTC one: an operator working late would
+/// otherwise have one evening split across two days (usage-trend).
+#[must_use]
+pub fn local_today() -> String {
+    Local::now().format("%Y-%m-%d").to_string()
 }
 
 #[must_use]

@@ -7,12 +7,13 @@ use anyhow::Result;
 use serde_json::{Value, json};
 
 use crate::tokens::{
-    ModelUsage, PersistedUsage, load_all_tokens, load_usage, save_token, save_usage,
+    DayUsage, ModelUsage, PersistedUsage, RETENTION_DAYS, load_all_tokens, load_usage, save_token,
+    save_usage, trim_days,
 };
 use crate::types::{
     AvailableAccount, ProviderId, ProviderKind, RefreshTokenExhaustedError, TokenData, UsageData,
 };
-use crate::utils::{now_iso, sha256_hex};
+use crate::utils::{local_today, now_iso, sha256_hex};
 
 pub type RefreshFuture = Pin<Box<dyn Future<Output = Result<TokenData>> + Send>>;
 
@@ -82,6 +83,9 @@ struct AccountState {
     /// Attempts and failures are not attributed: a model is only known once
     /// the upstream served it.
     models: BTreeMap<String, ModelUsage>,
+    /// Per-local-day traffic, keyed `YYYY-MM-DD`. Sorted by construction,
+    /// which is also chronological for that format (usage-trend AC-1).
+    days: BTreeMap<String, DayUsage>,
 }
 
 impl AccountState {
@@ -105,7 +109,13 @@ impl AccountState {
             total_cache_read_input_tokens: 0,
             total_reasoning_output_tokens: 0,
             models: BTreeMap::new(),
+            days: BTreeMap::new(),
         }
+    }
+
+    /// Today's bucket, opened on first touch.
+    fn today(&mut self) -> &mut DayUsage {
+        self.days.entry(local_today()).or_default()
     }
 }
 
@@ -121,6 +131,7 @@ impl From<&AccountState> for PersistedUsage {
             cache_read_input_tokens: state.total_cache_read_input_tokens,
             reasoning_output_tokens: state.total_reasoning_output_tokens,
             models: state.models.clone(),
+            days: state.days.clone(),
         }
     }
 }
@@ -308,12 +319,19 @@ impl AccountManager {
             state.total_cache_read_input_tokens += usage.cache_read_input_tokens;
             state.total_reasoning_output_tokens += usage.reasoning_output_tokens;
         }
+        // The same outcome, bucketed by local day (usage-trend AC-1).
+        let today = state.today();
+        today.successes += 1;
+        if let Some(usage) = usage {
+            today.add_tokens(usage);
+        }
         self.persist_usage();
     }
 
     pub fn record_attempt(&mut self, email: &str) {
         if let Some(state) = self.accounts.get_mut(email) {
             state.total_requests += 1;
+            state.today().requests += 1;
             self.persist_usage();
         }
     }
@@ -324,6 +342,7 @@ impl AccountManager {
         };
         state.failure_count += 1;
         state.total_failures += 1;
+        state.today().failures += 1;
         state.last_failure_kind = Some(kind.to_string());
         state.last_failure_at = Some(now_iso());
         state.last_error =
@@ -386,6 +405,17 @@ impl AccountManager {
                         "cacheCreationInputTokens": usage.cache_creation_input_tokens,
                         "cacheReadInputTokens": usage.cache_read_input_tokens,
                         "reasoningOutputTokens": usage.reasoning_output_tokens
+                    })).collect::<Vec<_>>(),
+                    "days": state.days.iter().map(|(date, day)| json!({
+                        "date": date,
+                        "requests": day.requests,
+                        "successes": day.successes,
+                        "failures": day.failures,
+                        "inputTokens": day.input_tokens,
+                        "outputTokens": day.output_tokens,
+                        "cacheCreationInputTokens": day.cache_creation_input_tokens,
+                        "cacheReadInputTokens": day.cache_read_input_tokens,
+                        "reasoningOutputTokens": day.reasoning_output_tokens
                     })).collect::<Vec<_>>(),
                     "expiresAt": state.token.expires_at,
                     "refreshing": false,
@@ -483,10 +513,17 @@ impl AccountManager {
     fn persist_usage(&self) {
         // Only loaded accounts are written: entries in the file for
         // unknown emails are dropped rather than carried forever.
+        // One cutoff for the whole write, so every account's window ends on
+        // the same day (usage-trend AC-4).
+        let cutoff = retention_cutoff();
         let usage: BTreeMap<String, PersistedUsage> = self
             .accounts
             .iter()
-            .map(|(email, state)| (email.clone(), PersistedUsage::from(state)))
+            .map(|(email, state)| {
+                let mut persisted = PersistedUsage::from(state);
+                persisted.days = trim_days(&persisted.days, &cutoff);
+                (email.clone(), persisted)
+            })
             .collect();
         // Write failures are swallowed: losing an increment of
         // observability must never fail the request that produced it.
@@ -512,6 +549,7 @@ impl AccountManager {
                 state.total_cache_read_input_tokens = usage.cache_read_input_tokens;
                 state.total_reasoning_output_tokens = usage.reasoning_output_tokens;
                 state.models = usage.models.clone();
+                state.days = usage.days.clone();
             }
             self.order.push(email.clone());
             self.accounts.insert(email, state);
@@ -539,4 +577,13 @@ fn unix_now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |duration| duration.as_secs_f64())
+}
+
+/// The oldest local day a write keeps: today minus the retention window.
+/// The clock reach lives here, at the edge that writes the file; the trim
+/// itself is pure over this value (usage-trend AC-4).
+fn retention_cutoff() -> String {
+    (chrono::Local::now() - chrono::Duration::days(RETENTION_DAYS - 1))
+        .format("%Y-%m-%d")
+        .to_string()
 }
