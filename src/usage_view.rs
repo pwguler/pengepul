@@ -115,29 +115,6 @@ pub(crate) fn print_accounts(payload: &Value, output: &mut Output, now: f64) {
                 ));
             }
         }
-        let pool_models = pool_model_rows(accounts);
-        if !pool_models.is_empty() {
-            output.line("  by model");
-            for row in pool_models {
-                output.line(&format!(
-                    "    {} {} ok {}",
-                    row.name,
-                    format_exact(row.successes),
-                    format_count(row.tokens())
-                ));
-                output.line(&format!(
-                    "      in {} out {} cache {}{}",
-                    format_count(row.input),
-                    format_count(row.output),
-                    format_count(row.cache),
-                    if row.reasoning == 0 {
-                        String::new()
-                    } else {
-                        format!(" reasoning {}", format_count(row.reasoning))
-                    }
-                ));
-            }
-        }
     }
 }
 
@@ -307,49 +284,6 @@ pub(crate) fn model_rows(account: &Value) -> Vec<ModelRow> {
 }
 
 /// Every account's models folded into one list for the pool footer.
-/// Every account's models folded into one list for the pool footer —
-/// empty unless more than one account contributed. With a single
-/// contributor the aggregate repeats that account's own list verbatim, so
-/// the section earns nothing and the caller omits it.
-pub(crate) fn pool_model_rows(accounts: &[Value]) -> Vec<ModelRow> {
-    let mut merged: std::collections::BTreeMap<String, ModelRow> =
-        std::collections::BTreeMap::new();
-    let mut contributors = 0;
-    for account in accounts {
-        let rows = model_rows(account);
-        if rows.is_empty() {
-            continue;
-        }
-        contributors += 1;
-        for row in rows {
-            let entry = merged.entry(row.name.clone()).or_insert_with(|| ModelRow {
-                name: row.name.clone(),
-                successes: 0,
-                input: 0,
-                output: 0,
-                cache: 0,
-                reasoning: 0,
-            });
-            entry.successes += row.successes;
-            entry.input += row.input;
-            entry.output += row.output;
-            entry.cache += row.cache;
-            entry.reasoning += row.reasoning;
-        }
-    }
-    if contributors < 2 {
-        return Vec::new();
-    }
-    let mut rows: Vec<ModelRow> = merged.into_values().collect();
-    rows.sort_by(|left, right| {
-        right
-            .tokens()
-            .cmp(&left.tokens())
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    rows
-}
-
 /// The rich pool view behind `accounts`: one panel per provider with rows,
 /// per-account token lines and a footer rollup. Pure over the payload and
 /// the clock value handed to it: the renderer reads no clock.
@@ -400,16 +334,6 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64) {
         }
 
         output.line(&format!("├{}┤", "─".repeat(INNER_WIDTH + 2)));
-        // AC-6: the same breakdown, summed across the pool.
-        let pool_models = pool_model_rows(accounts);
-        if !pool_models.is_empty() {
-            output.line(&panel_row(&paint(DIM, "by model")));
-            for row in pool_models {
-                output.line(&panel_row(&row.headline()));
-                output.line(&panel_row(&paint(DIM, &format!("  {}", row.detail()))));
-            }
-            output.line(&format!("├{}┤", "─".repeat(INNER_WIDTH + 2)));
-        }
         for line in footer_lines(&totals) {
             output.line(&panel_row(&line));
         }

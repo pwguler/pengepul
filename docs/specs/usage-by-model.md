@@ -20,6 +20,8 @@ model at accounting time but throws it away.
   call sites do not all carry a model. Per-model counters count
   **successes and their tokens** only; the account-level
   `requests/ok/failed` lines stay the source of truth for attempts.
+- **No pool-level model aggregate.** Models are shown under the account
+  that served them, once.
 - **No backfill.** Counters accumulated before this change have no model
   attribution and stay only in the account totals (user's choice:
   "diamkan saja"). Per-model lines therefore may sum to less than the
@@ -55,10 +57,8 @@ model at accounting time but throws it away.
   model per two lines: `<model>  <n> ok  <total>` then indented
   `in X  out Y  cache Z`, sorted by total tokens descending, ties broken
   by name. Accounts with no per-model history print no model lines.
-- AC-6: The same pool panel gains a `by model` section in its footer,
-  aggregating every account in that pool, in the same two-line shape and
-  the same sort order. **Revised:** the section prints only when more
-  than one account contributed model usage — see Revisions.
+- AC-6: **Withdrawn.** The pool footer carries no `by model` aggregate —
+  see Revisions. The per-account lines are the only breakdown.
 - AC-7: `Style::Plain` `accounts` carries the same information in plain
   form, indented under the account and under a `by model` heading in the
   pool footer.
@@ -79,13 +79,14 @@ model at accounting time but throws it away.
   aggregated per pool. The pool aggregate is derived in the renderer by
   summing the accounts' maps, so the payload keeps a single source of
   truth.
-- **AC-6 narrowed after seeing it live:** with one contributing account
-  the `by model` section repeats that account's own lines verbatim (the
-  live `anthropic` pool showed `claude-opus-5  2 ok  330.4K` twice in one
-  panel). The section now prints only when **two or more accounts**
-  contributed model usage. The test is the count of contributors, not of
-  accounts, so a pool like `commandcode` — two accounts, one of them with
-  no successful request — also omits it.
+- **AC-6 narrowed, then withdrawn.** First attempt: aggregate in every
+  pool footer. Seen live, with one contributing account it repeated that
+  account's own lines verbatim (`claude-opus-5  2 ok  330.4K` twice in
+  one panel), so it was gated on two or more contributors. The user then
+  asked for it to go entirely ("by modelnya ga usah"): a pool aggregate
+  is a sum of lines already on screen, and `status` already carries the
+  pool-level totals. Models now appear once, under the account that
+  served them. `pool_model_rows` is gone with it.
 
 ## Verification
 

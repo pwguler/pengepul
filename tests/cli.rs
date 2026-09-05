@@ -1556,21 +1556,20 @@ fn accounts_breaks_usage_down_per_model_on_a_tty() {
     assert!(lines[fable + 1].contains("out 400"));
     assert!(lines[fable + 1].contains("cache 8.5K"));
 
-    // AC-6: the pool footer aggregates every account's models.
-    let by_model = lines
-        .iter()
-        .position(|l| l.contains("by model"))
-        .expect("by model section");
-    let footer_fable = lines[by_model..]
-        .iter()
-        .position(|l| l.contains("claude-fable-5-1"))
-        .expect("aggregated fable");
-    // 612 + 3 successes across the two accounts.
+    // AC-6 (revised): the pool footer carries no model aggregate; the
+    // per-account lines are the only breakdown.
     assert!(
-        lines[by_model + footer_fable].contains("615 ok"),
-        "aggregate: {}",
-        lines[by_model + footer_fable]
+        !visible.contains("by model"),
+        "aggregate removed: {visible}"
     );
+    // Each model appears once per account that served it, never summed:
+    // fable ran on both accounts, so twice — not a third aggregated line.
+    assert_eq!(
+        visible.matches("claude-fable-5-1").count(),
+        2,
+        "one line per serving account: {visible}"
+    );
+    assert!(!visible.contains("615 ok"), "no summed count: {visible}");
 
     // AC-8: nothing escapes the panel width.
     for line in &lines {
@@ -1634,7 +1633,8 @@ fn accounts_lists_models_in_plain_output() {
     assert!(outcome.stdout.contains("claude-fable-5-1"));
     assert!(outcome.stdout.contains("10 ok"));
     assert!(outcome.stdout.contains("in 300 out 400 cache 500"));
-    assert!(outcome.stdout.contains("by model"));
+    // AC-6 (revised): no pool aggregate in plain either.
+    assert!(!outcome.stdout.contains("by model"));
 }
 
 /// usage-by-model AC-5: an account with no per-model history prints no
@@ -1671,80 +1671,4 @@ fn accounts_without_model_history_print_no_model_lines() {
     assert!(!visible.contains("untracked"));
     // The account totals still show.
     assert!(visible.contains("898 ok"));
-}
-
-/// usage-by-model AC-6 (revised): with a single contributing account the
-/// pool aggregate repeats that account's own lines verbatim, so the
-/// section is suppressed — including when a pool has several accounts but
-/// only one of them ever served a model.
-#[test]
-fn accounts_omits_the_by_model_section_for_a_single_contributor() {
-    let tmp = tempdir().expect("tempdir");
-    write_config(tmp.path(), "127.0.0.1", 8317);
-    let models = json!([{
-        "model": "claude-fable-5-1",
-        "successes": 12,
-        "inputTokens": 300,
-        "outputTokens": 400,
-        "cacheCreationInputTokens": 0,
-        "cacheReadInputTokens": 500,
-        "reasoningOutputTokens": 0
-    }]);
-    let mut runtime = FakeRuntime {
-        rich: true,
-        accounts_payload: Some(json!({
-            // One account: the aggregate would duplicate it.
-            "anthropic_like": {},
-            "providers": {
-                "anthropic": {
-                    "account_count": 1,
-                    "accounts": [account(json!({
-                        "email": "a@x.com",
-                        "available": true,
-                        "totalSuccesses": 12,
-                        "models": models
-                    }))]
-                },
-                // Two accounts, but only one ever served a model — the
-                // aggregate would still just repeat that one.
-                "commandcode": {
-                    "account_count": 2,
-                    "accounts": [
-                        account(json!({
-                            "email": "k1",
-                            "available": true,
-                            "totalSuccesses": 12,
-                            "models": models
-                        })),
-                        account(json!({
-                            "email": "k2",
-                            "available": true,
-                            "totalSuccesses": 0,
-                            "models": []
-                        }))
-                    ]
-                }
-            }
-        })),
-        ..FakeRuntime::default()
-    };
-
-    let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
-
-    assert_eq!(outcome.code, 0);
-    let visible = strip_ansi(&outcome.stdout);
-    assert!(
-        !visible.contains("by model"),
-        "duplicated section: {visible}"
-    );
-    // The per-account breakdown itself stays.
-    assert_eq!(
-        visible.matches("claude-fable-5-1").count(),
-        2,
-        "one line per contributing account, no aggregate: {visible}"
-    );
-
-    // Plain carries the same rule.
-    let plain = run(&["accounts"], tmp.path(), &mut runtime);
-    assert!(!plain.stdout.contains("by model"));
 }
