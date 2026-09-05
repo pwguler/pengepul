@@ -85,14 +85,14 @@ pub(crate) const INNER_WIDTH: usize = PANEL_WIDTH - 4;
 /// One `│ … │` row. The colored content is kept verbatim; only its *visible*
 /// width is measured, and tail padding is added after it, so escape bytes
 /// never fool the geometry. A row whose visible text overruns the fixed
-/// width degrades to uncolored, clipped text — box integrity wins over
-/// content, and the renderer's own columns never overrun.
+/// width degrades to uncolored text clipped with an ellipsis — box
+/// integrity wins over content, but the clip is always *marked*: a
+/// silently cut path or url reads as a real one that does not exist.
 pub(crate) fn panel_row(content: &str) -> String {
     let plain = strip_ansi(content);
     let visible = plain.chars().count();
     if visible > INNER_WIDTH {
-        let clipped: String = plain.chars().take(INNER_WIDTH).collect();
-        format!("│ {clipped} │")
+        format!("│ {} │", pad(&plain, INNER_WIDTH))
     } else {
         let tail = " ".repeat(INNER_WIDTH - visible);
         format!("│ {content}{tail} │")
@@ -237,8 +237,13 @@ pub(crate) fn paint(color: &str, text: &str) -> String {
 }
 
 /// Clamp to exactly `width` display columns: spaces pad short text and an
-/// ellipsis replaces the last visible character of long text.
+/// ellipsis replaces the last visible character of long text. A zero
+/// width yields the empty string rather than underflowing — the guard
+/// lives here, at the seam, not in every caller.
 pub(crate) fn pad(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
     let characters: Vec<char> = text.chars().collect();
     if characters.len() > width {
         let mut clipped: String = characters[..width - 1].iter().collect();

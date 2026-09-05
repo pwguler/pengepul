@@ -54,10 +54,10 @@ in files.
   that turns the platform tool's status text into panel rows.
 - **Render** (`render.rs`) — the panel language every verb prints with: the
   64-column box, the `Fact` row (`<label>  <value>`) and `fact_panel` that
-  every rich surface is built from, the three-color palette, glyphs, number
-  formats, and the `Style` (rich on a color TTY, plain otherwise) that
-  `main.rs` decides once at the edge. Knows nothing of Pools, Accounts, or
-  the admin payload.
+  every rich *fact* surface is built from, the three-color palette, glyphs,
+  number formats, and the `Style` (rich on a color TTY, plain otherwise)
+  that `main.rs` decides once at the edge. Knows nothing of Pools,
+  Accounts, or the admin payload.
 - **Usage view** (`usage_view.rs`) — the admin payload turned into the relay
   total block for `status` (one block: pool summary lines and the relay-wide
   aggregate) and pool panels with account rows, per-model lines and footers
@@ -114,10 +114,15 @@ in files.
   startup; a fresh process always retries every Account. Deleting the file is
   the only reset.
 - **Every rich panel speaks one grammar.** Header is `<subject>` or
-  `<subject> ─ <qualifier>`, never a colon; rows are `<label>  <value>` with
-  the label column fitted per panel; the status glyph marks a state value
-  only, never a plain fact. Plain output is a separate contract: it stays
-  byte-stable for scripts and does not follow the panel language.
+  `<subject> ─ <qualifier>`, never a colon, and a qualifier must add a
+  fact the rows do not carry. Fact rows are `<label>  <value>` with the
+  label column fitted per panel; the status glyph marks a state value
+  only. The exception is deliberate: `accounts` also carries *list* rows
+  (account and model tables) with their own fitted columns, and is the
+  one panel built by hand rather than by `fact_panel`, because it needs a
+  mid-panel separator between its list and its rollup. Plain output is a
+  separate contract: it stays byte-stable for scripts and does not follow
+  the panel language.
 - **Cloaking follows Claude Code except where fidelity breaks the client.**
   The beta set is audited against the current CLI binary, but
   `redact-thinking` is never sent (it empties thinking text pengepul's clients

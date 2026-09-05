@@ -1083,7 +1083,7 @@ fn service_actions_render_a_panel_when_rich_and_plain_bytes_when_piped() {
     assert!(visible.contains("●"));
     assert!(visible.contains("restarted"));
     for line in visible.lines() {
-        assert!(line.chars().count() <= 64, "too wide: {line}");
+        assert_eq!(line.chars().count(), 64, "off the fixed width: {line}");
     }
 
     // Piped: today's exact bytes (AC-1).
@@ -1204,7 +1204,7 @@ fn service_status_parses_systemctl_into_a_panel_when_rich() {
     assert!(visible.contains("│ tasks    7"), "{visible}");
     assert!(visible.contains("4m28s"));
     for line in visible.lines() {
-        assert!(line.chars().count() <= 64, "too wide: {line}");
+        assert_eq!(line.chars().count(), 64, "off the fixed width: {line}");
     }
 
     // Piped: the platform tool's text verbatim (AC-3).
@@ -2283,12 +2283,20 @@ fn accounts_footer_rows_use_the_row_grammar() {
 
     assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
+    let lines: Vec<&str> = visible.lines().collect();
+    // The footer starts after the mid-panel separator; searching the whole
+    // panel would match the per-account `tokens`/`reasoning` rows instead
+    // and could not detect a footer row drifting out of column.
+    let separator = lines
+        .iter()
+        .position(|line| line.starts_with('\u{251c}'))
+        .expect("mid-panel separator");
     let value_column = |label: &str| -> usize {
         let needle = format!("│ {label}");
-        let line = visible
-            .lines()
+        let line = lines[separator..]
+            .iter()
             .find(|line| line.contains(&needle))
-            .unwrap_or_else(|| panic!("row {label:?}:\n{visible}"));
+            .unwrap_or_else(|| panic!("footer row {label:?}:\n{visible}"));
         let after = line.find(label).expect("label") + label.chars().count();
         line[after..]
             .find(|c: char| !c.is_whitespace())
@@ -2303,4 +2311,118 @@ fn accounts_footer_rows_use_the_row_grammar() {
         columns.windows(2).all(|pair| pair[0] == pair[1]),
         "footer values not aligned: {columns:?}\n{visible}"
     );
+}
+
+/// consistent-panels AC-9: a value too wide for the box is marked, never
+/// silently amputated. `rich-everywhere` AC-9 had exempted the config and
+/// url lines from clipping entirely; putting them in a box removed that
+/// exemption, so the clip must at least be visible.
+#[test]
+fn a_value_too_wide_for_the_panel_is_marked_not_amputated() {
+    let tmp = tempdir().expect("tempdir");
+    // A config path an operator could plausibly pass to --config.
+    let deep = tmp
+        .path()
+        .join("home/kognos/work/projects/relays/pengepul/config");
+    std::fs::create_dir_all(&deep).expect("mkdir");
+    let config = deep.join("production-relay.yaml");
+    std::fs::write(
+        &config,
+        "host: 127.0.0.1\nport: 8318\napi-keys:\n  - sk-test\ndebug: \"off\"\n",
+    )
+    .expect("write config");
+    let mut runtime = FakeRuntime {
+        rich: true,
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_with_env(
+        &["--config", config.to_str().expect("utf8"), "status"],
+        tmp.path(),
+        tmp.path(),
+        &mut runtime,
+        Style::Rich,
+    )
+    .expect("status runs");
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    let config_row = visible
+        .lines()
+        .find(|line| line.contains("production-relay") || line.contains("projects"))
+        .expect("config row");
+    // The row still fits the box.
+    assert_eq!(
+        config_row.chars().count(),
+        64,
+        "row off the fixed width: {config_row}"
+    );
+    // And the truncation is visible: a silently cut path reads as a real
+    // path that does not exist.
+    assert!(
+        config_row.contains('\u{2026}'),
+        "clip not marked: {config_row}"
+    );
+}
+
+/// consistent-panels AC-4: the `service` header carries no state
+/// qualifier — `state ● active (running)` is already a row, and the
+/// header would only repeat it truncated and uncolored. The general rule:
+/// a qualifier must add a fact the rows do not carry.
+#[test]
+fn the_service_header_does_not_repeat_the_state_row() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime = FakeRuntime {
+        rich: true,
+        service_status_text: Some(
+            "● pengepul.service - pengepul API relay\n     Loaded: loaded (/x/pengepul.service; enabled; preset: enabled)\n     Active: active (running) since Sat 2026-09-05 14:48:16 WIB; 22min ago\n   Main PID: 3477298 (pengepul)\n"
+                .to_string(),
+        ),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(
+        &["service", "status"],
+        tmp.path(),
+        &mut runtime,
+        Style::Rich,
+    );
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    let header = visible.lines().next().expect("header");
+    // The state belongs to its row, not to the header.
+    assert!(
+        !header.contains("active"),
+        "header repeats the state row: {header}"
+    );
+    assert!(header.starts_with("┌─ service ─────"), "header: {header}");
+    assert!(
+        visible.contains("│ state    ● active (running)"),
+        "{visible}"
+    );
+}
+
+/// consistent-panels AC-8: `--version` is the one plain surface with no
+/// test at all, and it is the surface most likely to be parsed by a
+/// script. It leaves through clap's own exit path, never the verb
+/// dispatch, so neither Style can turn it into a panel.
+#[test]
+fn version_prints_the_same_bytes_in_both_styles() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime = FakeRuntime::default();
+
+    let mut text = |style: Style| -> String {
+        let error = run_with_env(&["--version"], tmp.path(), tmp.path(), &mut runtime, style)
+            .expect_err("--version leaves through clap");
+        error.to_string()
+    };
+
+    let plain = text(Style::Plain);
+    assert_eq!(
+        plain.trim_end(),
+        format!("pengepul {}", env!("CARGO_PKG_VERSION"))
+    );
+    // Same bytes under a rich terminal: a version string is machine-read.
+    assert_eq!(plain, text(Style::Rich));
 }

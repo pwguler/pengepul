@@ -59,8 +59,8 @@ The set of Accounts of one Provider behind the relay, spread across by Rotation.
 _Avoid_: account list, fleet, grouping
 
 **Panel**:
-One 64-column box of rich CLI output. Its header is `<subject>` or `<subject> ─ <qualifier>` and never carries a colon; its rows are Facts — `<label>  <value>` with the label column fitted to that panel. The status glyph marks a state value only. Plain output is not a panel and follows a separate, byte-stable contract.
-_Avoid_: card, box, widget, table (a table is the account/model rows *inside* a panel)
+One 64-column box of rich CLI output. Its header is `<subject>` or `<subject> ─ <qualifier>` and never carries a colon; a qualifier must add a fact the rows do not carry. Its fact rows are `<label>  <value>` with the label column fitted to that panel; it may also carry list rows — account and model tables with their own fitted columns. The status glyph marks a state value only. Plain output is not a panel and follows a separate, byte-stable contract.
+_Avoid_: card, box, widget
 
 **Usage counters**:
 The running per-account totals — requests, successes, failures, tokens in/out/cache/reasoning — broken down per model for the successes, summed relay-wide in `status` and shown per account in `accounts`, and persisted to `usage.json` in the provider's auth directory so they survive restarts and upgrades. Counters recorded before per-model attribution existed stay only in the account totals. Cooldowns and failure streaks are not persisted: a fresh process always retries.

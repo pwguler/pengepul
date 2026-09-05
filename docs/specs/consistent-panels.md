@@ -31,6 +31,10 @@ and a model row (`claude-opus-5  147 ok  23.9M`) keep their fitted
 columns: they are a table, not a fact. They sit under the panel's fact
 rows, indented for models.
 
+**Separator** — a panel with both list rows and a fact rollup divides
+them with `├───┤`. Only `accounts` has both, so it is the one panel
+built by hand rather than by `fact_panel`.
+
 ## Non-goals
 
 - **Plain output does not change.** Piped/`NO_COLOR`/`TERM=dumb` stays
@@ -40,6 +44,13 @@ rows, indented for models.
 - **No new verbs, flags, colors, or panel width.** 64 columns stands.
 - **`service logs`, `config show`, `help`, and errors on stderr stay
   plain** in both styles, as today.
+- **The rich/plain wording split for one state is deliberate.** An
+  account with no future cooldown reads `unavailable` in plain and
+  `unresponsive` in rich. `CONTEXT.md` puts `unavailable` on the Cooldown
+  avoid-list and `cli-style-dashboard` prescribes `unresponsive`, but
+  plain bytes are frozen by the non-goal above, so the two cannot be
+  reconciled without breaking a script. Recorded here so a later reader
+  does not "fix" one of them.
 - **No re-litigating what a panel *says*.** Only how it is shaped:
   `status` keeps its pool lines, `accounts` keeps its per-model lines.
 
@@ -47,7 +58,7 @@ rows, indented for models.
 
 - AC-1: One header helper produces every rich header. Headers carry no
   colon: `pool anthropic ─ 1 account, 1 available`,
-  `login commandcode`, `service ─ active`, `relay total ─ 2 pools, 3
+  `login commandcode`, `service`, `relay total ─ 2 pools, 3
   accounts`, `update`, `config`.
 - AC-2: One row helper produces every rich fact row: `label` padded to
   the panel's label column, two spaces, value. The label column is
@@ -79,8 +90,13 @@ rows, indented for models.
 - AC-9: The label column is computed per panel, not per row or per
   section, so values align down the whole box — including the `accounts`
   panel, whose per-account token rows and footer rollup share one column.
-  A label longer than the cap clips; the value never does, because a
-  truncated number is a lie.
+  A label longer than the cap clips. A **value** longer than the box
+  clips too — it is operator-supplied (a `--config` path, a url, an
+  install path) and the renderer cannot shrink it — but the clip is
+  always marked with an ellipsis, because a silently cut path reads as a
+  real path that does not exist. Where the renderer *does* control the
+  width (counts, token figures), it degrades to a compact form instead of
+  clipping: a truncated number is a lie.
 
 ## Revisions
 
@@ -93,11 +109,15 @@ rows, indented for models.
   per-account token rows and footer rollup were still built by `format!`
   with a single space, so one box held four different value columns
   (13, 11, 14, 10). They are `Fact`s now, sharing the panel's column.
-- **`fact_row` clips its label.** It did not, despite a comment claiming
-  it did: a provider key of 16+ characters pushed the value column out of
-  line, and 26+ pushed the token figure past the box edge where
-  `panel_row` amputated it — a silently truncated number. Found by the
-  landing judge, reproduced with a 30-char pool name.
+- **`fact_row` clips its label, and `panel_row` marks its clips.**
+  Neither did, despite comments claiming otherwise: a provider key of 16+
+  characters pushed the value column out of line, and 26+ pushed the
+  token figure past the box edge where `panel_row` cut it — uncolored and
+  unmarked. Two landing judges found the two halves. The label clips at
+  the cap; an over-long value still clips, but now with an ellipsis, so
+  truncation is visible. `rich-everywhere` AC-9 had exempted the `config`
+  and `url` lines from clipping entirely by keeping them outside a box;
+  status-total-only AC-2 put them in one, so this spec owes the mark.
 
 ## Verification
 
