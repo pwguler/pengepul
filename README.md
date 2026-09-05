@@ -59,7 +59,8 @@ pengepul login --provider openrouter \
 Registration is for new providers only: an id already in the file with a
 different `base-url` is an error, so a mistyped flag cannot move a live
 provider's traffic. Changing an endpoint means editing the file. Restart
-the relay afterwards — providers are read at startup.
+the relay afterwards — providers are read at startup. Registration
+rewrites `config.yaml`: values are preserved, comments are not.
 
 ```sh
 pengepul login --provider groq --key $GROQ_API_KEY # save a key (repeat to pool more)

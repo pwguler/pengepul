@@ -3282,10 +3282,23 @@ fn login_registers_a_new_provider_and_saves_its_key() {
     );
 
     assert_eq!(outcome.code, 0, "stderr: {}", outcome.stderr);
+    let registered_at = outcome
+        .stdout
+        .find("registered openrouter")
+        .expect("registration was not announced");
+    let saved_at = outcome
+        .stdout
+        .find("saved openrouter account token")
+        .expect("the token was not announced");
     assert!(
-        outcome.stdout.contains("registered openrouter"),
-        "registration was not announced: {}",
+        registered_at < saved_at,
+        "the registration must precede the token line: {}",
         outcome.stdout
+    );
+    // AC-1 also promises the credential is saved.
+    assert!(
+        tmp.path().join(".pengepul").join("openrouter").exists(),
+        "no credential was written for the registered provider"
     );
     // The config it read is the config it wrote.
     let written = std::fs::read_to_string(tmp.path().join(".pengepul").join("config.yaml"))
@@ -3546,8 +3559,14 @@ fn registration_leaves_every_other_field_alone() {
     assert_eq!(outcome.code, 0, "the written config does not load");
     let written = std::fs::read_to_string(tmp.path().join(".pengepul").join("config.yaml"))
         .expect("read config");
+    assert!(
+        written.contains("openrouter"),
+        "the provider was not written at all: {written}"
+    );
     assert!(written.contains("sk-test"), "api-keys lost: {written}");
     assert!(written.contains("8317"), "port lost: {written}");
+    assert!(written.contains("cloaking"), "cloaking lost: {written}");
+    assert!(written.contains("timeouts"), "timeouts lost: {written}");
     assert!(
         written.contains("https://existing.host/v1"),
         "the other provider was dropped: {written}"
@@ -3638,14 +3657,151 @@ fn login_help_documents_base_url() {
 
     let outcome = run(&["help", "login"], tmp.path(), &mut runtime);
 
+    // The doc text, not clap's flag list: `--base-url` prints from its
+    // #[arg] attribute even with the doc comment deleted, and `--key` is
+    // a pre-existing flag. Asserting on either proves nothing.
     assert!(
-        outcome.stdout.contains("--base-url"),
-        "the flag is undocumented: {}",
+        outcome
+            .stdout
+            .contains("register a new OpenAI-compatible provider"),
+        "the flag's purpose is undocumented: {}",
         outcome.stdout
     );
     assert!(
-        outcome.stdout.contains("--key"),
+        outcome.stdout.contains("needs --key"),
         "help does not say the flag needs a key: {}",
         outcome.stdout
+    );
+}
+
+/// P1-2 reproduction: a refused registration must not leave a credential
+/// in a live provider's pool.
+#[test]
+fn a_refused_registration_leaves_no_credential_behind() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  openrouter:\n    base-url: https://openrouter.ai/api/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+
+    let _ = run_err(
+        &[
+            "login",
+            "--provider",
+            "openrouter",
+            "--base-url",
+            "https://typo.host/v1",
+            "--key",
+            "sk-foreign",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    assert!(
+        !tmp.path().join(".pengepul").join("openrouter").exists(),
+        "a refused registration left a credential in a live provider's pool"
+    );
+}
+
+/// AC-11 in rich style: a registration is a row inside the login panel,
+/// not a bare line stacked above it. Every line holds the panel width.
+#[test]
+fn a_rich_registration_is_a_row_in_the_login_panel() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  existing:\n    base-url: https://existing.host/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+
+    let outcome = run_style(
+        &[
+            "login",
+            "--provider",
+            "openrouter",
+            "--base-url",
+            "https://openrouter.ai/api/v1",
+            "--key",
+            "sk-test",
+        ],
+        tmp.path(),
+        &mut runtime,
+        Style::Rich,
+    );
+
+    assert_eq!(outcome.code, 0, "stderr: {}", outcome.stderr);
+    let visible = strip_ansi(&outcome.stdout);
+    let lines: Vec<&str> = visible.lines().filter(|line| !line.is_empty()).collect();
+    // One panel, not two.
+    assert_eq!(
+        lines.iter().filter(|line| line.starts_with('┌')).count(),
+        1,
+        "a second panel was opened: {visible}"
+    );
+    // The registration is inside it, as a labelled row.
+    let row = lines
+        .iter()
+        .find(|line| line.contains("registered"))
+        .expect("the registration is not in the panel");
+    assert!(
+        row.starts_with('│') && row.ends_with('│'),
+        "the registration is not a panel row: {row}"
+    );
+    assert!(
+        row.contains("openrouter"),
+        "the row does not name the provider: {row}"
+    );
+    // The width invariant every other rich panel holds.
+    for line in &lines {
+        assert_eq!(
+            line.chars().count(),
+            64,
+            "a panel line broke the width: {line}"
+        );
+    }
+}
+
+/// P2-3: with only a legacy workspace config present, `load_config`
+/// migrates it to the home path — so registration must land in the
+/// migrated file, which is the one the next load reads. Correct today
+/// only because the migration ran moments earlier in the same process;
+/// this pins it.
+#[test]
+fn registration_follows_a_migrated_legacy_config() {
+    let tmp = tempdir().expect("tempdir");
+    let cwd = tmp.path().join("workspace");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    std::fs::write(
+        cwd.join("config.yaml"),
+        "host: \"127.0.0.1\"\nport: 8317\nauth-dir: ~/.pengepul\napi-keys:\n  - sk-test\nproviders:\n  existing:\n    base-url: https://existing.host/v1\n",
+    )
+    .expect("write legacy config");
+    let mut runtime = FakeRuntime::default();
+
+    let outcome = run_with_env(
+        &[
+            "login",
+            "--provider",
+            "openrouter",
+            "--base-url",
+            "https://openrouter.ai/api/v1",
+            "--key",
+            "sk-test",
+        ],
+        tmp.path(),
+        &cwd,
+        &mut runtime,
+        Style::Plain,
+    )
+    .expect("cli run");
+
+    assert_eq!(outcome.code, 0, "stderr: {}", outcome.stderr);
+    let home_config = std::fs::read_to_string(tmp.path().join(".pengepul").join("config.yaml"))
+        .expect("the migrated config was not written");
+    assert!(
+        home_config.contains("openrouter"),
+        "registration did not follow the migration: {home_config}"
     );
 }

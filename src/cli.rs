@@ -819,13 +819,25 @@ fn login(
             bail!("{builtin} uses OAuth; --base-url is for configured providers");
         }
         let email = runtime.login(&config, builtin.clone(), key)?;
-        print_login_saved(&builtin.to_string(), &email, output, style);
+        print_login_saved(&builtin.to_string(), &email, false, output, style);
         return Ok(());
     }
     // AC-2: registering without a credential leaves a provider that has
     // no account, which is the half-done state this flag exists to avoid.
     if base_url.is_some() && key.is_none() {
         bail!("--base-url registers {provider} and needs --key to be usable");
+    }
+    // A conflicting registration is refused before the credential is
+    // written. The token-before-config order below rests on the orphan
+    // being harmless because the provider is unconfigured; on this path
+    // it IS configured and live, so a foreign key would join its pool at
+    // the next reload and answer with 401s (AC-3).
+    if let (Some(requested), Some(existing)) = (base_url, config.providers.get(provider)) {
+        let requested = requested.trim().trim_end_matches('/');
+        let existing = existing.base_url.trim().trim_end_matches('/');
+        if requested != existing {
+            bail!("{provider} already points at {existing}; edit the config to change it");
+        }
     }
     if base_url.is_none() && !config.providers.contains_key(provider) {
         bail!(
@@ -857,30 +869,49 @@ fn login(
     // provider is still unconfigured. The other order leaves a registered
     // provider with no account (AC-9).
     save_token(&config.auth_dir, &token)?;
+    let mut registered = false;
     if let Some(base_url) = base_url {
+        // The path `env.load()` read. With a legacy config that load has
+        // just migrated it to the home path, so this resolves there \u2014 the
+        // file the next load will read, not the shadowed original.
         let path = selected_config_path(env.config_path, Some(env.home), env.cwd);
         register_provider(&path, provider, base_url)?;
-        // AC-11: one line, same in both styles \u2014 it precedes the login
-        // panel rather than opening a second one.
-        output.line(&format!("registered {provider}"));
+        registered = true;
     }
-    print_login_saved(provider, &label, output, style);
+    print_login_saved(provider, &label, registered, output, style);
     Ok(())
 }
 
 /// The login outcome: the plain line when piped, a `login: <provider>`
 /// panel when rich.
-fn print_login_saved(provider: &str, label: &str, output: &mut Output, style: Style) {
+/// AC-11: a registration is a fact of the login it arrived with, not an
+/// event of its own. Plain gets its own parseable line; rich gets a row
+/// inside the existing panel, because a bare line above a 64-column box
+/// is neither the panel language nor a second panel (CONTEXT.md, Panel).
+fn print_login_saved(
+    provider: &str,
+    label: &str,
+    registered: bool,
+    output: &mut Output,
+    style: Style,
+) {
     match style {
-        Style::Plain => output.line(&format!("saved {provider} account token for {label}")),
+        Style::Plain => {
+            if registered {
+                output.line(&format!("registered {provider}"));
+            }
+            output.line(&format!("saved {provider} account token for {label}"));
+        }
         Style::Rich => {
-            for line in fact_panel(
-                &format!("login {provider}"),
-                &[
-                    Fact::new("state", &format!("{} saved", status_glyph(ActionGlyph::Ok))),
-                    Fact::new("account", &paint(BOLD, label)),
-                ],
-            ) {
+            let mut facts = vec![Fact::new(
+                "state",
+                &format!("{} saved", status_glyph(ActionGlyph::Ok)),
+            )];
+            if registered {
+                facts.push(Fact::new("registered", &paint(BOLD, provider)));
+            }
+            facts.push(Fact::new("account", &paint(BOLD, label)));
+            for line in fact_panel(&format!("login {provider}"), &facts) {
                 output.line(&line);
             }
         }

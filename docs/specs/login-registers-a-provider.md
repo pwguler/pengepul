@@ -78,9 +78,11 @@ Tanpa `--base-url`, `login` berperilaku persis seperti sekarang.
   `https://h/v1` menghasilkan file yang sama.
 - AC-6: `--base-url` bersama provider bawaan (`anthropic`, `codex`)
   gagal, dengan pesan yang menyebut mereka memakai OAuth.
-- AC-7: Nama yang ditolak `validate_providers` — nama bawaan, nama
-  bergaris miring, URL kosong — tetap ditolak lewat jalur ini, dengan
-  pesan yang sama.
+- AC-7: Nama yang ditolak `validate_providers` — nama bergaris miring,
+  URL kosong — tetap ditolak lewat jalur ini, dengan pesan yang sama.
+  Nama bawaan juga ditolak, tapi lebih awal dan dengan pesan OAuth
+  (AC-6): `login` menangkapnya sebelum config disentuh, dan pesan itu
+  lebih menjelaskan daripada "is a built-in provider name".
 - AC-8: Config yang ditulis memuat kembali tanpa error, dan field lain
   (`api-keys`, `port`, `cloaking`, `timeouts`) tidak berubah nilainya.
 - AC-9: Kalau penyimpanan token gagal, config tidak ditulis sama sekali.
@@ -109,3 +111,21 @@ pengepul --config /tmp/cfg.yaml login --provider openrouter \
 ```
 
 Setiap kriteria butuh tes yang gagal ketika perbaikannya dibalik.
+
+## Revisions
+
+- **Pendaftaran menulis ulang file config.** `register_provider` mem-parse
+  `RawConfig`, menyisipkan satu entri, lalu menulis ulang seluruh file
+  lewat `serde_yaml`. Nilainya utuh — AC-8 tetap berlaku — tapi komentar
+  hilang, urutan kunci mengikuti urutan struct, dan bagian yang selama ini
+  memakai default (`cloaking`, `timeouts`, `stats`, `debug`, `body-limit`)
+  jadi tertulis eksplisit dengan nilai default hari ini. README mengajak
+  operator mengedit file ini dengan tangan, jadi ini terlihat olehnya, dan
+  README sekarang mengatakannya.
+- **Konflik ditolak sebelum kredensial ditulis.** Urutan token-dulu
+  beralasan bahwa token yatim tidak berbahaya karena providernya belum
+  terkonfigurasi. Di jalur AC-3 providernya justru sudah terkonfigurasi
+  dan hidup: satu salah ketik id menaruh key asing ke dalam pool provider
+  itu, yang akan ikut rotasi setelah reload dan menjawab 401. Pengecekan
+  konflik karena itu naik ke depan `save_token`, memakai `config.providers`
+  yang sudah dimuat. Ditemukan oleh judge; direproduksi sebelum diperbaiki.
