@@ -1034,7 +1034,8 @@ fn status_relay_total_covers_empty_pools_and_zero_relay() {
                         "available": true
                     }))]
                 },
-                // Empty pool: counts toward pools (AC-5), adds no tokens.
+                // Empty pools: hidden from status entirely (AC-4), and
+                // excluded from the header's pool count.
                 "codex": {"account_count": 0, "accounts": []},
                 "commandcode": {"account_count": 0, "accounts": []}
             }
@@ -1465,8 +1466,8 @@ fn a_command_level_config_wins_over_the_root_one() {
     assert_eq!(runtime.accounts_api_key.as_deref(), Some("sk-root"));
 }
 
-/// usage-by-model AC-5/AC-6/AC-8/AC-9: model lines under each account, a
-/// `by model` aggregate in the pool footer, both sorted by tokens.
+/// usage-by-model AC-5/AC-8/AC-9: model lines under each account, sorted
+/// by tokens, with no aggregate in the pool footer (AC-6, withdrawn).
 #[test]
 fn accounts_breaks_usage_down_per_model_on_a_tty() {
     let tmp = tempdir().expect("tempdir");
@@ -1604,8 +1605,8 @@ fn accounts_lists_models_in_plain_output() {
                                 "reasoningOutputTokens": 7
                             }]
                         })),
-                        // A second contributor, so the pool aggregate earns
-                        // its place (AC-6, revised).
+                        // A second account serving the same model: the
+                        // rows stay per-account, never summed.
                         account(json!({
                             "email": "b@x.com",
                             "available": true,
@@ -1726,8 +1727,12 @@ fn accounts_keeps_long_model_names_distinguishable() {
         visible.contains("deepseek-v4-flash-fast"),
         "name clipped: {visible}"
     );
-    // Every panel line is exactly the fixed width — not merely within it,
-    // so a renderer that clips or overflows fails here.
+    // Every panel line is exactly the fixed width. This alone cannot
+    // catch a clipped name — `panel_row` pads *and* clips to 64, so both
+    // `<= 64` and `== 64` hold for any renderer routed through it. The
+    // assertions above, on the whole names, are what catch that; `== 64`
+    // adds only the case of a line that bypasses `panel_row` and comes
+    // out short.
     for line in visible.lines() {
         assert_eq!(
             line.chars().count(),
@@ -1803,4 +1808,141 @@ fn accounts_fits_the_model_column_to_the_names_present() {
     for line in long_visible.lines() {
         assert_eq!(line.chars().count(), 64, "off the fixed width: {line}");
     }
+}
+
+/// usage-by-model AC-8: the name cap is load-bearing for box safety. A
+/// name past the cap must lose characters from the *name* only — the ok
+/// count and the token total stay whole. A `== 64` width assertion cannot
+/// catch this: `panel_row` clips an over-wide row to 64 either way.
+#[test]
+fn accounts_never_amputates_counts_for_an_overlong_model_name() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalSuccesses": 5,
+                        "models": [{
+                            // 44 chars: past the cap, and a shape real
+                            // path-style upstream ids take.
+                            "model": "accounts/fireworks/models/llama-v3p1-405b-it",
+                            "successes": 5,
+                            "inputTokens": 1_000,
+                            "outputTokens": 2_000,
+                            "cacheCreationInputTokens": 0,
+                            "cacheReadInputTokens": 0,
+                            "reasoningOutputTokens": 0
+                        }]
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    let row = visible
+        .lines()
+        .find(|line| line.contains("accounts/fireworks"))
+        .expect("model row");
+    assert!(row.contains("5 ok"), "ok count amputated: {row}");
+    assert!(row.contains("3.0K"), "token total amputated: {row}");
+    assert_eq!(row.chars().count(), 64, "row width: {row}");
+}
+
+/// status-total-only AC-6: a relay with no pools at all still prints the
+/// block. The existing empty-pools test covers one loaded account; this
+/// covers the zero case its name promises.
+#[test]
+fn status_prints_the_block_for_a_relay_with_no_pools() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "0.0.0.0", 8318);
+    let mut runtime = FakeRuntime {
+        accounts_payload: Some(json!({"providers": {}})),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run(&["status"], tmp.path(), &mut runtime);
+
+    assert_eq!(outcome.code, 0);
+    assert!(
+        outcome
+            .stdout
+            .starts_with("relay total: 0 pools, 0 accounts")
+    );
+    assert!(outcome.stdout.contains("requests 0  (0 ok, 0 failed)"));
+    assert!(outcome.stdout.contains("tokens in 0  out 0  cache 0"));
+    assert!(outcome.stdout.contains("total 0"));
+}
+
+/// usage-by-model AC-8: one name column per panel, not per account — the
+/// same model's ok cell must land in the same place in every row of a box.
+#[test]
+fn accounts_shares_one_model_column_across_a_pool() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let model = |name: &str| {
+        json!({
+            "model": name,
+            "successes": 5,
+            "inputTokens": 1,
+            "outputTokens": 1,
+            "cacheCreationInputTokens": 0,
+            "cacheReadInputTokens": 0,
+            "reasoningOutputTokens": 0
+        })
+    };
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 2,
+                    "accounts": [
+                        account(json!({
+                            "email": "a@x.com",
+                            "available": true,
+                            "totalSuccesses": 5,
+                            "models": [model("claude-sonnet-4-5")]
+                        })),
+                        account(json!({
+                            "email": "b@x.com",
+                            "available": true,
+                            "totalSuccesses": 5,
+                            "models": [model("claude-opus-5")]
+                        }))
+                    ]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    let column = |needle: &str| -> usize {
+        let line = visible
+            .lines()
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("row for {needle}"));
+        line.find("5 ok")
+            .unwrap_or_else(|| panic!("ok cell: {line}"))
+    };
+    // The shorter name sits on the wider account's column, not its own.
+    assert_eq!(
+        column("claude-sonnet-4-5"),
+        column("claude-opus-5"),
+        "columns disagree inside one panel:\n{visible}"
+    );
 }

@@ -69,11 +69,14 @@ model at accounting time but throws it away.
   form, indented under the account. Plain does not clip the model name at
   all (no fixed columns to keep aligned), so it is the surface that can
   always be trusted for the full id.
-- AC-8: Model names render whole at their catalog widths: the name cell
-  is fitted to the longest name actually present (capped so the box never
-  breaks — the widest shipped id is 28 chars, the cap is 38), and two
-  names sharing a long prefix stay distinguishable. Panel lines are
-  exactly 64 visible columns.
+- AC-8: Model names render whole at the widths the shipped catalog uses
+  (longest: 28 chars): the name cell is fitted to the longest name
+  present **in the panel** and capped at 38, so names up to the cap stay
+  whole and two of them sharing a prefix stay distinguishable. Past the
+  cap a name clips — two 39-char names sharing 37 characters do collide,
+  and AC-7's plain output is the un-clipped surface for that case. The
+  cap protects the `ok` and token cells: they are never amputated.
+  Panel lines are exactly 64 visible columns.
 - AC-9: `total` on a model line = in + out + cache-read +
   cache-creation, matching the share-bar and relay-total definition;
   reasoning is excluded from the total and shown only in the detail line
@@ -94,11 +97,18 @@ model at accounting time but throws it away.
   `upstream_model` strips — no real collision existed). A fixed 38 fixed
   the clipping but left a 25-column gap after short names, so the column
   is now fitted to the rows present and capped at 38.
-- **Width assertions strengthened.** `<= 64` held for any renderer at all
-  (`panel_row` clips to 64), so it could not catch the clipping bug it
-  was meant to catch. The panel tests now assert `== 64`, and the lib
-  width test's fixture carries a `models` array so model rows are
-  actually exercised.
+- **One name column per panel, not per account.** The fit was first
+  computed inside the per-account loop, so the same model's `ok` cell
+  landed in different places in one box. It is now fitted across every
+  account in the pool.
+- **Width assertions.** `<= 64` held for any renderer routed through
+  `panel_row`, which pads *and* clips to 64 — so it could not catch the
+  clipping bug it was meant to catch. It is now `== 64`, which is
+  stronger in exactly one respect (a line bypassing `panel_row` and
+  coming out short); what actually guards the names is asserting the
+  whole name is present, and what guards the counts is a fixture past
+  the cap asserting the `ok` and token cells survive. The lib width
+  fixture gained a `models` array so model rows are exercised there too.
 - **AC-6 narrowed, then withdrawn.** First attempt: aggregate in every
   pool footer. Seen live, with one contributing account it repeated that
   account's own lines verbatim (`claude-opus-5  2 ok  330.4K` twice in

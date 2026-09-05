@@ -20,7 +20,9 @@ the total"*, then, choosing the shape: total **plus one line per pool**.
   client-side sums; only the renderer changes.
 - **No change to `accounts`, `service`, `login`, `update`, `config`.**
 - **Empty pools stay hidden** in `status` (they have no accounts and
-  nothing to summarize); `accounts` keeps listing them.
+  nothing to summarize). `accounts` keeps listing them in its plain
+  branch (`codex: 0 accounts`); its rich branch has skipped them since
+  v0.10.2, which this spec does not change either way.
 
 ## Acceptance criteria
 

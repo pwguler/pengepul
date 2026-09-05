@@ -336,15 +336,21 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64) {
         for account in accounts {
             totals.add(account);
         }
+        // One name column for the whole panel: the same model's ok cell
+        // must land in the same place in every row of a box.
+        let width = name_column(
+            &accounts
+                .iter()
+                .flat_map(model_rows)
+                .collect::<Vec<ModelRow>>(),
+        );
         for account in accounts {
             output.line(&panel_row(&account_row(account, pool_total, now)));
             for line in account_detail_lines(account) {
                 output.line(&panel_row(&line));
             }
             // AC-5: the models this account served, heaviest first.
-            let rows = model_rows(account);
-            let width = name_column(&rows);
-            for row in rows {
+            for row in model_rows(account) {
                 output.line(&panel_row(&format!("  {}", row.headline(width))));
                 output.line(&panel_row(&paint(DIM, &format!("    {}", row.detail()))));
             }
