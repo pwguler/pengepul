@@ -750,9 +750,11 @@ pub(crate) fn footer_facts(totals: &PoolTotals) -> Vec<Fact> {
             &paint(BOLD, &format_count(totals.reasoning)),
         ));
     }
-    // The pool total stands alone, separated like the relay block's.
+    // Named for its scope: `status` prints `total` for the whole relay,
+    // and one word must not mean two spans (ARCHITECTURE, "One word, one
+    // scope").
     lines.push(Fact::new(
-        "total",
+        "pool",
         &paint(BOLD, &format_count(totals.tokens())),
     ));
     lines

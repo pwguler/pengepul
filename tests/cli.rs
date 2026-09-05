@@ -2305,7 +2305,7 @@ fn accounts_footer_rows_use_the_row_grammar() {
             .expect("value")
             + after
     };
-    let columns: Vec<usize> = ["requests", "tokens", "reasoning", "total"]
+    let columns: Vec<usize> = ["requests", "tokens", "reasoning", "pool"]
         .into_iter()
         .map(value_column)
         .collect();
@@ -2904,5 +2904,44 @@ fn usage_treats_an_out_of_window_history_as_empty() {
     assert!(
         visible.contains("no usage recorded yet"),
         "30 flat bars for out-of-window history: {visible}"
+    );
+}
+
+/// ARCHITECTURE, "One word, one scope": three panels printed `total` for
+/// three different spans — one pool, another pool, and the whole relay.
+/// A pool footer names its own scope.
+#[test]
+fn a_pool_footer_names_its_scope_rather_than_saying_total() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalRequests": 10,
+                        "totalInputTokens": 1_000
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    assert!(
+        !visible.contains("│ total"),
+        "a pool total is not the relay total: {visible}"
+    );
+    assert!(
+        visible.contains("│ pool"),
+        "footer names its scope: {visible}"
     );
 }

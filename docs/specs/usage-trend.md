@@ -139,6 +139,16 @@ before.
   fields. `PoolTotals` now accumulates through `account_tokens` itself,
   with a debug assertion pinning the two paths equal, so a change to what
   "carried load" means cannot silently move one view and not the other.
+- **The invariant caught its own author's older code.** Adding "One word,
+  one scope" to ARCHITECTURE exposed that three panels printed `total`
+  for three spans: one pool (322.1M), another pool (58.3M) and the relay
+  (380.5M). The pool footer says `pool` now. Pre-existing, and the new
+  invariant is what made it visible.
+- **The window bounds memory, not only the file.** `persist_usage`
+  trimmed the copy it wrote while `state.days` kept every bucket for the
+  life of the process, so a relay up past the window served an admin
+  payload holding more history than its own file. `today()` trims before
+  it opens a bucket.
 - **A subset could exceed its superset.** A payload carrying buckets but
   no cumulative counters printed `all time 0` under `window 11.0K`.
   Clamped: `all time` is at least the window it contains.

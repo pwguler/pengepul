@@ -113,8 +113,19 @@ impl AccountState {
         }
     }
 
-    /// Today's bucket, opened on first touch.
+    /// Today's bucket, opened on first touch. Trims the window first, so
+    /// a long-lived process cannot serve an admin payload holding more
+    /// history than its own file (usage-trend AC-4).
     fn today(&mut self) -> &mut DayUsage {
+        let cutoff = retention_cutoff();
+        if self
+            .days
+            .keys()
+            .next()
+            .is_some_and(|oldest| *oldest < cutoff)
+        {
+            self.days = trim_days(&self.days, &cutoff);
+        }
         self.days.entry(local_today()).or_default()
     }
 }

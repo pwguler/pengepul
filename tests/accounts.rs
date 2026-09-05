@@ -649,3 +649,38 @@ async fn a_reauth_lockout_lands_in_the_daily_bucket_too() {
         "daily failures must reconcile with the cumulative count"
     );
 }
+
+/// usage-trend AC-4: the window bounds memory too, not only the file.
+/// `persist_usage` trimmed the copy it wrote while `state.days` kept every
+/// bucket for the life of the process, so a long-lived relay served an
+/// admin payload holding more history than its own file.
+#[tokio::test]
+async fn in_memory_buckets_are_trimmed_not_only_the_written_copy() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let usage_file = tmp.path().join("commandcode").join("usage.json");
+    let stale = (chrono::Local::now() - chrono::Duration::days(200))
+        .format("%Y-%m-%d")
+        .to_string();
+    fs::create_dir_all(usage_file.parent().expect("parent")).expect("mkdir");
+    fs::write(
+        &usage_file,
+        json!({"k@example.com": {"days": {stale.clone(): {"requests": 5}}}}).to_string(),
+    )
+    .expect("write");
+
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    manager.record_attempt("k@example.com");
+
+    let dates: Vec<String> = manager.snapshots()[0]["days"]
+        .as_array()
+        .expect("days")
+        .iter()
+        .filter_map(|day| day["date"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !dates.contains(&stale),
+        "the payload serves a bucket the file no longer holds: {dates:?}"
+    );
+}
