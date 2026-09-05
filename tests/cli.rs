@@ -2547,3 +2547,160 @@ fn a_control_character_cannot_split_a_panel_row() {
         );
     }
 }
+
+/// usage-trend AC-5/AC-6/AC-9: one panel, a 30-character sparkline of
+/// relay-wide daily tokens, a peak row naming its day, and a total.
+#[test]
+fn usage_renders_a_thirty_day_sparkline() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let day = |date: &str, input: i64| {
+        json!({
+            "date": date,
+            "requests": 1,
+            "successes": 1,
+            "failures": 0,
+            "inputTokens": input,
+            "outputTokens": 0,
+            "cacheCreationInputTokens": 0,
+            "cacheReadInputTokens": 0,
+            "reasoningOutputTokens": 0
+        })
+    };
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "days": [day("2026-09-01", 1_000), day("2026-09-03", 9_000)]
+                    }))]
+                },
+                // AC-9: a second pool's days sum into the same bars.
+                "commandcode": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "k@x.com",
+                        "available": true,
+                        "days": [day("2026-09-01", 1_000)]
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    let lines: Vec<&str> = visible.lines().collect();
+    assert_eq!(lines.len(), 5, "four rows in a box: {visible}");
+    assert!(lines[0].contains("usage ─ last 30 days"), "{visible}");
+    // AC-6: one character per day, oldest left, no blanks.
+    let spark_row = lines[1];
+    assert!(spark_row.contains("│ tokens"), "{visible}");
+    let spark: String = spark_row
+        .chars()
+        .filter(|c| "▁▂▃▄▅▆▇█".contains(*c))
+        .collect();
+    assert_eq!(spark.chars().count(), 30, "one bar per day: {spark_row}");
+    assert!(spark.ends_with('▁'), "today is idle here: {spark_row}");
+    // AC-9: 09-03 is the peak and it sums both pools on 09-01.
+    assert!(lines[2].contains("peak"), "{visible}");
+    assert!(lines[2].contains("9.0K"), "peak value: {}", lines[2]);
+    assert!(lines[2].contains("2026-09-03"), "peak date: {}", lines[2]);
+    assert!(lines[3].contains("total"), "{visible}");
+    assert!(lines[3].contains("11.0K"), "total sums pools: {}", lines[3]);
+    for line in &lines {
+        assert_eq!(line.chars().count(), 64, "off the fixed width: {line}");
+    }
+}
+
+/// usage-trend AC-8: with no history the panel says so rather than
+/// drawing thirty flat bars that would read as thirty idle days.
+#[test]
+fn usage_says_so_when_no_history_exists() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "days": []
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    assert!(
+        visible.contains("no usage recorded yet"),
+        "must not draw thirty idle bars: {visible}"
+    );
+    assert!(
+        !visible.contains("▁▁▁"),
+        "flat line reads as thirty idle days: {visible}"
+    );
+}
+
+/// usage-trend AC-7: plain is one parseable line per day, no block
+/// characters — a sparkline in a pipe is hostile to a script.
+#[test]
+fn usage_plain_is_one_line_per_day() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "days": [{
+                            "date": "2026-09-03",
+                            "requests": 7,
+                            "successes": 6,
+                            "failures": 1,
+                            "inputTokens": 100,
+                            "outputTokens": 200,
+                            "cacheCreationInputTokens": 10,
+                            "cacheReadInputTokens": 20,
+                            "reasoningOutputTokens": 5
+                        }]
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run(&["usage"], tmp.path(), &mut runtime);
+
+    assert_eq!(outcome.code, 0);
+    assert!(
+        !outcome.stdout.contains('▁') && !outcome.stdout.contains('█'),
+        "block characters in a pipe: {}",
+        outcome.stdout
+    );
+    // date requests input output cache reasoning
+    assert!(
+        outcome.stdout.contains("2026-09-03 7 100 200 30 5"),
+        "parseable row: {}",
+        outcome.stdout
+    );
+}

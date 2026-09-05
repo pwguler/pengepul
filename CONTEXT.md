@@ -63,7 +63,8 @@ One 64-column box of rich CLI output. Its header is `<subject>` or `<subject> �
 _Avoid_: card, box, widget
 
 **Usage counters**:
-The running per-account totals — requests, successes, failures, tokens in/out/cache/reasoning — broken down per model for the successes, summed relay-wide in `status` and shown per account in `accounts`, and persisted to `usage.json` in the provider's auth directory so they survive restarts and upgrades. Counters recorded before per-model attribution existed stay only in the account totals. Cooldowns and failure streaks are not persisted: a fresh process always retries.
+The running per-account totals — requests, successes, failures, tokens in/out/cache/reasoning — broken down per model for the successes and bucketed per **local calendar day**, summed relay-wide in `status`, shown per account in `accounts`, shown as a 30-day trend in `usage`, and persisted to `usage.json` in the provider's auth directory so they survive restarts and upgrades. Counters recorded before per-model attribution or daily bucketing existed stay only in the account totals. Daily buckets are kept for 90 days. Cooldowns and failure streaks are not persisted: a fresh process always retries.
+_Avoid_: stats file, metrics, telemetry
 _Avoid_: stats file, metrics, telemetry
 
 ### Access and billing identity

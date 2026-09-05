@@ -8,8 +8,8 @@ use serde_json::Value;
 
 use crate::render::{
     AMBER, ActionGlyph, BOLD, DIM, Fact, GREEN, INNER_WIDTH, Output, RED, fact_panel, fact_row,
-    format_count, format_exact, label_column, pad, paint, panel_row, share_bar, status_glyph,
-    top_rule,
+    format_count, format_exact, label_column, pad, paint, panel_row, share_bar, sparkline,
+    status_glyph, top_rule,
 };
 
 /// `"on cooldown 4m12s"` while a cooldown lasts, `""` once it has cleared or
@@ -752,6 +752,158 @@ pub(crate) fn account_tokens(account: &Value) -> i64 {
         + i64_field(account, "totalOutputTokens")
         + i64_field(account, "totalCacheReadInputTokens")
         + i64_field(account, "totalCacheCreationInputTokens")
+}
+
+/// How many local days the trend shows. The file keeps more (the store's
+/// retention); the panel shows this many (usage-trend AC-5).
+const TREND_DAYS: usize = 30;
+
+/// One day of relay-wide traffic: every account of every pool, summed.
+pub(crate) struct TrendDay {
+    date: String,
+    tokens: i64,
+}
+
+/// The payload's per-account `days` arrays folded into one relay-wide
+/// series, oldest first, covering the `TREND_DAYS` window that ends on
+/// `today`. Days with no traffic are present with zero, so the sparkline
+/// has one column per calendar day rather than one per recorded day.
+/// Pure over the payload and the date handed in (AC-9, AC-10).
+pub(crate) fn trend_days(payload: &Value, today: &str) -> Vec<TrendDay> {
+    let mut totals: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    for (_provider_id, provider) in providers(payload) {
+        let accounts = provider
+            .get("accounts")
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
+        for account in accounts {
+            let days = account
+                .get("days")
+                .and_then(Value::as_array)
+                .map_or(&[][..], Vec::as_slice);
+            for day in days {
+                let Some(date) = day.get("date").and_then(Value::as_str) else {
+                    continue;
+                };
+                let tokens = i64_field(day, "inputTokens")
+                    + i64_field(day, "outputTokens")
+                    + i64_field(day, "cacheReadInputTokens")
+                    + i64_field(day, "cacheCreationInputTokens");
+                *totals.entry(date.to_string()).or_default() += tokens;
+            }
+        }
+    }
+    if totals.is_empty() {
+        return Vec::new();
+    }
+    window_dates(today, TREND_DAYS)
+        .into_iter()
+        .map(|date| {
+            let tokens = totals.get(&date).copied().unwrap_or(0);
+            TrendDay { date, tokens }
+        })
+        .collect()
+}
+
+/// The `count` calendar dates ending at `today`, oldest first. Date math
+/// on the `YYYY-MM-DD` string so the renderer stays clock-free.
+fn window_dates(today: &str, count: usize) -> Vec<String> {
+    let Ok(end) = chrono::NaiveDate::parse_from_str(today, "%Y-%m-%d") else {
+        return Vec::new();
+    };
+    let span = i64::try_from(count).unwrap_or(0);
+    (0..span)
+        .rev()
+        .map(|back| {
+            (end - chrono::Duration::days(back))
+                .format("%Y-%m-%d")
+                .to_string()
+        })
+        .collect()
+}
+
+/// The `Style::Rich` trend: one panel, four rows (AC-5).
+pub(crate) fn print_trend_rich(payload: &Value, output: &mut Output, today: &str) {
+    let days = trend_days(payload, today);
+    if days.is_empty() {
+        // AC-8: thirty flat bars would read as thirty idle days.
+        for line in fact_panel(
+            "usage ─ last 30 days",
+            &[Fact::new("tokens", &paint(DIM, "no usage recorded yet"))],
+        ) {
+            output.line(&line);
+        }
+        return;
+    }
+    let values: Vec<i64> = days.iter().map(|day| day.tokens).collect();
+    let peak = days
+        .iter()
+        .max_by_key(|day| day.tokens)
+        .expect("non-empty window");
+    let total: i64 = values.iter().sum();
+    for line in fact_panel(
+        "usage ─ last 30 days",
+        &[
+            Fact::new("tokens", &sparkline(&values)),
+            Fact::new(
+                "peak",
+                &format!(
+                    "{} on {}",
+                    paint(BOLD, &format_count(peak.tokens)),
+                    peak.date
+                ),
+            ),
+            Fact::new(
+                "total",
+                &format!(
+                    "{} across {} days",
+                    paint(BOLD, &format_count(total)),
+                    days.len()
+                ),
+            ),
+        ],
+    ) {
+        output.line(&line);
+    }
+}
+
+/// The `Style::Plain` trend: one parseable row per recorded day, oldest
+/// first, no block characters (AC-7).
+pub(crate) fn print_trend_plain(payload: &Value, output: &mut Output, today: &str) {
+    let mut rows: std::collections::BTreeMap<String, (i64, i64, i64, i64, i64)> =
+        std::collections::BTreeMap::new();
+    for (_provider_id, provider) in providers(payload) {
+        let accounts = provider
+            .get("accounts")
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
+        for account in accounts {
+            let days = account
+                .get("days")
+                .and_then(Value::as_array)
+                .map_or(&[][..], Vec::as_slice);
+            for day in days {
+                let Some(date) = day.get("date").and_then(Value::as_str) else {
+                    continue;
+                };
+                let row = rows.entry(date.to_string()).or_default();
+                row.0 += i64_field(day, "requests");
+                row.1 += i64_field(day, "inputTokens");
+                row.2 += i64_field(day, "outputTokens");
+                row.3 += i64_field(day, "cacheReadInputTokens")
+                    + i64_field(day, "cacheCreationInputTokens");
+                row.4 += i64_field(day, "reasoningOutputTokens");
+            }
+        }
+    }
+    let window: std::collections::BTreeSet<String> =
+        window_dates(today, TREND_DAYS).into_iter().collect();
+    for (date, row) in rows.iter().filter(|(date, _)| window.contains(*date)) {
+        output.line(&format!(
+            "{date} {} {} {} {} {}",
+            row.0, row.1, row.2, row.3, row.4
+        ));
+    }
 }
 
 #[cfg(test)]

@@ -197,6 +197,31 @@ pub(crate) fn fact_row(fact: &Fact, column: usize) -> String {
     format!("{label}  {}", fact.value)
 }
 
+/// The eight heights a sparkline column can take. A zero day renders the
+/// shortest block, never a blank: a gap in the line would read as missing
+/// data rather than an idle day (usage-trend AC-6).
+const SPARK_BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+/// One character per value, scaled to the largest. Pure over its input:
+/// the caller decides which days and in which order.
+pub(crate) fn sparkline(values: &[i64]) -> String {
+    let peak = values.iter().copied().max().unwrap_or(0);
+    values
+        .iter()
+        .map(|value| {
+            if peak <= 0 {
+                return SPARK_BLOCKS[0];
+            }
+            // Scaled into 0..=7 by integer math, so a non-zero day never
+            // renders as the same height as an idle one unless it rounds
+            // there honestly.
+            let index = (value.max(&0) * 7).div_euclid(peak);
+            let index = usize::try_from(index).unwrap_or(0).min(7);
+            SPARK_BLOCKS[index]
+        })
+        .collect()
+}
+
 /// A panel of labelled facts: header, aligned rows, bottom rule.
 pub(crate) fn fact_panel(subject: &str, facts: &[Fact]) -> Vec<String> {
     let column = label_column(facts);

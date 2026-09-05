@@ -12,8 +12,9 @@ use crate::tokens::save_token;
 use crate::types::{ProviderId, ProviderKind, TokenData};
 use crate::usage_view::{
     Connection, print_accounts, print_pool_rich, print_relay_total_plain, print_relay_total_rich,
+    print_trend_plain, print_trend_rich,
 };
-use crate::utils::sha256_hex;
+use crate::utils::{local_today, sha256_hex};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunOutcome {
@@ -188,6 +189,11 @@ enum Command {
         #[arg(long)]
         reload: bool,
     },
+    /// show the last 30 days of token usage
+    Usage {
+        #[arg(long = "config")]
+        command_config: Option<PathBuf>,
+    },
     /// inspect config
     Config {
         #[command(subcommand)]
@@ -301,6 +307,14 @@ pub fn run_with_env(
             accounts(
                 root_env.with_override(command_config.as_deref()),
                 reload,
+                runtime,
+                &mut output,
+                style,
+            )?;
+        }
+        Some(Command::Usage { command_config }) => {
+            usage(
+                root_env.with_override(command_config.as_deref()),
                 runtime,
                 &mut output,
                 style,
@@ -438,6 +452,26 @@ fn accounts(
     match style {
         Style::Plain => print_accounts(&accounts, output, now),
         Style::Rich => print_pool_rich(&accounts, output, now),
+    }
+    Ok(())
+}
+
+/// The usage trend: the relay's daily buckets, summed across every pool.
+/// `today` is sampled once here so the renderer stays clock-free
+/// (usage-trend AC-10).
+fn usage(
+    env: CommandEnv<'_>,
+    runtime: &mut impl CliRuntime,
+    output: &mut Output,
+    style: Style,
+) -> Result<()> {
+    let config = env.load()?;
+    let base_url = base_url(&config);
+    let accounts = runtime.accounts(&base_url, &first_api_key(&config)?)?;
+    let today = local_today();
+    match style {
+        Style::Plain => print_trend_plain(&accounts, output, &today),
+        Style::Rich => print_trend_rich(&accounts, output, &today),
     }
     Ok(())
 }
