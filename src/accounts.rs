@@ -294,19 +294,19 @@ impl AccountManager {
         state.last_failure_at = None;
         state.last_success_at = Some(now_iso());
         state.total_successes += 1;
+        // Keyed by the upstream model name: what the provider billed, not
+        // what the client happened to ask for. A success with no usage
+        // block (count-tokens, or a 2xx whose usage will not parse) still
+        // belongs to its model, so the counter opens either way.
+        let counters = state.models.entry(model.to_string()).or_default();
+        counters.successes += 1;
         if let Some(usage) = usage {
+            counters.add_tokens(usage);
             state.total_input_tokens += usage.input_tokens;
             state.total_output_tokens += usage.output_tokens;
             state.total_cache_creation_input_tokens += usage.cache_creation_input_tokens;
             state.total_cache_read_input_tokens += usage.cache_read_input_tokens;
             state.total_reasoning_output_tokens += usage.reasoning_output_tokens;
-            // Keyed by the upstream model name: what the provider billed,
-            // not what the client happened to ask for.
-            state
-                .models
-                .entry(model.to_string())
-                .or_default()
-                .add(usage);
         }
         self.persist_usage();
     }

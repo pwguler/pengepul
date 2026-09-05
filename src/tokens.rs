@@ -277,9 +277,10 @@ pub(crate) struct ModelUsage {
 }
 
 impl ModelUsage {
-    /// Fold one success into this model's running counters.
-    pub(crate) fn add(&mut self, usage: &crate::types::UsageData) {
-        self.successes += 1;
+    /// Fold one success's tokens into this model's counters. The success
+    /// itself is counted by the caller, which also counts the usage-less
+    /// ones (count-tokens, unparseable usage).
+    pub(crate) fn add_tokens(&mut self, usage: &crate::types::UsageData) {
         self.input_tokens += usage.input_tokens;
         self.output_tokens += usage.output_tokens;
         self.cache_creation_input_tokens += usage.cache_creation_input_tokens;

@@ -50,7 +50,9 @@ the total"*, then, choosing the shape: total **plus one line per pool**.
   aggregates.
 - AC-7: `accounts` output is byte-identical to v0.10.2 for both styles
   (guarded by the existing `accounts` tests, which must not need edits
-  for this spec).
+  for this spec). **Scope:** this AC binds this spec alone. The
+  `usage-by-model` spec, landing alongside, deliberately changes
+  `accounts` and edits those tests.
 - AC-8: The renderer stays pure: no clock read beyond the `now` already
   passed in, no I/O.
 

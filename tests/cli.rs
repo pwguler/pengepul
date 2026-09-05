@@ -392,11 +392,11 @@ fn status_rolls_up_pool_health_and_token_totals_per_provider() {
     assert!(
         outcome
             .stdout
-            .contains("anthropic     3 accounts   1,204 req"),
+            .contains("anthropic          3 accounts   1,204 req"),
         "pool line missing:\n{}",
         outcome.stdout
     );
-    assert!(outcome.stdout.contains("groq          1 account"));
+    assert!(outcome.stdout.contains("groq               1 account"));
     // AC-1: the aggregate is relay-wide, printed once.
     assert!(
         outcome
@@ -478,14 +478,15 @@ fn status_renders_panels_on_a_tty() {
     assert!(!visible.contains("a@x.com"));
     // AC-3: the pool summary line carries name, accounts, requests, tokens.
     assert!(
-        visible.contains("anthropic     3 accounts"),
+        visible.contains("anthropic          3 accounts"),
         "pool line: {visible}"
     );
     // AC-4: the empty pool is omitted from lines and from the header count.
     assert!(!visible.contains("deepseek"));
-    // AC-2: every line fits the 64-column box.
+    // AC-2: every line is exactly the 64-column box width. `<= 64` would
+    // hold for any renderer at all, since panel_row clips to 64.
     for line in visible.lines() {
-        assert!(line.chars().count() <= 64, "too wide: {line}");
+        assert_eq!(line.chars().count(), 64, "off the fixed width: {line}");
     }
     let borders: Vec<&str> = visible
         .lines()
@@ -1571,9 +1572,9 @@ fn accounts_breaks_usage_down_per_model_on_a_tty() {
     );
     assert!(!visible.contains("615 ok"), "no summed count: {visible}");
 
-    // AC-8: nothing escapes the panel width.
+    // AC-8: exactly the panel width, not merely within it.
     for line in &lines {
-        assert!(line.chars().count() <= 64, "too wide: {line}");
+        assert_eq!(line.chars().count(), 64, "off the fixed width: {line}");
     }
 }
 
@@ -1671,4 +1672,135 @@ fn accounts_without_model_history_print_no_model_lines() {
     assert!(!visible.contains("untracked"));
     // The account totals still show.
     assert!(visible.contains("898 ok"));
+}
+
+/// usage-by-model AC-8: a model name is never clipped by a cell narrower
+/// than the panel. Two names sharing a long prefix must stay distinct —
+/// the rendered rows are what a reader uses to tell models apart.
+#[test]
+fn accounts_keeps_long_model_names_distinguishable() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let usage = |model: &str, tokens: i64| {
+        json!({
+            "model": model,
+            "successes": 5,
+            "inputTokens": tokens,
+            "outputTokens": 0,
+            "cacheCreationInputTokens": 0,
+            "cacheReadInputTokens": 0,
+            "reasoningOutputTokens": 0
+        })
+    };
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "deepseek": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "d@x.com",
+                        "available": true,
+                        "totalSuccesses": 10,
+                        "models": [
+                            // 28 chars: the longest in this repo's catalog.
+                            usage("deepseek-v4-flash-vision-exp", 20),
+                            usage("deepseek-v4-flash-fast", 10)
+                        ]
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    assert!(
+        visible.contains("deepseek-v4-flash-vision-exp"),
+        "name clipped: {visible}"
+    );
+    assert!(
+        visible.contains("deepseek-v4-flash-fast"),
+        "name clipped: {visible}"
+    );
+    // Every panel line is exactly the fixed width — not merely within it,
+    // so a renderer that clips or overflows fails here.
+    for line in visible.lines() {
+        assert_eq!(
+            line.chars().count(),
+            64,
+            "panel line off the fixed width: {line}"
+        );
+    }
+}
+
+/// usage-by-model AC-8: the name column is only as wide as the longest
+/// name actually present, so a pool of short names does not leave a
+/// 25-column gap before its numbers — and a long name still renders whole.
+#[test]
+fn accounts_fits_the_model_column_to_the_names_present() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let model = |name: &str| {
+        json!({
+            "model": name,
+            "successes": 5,
+            "inputTokens": 1,
+            "outputTokens": 1,
+            "cacheCreationInputTokens": 0,
+            "cacheReadInputTokens": 0,
+            "reasoningOutputTokens": 0
+        })
+    };
+    let payload = |models: Value| {
+        json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalSuccesses": 5,
+                        "models": models
+                    }))]
+                }
+            }
+        })
+    };
+
+    // Short names: the ok column sits close to them.
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(payload(json!([model("claude-opus-5")]))),
+        ..FakeRuntime::default()
+    };
+    let short = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+    let short_visible = strip_ansi(&short.stdout);
+    assert!(
+        short_visible.contains("claude-opus-5  5 ok"),
+        "column not fitted: {short_visible}"
+    );
+
+    // A long name in the same pool widens the column for every row.
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(payload(json!([
+            model("claude-opus-5"),
+            model("deepseek-v4-flash-vision-exp")
+        ]))),
+        ..FakeRuntime::default()
+    };
+    let long = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+    let long_visible = strip_ansi(&long.stdout);
+    assert!(long_visible.contains("deepseek-v4-flash-vision-exp"));
+    assert!(
+        long_visible.contains("claude-opus-5               "),
+        "rows share one column: {long_visible}"
+    );
+    for line in long_visible.lines() {
+        assert_eq!(line.chars().count(), 64, "off the fixed width: {line}");
+    }
 }

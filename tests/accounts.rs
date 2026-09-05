@@ -426,3 +426,65 @@ async fn per_model_counters_persist_and_tolerate_legacy_files() {
         "no attribution for pre-existing history"
     );
 }
+
+/// usage-by-model: a success with no usage block (the count-tokens route,
+/// or a 2xx whose usage will not parse) still belongs to the model that
+/// served it. Without this, per-model `ok` counts drift below the
+/// account's for reasons unrelated to the no-backfill gap.
+#[tokio::test]
+async fn a_success_without_usage_still_counts_against_its_model() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+
+    manager.record_success("k@example.com", None, "claude-fable-5-1");
+    manager.record_success(
+        "k@example.com",
+        Some(&UsageData {
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            reasoning_output_tokens: 0,
+        }),
+        "claude-fable-5-1",
+    );
+
+    let snapshot = &manager.snapshots()[0];
+    assert_eq!(snapshot["totalSuccesses"], 2);
+    let models = snapshot["models"].clone();
+    assert_eq!(models[0]["model"], "claude-fable-5-1");
+    // Both successes counted; only the second carried tokens.
+    assert_eq!(models[0]["successes"], 2);
+    assert_eq!(models[0]["inputTokens"], 10);
+    assert_eq!(models[0]["outputTokens"], 20);
+}
+
+/// usage-by-model AC-4: a `models` sub-object that is not an object, or
+/// holds junk entries, degrades to no attribution — never a failed load.
+#[tokio::test]
+async fn a_corrupt_models_block_loads_as_no_attribution() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let usage_file = tmp.path().join("commandcode").join("usage.json");
+    fs::create_dir_all(usage_file.parent().expect("parent")).expect("mkdir");
+    fs::write(
+        &usage_file,
+        json!({
+            "k@example.com": {
+                "total_requests": 5,
+                "total_successes": 5,
+                "models": "not-an-object"
+            }
+        })
+        .to_string(),
+    )
+    .expect("write");
+
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    let snapshot = &manager.snapshots()[0];
+    assert_eq!(snapshot["totalRequests"], 5);
+    assert_eq!(snapshot["models"].as_array().expect("array").len(), 0);
+}

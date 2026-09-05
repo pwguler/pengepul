@@ -206,8 +206,9 @@ request stays on the endpoint or subscription family it named. A failed account 
 off up to 5 minutes; a dead refresh token locks it out for 24 hours until a fresh
 `pengepul login`.
 
-`pengepul status` shows each pool: accounts available and on cooldown, requests served,
-and token totals per account and summed. `pengepul accounts` lists the same totals per
-account. In a terminal both render as panels with per-account share-of-pool bars;
-piped or `NO_COLOR` output stays plain. These numbers live in memory and reset when the
-relay restarts.
+`pengepul status` shows one block: where the relay is, one summary line per pool, and
+the relay-wide totals — requests served and tokens in/out/cache. `pengepul accounts`
+is the detailed view: a panel per pool with per-account rows, share-of-pool bars, and
+the models each account served. In a terminal both render as panels; piped or
+`NO_COLOR` output stays plain. The counters persist to `usage.json` in each provider's
+auth directory, so they survive a restart; cooldowns do not.

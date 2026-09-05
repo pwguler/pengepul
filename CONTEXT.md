@@ -59,7 +59,7 @@ The set of Accounts of one Provider behind the relay, spread across by Rotation.
 _Avoid_: account list, fleet, grouping
 
 **Usage counters**:
-The running per-account totals — requests, successes, failures, tokens in/out/cache/reasoning — shown in `status`/`accounts` and persisted to `usage.json` in the provider's auth directory so they survive restarts and upgrades. Cooldowns and failure streaks are not persisted: a fresh process always retries.
+The running per-account totals — requests, successes, failures, tokens in/out/cache/reasoning — broken down per model for the successes, summed relay-wide in `status` and shown per account in `accounts`, and persisted to `usage.json` in the provider's auth directory so they survive restarts and upgrades. Counters recorded before per-model attribution existed stay only in the account totals. Cooldowns and failure streaks are not persisted: a fresh process always retries.
 _Avoid_: stats file, metrics, telemetry
 
 ### Access and billing identity

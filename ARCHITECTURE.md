@@ -56,9 +56,11 @@ in files.
   64-column box, the three-color palette, glyphs, number formats, and the
   `Style` (rich on a color TTY, plain otherwise) that `main.rs` decides once
   at the edge. Knows nothing of Pools, Accounts, or the admin payload.
-- **Usage view** (`usage_view.rs`) — the admin payload turned into pool panels,
-  account rows, footers and the relay total block for `status`/`accounts`, in
-  both styles. Pure over the payload and a `now` the verb hands in.
+- **Usage view** (`usage_view.rs`) — the admin payload turned into the relay
+  total block for `status` (one block: pool summary lines and the relay-wide
+  aggregate) and pool panels with account rows, per-model lines and footers
+  for `accounts`, in both styles. Pure over the payload and a `now` the verb
+  hands in.
 
 ## Seams
 
@@ -105,9 +107,10 @@ in files.
 - **The Provider registry is the `config.yaml` `providers:` section**, read at
   startup; there is no database and nothing on the serving path writes it.
 - **Usage counters survive a restart; Cooldown does not.** Requests, successes,
-  failures and tokens per Account are written to `usage.json` after every
-  outcome and reloaded at startup; a fresh process always retries every
-  Account. Deleting the file is the only reset.
+  failures and tokens per Account — and per model within an Account, for the
+  successes — are written to `usage.json` after every outcome and reloaded at
+  startup; a fresh process always retries every Account. Deleting the file is
+  the only reset.
 - **Cloaking follows Claude Code except where fidelity breaks the client.**
   The beta set is audited against the current CLI binary, but
   `redact-thinking` is never sent (it empties thinking text pengepul's clients

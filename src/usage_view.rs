@@ -218,11 +218,13 @@ impl ModelRow {
         self.input + self.output + self.cache
     }
 
-    /// `claude-fable-5-1        612 ok     9.2K`
-    fn headline(&self) -> String {
+    /// `claude-fable-5-1   612 ok     9.2K` — `width` is the name column
+    /// the caller fitted to the rows it is about to print, so short names
+    /// keep their numbers close and one long name widens every row.
+    fn headline(&self, width: usize) -> String {
         format!(
             "{} {} {:>tokens$}",
-            pad(&self.name, MODEL_NAME_WIDTH),
+            pad(&self.name, width),
             ok_cell(self.successes),
             format_count(self.tokens()),
             tokens = POOL_TOKENS_WIDTH
@@ -245,9 +247,23 @@ impl ModelRow {
     }
 }
 
-/// The model name cell, sized so name + ok + tokens fits the inner width
-/// with room for the two-space indent the nested lines carry.
-const MODEL_NAME_WIDTH: usize = 22;
+/// The widest the model name cell may grow. The indented account row
+/// spends its 60 inner columns as 2 indent + name + 1 + ok 9 + 1 +
+/// tokens 9, so 38 is what is left; the widest id in the shipped catalog
+/// is 28. `name_column` fits the cell to the rows actually present and
+/// clamps here, so a longer id clips rather than breaking the box — the
+/// plain branch prints names un-clipped.
+const MODEL_NAME_WIDTH: usize = 38;
+
+/// The name column for one account's rows: the longest name present plus
+/// a space of air before the ok cell, capped at `MODEL_NAME_WIDTH`.
+fn name_column(rows: &[ModelRow]) -> usize {
+    rows.iter()
+        .map(|row| row.name.chars().count() + 1)
+        .max()
+        .unwrap_or(0)
+        .min(MODEL_NAME_WIDTH)
+}
 
 /// The account's `models` array, heaviest first, ties broken by name so the
 /// order never wobbles between calls.
@@ -283,7 +299,6 @@ pub(crate) fn model_rows(account: &Value) -> Vec<ModelRow> {
     rows
 }
 
-/// Every account's models folded into one list for the pool footer.
 /// The rich pool view behind `accounts`: one panel per provider with rows,
 /// per-account token lines and a footer rollup. Pure over the payload and
 /// the clock value handed to it: the renderer reads no clock.
@@ -327,8 +342,10 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64) {
                 output.line(&panel_row(&line));
             }
             // AC-5: the models this account served, heaviest first.
-            for row in model_rows(account) {
-                output.line(&panel_row(&format!("  {}", row.headline())));
+            let rows = model_rows(account);
+            let width = name_column(&rows);
+            for row in rows {
+                output.line(&panel_row(&format!("  {}", row.headline(width))));
                 output.line(&panel_row(&paint(DIM, &format!("    {}", row.detail()))));
             }
         }
@@ -361,11 +378,12 @@ pub(crate) struct PoolLine {
     tokens: i64,
 }
 
-/// The pool line's column budget inside the 60 inner columns: name 13 +
-/// accounts 12 + requests 11 + tokens 9, single spaces between (48), the
-/// rest is slack. Names longer than the cell keep their own width and push
-/// the row right; `panel_row` truncates if that overflows.
-const POOL_NAME_WIDTH: usize = 13;
+/// The pool line's column budget inside the 60 inner columns: name 18 +
+/// accounts 12 + requests 11 + tokens 9, single spaces between (53), the
+/// rest is slack. `pad` clips a longer pool name to the cell with an
+/// ellipsis rather than pushing the row right, so the token column stays
+/// aligned down the block.
+const POOL_NAME_WIDTH: usize = 18;
 const POOL_ACCOUNTS_WIDTH: usize = 12;
 const POOL_REQUESTS_WIDTH: usize = 11;
 const POOL_TOKENS_WIDTH: usize = 9;
@@ -724,7 +742,16 @@ mod tests {
                         "totalOutputTokens": 401_200,
                         "totalCacheCreationInputTokens": 6_000_000,
                         "totalCacheReadInputTokens": 155_000_000,
-                        "totalReasoningOutputTokens": 64_000
+                        "totalReasoningOutputTokens": 64_000,
+                        "models": [{
+                            "model": "claude-fable-5-1",
+                            "successes": 612,
+                            "inputTokens": 300,
+                            "outputTokens": 400,
+                            "cacheCreationInputTokens": 0,
+                            "cacheReadInputTokens": 8_000,
+                            "reasoningOutputTokens": 42
+                        }]
                     }]
                 }
             }
