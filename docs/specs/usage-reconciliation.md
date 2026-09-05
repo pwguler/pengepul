@@ -1,97 +1,133 @@
 # usage-reconciliation
 
-> **Draft.** The destination is named and the frontier is sketched. No
-> decision below is settled, and nothing is implemented from this file
-> yet. Work it with `drill`, one open decision per session.
+## Goal
 
-## Destination
+`requests == successes + failures` holds for every Account, cumulatively
+and per local day, **by construction rather than by repair**: the same
+call writes both sides, so no interleaving, no concurrent attempt, no
+crash and no future call site can put them out of step.
 
-Every number the CLI prints about requests is trustworthy enough to audit,
-not merely useful enough to read: `requests == successes + failures` per
-Account and per local day, each outcome attributed to the attempt that
-produced it, and no counter written to disk that the relay cannot justify.
+This is the drill the counter work never got. It shipped alongside
+`usage-trend` after five judge rounds found eight P1s and one P0, each
+round's fix causing the next round's defect — the signature of a design
+whose invariants were written after its code.
 
-## Decisions so far
+## The rule
 
-The reconciliation work that shipped with `usage-trend` — the settling
-seam, Refusals, load-time repair, both-direction repair, the in-flight
-day list. It closed a real gap the operator hit (`1,404 requests, 1,398
-ok, 0 failed`) and survived five review rounds, but it was never drilled:
-its invariants were written after its code and revised three times.
-This draft is the drill it did not get.
+**A counter counts outcomes.** One word, one scope: `requests` means the
+same thing in `status`, in `accounts`, in `usage`, cumulatively and in a
+daily bucket. A request that has started but not finished is not counted
+anywhere, and lands in its bucket the moment it settles.
 
-## Open decisions
+```rust
+// record_attempt: no longer counts anything
 
-### 1. What identifies an attempt? — **HITL**
+fn settle(&mut self, success: bool) {
+    self.total_requests += 1;
+    let day = self.day(&local_today());
+    day.requests += 1;
+    if success { day.successes += 1 } else { day.failures += 1 }
+}
+```
 
-`settle` pops the *oldest* in-flight entry, so it settles "an attempt",
-never "this attempt". Counts stay correct; day attribution can be wrong
-when two attempts straddle local midnight.
+The day an outcome books to is the day it **arrived**, not the day its
+attempt opened. This is what makes the identity problem disappear rather
+than get solved: `settle` no longer needs to know which attempt it is
+settling, because it no longer books anything to another day.
 
-The judge's proposal, and the shape `StreamAccounting` already uses for
-one path: `record_attempt` returns an `Attempt` guard carrying its id and
-opening day; `settle` consumes it **by value**, so a second settle is a
-compile error and a dropped guard records a failure on `Drop`.
+## Decisions
 
-The fork is cost, not correctness: the guard must travel through 8
-accounting call sites in `app.rs` and survive an async boundary into the
-stream path. Roughly 200 lines, and it deletes `in_flight`, most of
-`reconcile_loaded_counters`' reason to exist, and several paragraphs of
-invariant prose.
+- **An outcome books to its own day.** The alternative — attributing it
+  to the attempt that produced it — requires attempt identity: either a
+  guard consumed by `settle`, or an id on the in-flight entry. Both were
+  costed and both were declined. The guard's headline property does not
+  even hold here: `AccountManager` sits behind a `tokio::sync::Mutex` and
+  `Drop` is sync, so a dropped guard cannot settle directly; it must
+  `tokio::spawn`, exactly as `StreamAccounting` does, and cannot settle
+  at all during runtime shutdown. Cost accepted: a request spanning local
+  midnight counts on the day it finished.
+- **Counters count outcomes everywhere**, not attempts cumulatively and
+  outcomes per day. Two meanings for one word is the defect the operator
+  cut from the panels twice; it does not belong in the data either.
+- **Load-time repair stays, as a migration.** A gap can no longer be
+  created, so repair now only ever meets files written by the old
+  scheme. It fires once, writes back, and finds nothing on every later
+  load. Deletable in a later release.
+- **A datastore is orthogonal, not a superset.** The unbuilt SQLite +
+  Prisma + Next.js design (`keyed-usage`, `usage-console`, `web-console`,
+  `workspace-split`) stores one row per *client request* keyed by inbound
+  API key. `UsageEvent` has **no account column**: account counters keep
+  their shape and their meaning through the whole migration, so building
+  the console leaves this bug exactly as it is. Findings:
+  `docs/research/usage-reconciliation-datastore.md`.
 
-- **A**: build the guard. Makes double-count and leaks unrepresentable.
-- **B**: keep the list, accept wrong day attribution across midnight.
-- **C**: something narrower — an id on the list entry without the guard.
+## Non-goals
 
-### 2. What bounds `in_flight`? — **HITL**
+- **Attempt identity.** No guard, no id, no per-attempt token. The design
+  removes the need for one instead of building it.
+- **Counting an attempt lost to a crash.** `SIGKILL` between attempt and
+  outcome loses the request from the counters entirely. Accepted: the
+  relay counts what it observed, and a number it cannot justify is worse
+  than a number it does not have.
+- **In-flight visibility.** `status` no longer reads one low while a
+  request streams. The gap that showed it was also the gap that hid real
+  defects for months; the operator read it as damage three times in one
+  session.
+- **Multi-process safety.** `persist_usage` stays whole-file
+  last-writer-wins. One relay per auth directory, still unenforced.
+- **Per-harness attribution**, queued separately.
+- **No change to the panels.** `status`, `accounts` and `usage` keep
+  their current shape and their plain bytes.
 
-`src/accounts.rs:99`. `record_attempt` pushes; only `settle` and a
-restart pop. Any path recording an attempt without settling leaks an
-entry permanently, and each leaked entry misattributes a *later*
-outcome's day. There is no cap, no timeout, no reaper. Five review rounds
-found leaking paths one at a time; nothing structurally prevents the
-next.
+## Acceptance criteria
 
-Resolved by decision 1A (a dropped guard settles itself). Needs its own
-answer only if 1 lands on B or C.
+- AC-1: `AccountState::settle` increments `total_requests` and the daily
+  bucket's `requests` in the same call that increments `successes` or
+  `failures`. No other code path writes `total_requests` or a bucket's
+  `requests`.
+- AC-2: `record_attempt` no longer writes any counter. It is removed, or
+  reduced to what remains of it, and `src/app.rs` has no call site that
+  counts a request before its outcome.
+- AC-3: `AccountState::in_flight` is deleted, with the pop-oldest branch,
+  the implied-attempt branch, and the retention clamp that existed only
+  to keep a stale in-flight day inside the window.
+- AC-4: `settle` takes no attempt and returns the day it wrote, so
+  `record_success` books its tokens to the same bucket as its outcome.
+- AC-5: For every sequence of recorder calls, cumulative
+  `requests == successes + failures` and, for every bucket,
+  `requests == successes + failures`. The table test asserts exact
+  counts per sequence, not balance alone: balance cannot distinguish
+  "counted correctly" from "attempt and outcome both dropped".
+- AC-6: Two concurrent outcomes on one account both count, with their
+  tokens and their per-model rows. The round-4 P0 stays closed.
+- AC-7: A recorder firing twice for one request counts two requests, and
+  the balance holds. The seam does not refuse: with nothing to refuse
+  against, a double-recording path inflates `requests` rather than
+  corrupting the invariant. A caller that must not record twice applies
+  its health without an outcome (`record_billing_cooldown`).
+- AC-8: `reconcile_loaded_counters` repairs a file written by the old
+  scheme, writes the repair back at load, and finds nothing to repair on
+  the next load of the file it just wrote.
+- AC-9: A Refusal counts a failed request and never touches account
+  health: no cooldown, no failure streak, no effect on Rotation.
+- AC-10: A cooldown only ever widens. A 24-hour reauth lockout survives a
+  paired failure carrying a 2-second backoff.
+- AC-11: No test hardcodes a calendar date. Dates come from the clock, so
+  no test can go red on a fixed future day.
+- AC-12: `ARCHITECTURE.md` states the counting rule, and no comment,
+  doc or spec claims the seam refuses a second outcome.
 
-### 3. Should the relay repair persisted counters at all? — **HITL**
+## Verification
 
-`reconcile_loaded_counters` rewrites `usage.json` at every load. It fixed
-the operator's real 6-request gap, is idempotent, and is tested in both
-directions — but it is the one piece that can *destroy* history rather
-than only misreport it, and it runs before the process is known healthy.
+```bash
+source ~/.cargo/env
+cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
+TMPDIR=/home/kognos/tmp/a/rather/long/temp/prefix cargo test   # long-path safety
 
-- **A**: keep repairing at load.
-- **B**: repair, but write a `repaired: {...}` record beside the counters
-  so the operator can see what was changed.
-- **C**: never rewrite; show the gap in the panel and leave the file
-  alone.
+# AC-5, by hand, against the live relay:
+pengepul accounts        # every account: requests == ok + failed
+pengepul usage | cat     # every day:     requests == ok + failed
+```
 
-### 4. Is a datastore the answer? — **AFK**
-
-Repeatedly proposed and repeatedly the wrong tool for *this* bug: a
-database changes where counters live, not whether an outcome knows its
-attempt. But `docs/specs/keyed-usage.md`, `usage-console.md` and
-`web-console.md` describe a settled-but-unbuilt Postgres design for
-history beyond 90 days, cross-process reconciliation, and queries.
-Research whether that design subsumes this one or is orthogonal to it.
-Findings to `docs/research/usage-reconciliation-datastore.md`.
-
-## Not yet specified
-
-- Multi-process safety. `persist_usage` is whole-file last-writer-wins;
-  two relays on one auth dir would clobber each other. No decision needs
-  it today (one relay per auth dir), and nothing enforces that.
-- Whether `requests` should count attempts or *completed* attempts. The
-  in-flight window makes `status` read one low while a request streams,
-  which is honest but confused the operator once already.
-
-## Out of scope
-
-- The `usage-trend` feature itself: `pengepul usage`, daily buckets,
-  retention, the sparkline. Shipped and reviewed; this draft does not
-  reopen it.
-- Per-harness attribution, which the operator queued separately and which
-  needs its own drill (one shared API key today, so nothing distinguishes
-  callers).
+Each acceptance criterion needs a test that fails when its fix is
+reverted. Round 5 caught two claims that no test could falsify.
