@@ -21,7 +21,11 @@ in files.
 - **Account** (`accounts.rs`) — `AccountManager`: holds every Account of one
   Provider and picks who serves next; **Rotation**, **Cooldown** and due
   **Refresh** live here, and every request outcome updates the Account's
-  Usage counters, which it hands to the Credential store to persist.
+  Usage counters, which it hands to the Credential store to persist. Every
+  outcome passes through one private seam (`AccountState::settle`), so the
+  attempt/outcome invariant holds by construction rather than by each
+  recorder remembering it; counters read from disk are repaired at load,
+  where nothing is in flight.
 - **Credential store** (`tokens.rs`) — reads and writes what an Account
   leaves on disk under the auth dir: the one credential it holds, and the
   provider's **Usage counters** file (`usage.json`), both at `0600`, the
