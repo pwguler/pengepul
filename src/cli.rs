@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use serde_json::Value;
 
-use crate::config::{Config, load_config, selected_config_path};
+use crate::config::{Config, load_config, register_provider, selected_config_path};
 pub use crate::render::Style;
 use crate::render::{ActionGlyph, BOLD, DIM, Fact, Output, fact_panel, paint, status_glyph};
 use crate::service::service_status_panel;
@@ -170,6 +170,9 @@ enum Command {
         /// static API key for a configured OpenAI-compatible provider
         #[arg(long)]
         key: Option<String>,
+        /// register a new OpenAI-compatible provider at this URL; needs --key
+        #[arg(long = "base-url")]
+        base_url: Option<String>,
     },
     /// show local server status
     Status {
@@ -333,11 +336,13 @@ pub fn run_with_env(
             command_config,
             provider,
             key,
+            base_url,
         }) => {
             login(
                 root_env.with_override(command_config.as_deref()),
                 &provider,
                 key.as_deref(),
+                base_url.as_deref(),
                 runtime,
                 &mut output,
                 style,
@@ -796,6 +801,7 @@ fn login(
     env: CommandEnv<'_>,
     provider: &str,
     key: Option<&str>,
+    base_url: Option<&str>,
     runtime: &mut impl CliRuntime,
     output: &mut Output,
     style: Style,
@@ -807,11 +813,21 @@ fn login(
         if key.is_some() {
             bail!("{builtin} uses OAuth; --key is for configured providers");
         }
+        // AC-6: a built-in's endpoint is fixed, so there is nothing to
+        // register.
+        if base_url.is_some() {
+            bail!("{builtin} uses OAuth; --base-url is for configured providers");
+        }
         let email = runtime.login(&config, builtin.clone(), key)?;
         print_login_saved(&builtin.to_string(), &email, output, style);
         return Ok(());
     }
-    if !config.providers.contains_key(provider) {
+    // AC-2: registering without a credential leaves a provider that has
+    // no account, which is the half-done state this flag exists to avoid.
+    if base_url.is_some() && key.is_none() {
+        bail!("--base-url registers {provider} and needs --key to be usable");
+    }
+    if base_url.is_none() && !config.providers.contains_key(provider) {
         bail!(
             "{provider} is not configured; configured providers: {}",
             config
@@ -836,7 +852,18 @@ fn login(
         last_refresh_at: None,
         plan_type: None,
     };
+    // The token first: if the config write then fails, what is left is an
+    // orphan token in the auth-dir, which is harmless because the
+    // provider is still unconfigured. The other order leaves a registered
+    // provider with no account (AC-9).
     save_token(&config.auth_dir, &token)?;
+    if let Some(base_url) = base_url {
+        let path = selected_config_path(env.config_path, Some(env.home), env.cwd);
+        register_provider(&path, provider, base_url)?;
+        // AC-11: one line, same in both styles \u2014 it precedes the login
+        // panel rather than opening a second one.
+        output.line(&format!("registered {provider}"));
+    }
     print_login_saved(provider, &label, output, style);
     Ok(())
 }

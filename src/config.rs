@@ -160,6 +160,53 @@ pub fn selected_config_path(
     config_paths(config_path, home_override, cwd).1
 }
 
+/// Register an OpenAI-compatible provider in the config file `login` read.
+///
+/// Rewrites the file in place, leaving every other field as it was. The
+/// provider must be new: an id already present with a different
+/// `base-url` is an error rather than an overwrite, so one mistyped flag
+/// cannot move a live provider's traffic to another host
+/// (login-registers-a-provider, AC-3). Re-registering the same URL is
+/// accepted, so repeating a command is safe.
+///
+/// # Errors
+///
+/// Returns an error when the config cannot be read, parsed, or written,
+/// when `base_url` is empty, or when `id` is already registered with a
+/// different `base-url`.
+pub fn register_provider(path: &Path, id: &str, base_url: &str) -> Result<()> {
+    // A trailing slash would make `{base_url}/chat/completions` a double
+    // slash, which some hosts answer with a 404 that names nothing
+    // (AC-5).
+    let base_url = base_url.trim().trim_end_matches('/');
+    if base_url.is_empty() {
+        bail!("providers: {id} is missing base-url");
+    }
+    let text =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut raw: RawConfig = if text.trim().is_empty() {
+        RawConfig::default()
+    } else {
+        serde_yaml::from_str(&text).with_context(|| format!("invalid config {}", path.display()))?
+    };
+    if let Some(existing) = raw.providers.get(id) {
+        let existing = existing.base_url.trim().trim_end_matches('/');
+        if existing != base_url {
+            bail!("{id} already points at {existing}; edit the config to change it");
+        }
+    }
+    raw.providers.insert(
+        id.to_string(),
+        RawConfiguredProvider {
+            base_url: base_url.to_string(),
+        },
+    );
+    // The same validation the load path applies, so a name this file
+    // would reject cannot enter through this door (AC-7).
+    validate_providers(&raw.providers)?;
+    write_config(path, &raw, false)
+}
+
 /// Load config from an explicit path, the default home config, or legacy workspace config.
 ///
 /// # Errors

@@ -150,6 +150,15 @@ fn run(argv: &[&str], home: &Path, runtime: &mut impl CliRuntime) -> RunOutcome 
     run_with_env(argv, home, home, runtime, Style::Plain).expect("cli run")
 }
 
+/// The error a failing command reports. `run` panics on failure, which
+/// is right for the happy path and useless for testing a refusal.
+fn run_err(argv: &[&str], home: &Path, runtime: &mut impl CliRuntime) -> String {
+    match run_with_env(argv, home, home, runtime, Style::Plain) {
+        Ok(outcome) => panic!("expected a refusal, got: {}", outcome.stdout),
+        Err(error) => format!("{error:#}"),
+    }
+}
+
 fn run_style(
     argv: &[&str],
     home: &Path,
@@ -3245,4 +3254,398 @@ fn a_day_of_failures_is_one_day_recorded_not_zero() {
         .find(|line| line.contains("peak"))
         .expect("peak row");
     assert!(peak.contains(&today), "peak names the recorded day: {peak}");
+}
+
+/// AC-1: `--base-url` mendaftarkan provider baru dan menyimpan keynya
+/// dalam satu perintah, ke file config yang sama dengan yang dibaca.
+#[test]
+fn login_registers_a_new_provider_and_saves_its_key() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  existing:\n    base-url: https://existing.host/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+
+    let outcome = run(
+        &[
+            "login",
+            "--provider",
+            "openrouter",
+            "--base-url",
+            "https://openrouter.ai/api/v1",
+            "--key",
+            "sk-or-v1-test",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    assert_eq!(outcome.code, 0, "stderr: {}", outcome.stderr);
+    assert!(
+        outcome.stdout.contains("registered openrouter"),
+        "registration was not announced: {}",
+        outcome.stdout
+    );
+    // The config it read is the config it wrote.
+    let written = std::fs::read_to_string(tmp.path().join(".pengepul").join("config.yaml"))
+        .expect("read config");
+    assert!(
+        written.contains("openrouter"),
+        "provider not written: {written}"
+    );
+    assert!(
+        written.contains("https://openrouter.ai/api/v1"),
+        "base-url not written: {written}"
+    );
+    // AC-8: the provider that was already there survives.
+    assert!(
+        written.contains("https://existing.host/v1"),
+        "an existing provider was dropped: {written}"
+    );
+}
+
+/// AC-2: registering without a credential would leave a provider that has
+/// no account. The flag exists to avoid exactly that half-done state.
+#[test]
+fn base_url_without_a_key_registers_nothing() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  existing:\n    base-url: https://existing.host/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+
+    let error = run_err(
+        &[
+            "login",
+            "--provider",
+            "openrouter",
+            "--base-url",
+            "https://openrouter.ai/api/v1",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    // The message must name the registration, not merely mention --key:
+    // the pre-existing "takes a static API key" error also contains
+    // "--key", and would let this test pass with the guard deleted.
+    assert!(
+        error.contains("registers openrouter"),
+        "the error does not name what the flag was doing: {error}"
+    );
+    let written = std::fs::read_to_string(tmp.path().join(".pengepul").join("config.yaml"))
+        .expect("read config");
+    assert!(
+        !written.contains("openrouter"),
+        "a failed registration wrote to the config: {written}"
+    );
+}
+
+/// AC-3: one mistyped flag must not move a live provider's traffic to
+/// another host.
+#[test]
+fn a_different_base_url_for_a_known_provider_is_refused() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  openrouter:\n    base-url: https://openrouter.ai/api/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+
+    let error = run_err(
+        &[
+            "login",
+            "--provider",
+            "openrouter",
+            "--base-url",
+            "https://typo.host/v1",
+            "--key",
+            "sk-test",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    assert!(
+        error.contains("https://openrouter.ai/api/v1"),
+        "the error does not name the URL it kept: {error}"
+    );
+    let written = std::fs::read_to_string(tmp.path().join(".pengepul").join("config.yaml"))
+        .expect("read config");
+    assert!(
+        written.contains("https://openrouter.ai/api/v1"),
+        "the live URL was overwritten: {written}"
+    );
+    assert!(
+        !written.contains("typo.host"),
+        "the rejected URL was written anyway: {written}"
+    );
+}
+
+/// AC-4: the same URL is not a conflict, so repeating a command is safe.
+#[test]
+fn re_registering_the_same_url_is_accepted() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  openrouter:\n    base-url: https://openrouter.ai/api/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+
+    let outcome = run(
+        &[
+            "login",
+            "--provider",
+            "openrouter",
+            // AC-5: the trailing slash is trimmed, so this is the same URL.
+            "--base-url",
+            "https://openrouter.ai/api/v1/",
+            "--key",
+            "sk-test",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    assert_eq!(outcome.code, 0, "stderr: {}", outcome.stderr);
+    assert!(outcome.stdout.contains("saved openrouter account token"));
+}
+
+/// AC-5: `base_url` is joined as `{base_url}/chat/completions`, so a
+/// trailing slash would make a double slash: a 404 on some hosts, with a
+/// message that names nothing.
+#[test]
+fn a_trailing_slash_is_trimmed_before_it_is_written() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  existing:\n    base-url: https://existing.host/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+
+    let outcome = run(
+        &[
+            "login",
+            "--provider",
+            "openrouter",
+            "--base-url",
+            "https://openrouter.ai/api/v1/",
+            "--key",
+            "sk-test",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    assert_eq!(outcome.code, 0, "stderr: {}", outcome.stderr);
+    let written = std::fs::read_to_string(tmp.path().join(".pengepul").join("config.yaml"))
+        .expect("read config");
+    assert!(
+        written.contains("https://openrouter.ai/api/v1\n")
+            || written.contains("https://openrouter.ai/api/v1\""),
+        "the trailing slash survived: {written}"
+    );
+    assert!(
+        !written.contains("api/v1/"),
+        "the trailing slash survived: {written}"
+    );
+}
+
+/// AC-6: a built-in provider's endpoint is fixed, so there is nothing to
+/// register.
+#[test]
+fn a_builtin_provider_refuses_a_base_url() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime::default();
+
+    let error = run_err(
+        &[
+            "login",
+            "--provider",
+            "anthropic",
+            "--base-url",
+            "https://elsewhere.host/v1",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    assert!(
+        error.contains("OAuth"),
+        "the error does not say why: {error}"
+    );
+}
+
+/// AC-7: a name the load path rejects cannot enter through this door
+/// either.
+#[test]
+fn registration_applies_the_same_name_rules_as_the_config() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  existing:\n    base-url: https://existing.host/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+
+    let error = run_err(
+        &[
+            "login",
+            "--provider",
+            "some/vendor",
+            "--base-url",
+            "https://host/v1",
+            "--key",
+            "sk-test",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+    assert!(
+        error.contains('/'),
+        "the error does not name the rule: {error}"
+    );
+    let written = std::fs::read_to_string(tmp.path().join(".pengepul").join("config.yaml"))
+        .expect("read config");
+    assert!(
+        !written.contains("some/vendor"),
+        "a rejected name was written: {written}"
+    );
+}
+
+/// AC-8: the written config loads again, and the fields this command has
+/// no business touching are untouched.
+#[test]
+fn registration_leaves_every_other_field_alone() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  existing:\n    base-url: https://existing.host/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+
+    let registered = run(
+        &[
+            "login",
+            "--provider",
+            "openrouter",
+            "--base-url",
+            "https://openrouter.ai/api/v1",
+            "--key",
+            "sk-test",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+    assert_eq!(registered.code, 0, "stderr: {}", registered.stderr);
+
+    // It parses: any later command that loads config would fail otherwise.
+    let outcome = run(&["config", "show"], tmp.path(), &mut runtime);
+    assert_eq!(outcome.code, 0, "the written config does not load");
+    let written = std::fs::read_to_string(tmp.path().join(".pengepul").join("config.yaml"))
+        .expect("read config");
+    assert!(written.contains("sk-test"), "api-keys lost: {written}");
+    assert!(written.contains("8317"), "port lost: {written}");
+    assert!(
+        written.contains("https://existing.host/v1"),
+        "the other provider was dropped: {written}"
+    );
+}
+
+/// AC-10: without `--base-url`, nothing about `login` changes.
+#[test]
+fn login_without_a_base_url_is_unchanged() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  openrouter:\n    base-url: https://openrouter.ai/api/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+
+    let configured = run(
+        &["login", "--provider", "openrouter", "--key", "sk-test"],
+        tmp.path(),
+        &mut runtime,
+    );
+    assert_eq!(configured.code, 0, "stderr: {}", configured.stderr);
+    assert!(configured.stdout.contains("saved openrouter account token"));
+    assert!(
+        !configured.stdout.contains("registered"),
+        "a plain login announced a registration: {}",
+        configured.stdout
+    );
+
+    // An unconfigured provider without --base-url still names what is
+    // configured.
+    let error = run_err(
+        &["login", "--provider", "nowhere", "--key", "sk-test"],
+        tmp.path(),
+        &mut runtime,
+    );
+    assert!(error.contains("not configured"), "{error}");
+}
+
+/// AC-9: the token is saved before the config is written, so a failure
+/// there leaves no registered provider behind. The reverse order would
+/// leave a provider with no account: the half-done state AC-2 refuses.
+#[test]
+fn a_failed_token_save_registers_nothing() {
+    let tmp = tempdir().expect("tempdir");
+    let config_dir = tmp.path().join(".pengepul");
+    std::fs::create_dir_all(&config_dir).expect("config dir");
+    // auth-dir points at a path that cannot become a directory.
+    let blocked = tmp.path().join("blocked");
+    std::fs::write(&blocked, "not a directory").expect("write blocker");
+    std::fs::write(
+        config_dir.join("config.yaml"),
+        format!(
+            "host: \"127.0.0.1\"\nport: 8317\nauth-dir: {}\napi-keys:\n  - sk-test\nproviders:\n  existing:\n    base-url: https://existing.host/v1\n",
+            blocked.display()
+        ),
+    )
+    .expect("write config");
+    let mut runtime = FakeRuntime::default();
+
+    let error = run_err(
+        &[
+            "login",
+            "--provider",
+            "openrouter",
+            "--base-url",
+            "https://openrouter.ai/api/v1",
+            "--key",
+            "sk-test",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    assert!(!error.is_empty(), "the failure was silent");
+    let written = std::fs::read_to_string(config_dir.join("config.yaml")).expect("read config");
+    assert!(
+        !written.contains("openrouter"),
+        "the provider was registered despite a failed token save: {written}"
+    );
+}
+
+/// AC-12: the flag documents what it does and what it needs.
+#[test]
+fn login_help_documents_base_url() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime = FakeRuntime::default();
+
+    let outcome = run(&["help", "login"], tmp.path(), &mut runtime);
+
+    assert!(
+        outcome.stdout.contains("--base-url"),
+        "the flag is undocumented: {}",
+        outcome.stdout
+    );
+    assert!(
+        outcome.stdout.contains("--key"),
+        "help does not say the flag needs a key: {}",
+        outcome.stdout
+    );
 }
