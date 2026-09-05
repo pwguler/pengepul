@@ -3573,9 +3573,15 @@ fn registration_leaves_every_other_field_alone() {
         &mut runtime,
     );
 
-    // It parses: any later command that loads config would fail otherwise.
+    // It parses, and the reload sees the new provider. `run` panics on a
+    // load failure, and `code` is a constant on the Ok path, so the
+    // assertion has to be about what `config show` actually reports.
     let outcome = run(&["config", "show"], tmp.path(), &mut runtime);
-    assert_eq!(outcome.code, 0, "the written config does not load");
+    assert!(
+        outcome.stdout.contains("openrouter"),
+        "the reloaded config does not carry the provider: {}",
+        outcome.stdout
+    );
     let written = std::fs::read_to_string(tmp.path().join(".pengepul").join("config.yaml"))
         .expect("read config");
     assert!(
