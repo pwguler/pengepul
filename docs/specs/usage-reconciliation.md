@@ -83,8 +83,9 @@ settling, because it no longer books anything to another day.
 
 - AC-1: `AccountState::settle` increments `total_requests` and the daily
   bucket's `requests` in the same call that increments `successes` or
-  `failures`. No other code path writes `total_requests` or a bucket's
-  `requests`.
+  `failures`. No other code path *on the serving path* writes
+  `total_requests` or a bucket's `requests`; the load path writes both,
+  as AC-8 requires.
 - AC-2: `record_attempt` no longer writes any counter. It is removed, or
   reduced to what remains of it, and `src/app.rs` has no call site that
   counts a request before its outcome.

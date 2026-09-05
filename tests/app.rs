@@ -2282,14 +2282,17 @@ async fn billing_scoped_upstream_rejection_fails_over_to_the_next_account() {
         .and_then(|accounts| accounts.iter().find(|a| a["email"] == calls[1]))
         .expect("serving account in admin output");
     assert_eq!(served["failureCount"], 0);
-    // One attempt, one outcome: the billing marker adds the cooldown, not
-    // a second failure (ARCHITECTURE, "Outcomes never exceed attempts").
+    // One request, one outcome: the billing marker adds the cooldown, not
+    // a second failure (ARCHITECTURE, "A counter counts outcomes, never
+    // attempts"). Exact counts, not balance: a double-count now adds a
+    // request and a failure together, so it balances and only the tuple
+    // catches it.
     let requests = drained["totalRequests"].as_i64().expect("requests");
     let ok = drained["totalSuccesses"].as_i64().expect("ok");
     let failed = drained["totalFailures"].as_i64().expect("failed");
     assert_eq!(
-        requests,
-        ok + failed,
+        (requests, ok, failed),
+        (1, 0, 1),
         "a billing rejection counted twice: {requests} requests, {ok} ok, {failed} failed"
     );
     // The cooldown it justifies is still applied.
@@ -2658,7 +2661,7 @@ async fn a_fetch_that_parses_to_nothing_keeps_the_known_versions() {
     assert_eq!(kept.codex, "0.140.0".parse().ok());
 }
 
-/// ARCHITECTURE, "Outcomes never exceed attempts": a client that hangs
+/// ARCHITECTURE, "A counter counts outcomes, never attempts": a client that hangs
 /// up mid-stream still made a request. The outcome is recorded after the
 /// yield loop, so dropping the body skips it and the attempt leaks.
 #[tokio::test]
@@ -2730,10 +2733,12 @@ async fn a_client_disconnect_mid_stream_still_reaches_an_outcome() {
     let requests = account["totalRequests"].as_i64().expect("requests");
     let ok = account["totalSuccesses"].as_i64().expect("ok");
     let failed = account["totalFailures"].as_i64().expect("failed");
+    // Exact counts, not balance: with the `Drop` guard removed nothing is
+    // recorded at all, and 0/0/0 balances. The tuple is what fails.
     assert_eq!(
-        requests,
-        ok + failed,
-        "a disconnected stream leaked its attempt: \
+        (requests, ok, failed),
+        (1, 0, 1),
+        "a disconnected stream did not reach an outcome: \
          {requests} requests, {ok} ok, {failed} failed"
     );
     // The account was serving a 2xx stream when the client hung up: that
@@ -2748,7 +2753,7 @@ async fn a_client_disconnect_mid_stream_still_reaches_an_outcome() {
     );
 }
 
-/// ARCHITECTURE, "Outcomes never exceed attempts", on the request paths
+/// ARCHITECTURE, "A counter counts outcomes, never attempts", on the request paths
 /// rather than on the manager: a 501 refusal counts its attempt as a
 /// failed request, and leaves the account's health alone so rotation
 /// still offers it.
@@ -2867,7 +2872,7 @@ impl UpstreamClient for RejectingUpstream {
     }
 }
 
-/// ARCHITECTURE, "Outcomes never exceed attempts": an upstream 400 is
+/// ARCHITECTURE, "A counter counts outcomes, never attempts": an upstream 400 is
 /// the client's fault, not the account's. It counts as a failed request
 /// so the panels reconcile, and leaves the account in rotation.
 #[tokio::test]
@@ -2914,10 +2919,13 @@ async fn an_upstream_400_reconciles_and_spares_the_account() {
     let requests = account["totalRequests"].as_i64().expect("requests");
     let ok = account["totalSuccesses"].as_i64().expect("ok");
     let failed = account["totalFailures"].as_i64().expect("failed");
+    // Exact counts, not balance: with the refusal call removed nothing is
+    // recorded and 0/0/0 balances.
     assert_eq!(
-        requests,
-        ok + failed,
-        "an upstream 400 leaked its attempt: {requests} requests, {ok} ok, {failed} failed"
+        (requests, ok, failed),
+        (1, 0, 1),
+        "an upstream 400 did not reach an outcome: \
+         {requests} requests, {ok} ok, {failed} failed"
     );
     assert_eq!(
         account["available"], true,

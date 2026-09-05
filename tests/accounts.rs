@@ -680,7 +680,7 @@ async fn in_memory_buckets_are_trimmed_not_only_the_written_copy() {
     );
 }
 
-/// Every attempt reaches an outcome: `requests` must equal
+/// A counter counts outcomes: `requests` must equal
 /// `successes + failures`, or the three panels report a gap the operator
 /// cannot account for ("1,404 requests, 1,398 ok, 0 failed").
 #[tokio::test]
@@ -1004,12 +1004,12 @@ async fn the_invariant_holds_across_a_restart() {
     let requests = snapshot["totalRequests"].as_i64().expect("requests");
     let ok = snapshot["totalSuccesses"].as_i64().expect("ok");
     let failed = snapshot["totalFailures"].as_i64().expect("failed");
-    assert_eq!(requests, 3, "two recorded attempts, one implied");
+    assert_eq!(requests, 3, "three outcomes, three requests");
     assert_eq!(ok, 1);
     assert_eq!(failed, 2);
     assert_eq!(requests, ok + failed);
 
-    // An outcome with no attempt at all counts the attempt it implies.
+    // Each outcome counts its own request (ADR-0015).
     rebuilt.record_refusal("k@example.com");
     let snapshot = &rebuilt.snapshots()[0];
     let requests = snapshot["totalRequests"].as_i64().expect("requests");

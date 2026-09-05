@@ -195,6 +195,13 @@ before.
   trims, but only a recorder calls it, so a process idle since the window
   moved kept serving them. `snapshots()` filters to the window: what is
   served is bounded by the same rule as what is written.
+> **Superseded by ADR-0015 for the mechanism, not the findings.** The
+> entries below describe defects that were real and fixes that were made.
+> The machinery they name — in-flight attempts, an outcome booking to its
+> attempt's day, an implied attempt — no longer exists: a counter now
+> counts outcomes, and `settle` writes the request and its outcome in one
+> call. Read them as history, not as a description of the code.
+
 - **An outcome belongs to its attempt's day.** With the in-flight count
   fixed, a request spanning local midnight still booked its attempt on
   one day and its outcome on the next, so both buckets were unbalanced
