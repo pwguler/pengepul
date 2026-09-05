@@ -2282,6 +2282,21 @@ async fn billing_scoped_upstream_rejection_fails_over_to_the_next_account() {
         .and_then(|accounts| accounts.iter().find(|a| a["email"] == calls[1]))
         .expect("serving account in admin output");
     assert_eq!(served["failureCount"], 0);
+    // One attempt, one outcome: the billing marker adds the cooldown, not
+    // a second failure (ARCHITECTURE, "Every attempt reaches an outcome").
+    let requests = drained["totalRequests"].as_i64().expect("requests");
+    let ok = drained["totalSuccesses"].as_i64().expect("ok");
+    let failed = drained["totalFailures"].as_i64().expect("failed");
+    assert_eq!(
+        requests,
+        ok + failed,
+        "a billing rejection counted twice: {requests} requests, {ok} ok, {failed} failed"
+    );
+    // The cooldown it justifies is still applied.
+    assert_eq!(
+        drained["available"], false,
+        "the drained account kept serving"
+    );
 }
 
 #[tokio::test]
@@ -2720,6 +2735,16 @@ async fn a_client_disconnect_mid_stream_still_reaches_an_outcome() {
         ok + failed,
         "a disconnected stream leaked its attempt: \
          {requests} requests, {ok} ok, {failed} failed"
+    );
+    // The account was serving a 2xx stream when the client hung up: that
+    // is not its fault, so it keeps its health and its place in rotation.
+    assert_eq!(
+        account["available"], true,
+        "a client disconnect cooled the account down"
+    );
+    assert_eq!(
+        account["failureCount"], 0,
+        "a client disconnect opened a failure streak"
     );
 }
 

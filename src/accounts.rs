@@ -354,6 +354,21 @@ impl AccountManager {
         self.persist_usage();
     }
 
+    /// Apply the billing cooldown and its failure streak to an account
+    /// whose request already reached an outcome. Counts no new outcome:
+    /// `requests` must keep equalling `successes + failures`.
+    pub fn record_billing_cooldown(&mut self, email: &str, detail: &str) {
+        let Some(state) = self.accounts.get_mut(email) else {
+            return;
+        };
+        state.failure_count += 1;
+        state.last_failure_kind = Some("billing".to_string());
+        state.last_failure_at = Some(now_iso());
+        state.last_error = Some(format!("billing: {detail}"));
+        state.cooldown_until = unix_now() + BILLING_COOLDOWN_SECONDS;
+        self.persist_usage();
+    }
+
     pub fn record_attempt(&mut self, email: &str) {
         if let Some(state) = self.accounts.get_mut(email) {
             state.total_requests += 1;

@@ -63,7 +63,7 @@ One 64-column box of rich CLI output. Its header is `<subject>` or `<subject> â”
 _Avoid_: card, box, widget
 
 **Refusal**:
-A request the relay accepted and then declined to serve without asking upstream â€” a dialect the Provider cannot serve, or a body the upstream rejected as malformed. It counts as a failed request so `requests` still equals `successes + failures`, but it never touches the Account's health: no Cooldown, no failure streak, no change to Rotation. It is the relay's or the client's fault, not the Account's.
+A request that reached an outcome no Account is at fault for: a dialect the Provider cannot serve, a body the upstream rejected as malformed, or a client that hung up before its stream completed. It counts as a failed request so `requests` still equals `successes + failures`, but it never touches the Account's health: no Cooldown, no failure streak, no change to Rotation. Defined by its effect, not by whether the relay asked upstream first.
 _Avoid_: rejection, refused request, bad request
 
 **Usage counters**:

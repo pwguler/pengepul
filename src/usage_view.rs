@@ -377,10 +377,13 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64) {
             }
             let unattributed = unattributed_tokens(account);
             if unattributed > 0 {
+                // On the model rows' column, not a third alignment: it is
+                // a row in that list, naming what the list does not claim.
                 output.line(&panel_row(&paint(
                     DIM,
                     &format!(
-                        "  unattributed  {}  \u{2014} before per-model tracking",
+                        "  {}{}  \u{2014} before per-model tracking",
+                        pad("unattributed", width),
                         format_count(unattributed)
                     ),
                 )));
@@ -800,6 +803,10 @@ const TREND_DAYS: usize = 30;
 pub(crate) struct TrendDay {
     date: String,
     tokens: i64,
+    /// Whether the relay held a bucket for this day. Carried rather than
+    /// re-derived from `tokens > 0`: a day whose every request failed is
+    /// history with no tokens, and two rules for one word drift.
+    recorded: bool,
 }
 
 /// The payload's per-account `days` arrays folded into one relay-wide
@@ -837,7 +844,12 @@ pub(crate) fn trend_days(payload: &Value, today: &str) -> Vec<TrendDay> {
         .into_iter()
         .map(|date| {
             let tokens = totals.get(&date).copied().unwrap_or(0);
-            TrendDay { date, tokens }
+            let recorded = totals.contains_key(&date);
+            TrendDay {
+                date,
+                tokens,
+                recorded,
+            }
         })
         .collect();
     // Emptiness is judged over the *window*, not over every bucket the
@@ -846,8 +858,7 @@ pub(crate) fn trend_days(payload: &Value, today: &str) -> Vec<TrendDay> {
     // A day is history because it was *recorded*, not because it spent
     // tokens — a day of failures is history, and plain prints it, so rich
     // must not call it empty.
-    let recorded: std::collections::BTreeSet<&String> = totals.keys().collect();
-    if !window.iter().any(|day| recorded.contains(&day.date)) {
+    if !window.iter().any(|day| day.recorded) {
         return Vec::new();
     }
     window
@@ -893,7 +904,7 @@ pub(crate) fn print_trend_rich(payload: &Value, output: &mut Output, today: &str
     // window is drawn but was never recorded. Saying "across 30 days"
     // when one day exists invites the reader to compare the total against
     // `status` and conclude the trend is broken, when it is only new.
-    let recorded: Vec<&TrendDay> = days.iter().filter(|day| day.tokens > 0).collect();
+    let recorded: Vec<&TrendDay> = days.iter().filter(|day| day.recorded).collect();
     // The all-time figure comes from the same sum `status` prints, over the
     // same payload, so the two verbs cannot drift and the window is
     // visibly a subset rather than a competing total.

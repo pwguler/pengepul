@@ -3191,3 +3191,56 @@ fn an_account_names_the_tokens_no_model_claims() {
         "a fully attributed account needs no remainder row: {visible}"
     );
 }
+
+/// usage-trend AC-8: a day whose every request failed is one day of
+/// history, not zero. `window` must say so, and the bars must not read as
+/// thirty idle days.
+#[test]
+fn a_day_of_failures_is_one_day_recorded_not_zero() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalRequests": 9,
+                        "totalFailures": 9,
+                        "days": [{
+                            "date": today.clone(),
+                            "requests": 9,
+                            "successes": 0,
+                            "failures": 9,
+                            "inputTokens": 0,
+                            "outputTokens": 0,
+                            "cacheReadInputTokens": 0,
+                            "cacheCreationInputTokens": 0,
+                            "reasoningOutputTokens": 0
+                        }]
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let visible = strip_ansi(&run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich).stdout);
+    let window = visible
+        .lines()
+        .find(|line| line.contains("window"))
+        .expect("window row");
+    assert!(
+        window.contains("1 day recorded"),
+        "a day of failures counted as zero: {window}"
+    );
+    let peak = visible
+        .lines()
+        .find(|line| line.contains("peak"))
+        .expect("peak row");
+    assert!(peak.contains(&today), "peak names the recorded day: {peak}");
+}

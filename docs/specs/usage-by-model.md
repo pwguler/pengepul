@@ -64,8 +64,10 @@ model at accounting time but throws it away.
   a `models` map per email; a manager built over that file restores the
   per-model counters. A file written before this change (no `models`
   key) loads with empty per-model history and intact account totals.
-- AC-5: `pengepul accounts` (rich) prints under each account row, one
-  model per two lines: `<model>  <n> ok  <total>` then indented
+- AC-5: `pengepul accounts` (rich) prints, under each account row and
+  after its model lines, an `unattributed` row naming the tokens no model
+  claims when that remainder is non-zero. Model lines are one model per
+  two lines: `<model>  <n> ok  <total>` then indented
   `in X  out Y  cache Z`, sorted by total tokens descending, ties broken
   by name. Accounts with no per-model history print no model lines.
 - AC-6: **Withdrawn.** The pool footer carries no `by model` aggregate —
