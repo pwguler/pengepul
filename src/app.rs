@@ -1669,7 +1669,8 @@ async fn next_provider_account(
         ));
     };
     let email = account.token.email.clone();
-    manager.record_attempt(&email);
+    // Dispatch counts nothing: the call that records this request's
+    // outcome is the call that counts it (ADR-0015).
     match manager.refresh_if_due(&email).await {
         Ok(true) => {}
         Ok(false) => {
