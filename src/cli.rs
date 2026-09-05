@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -889,14 +890,33 @@ fn login(
     // orphan token in the auth-dir, which is harmless because the
     // provider is still unconfigured. The other order leaves a registered
     // provider with no account (AC-9).
-    save_token(&config.auth_dir, &token)?;
+    let written = save_token(&config.auth_dir, &token)?;
     let mut registered = false;
     if let Some(base_url) = base_url {
         // The path `env.load()` read. With a legacy config that load has
         // just migrated it to the home path, so this resolves there \u2014 the
         // file the next load will read, not the shadowed original.
         let path = selected_config_path(env.config_path, Some(env.home), env.cwd);
-        register_provider(&path, provider, base_url)?;
+        if let Err(error) = register_provider(&path, provider, base_url) {
+            // The token was written first so a refusal could never leave a
+            // registered provider without an account. When the write
+            // itself fails the mirror problem appears: a credential in a
+            // pool the config never gained, invisible to the operator. Take
+            // it back, and say so if that also fails.
+            if let Err(cleanup) = fs::remove_file(&written) {
+                return Err(error.context(format!(
+                    "left a credential at {} that could not be removed: {cleanup}",
+                    written.display()
+                )));
+            }
+            // And the directory it created, if this was the first key for
+            // an id that never became a provider. `remove_dir` refuses a
+            // non-empty one, so an existing pool is never touched.
+            if let Some(pool) = written.parent() {
+                let _ = fs::remove_dir(pool);
+            }
+            return Err(error);
+        }
         registered = true;
     }
     print_login_saved(provider, &label, registered, output, style);

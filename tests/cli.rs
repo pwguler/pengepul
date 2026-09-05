@@ -4077,3 +4077,118 @@ fn an_empty_key_saves_no_credential() {
         );
     }
 }
+
+/// The token is written before the config so a refusal cannot leave a
+/// registered provider without an account. When the config write itself
+/// fails, the mirror problem appears: a credential in a pool the config
+/// never gained. The command must take it back.
+#[test]
+fn a_failed_config_write_takes_its_credential_back() {
+    let tmp = tempdir().expect("tempdir");
+    let config_path = tmp.path().join("readonly.yaml");
+    let auth_dir = tmp.path().join("auth");
+    std::fs::write(
+        &config_path,
+        format!(
+            "host: \"127.0.0.1\"\nport: 8317\nauth-dir: {}\napi-keys:\n  - sk-test\nproviders:\n  groq:\n    base-url: https://api.groq.com/openai/v1\n",
+            auth_dir.display()
+        ),
+    )
+    .expect("write config");
+    let mut permissions = std::fs::metadata(&config_path)
+        .expect("metadata")
+        .permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&config_path, permissions).expect("chmod");
+    let mut runtime = FakeRuntime::default();
+
+    let error = run_with_env(
+        &[
+            "--config",
+            config_path.to_str().expect("path"),
+            "login",
+            "--provider",
+            "openrouter",
+            "--base-url",
+            "https://openrouter.ai/api/v1",
+            "--key",
+            "sk-orphan",
+        ],
+        tmp.path(),
+        tmp.path(),
+        &mut runtime,
+        Style::Plain,
+    )
+    .expect_err("a failed config write reported success");
+
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("Permission denied") || error.contains("failed to write"),
+        "the failure was not reported: {error}"
+    );
+    assert!(
+        !auth_dir.join("openrouter").exists(),
+        "a credential outlived the registration that failed"
+    );
+}
+
+/// The cleanup above must never take more than it wrote. Registering a
+/// second key for a provider that is already live, with a config that
+/// cannot be written, must leave the existing pool exactly as it was.
+#[test]
+fn the_cleanup_never_empties_an_existing_pool() {
+    let tmp = tempdir().expect("tempdir");
+    let config_path = tmp.path().join("readonly.yaml");
+    let auth_dir = tmp.path().join("auth");
+    let pool = auth_dir.join("groq");
+    std::fs::create_dir_all(&pool).expect("pool");
+    std::fs::write(pool.join("key-legit.json"), "{}").expect("legit key");
+    std::fs::write(
+        &config_path,
+        format!(
+            "host: \"127.0.0.1\"\nport: 8317\nauth-dir: {}\napi-keys:\n  - sk-test\nproviders:\n  groq:\n    base-url: https://api.groq.com/openai/v1\n",
+            auth_dir.display()
+        ),
+    )
+    .expect("write config");
+    let mut permissions = std::fs::metadata(&config_path)
+        .expect("metadata")
+        .permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&config_path, permissions).expect("chmod");
+    let mut runtime = FakeRuntime::default();
+
+    // A different URL for a live provider: refused before anything is
+    // written at all.
+    let _ = run_with_env(
+        &[
+            "--config",
+            config_path.to_str().expect("path"),
+            "login",
+            "--provider",
+            "groq",
+            "--base-url",
+            "https://elsewhere.host/v1",
+            "--key",
+            "sk-second",
+        ],
+        tmp.path(),
+        tmp.path(),
+        &mut runtime,
+        Style::Plain,
+    );
+
+    let files: Vec<_> = std::fs::read_dir(&pool)
+        .expect("read pool")
+        .filter_map(|entry| {
+            entry
+                .ok()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+        })
+        .collect();
+    assert_eq!(
+        files,
+        vec!["key-legit.json".to_string()],
+        "the cleanup disturbed a live pool: {files:?}"
+    );
+}
