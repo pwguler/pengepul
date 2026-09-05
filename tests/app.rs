@@ -2722,3 +2722,184 @@ async fn a_client_disconnect_mid_stream_still_reaches_an_outcome() {
          {requests} requests, {ok} ok, {failed} failed"
     );
 }
+
+/// ARCHITECTURE, "Every attempt reaches an outcome", on the request paths
+/// rather than on the manager: a 501 refusal counts its attempt as a
+/// failed request, and leaves the account's health alone so rotation
+/// still offers it.
+#[tokio::test]
+async fn a_501_refusal_reconciles_and_spares_the_account() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &groq_key_token()).expect("save groq key");
+    let upstream = Arc::new(GenericUpstream::default());
+    let app = create_app_with_upstream(config_with_groq(tmp.path().to_path_buf()), upstream);
+
+    let (status, _) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .body(Body::from(
+                json!({
+                    "model": "groq/llama-3.3-70b",
+                    "max_tokens": 16,
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 501);
+
+    let (status, snapshot) = json_response(
+        app,
+        axum::http::Request::builder()
+            .method("GET")
+            .uri("/admin/accounts")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let account = &snapshot["providers"]["groq"]["accounts"][0];
+    let requests = account["totalRequests"].as_i64().expect("requests");
+    let ok = account["totalSuccesses"].as_i64().expect("ok");
+    let failed = account["totalFailures"].as_i64().expect("failed");
+    assert_eq!(
+        requests,
+        ok + failed,
+        "a 501 refusal leaked its attempt: {requests} requests, {ok} ok, {failed} failed"
+    );
+    // A refusal is not the account's fault: no cooldown, still available.
+    assert_eq!(
+        account["available"], true,
+        "a refusal cooled the account down"
+    );
+    assert_eq!(
+        account["failureCount"], 0,
+        "a refusal opened a failure streak"
+    );
+    // And the daily bucket agrees with the cumulative counters.
+    let day = &account["days"][0];
+    assert_eq!(
+        day["requests"].as_i64().expect("day requests"),
+        day["successes"].as_i64().expect("day ok") + day["failures"].as_i64().expect("day failed"),
+        "the daily bucket disagrees: {day}"
+    );
+}
+
+/// An upstream that rejects the body: the most common non-account
+/// failure, and the one that used to record no outcome at all.
+#[derive(Default)]
+struct RejectingUpstream;
+
+impl UpstreamClient for RejectingUpstream {
+    fn generic_chat(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        Box::pin(async {
+            Ok(UpstreamJsonResponse {
+                status: axum::http::StatusCode::BAD_REQUEST,
+                body: json!({"error": {"message": "context length exceeded"}}),
+            })
+        })
+    }
+
+    fn anthropic_messages(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("not exercised")
+    }
+    fn anthropic_messages_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!("not exercised")
+    }
+    fn anthropic_count_tokens(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("not exercised")
+    }
+    fn codex_responses(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("not exercised")
+    }
+    fn codex_responses_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!("not exercised")
+    }
+    fn generic_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!("not exercised")
+    }
+    fn fetch_models(
+        &self,
+        _kind: ProviderKind,
+        _account: AvailableAccount,
+        _config: Arc<Config>,
+    ) -> ModelsFuture {
+        unreachable!("not exercised")
+    }
+    fn fetch_cli_versions(&self) -> CliVersionsFuture {
+        unreachable!("not exercised")
+    }
+}
+
+/// ARCHITECTURE, "Every attempt reaches an outcome": an upstream 400 is
+/// the client's fault, not the account's. It counts as a failed request
+/// so the panels reconcile, and leaves the account in rotation.
+#[tokio::test]
+async fn an_upstream_400_reconciles_and_spares_the_account() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &groq_key_token()).expect("save groq key");
+    let app = create_app_with_upstream(
+        config_with_groq(tmp.path().to_path_buf()),
+        Arc::new(RejectingUpstream),
+    );
+
+    let (status, _) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .body(Body::from(
+                json!({
+                    "model": "groq/llama-3.3-70b",
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 400);
+
+    let (status, snapshot) = json_response(
+        app,
+        axum::http::Request::builder()
+            .method("GET")
+            .uri("/admin/accounts")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let account = &snapshot["providers"]["groq"]["accounts"][0];
+    let requests = account["totalRequests"].as_i64().expect("requests");
+    let ok = account["totalSuccesses"].as_i64().expect("ok");
+    let failed = account["totalFailures"].as_i64().expect("failed");
+    assert_eq!(
+        requests,
+        ok + failed,
+        "an upstream 400 leaked its attempt: {requests} requests, {ok} ok, {failed} failed"
+    );
+    assert_eq!(
+        account["available"], true,
+        "a client's bad body cooled the account"
+    );
+    assert_eq!(
+        account["failureCount"], 0,
+        "a client's bad body opened a streak"
+    );
+}
