@@ -346,9 +346,16 @@ impl Drop for FileLock {
 /// This exists as a function because it did not: `login` and
 /// `register_provider` each carried their own copy, they drifted by one
 /// call, and the guard that runs first was the one missing it.
+///
+/// One pass over a set, rather than a chain of trims, so the result is a
+/// fixed point: `normalize(normalize(x)) == normalize(x)` for every
+/// input. A chain is not — `.trim().trim_end_matches('/').trim_end()`
+/// leaves the slash in `https://h/v1/ /`, and the stored form then
+/// disagrees with the guard that compares against it.
 #[must_use]
 pub fn normalize_base_url(url: &str) -> &str {
-    url.trim().trim_end_matches('/').trim_end()
+    url.trim()
+        .trim_end_matches(|c: char| c == '/' || c.is_whitespace())
 }
 
 /// Reject a Provider id the registry cannot hold.
@@ -730,5 +737,43 @@ mod lock_tests {
         // The proof that matters: a second registration can still take it.
         register_provider(&path, "other", "https://other.host/v1")
             .expect("the lock was never released");
+    }
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::normalize_base_url;
+
+    /// A stored form must be a fixed point, or the guard that compares
+    /// against it disagrees with the writer that produced it. The first
+    /// version chained three trims and was not one.
+    #[test]
+    fn normalizing_twice_changes_nothing() {
+        for url in [
+            "https://h/v1",
+            "https://h/v1/",
+            "https://h/v1 /",
+            "https://h/v1/ /",
+            "  https://h/v1//  ",
+            "https://h/v1/ / / ",
+            "/",
+            "///",
+            "   ",
+            "",
+        ] {
+            let once = normalize_base_url(url);
+            let twice = normalize_base_url(once);
+            assert_eq!(once, twice, "not a fixed point: {url:?} -> {once:?}");
+        }
+    }
+
+    /// And it still does the job it was extracted for.
+    #[test]
+    fn it_strips_what_the_upstream_join_would_double() {
+        assert_eq!(normalize_base_url("https://h/v1/"), "https://h/v1");
+        assert_eq!(normalize_base_url("https://h/v1 /"), "https://h/v1");
+        assert_eq!(normalize_base_url("  https://h/v1  "), "https://h/v1");
+        assert_eq!(normalize_base_url("/"), "");
+        assert_eq!(normalize_base_url("   "), "");
     }
 }

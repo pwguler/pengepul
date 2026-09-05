@@ -1,3 +1,4 @@
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -3716,6 +3717,14 @@ fn a_refused_registration_leaves_no_credential_behind() {
         "  openrouter:\n    base-url: https://openrouter.ai/api/v1\n",
     );
     let mut runtime = FakeRuntime::default();
+    // The rollback would restore exactly what a file check looks for, so
+    // it cannot show whether the guard refused before the write or the
+    // rollback cleaned up after it. `save_token` chmods the pool to 0700
+    // and nothing restores the mode: that mark survives.
+    let pool = tmp.path().join(".pengepul").join("openrouter");
+    std::fs::create_dir_all(&pool).expect("pool");
+    std::fs::set_permissions(&pool, std::fs::Permissions::from_mode(0o755)).expect("chmod pool");
+    let before = pool_mode(&pool);
 
     let _ = run_err(
         &[
@@ -3732,8 +3741,13 @@ fn a_refused_registration_leaves_no_credential_behind() {
     );
 
     assert!(
-        !tmp.path().join(".pengepul").join("openrouter").exists(),
+        pool_entries(&pool).is_empty(),
         "a refused registration left a credential in a live provider's pool"
+    );
+    assert_eq!(
+        pool_mode(&pool),
+        before,
+        "the credential was written and then rolled back, not refused"
     );
 }
 
@@ -3857,6 +3871,8 @@ fn a_rejected_id_cannot_write_into_a_live_pool() {
     let pool = tmp.path().join(".pengepul").join("groq");
     std::fs::create_dir_all(&pool).expect("pool");
     std::fs::write(pool.join("key-legit.json"), "{}").expect("legit key");
+    std::fs::set_permissions(&pool, std::fs::Permissions::from_mode(0o755)).expect("chmod pool");
+    let before_mode = pool_mode(&pool);
     let mut runtime = FakeRuntime::default();
 
     let error = run_err(
@@ -3889,6 +3905,11 @@ fn a_rejected_id_cannot_write_into_a_live_pool() {
         files,
         vec!["key-legit.json".to_string()],
         "a foreign credential joined a live pool: {files:?}"
+    );
+    assert_eq!(
+        pool_mode(&pool),
+        before_mode,
+        "the credential was written into the live pool and then rolled back"
     );
 }
 
@@ -3939,6 +3960,14 @@ fn an_empty_base_url_is_refused_before_the_credential() {
         "  existing:\n    base-url: https://existing.host/v1\n",
     );
     let mut runtime = FakeRuntime::default();
+    // The rollback removes the file it wrote and even the directory, so
+    // no file-level check can see the write. `save_token` also chmods the
+    // pool to 0700 and the rollback never restores the mode: that is the
+    // one mark it cannot erase.
+    seed_orphan_pool(tmp.path(), "openrouter", "sk-seeded", &mut runtime);
+    let pool = tmp.path().join(".pengepul").join("openrouter");
+    std::fs::set_permissions(&pool, std::fs::Permissions::from_mode(0o755)).expect("chmod pool");
+    let before = pool_mode(&pool);
 
     let error = run_err(
         &[
@@ -3958,9 +3987,10 @@ fn an_empty_base_url_is_refused_before_the_credential() {
         error.contains("missing base-url"),
         "the error does not name the rule: {error}"
     );
-    assert!(
-        !tmp.path().join(".pengepul").join("openrouter").exists(),
-        "an empty URL still wrote a credential"
+    assert_eq!(
+        pool_mode(&pool),
+        before,
+        "an empty URL reached save_token, which chmodded the pool"
     );
 }
 
@@ -4023,6 +4053,70 @@ fn no_id_shape_can_write_a_credential_anywhere_unexpected() {
             "id {id:?} wrote something before it was refused"
         );
     }
+}
+
+/// A pool directory's permission bits. `save_token` sets them to 0700 and
+/// no rollback restores them, so this survives where a file check cannot.
+fn pool_mode(pool: &Path) -> u32 {
+    std::fs::metadata(pool)
+        .expect("pool metadata")
+        .permissions()
+        .mode()
+        & 0o777
+}
+
+/// The filenames in a pool, sorted.
+fn pool_entries(pool: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(pool) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|entry| {
+            entry
+                .ok()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Seed a provider's pool through the CLI, then hand-remove it from the
+/// config, leaving the credential on disk under the label its key hashes
+/// to.
+///
+/// Three ordering guards could not be tested without this. The rollback
+/// added in a later round restores the filesystem to exactly the state
+/// those tests asserted — no credential, no pool — so each passed with
+/// its guard deleted. With the file already present, `credential_is_new`
+/// is false, the rollback is inert, and a guard that fails to refuse
+/// shows up as an overwritten file.
+fn seed_orphan_pool(
+    home: &Path,
+    provider: &str,
+    key: &str,
+    runtime: &mut impl CliRuntime,
+) -> PathBuf {
+    let config = home.join(".pengepul").join("config.yaml");
+    let original = std::fs::read_to_string(&config).expect("read config");
+    std::fs::write(
+        &config,
+        format!("{original}  {provider}:\n    base-url: https://seed.host/v1\n"),
+    )
+    .expect("add provider");
+    run(
+        &["login", "--provider", provider, "--key", key],
+        home,
+        runtime,
+    );
+    let pool = home.join(".pengepul").join(provider);
+    let seeded = std::fs::read_dir(&pool)
+        .expect("read pool")
+        .find_map(|entry| entry.ok().map(|e| e.path()))
+        .expect("the pool was not seeded");
+    // Hand-removal: the pool outlives its config entry.
+    std::fs::write(&config, original).expect("restore config");
+    seeded
 }
 
 /// Every file under `root`, sorted: what the command must not change when
