@@ -3486,9 +3486,11 @@ fn a_builtin_provider_refuses_a_base_url() {
         &mut runtime,
     );
 
+    // Names the flag, not just "OAuth": the pre-existing --key guard says
+    // "OAuth" too, so that substring cannot tell the two guards apart.
     assert!(
-        error.contains("OAuth"),
-        "the error does not say why: {error}"
+        error.contains("--base-url"),
+        "the error does not name the flag it refused: {error}"
     );
 }
 
@@ -3516,8 +3518,10 @@ fn registration_applies_the_same_name_rules_as_the_config() {
         tmp.path(),
         &mut runtime,
     );
+    // The rule, not a character: the provider and the URL both contain
+    // '/', so that assertion held for any error at all.
     assert!(
-        error.contains('/'),
+        error.contains("must not contain"),
         "the error does not name the rule: {error}"
     );
     let written = std::fs::read_to_string(tmp.path().join(".pengepul").join("config.yaml"))
