@@ -6,13 +6,12 @@ use serde_json::Value;
 
 use crate::config::{Config, load_config, selected_config_path};
 pub use crate::render::Style;
-use crate::render::{ActionGlyph, BOLD, DIM, Output, action_panel, paint, status_glyph};
+use crate::render::{ActionGlyph, BOLD, DIM, Fact, Output, fact_panel, paint, status_glyph};
 use crate::service::service_status_panel;
 use crate::tokens::save_token;
 use crate::types::{ProviderId, ProviderKind, TokenData};
 use crate::usage_view::{
-    print_accounts, print_pool_inner, print_pool_rich, print_relay_total_plain,
-    print_relay_total_rich,
+    Connection, print_accounts, print_pool_rich, print_relay_total_plain, print_relay_total_rich,
 };
 use crate::utils::sha256_hex;
 
@@ -405,21 +404,17 @@ fn status(
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_string();
-    let connection = [
-        format!("config {}", env.config_file().display()),
-        format!("url {base_url} \u{2014} server {server}"),
-    ];
+    let connection = Connection {
+        config: env.config_file().display().to_string(),
+        url: base_url.clone(),
+        server,
+    };
     let accounts = runtime.accounts(&base_url, &first_api_key(&config)?)?;
-    let now = unix_now();
+    // status-total-only: the relay block is the whole view; per-pool and
+    // per-account detail lives in `accounts`.
     match style {
-        Style::Plain => {
-            print_pool_inner(&accounts, output, now);
-            print_relay_total_plain(&accounts, output, &connection);
-        }
-        Style::Rich => {
-            print_pool_rich(&accounts, output, false, now);
-            print_relay_total_rich(&accounts, output, &connection);
-        }
+        Style::Plain => print_relay_total_plain(&accounts, output, &connection),
+        Style::Rich => print_relay_total_rich(&accounts, output, &connection),
     }
     Ok(())
 }
@@ -442,7 +437,7 @@ fn accounts(
     let now = unix_now();
     match style {
         Style::Plain => print_accounts(&accounts, output, now),
-        Style::Rich => print_pool_rich(&accounts, output, true, now),
+        Style::Rich => print_pool_rich(&accounts, output, now),
     }
     Ok(())
 }
@@ -458,12 +453,9 @@ fn config_command(
         ConfigCommand::Path => match style {
             Style::Plain => output.line(&path.display().to_string()),
             Style::Rich => {
-                for line in action_panel(
+                for line in fact_panel(
                     "config",
-                    &[format!(
-                        "path  {}",
-                        paint(BOLD, &path.display().to_string())
-                    )],
+                    &[Fact::new("path", &paint(BOLD, &path.display().to_string()))],
                 ) {
                     output.line(&line);
                 }
@@ -475,8 +467,7 @@ fn config_command(
             match style {
                 Style::Plain => output.line(&key),
                 Style::Rich => {
-                    for line in action_panel("config", &[format!("api key  {}", paint(BOLD, &key))])
-                    {
+                    for line in fact_panel("config", &[Fact::new("api key", &paint(BOLD, &key))]) {
                         output.line(&line);
                     }
                 }
@@ -571,13 +562,18 @@ fn service_command(
                 let not_installed = error.to_string().contains("no service installed");
                 match style {
                     Style::Rich if not_installed => {
-                        for line in action_panel(
+                        for line in fact_panel(
                             "service",
-                            &[format!(
-                                "{} not installed  {}",
-                                status_glyph(ActionGlyph::Attention),
-                                paint(DIM, "run pengepul service install")
-                            )],
+                            &[
+                                Fact::new(
+                                    "state",
+                                    &format!(
+                                        "{} not installed",
+                                        status_glyph(ActionGlyph::Attention)
+                                    ),
+                                ),
+                                Fact::new("fix", &paint(DIM, "pengepul service install")),
+                            ],
                         ) {
                             output.line(&line);
                         }
@@ -606,13 +602,15 @@ fn print_action_with_path(
     match style {
         Style::Plain => output.line(&format!("{verb} service: {}", path.display())),
         Style::Rich => {
-            for line in action_panel(
+            for line in fact_panel(
                 subject,
-                &[format!(
-                    "{} {verb}  {}",
-                    status_glyph(ActionGlyph::Ok),
-                    path.display()
-                )],
+                &[
+                    Fact::new(
+                        "state",
+                        &format!("{} {verb}", status_glyph(ActionGlyph::Ok)),
+                    ),
+                    Fact::new("path", &paint(DIM, &path.display().to_string())),
+                ],
             ) {
                 output.line(&line);
             }
@@ -633,7 +631,13 @@ fn print_action(
     match style {
         Style::Plain => output.line(plain),
         Style::Rich => {
-            for line in action_panel(subject, &[format!("{} {state}", status_glyph(glyph))]) {
+            for line in fact_panel(
+                subject,
+                &[Fact::new(
+                    "state",
+                    &format!("{} {state}", status_glyph(glyph)),
+                )],
+            ) {
                 output.line(&line);
             }
         }
@@ -687,14 +691,23 @@ fn update(
     let tag = runtime.latest_release_tag()?;
 
     if !tag_is_newer(&tag, current) {
-        print_action(
-            "update",
-            &format!("pengepul {current} is the latest release"),
-            &format!("latest  {current}"),
-            ActionGlyph::Ok,
-            output,
-            style,
-        );
+        match style {
+            Style::Plain => output.line(&format!("pengepul {current} is the latest release")),
+            Style::Rich => {
+                for line in fact_panel(
+                    "update",
+                    &[
+                        Fact::new(
+                            "state",
+                            &format!("{} latest", status_glyph(ActionGlyph::Ok)),
+                        ),
+                        Fact::new("version", &paint(BOLD, current)),
+                    ],
+                ) {
+                    output.line(&line);
+                }
+            }
+        }
         return Ok(());
     }
     if check {
@@ -704,12 +717,16 @@ fn update(
         match style {
             Style::Plain => output.line(&plain),
             Style::Rich => {
-                for line in action_panel(
+                for line in fact_panel(
                     "update",
-                    &[format!(
-                        "{} running {current}  available {tag}",
-                        status_glyph(ActionGlyph::Attention)
-                    )],
+                    &[
+                        Fact::new(
+                            "state",
+                            &format!("{} available", status_glyph(ActionGlyph::Attention)),
+                        ),
+                        Fact::new("running", current),
+                        Fact::new("version", &paint(BOLD, &tag)),
+                    ],
                 ) {
                     output.line(&line);
                 }
@@ -723,13 +740,16 @@ fn update(
     match style {
         Style::Plain => output.line(&plain),
         Style::Rich => {
-            for line in action_panel(
+            for line in fact_panel(
                 "update",
-                &[format!(
-                    "{} updated {tag}  {}",
-                    status_glyph(ActionGlyph::Ok),
-                    path.display()
-                )],
+                &[
+                    Fact::new(
+                        "state",
+                        &format!("{} updated", status_glyph(ActionGlyph::Ok)),
+                    ),
+                    Fact::new("version", &paint(BOLD, &tag)),
+                    Fact::new("path", &paint(DIM, &path.display().to_string())),
+                ],
             ) {
                 output.line(&line);
             }
@@ -793,13 +813,12 @@ fn print_login_saved(provider: &str, label: &str, output: &mut Output, style: St
     match style {
         Style::Plain => output.line(&format!("saved {provider} account token for {label}")),
         Style::Rich => {
-            for line in action_panel(
-                &format!("login: {provider}"),
-                &[format!(
-                    "{} saved  {}",
-                    status_glyph(ActionGlyph::Ok),
-                    paint(BOLD, label)
-                )],
+            for line in fact_panel(
+                &format!("login {provider}"),
+                &[
+                    Fact::new("state", &format!("{} saved", status_glyph(ActionGlyph::Ok))),
+                    Fact::new("account", &paint(BOLD, label)),
+                ],
             ) {
                 output.line(&line);
             }

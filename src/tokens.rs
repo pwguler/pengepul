@@ -259,6 +259,34 @@ pub(crate) struct PersistedUsage {
     pub(crate) cache_creation_input_tokens: i64,
     pub(crate) cache_read_input_tokens: i64,
     pub(crate) reasoning_output_tokens: i64,
+    /// Per-model successes and their tokens, keyed by upstream model name.
+    /// Absent in files written before usage-by-model: those load empty.
+    pub(crate) models: BTreeMap<String, ModelUsage>,
+}
+
+/// What one model cost on one account. Successes only, by construction:
+/// attempts and failures are recorded before a model is known to be served.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ModelUsage {
+    pub(crate) successes: i64,
+    pub(crate) input_tokens: i64,
+    pub(crate) output_tokens: i64,
+    pub(crate) cache_creation_input_tokens: i64,
+    pub(crate) cache_read_input_tokens: i64,
+    pub(crate) reasoning_output_tokens: i64,
+}
+
+impl ModelUsage {
+    /// Fold one success's tokens into this model's counters. The success
+    /// itself is counted by the caller, which also counts the usage-less
+    /// ones (count-tokens, unparseable usage).
+    pub(crate) fn add_tokens(&mut self, usage: &crate::types::UsageData) {
+        self.input_tokens += usage.input_tokens;
+        self.output_tokens += usage.output_tokens;
+        self.cache_creation_input_tokens += usage.cache_creation_input_tokens;
+        self.cache_read_input_tokens += usage.cache_read_input_tokens;
+        self.reasoning_output_tokens += usage.reasoning_output_tokens;
+    }
 }
 
 /// Path of a provider's usage file: `~/.pengepul/<provider>/usage.json`.
@@ -301,7 +329,35 @@ fn parse_persisted_usage(entry: &Value) -> Option<PersistedUsage> {
         cache_creation_input_tokens: field("total_cache_creation_input_tokens"),
         cache_read_input_tokens: field("total_cache_read_input_tokens"),
         reasoning_output_tokens: field("total_reasoning_output_tokens"),
+        models: parse_persisted_models(object.get("models")),
     })
+}
+
+/// The `models` map of a usage entry. Missing (files written before
+/// usage-by-model) or malformed yields an empty map: the account totals
+/// still load, and the breakdown simply starts from here.
+fn parse_persisted_models(entry: Option<&Value>) -> BTreeMap<String, ModelUsage> {
+    let Some(Value::Object(models)) = entry else {
+        return BTreeMap::new();
+    };
+    models
+        .iter()
+        .filter_map(|(model, usage)| {
+            let object = usage.as_object()?;
+            let field = |key: &str| object.get(key).and_then(Value::as_i64).unwrap_or(0);
+            Some((
+                model.clone(),
+                ModelUsage {
+                    successes: field("successes"),
+                    input_tokens: field("input_tokens"),
+                    output_tokens: field("output_tokens"),
+                    cache_creation_input_tokens: field("cache_creation_input_tokens"),
+                    cache_read_input_tokens: field("cache_read_input_tokens"),
+                    reasoning_output_tokens: field("reasoning_output_tokens"),
+                },
+            ))
+        })
+        .collect()
 }
 
 /// Atomically write a provider's usage counters: temp file + rename, so a crash mid-
@@ -319,6 +375,20 @@ pub(crate) fn save_usage(
     }
     let mut entries = serde_json::Map::new();
     for (email, usage) in usage {
+        let mut models = serde_json::Map::new();
+        for (model, counters) in &usage.models {
+            models.insert(
+                model.clone(),
+                json!({
+                    "successes": counters.successes,
+                    "input_tokens": counters.input_tokens,
+                    "output_tokens": counters.output_tokens,
+                    "cache_creation_input_tokens": counters.cache_creation_input_tokens,
+                    "cache_read_input_tokens": counters.cache_read_input_tokens,
+                    "reasoning_output_tokens": counters.reasoning_output_tokens,
+                }),
+            );
+        }
         entries.insert(
             email.clone(),
             json!({
@@ -330,6 +400,7 @@ pub(crate) fn save_usage(
                 "total_cache_creation_input_tokens": usage.cache_creation_input_tokens,
                 "total_cache_read_input_tokens": usage.cache_read_input_tokens,
                 "total_reasoning_output_tokens": usage.reasoning_output_tokens,
+                "models": models,
             }),
         );
     }

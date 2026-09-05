@@ -271,9 +271,16 @@ fn status_reports_health_and_account_counts() {
             .contains("url http://127.0.0.1:8318 \u{2014} server ok")
     );
 
-    assert!(outcome.stdout.contains("anthropic: 1 account"));
-    // Empty pools are hidden (AC-7, revised): codex has no loaded accounts.
-    assert!(!outcome.stdout.contains("codex:"));
+    // status-total-only AC-3: the pool appears as one summary line, not a
+    // panel with its own request/token rollup.
+    assert!(outcome.stdout.contains("anthropic"));
+    assert!(
+        !outcome
+            .stdout
+            .contains("anthropic: 1 account (1 available)")
+    );
+    // Empty pools are hidden (AC-4): codex has no loaded accounts.
+    assert!(!outcome.stdout.contains("codex"));
     assert_eq!(runtime.health_url.as_deref(), Some("http://127.0.0.1:8318"));
     assert_eq!(runtime.accounts_api_key.as_deref(), Some("sk-test"));
 }
@@ -380,12 +387,17 @@ fn status_rolls_up_pool_health_and_token_totals_per_provider() {
     let outcome = run(&["status"], tmp.path(), &mut runtime);
 
     assert_eq!(outcome.code, 0);
+    // status-total-only AC-3: one line per pool — name, accounts, requests,
+    // tokens — and no per-pool request/token rollup lines.
     assert!(
         outcome
             .stdout
-            .contains("anthropic: 3 accounts (2 available)")
+            .contains("anthropic          3 accounts   1,204 req      370.1M"),
+        "pool line missing:\n{}",
+        outcome.stdout
     );
-    assert!(outcome.stdout.contains("on cooldown"));
+    assert!(outcome.stdout.contains("groq               1 account"));
+    // AC-1: the aggregate is relay-wide, printed once.
     assert!(
         outcome
             .stdout
@@ -394,24 +406,19 @@ fn status_rolls_up_pool_health_and_token_totals_per_provider() {
     assert!(
         outcome
             .stdout
-            .contains("tokens in 45.2M  out 812.3K  cache 324.1M  reasoning 96.0K")
+            .contains("tokens in 45.2M  out 812.3K  cache 324.1M")
     );
-    // A provider whose account omits every total rolls up as zeros (AC-4).
-    assert!(outcome.stdout.contains("groq: 1 account (1 available)"));
-    assert!(outcome.stdout.contains("requests 0  (0 ok, 0 failed)"));
-    assert!(
-        outcome
-            .stdout
-            .contains("tokens in 0  out 0  cache 0  reasoning 0")
-    );
-    // An empty pool is hidden entirely, not even a bare header (AC-7,
-    // revised: the user asked for empty pools not to be shown).
+    assert!(outcome.stdout.contains("reasoning 96.0K"));
+    // AC-4: an empty pool is hidden entirely.
     assert!(!outcome.stdout.contains("deepseek"));
-    // Each rollup block opens on its own line after a blank one (AC-1).
+    // AC-1: no per-account row survives in status.
+    assert!(!outcome.stdout.contains("a@x.com"));
+    assert!(!outcome.stdout.contains("on cooldown"));
+    // AC-1: the block opens the output; nothing precedes the header.
     assert!(
         outcome
             .stdout
-            .starts_with("anthropic: 3 accounts (2 available")
+            .starts_with("relay total: 2 pools, 4 accounts")
     );
 }
 
@@ -459,35 +466,41 @@ fn status_renders_panels_on_a_tty() {
     assert_eq!(outcome.code, 0);
     let stdout = outcome.stdout.clone();
     let visible = strip_ansi(&stdout);
-    // Color is present in the raw bytes: green glyph, amber cooldown glyph,
-    // bold numbers (AC-5).
-    assert!(stdout.contains("\x1b[32m●\x1b[0m"));
-    assert!(stdout.contains("\x1b[33m●\x1b[0m"));
+    // status-total-only AC-2: one box panel, headed by the relay total.
     assert!(stdout.contains("\x1b[1m"));
-    // Panel rules with the pool header inside the top rule (AC-3).
-    assert!(visible.contains("┌─ pool: anthropic"));
-    assert!(visible.contains("─ 3 accounts, 1 available"));
+    assert!(
+        visible.contains("┌─ relay total ─ 1 pool, 3 accounts"),
+        "panel header: {visible}"
+    );
     assert!(visible.contains('└'));
-    // Rows: email, glyph, state, ok count, share bar, percentage (AC-3/5).
-    assert!(visible.contains('│'));
-    assert!(visible.contains("a@x.com"));
-    assert!(visible.contains("● available"));
-    assert!(visible.contains("638 ok"));
-    // Row state drops the plain branch's leading "on"; the glyph carries it.
-    assert!(visible.contains("● cooldown 4m12s"));
-    assert!(visible.contains("100%"));
-    assert!(visible.contains("█"));
-    assert!(visible.contains("░"));
-    // Footer carries this fixture's summed rollup (AC-3).
-    assert!(visible.contains("requests 640"));
-    assert!(visible.contains("tokens in 22.1M"));
-    assert!(visible.contains("reasoning 64.0K"));
-    // Empty pool is hidden entirely, not a note and not a box (AC-3,
-    // revised: the user asked for empty pools not to be shown).
+    // AC-1: no pool panel, no account row survives.
+    assert!(!visible.contains("pool: anthropic"));
+    assert!(!visible.contains("a@x.com"));
+    // AC-3: the pool summary row carries name, accounts, requests and the
+    // right-aligned token cell. Asserted against the row itself: the
+    // header also contains "3 accounts", so a panel-wide `contains` would
+    // pass even if the row printed nothing but the name.
+    let pool_row = visible
+        .lines()
+        .find(|line| line.contains("│ anthropic"))
+        .expect("pool row");
+    assert!(pool_row.contains("3 accounts"), "pool row: {pool_row}");
+    assert!(pool_row.contains("640 req"), "pool row: {pool_row}");
+    assert!(pool_row.contains("183.5M"), "token cell: {pool_row}");
+    // AC-4: the empty pool is omitted from lines and from the header count.
     assert!(!visible.contains("deepseek"));
-    // Every panel line fits the fixed width, ANSI excluded (AC-3/AC-7).
+    // AC-2: every line is exactly the 64-column box width. `<= 64` would
+    // hold for any renderer at all, since panel_row clips to 64.
     for line in visible.lines() {
-        assert!(line.chars().count() <= 64, "panel line too wide: {line}");
+        assert_eq!(line.chars().count(), 64, "off the fixed width: {line}");
+    }
+    let borders: Vec<&str> = visible
+        .lines()
+        .filter(|line| line.starts_with('┌') || line.starts_with('└'))
+        .collect();
+    assert_eq!(borders.len(), 2, "exactly one panel: {visible}");
+    for border in borders {
+        assert_eq!(border.chars().count(), 64, "border width: {border}");
     }
 }
 
@@ -533,15 +546,18 @@ fn accounts_renders_panels_with_detail_lines_on_a_tty() {
     let stdout = outcome.stdout.clone();
     let visible = strip_ansi(&stdout);
     // Same panel frame as status (AC-6).
-    assert!(visible.contains("┌─ pool: anthropic"));
+    assert!(visible.contains("┌─ pool anthropic"));
     assert!(visible.contains('└'));
     assert!(visible.contains("● available"));
     assert!(visible.contains("● unresponsive"));
-    // Per-account detail lines beneath each row (AC-6); reasoning gets its
-    // own line because five fields cannot fit the fixed width.
+    // Per-account token facts beneath each row (AC-6); reasoning gets its
+    // own row because five fields cannot fit the fixed width. Both now
+    // carry labels, like every other fact row (consistent-panels AC-2).
     assert!(visible.contains("in 22.1M  out 401.2K  cache 161.0M"));
-    assert!(visible.contains("reasoning 64.0K"));
-    // The no-reasoning account omits the reasoning line (AC-6).
+    assert!(visible.contains("│ tokens"));
+    assert!(visible.contains("│ reasoning"));
+    assert!(visible.contains("64.0K"));
+    // The no-reasoning account omits the reasoning row (AC-6).
     assert!(visible.contains("in 0  out 0  cache 0"));
     assert!(!visible.contains("reasoning 0"));
 }
@@ -952,16 +968,20 @@ fn status_ends_with_relay_total_block_in_plain() {
     let outcome = run(&["status"], tmp.path(), &mut runtime);
 
     assert_eq!(outcome.code, 0);
-    // AC-1: blank line, header, two totals.
+    // AC-1: the block is the whole output — header, connection, pool lines,
+    // aggregate.
     assert!(
         outcome
             .stdout
-            .contains("\nrelay total: 2 pools, 2 accounts\n")
+            .starts_with("relay total: 2 pools, 2 accounts\n")
     );
-    assert!(outcome.stdout.contains("total requests 650\n"));
-    assert!(outcome.stdout.contains("total tokens 175\n"));
-    // The block is last: nothing after `total tokens`.
-    assert!(outcome.stdout.trim_end().ends_with("total tokens 175"));
+    assert!(outcome.stdout.contains("requests 650  (0 ok, 0 failed)\n"));
+    assert!(outcome.stdout.contains("total 175\n"));
+    // AC-3: one line per pool.
+    assert!(outcome.stdout.contains("anthropic"));
+    assert!(outcome.stdout.contains("commandcode"));
+    // The aggregate is last: nothing after `total`.
+    assert!(outcome.stdout.trim_end().ends_with("total 175"));
 }
 
 #[test]
@@ -991,24 +1011,23 @@ fn status_relay_total_block_in_rich_has_64_wide_rule() {
 
     assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
-    // AC-2: rule of exactly 64 with the header inside, then the two totals.
+    // AC-2: a single 64-wide box panel headed by the relay total.
     let lines: Vec<&str> = visible.lines().collect();
-    let rule_index = lines
+    let top = lines
         .iter()
-        .position(|line| line.contains("relay total:"))
-        .expect("relay total rule present");
-    let last_panel = lines
+        .position(|line| line.starts_with('┌'))
+        .expect("panel top");
+    assert!(lines[top].contains("relay total ─ 1 pool, 1 account"));
+    assert_eq!(lines[top].chars().count(), 64, "top rule: {}", lines[top]);
+    let bottom = lines
         .iter()
         .rposition(|line| line.starts_with('└'))
-        .expect("panel bottom rule present");
-    // AC-2: the block sits after the panels, not before them.
-    assert!(rule_index > last_panel);
-    let rule = lines[rule_index];
-    assert_eq!(rule.chars().count(), 64, "rule line: {rule}");
-    assert!(rule.starts_with('─'));
-    assert!(visible.contains("total requests 640"));
-    assert!(visible.contains("total tokens 153"));
-    assert!(visible.trim_end().ends_with("total tokens 153"));
+        .expect("panel bottom");
+    assert_eq!(bottom, lines.len() - 1, "panel closes the output");
+    assert!(visible.contains("│ requests"));
+    assert!(visible.contains("640"));
+    assert!(visible.contains("│ total"));
+    assert!(visible.contains("153"));
 }
 
 #[test]
@@ -1026,7 +1045,8 @@ fn status_relay_total_covers_empty_pools_and_zero_relay() {
                         "available": true
                     }))]
                 },
-                // Empty pool: counts toward pools (AC-5), adds no tokens.
+                // Empty pools: hidden from status entirely (AC-4), and
+                // excluded from the header's pool count.
                 "codex": {"account_count": 0, "accounts": []},
                 "commandcode": {"account_count": 0, "accounts": []}
             }
@@ -1037,11 +1057,13 @@ fn status_relay_total_covers_empty_pools_and_zero_relay() {
     let outcome = run(&["status"], tmp.path(), &mut runtime);
 
     assert_eq!(outcome.code, 0);
-    // AC-4: block prints even at a zero relay; AC-5: empty pools count.
-    // Empty pools are hidden, so the header counts only shown pools.
+    // AC-6: block prints even at a zero relay; empty pools are hidden, so
+    // the header counts only shown pools.
     assert!(outcome.stdout.contains("relay total: 1 pool, 1 account\n"));
-    assert!(outcome.stdout.contains("total requests 0\n"));
-    assert!(outcome.stdout.contains("total tokens 0\n"));
+    assert!(outcome.stdout.contains("requests 0  (0 ok, 0 failed)\n"));
+    assert!(outcome.stdout.contains("total 0\n"));
+    assert!(!outcome.stdout.contains("codex"));
+    assert!(!outcome.stdout.contains("commandcode"));
 }
 
 #[test]
@@ -1061,7 +1083,7 @@ fn service_actions_render_a_panel_when_rich_and_plain_bytes_when_piped() {
     assert!(visible.contains("●"));
     assert!(visible.contains("restarted"));
     for line in visible.lines() {
-        assert!(line.chars().count() <= 64, "too wide: {line}");
+        assert_eq!(line.chars().count(), 64, "off the fixed width: {line}");
     }
 
     // Piped: today's exact bytes (AC-1).
@@ -1089,7 +1111,7 @@ fn login_renders_a_panel_when_rich_and_plain_bytes_when_piped() {
     );
     assert_eq!(rich.code, 0);
     let visible = strip_ansi(&rich.stdout);
-    assert!(visible.contains("┌─ login: commandcode "), "{visible}");
+    assert!(visible.contains("┌─ login commandcode "), "{visible}");
     assert!(visible.contains("key-"));
     assert!(visible.contains("●"));
     assert!(visible.contains("saved"));
@@ -1143,7 +1165,9 @@ fn config_path_and_api_key_render_a_panel_when_rich_and_bare_when_piped() {
     let rich = run_style(&["config", "path"], tmp.path(), &mut runtime, Style::Rich);
     let visible = strip_ansi(&rich.stdout);
     assert!(visible.contains("┌─ config "), "{visible}");
-    assert!(visible.contains("config.yaml"));
+    // By label, not by path text: under a long TMPDIR the path is clipped
+    // to the box and its tail (`config.yaml`) is exactly what goes.
+    assert!(visible.contains("│ path"), "{visible}");
 
     let plain = run(&["config", "path"], tmp.path(), &mut runtime);
     assert_eq!(
@@ -1178,10 +1202,11 @@ fn service_status_parses_systemctl_into_a_panel_when_rich() {
     assert!(visible.contains("3162166"));
     assert!(visible.contains("2.3M"));
     assert!(visible.contains("2.614s"));
-    assert!(visible.contains("tasks  7"));
+    assert!(visible.contains("tasks"), "{visible}");
+    assert!(visible.contains("│ tasks    7"), "{visible}");
     assert!(visible.contains("4m28s"));
     for line in visible.lines() {
-        assert!(line.chars().count() <= 64, "too wide: {line}");
+        assert_eq!(line.chars().count(), 64, "off the fixed width: {line}");
     }
 
     // Piped: the platform tool's text verbatim (AC-3).
@@ -1255,28 +1280,26 @@ fn status_moves_the_header_facts_into_the_relay_block() {
     write_config(tmp.path(), "0.0.0.0", 8318);
     let mut runtime = FakeRuntime::default();
 
-    // Rich: no header lines before the first panel.
+    // Rich: the relay panel is the only block, and the facts live in it.
     let rich = run_style(&["status"], tmp.path(), &mut runtime, Style::Rich);
     let visible = strip_ansi(&rich.stdout);
     let first_panel = visible.find('\u{250c}').expect("panel present");
     assert!(
         !visible[..first_panel].contains("config:"),
-        "header must not precede panels: {}",
+        "header must not precede the panel: {}",
         &visible[..first_panel]
     );
     assert!(!visible[..first_panel].contains("url:"));
     assert!(!visible[..first_panel].contains("server:"));
-    // Facts live in the relay block.
-    assert!(visible.contains("relay total:"));
-    assert!(visible.contains("server ok"));
-    assert!(visible.contains("url http://127.0.0.1:8318 \u{2014} server ok"));
+    assert!(visible.contains("relay total"));
+    assert!(visible.contains("│ server"));
+    assert!(visible.contains("│ url"));
+    assert!(visible.contains("http://127.0.0.1:8318"));
 
     // Plain: same facts, same place.
     let plain = run(&["status"], tmp.path(), &mut runtime);
     let body = plain.stdout;
-    let first_pool = body.find("anthropic:").expect("pool line");
-    assert!(!body[..first_pool].contains("config:"));
-    assert!(body.contains("relay total:"));
+    assert!(body.starts_with("relay total:"));
     assert!(body.contains("url http://127.0.0.1:8318 \u{2014} server ok"));
 }
 
@@ -1366,7 +1389,8 @@ fn action_panels_hold_the_width_and_paint_the_glyph() {
     assert!(login.stdout.contains("\u{1b}[32m●"));
     assert!(update.stdout.contains("\u{1b}[32m●"));
     assert!(update_check.stdout.contains("\u{1b}[33m●"));
-    assert!(strip_ansi(&update.stdout).contains("updated v99.0.0"));
+    assert!(strip_ansi(&update.stdout).contains("updated"));
+    assert!(strip_ansi(&update.stdout).contains("v99.0.0"));
 }
 
 #[test]
@@ -1456,4 +1480,1070 @@ fn a_command_level_config_wins_over_the_root_one() {
     );
     assert_eq!(runtime.health_url.as_deref(), Some("http://127.0.0.1:8317"));
     assert_eq!(runtime.accounts_api_key.as_deref(), Some("sk-root"));
+}
+
+/// usage-by-model AC-5/AC-8/AC-9: model lines under each account, sorted
+/// by tokens, with no aggregate in the pool footer (AC-6, withdrawn).
+#[test]
+fn accounts_breaks_usage_down_per_model_on_a_tty() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 2,
+                    "accounts": [
+                        account(json!({
+                            "email": "a@x.com",
+                            "available": true,
+                            "totalRequests": 700,
+                            "totalSuccesses": 700,
+                            "totalInputTokens": 1_000,
+                            "totalOutputTokens": 2_000,
+                            "models": [
+                                // Deliberately not in display order: the
+                                // renderer sorts by tokens, not payload.
+                                {
+                                    "model": "claude-sonnet-4-5",
+                                    "successes": 67,
+                                    "inputTokens": 100,
+                                    "outputTokens": 200,
+                                    "cacheCreationInputTokens": 0,
+                                    "cacheReadInputTokens": 700,
+                                    "reasoningOutputTokens": 0
+                                },
+                                {
+                                    "model": "claude-fable-5-1",
+                                    "successes": 612,
+                                    "inputTokens": 300,
+                                    "outputTokens": 400,
+                                    "cacheCreationInputTokens": 500,
+                                    "cacheReadInputTokens": 8_000,
+                                    "reasoningOutputTokens": 42
+                                }
+                            ]
+                        })),
+                        account(json!({
+                            "email": "b@x.com",
+                            "available": true,
+                            "totalRequests": 3,
+                            "totalSuccesses": 3,
+                            "models": [{
+                                "model": "claude-fable-5-1",
+                                "successes": 3,
+                                "inputTokens": 10,
+                                "outputTokens": 20,
+                                "cacheCreationInputTokens": 0,
+                                "cacheReadInputTokens": 30,
+                                "reasoningOutputTokens": 0
+                            }]
+                        }))
+                    ]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    let lines: Vec<&str> = visible.lines().collect();
+
+    // AC-5: two lines per model, under the account row that served it.
+    let a_row = lines.iter().position(|l| l.contains("a@x.com")).expect("a");
+    let fable = lines
+        .iter()
+        .position(|l| l.contains("claude-fable-5-1"))
+        .expect("fable line");
+    let sonnet = lines
+        .iter()
+        .position(|l| l.contains("claude-sonnet-4-5"))
+        .expect("sonnet line");
+    assert!(fable > a_row, "model lines follow their account row");
+    // AC-5: sorted by total tokens descending — fable (9,200) before
+    // sonnet (1,000), despite the payload's order.
+    assert!(fable < sonnet, "sorted by tokens: {visible}");
+    assert!(lines[fable].contains("612 ok"));
+    assert!(lines[fable].contains("9.2K"), "total: {}", lines[fable]);
+    // AC-9: reasoning is excluded from the total, shown in the detail line.
+    assert!(lines[fable + 1].contains("in 300"));
+    assert!(lines[fable + 1].contains("out 400"));
+    assert!(lines[fable + 1].contains("cache 8.5K"));
+
+    // AC-6 (revised): the pool footer carries no model aggregate; the
+    // per-account lines are the only breakdown.
+    assert!(
+        !visible.contains("by model"),
+        "aggregate removed: {visible}"
+    );
+    // Each model appears once per account that served it, never summed:
+    // fable ran on both accounts, so twice — not a third aggregated line.
+    assert_eq!(
+        visible.matches("claude-fable-5-1").count(),
+        2,
+        "one line per serving account: {visible}"
+    );
+    assert!(!visible.contains("615 ok"), "no summed count: {visible}");
+
+    // AC-8: exactly the panel width, not merely within it.
+    for line in &lines {
+        assert_eq!(line.chars().count(), 64, "off the fixed width: {line}");
+    }
+}
+
+/// usage-by-model AC-7: the plain branch carries the same information.
+#[test]
+fn accounts_lists_models_in_plain_output() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 2,
+                    "accounts": [
+                        account(json!({
+                            "email": "a@x.com",
+                            "available": true,
+                            "totalRequests": 10,
+                            "totalSuccesses": 10,
+                            "models": [{
+                                "model": "claude-fable-5-1",
+                                "successes": 10,
+                                "inputTokens": 300,
+                                "outputTokens": 400,
+                                "cacheCreationInputTokens": 0,
+                                "cacheReadInputTokens": 500,
+                                "reasoningOutputTokens": 7
+                            }]
+                        })),
+                        // A second account serving the same model: the
+                        // rows stay per-account, never summed.
+                        account(json!({
+                            "email": "b@x.com",
+                            "available": true,
+                            "totalRequests": 2,
+                            "totalSuccesses": 2,
+                            "models": [{
+                                "model": "claude-sonnet-4-5",
+                                "successes": 2,
+                                "inputTokens": 5,
+                                "outputTokens": 6,
+                                "cacheCreationInputTokens": 0,
+                                "cacheReadInputTokens": 0,
+                                "reasoningOutputTokens": 0
+                            }]
+                        }))
+                    ]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run(&["accounts"], tmp.path(), &mut runtime);
+
+    assert_eq!(outcome.code, 0);
+    assert!(outcome.stdout.contains("claude-fable-5-1"));
+    assert!(outcome.stdout.contains("10 ok"));
+    assert!(outcome.stdout.contains("in 300 out 400 cache 500"));
+    // AC-6 (revised): no pool aggregate in plain either.
+    assert!(!outcome.stdout.contains("by model"));
+}
+
+/// usage-by-model AC-5: an account with no per-model history prints no
+/// model lines — old counters are simply not attributed (no `untracked`).
+#[test]
+fn accounts_without_model_history_print_no_model_lines() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalRequests": 921,
+                        "totalSuccesses": 898,
+                        "totalInputTokens": 1_000,
+                        "models": []
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    assert!(!visible.contains("by model"), "no section: {visible}");
+    assert!(!visible.contains("untracked"));
+    // The account totals still show.
+    assert!(visible.contains("898 ok"));
+}
+
+/// usage-by-model AC-8: a model name is never clipped by a cell narrower
+/// than the panel. Two names sharing a long prefix must stay distinct —
+/// the rendered rows are what a reader uses to tell models apart.
+#[test]
+fn accounts_keeps_long_model_names_distinguishable() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let usage = |model: &str, tokens: i64| {
+        json!({
+            "model": model,
+            "successes": 5,
+            "inputTokens": tokens,
+            "outputTokens": 0,
+            "cacheCreationInputTokens": 0,
+            "cacheReadInputTokens": 0,
+            "reasoningOutputTokens": 0
+        })
+    };
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "deepseek": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "d@x.com",
+                        "available": true,
+                        "totalSuccesses": 10,
+                        "models": [
+                            // 28 chars: the longest in this repo's catalog.
+                            usage("deepseek-v4-flash-vision-exp", 20),
+                            usage("deepseek-v4-flash-fast", 10)
+                        ]
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    assert!(
+        visible.contains("deepseek-v4-flash-vision-exp"),
+        "name clipped: {visible}"
+    );
+    assert!(
+        visible.contains("deepseek-v4-flash-fast"),
+        "name clipped: {visible}"
+    );
+    // Every panel line is exactly the fixed width. This alone cannot
+    // catch a clipped name — `panel_row` pads *and* clips to 64, so both
+    // `<= 64` and `== 64` hold for any renderer routed through it. The
+    // assertions above, on the whole names, are what catch that; `== 64`
+    // adds only the case of a line that bypasses `panel_row` and comes
+    // out short.
+    for line in visible.lines() {
+        assert_eq!(
+            line.chars().count(),
+            64,
+            "panel line off the fixed width: {line}"
+        );
+    }
+}
+
+/// usage-by-model AC-8: the name column is only as wide as the longest
+/// name actually present, so a pool of short names does not leave a
+/// 25-column gap before its numbers — and a long name still renders whole.
+#[test]
+fn accounts_fits_the_model_column_to_the_names_present() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let model = |name: &str| {
+        json!({
+            "model": name,
+            "successes": 5,
+            "inputTokens": 1,
+            "outputTokens": 1,
+            "cacheCreationInputTokens": 0,
+            "cacheReadInputTokens": 0,
+            "reasoningOutputTokens": 0
+        })
+    };
+    let payload = |models: Value| {
+        json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalSuccesses": 5,
+                        "models": models
+                    }))]
+                }
+            }
+        })
+    };
+
+    // Short names: the ok column sits close to them.
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(payload(json!([model("claude-opus-5")]))),
+        ..FakeRuntime::default()
+    };
+    let short = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+    let short_visible = strip_ansi(&short.stdout);
+    assert!(
+        short_visible.contains("claude-opus-5  5 ok"),
+        "column not fitted: {short_visible}"
+    );
+
+    // A long name in the same pool widens the column for every row.
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(payload(json!([
+            model("claude-opus-5"),
+            model("deepseek-v4-flash-vision-exp")
+        ]))),
+        ..FakeRuntime::default()
+    };
+    let long = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+    let long_visible = strip_ansi(&long.stdout);
+    assert!(long_visible.contains("deepseek-v4-flash-vision-exp"));
+    assert!(
+        long_visible.contains("claude-opus-5               "),
+        "rows share one column: {long_visible}"
+    );
+    for line in long_visible.lines() {
+        assert_eq!(line.chars().count(), 64, "off the fixed width: {line}");
+    }
+}
+
+/// usage-by-model AC-8: the name cap is load-bearing for box safety. A
+/// name past the cap must lose characters from the *name* only — the ok
+/// count and the token total stay whole. A `== 64` width assertion cannot
+/// catch this: `panel_row` clips an over-wide row to 64 either way.
+#[test]
+fn accounts_never_amputates_counts_for_an_overlong_model_name() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalSuccesses": 5,
+                        "models": [{
+                            // 44 chars: past the cap, and a shape real
+                            // path-style upstream ids take.
+                            "model": "accounts/fireworks/models/llama-v3p1-405b-it",
+                            "successes": 5,
+                            "inputTokens": 1_000,
+                            "outputTokens": 2_000,
+                            "cacheCreationInputTokens": 0,
+                            "cacheReadInputTokens": 0,
+                            "reasoningOutputTokens": 0
+                        }]
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    let row = visible
+        .lines()
+        .find(|line| line.contains("accounts/fireworks"))
+        .expect("model row");
+    assert!(row.contains("5 ok"), "ok count amputated: {row}");
+    assert!(row.contains("3.0K"), "token total amputated: {row}");
+    assert_eq!(row.chars().count(), 64, "row width: {row}");
+}
+
+/// status-total-only AC-6: a relay with no pools at all still prints the
+/// block. The existing empty-pools test covers one loaded account; this
+/// covers the zero case its name promises.
+#[test]
+fn status_prints_the_block_for_a_relay_with_no_pools() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "0.0.0.0", 8318);
+    let mut runtime = FakeRuntime {
+        accounts_payload: Some(json!({"providers": {}})),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run(&["status"], tmp.path(), &mut runtime);
+
+    assert_eq!(outcome.code, 0);
+    assert!(
+        outcome
+            .stdout
+            .starts_with("relay total: 0 pools, 0 accounts")
+    );
+    assert!(outcome.stdout.contains("requests 0  (0 ok, 0 failed)"));
+    assert!(outcome.stdout.contains("tokens in 0  out 0  cache 0"));
+    assert!(outcome.stdout.contains("total 0"));
+}
+
+/// usage-by-model AC-8: one name column per panel, not per account — the
+/// same model's ok cell must land in the same place in every row of a box.
+#[test]
+fn accounts_shares_one_model_column_across_a_pool() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let model = |name: &str| {
+        json!({
+            "model": name,
+            "successes": 5,
+            "inputTokens": 1,
+            "outputTokens": 1,
+            "cacheCreationInputTokens": 0,
+            "cacheReadInputTokens": 0,
+            "reasoningOutputTokens": 0
+        })
+    };
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 2,
+                    "accounts": [
+                        account(json!({
+                            "email": "a@x.com",
+                            "available": true,
+                            "totalSuccesses": 5,
+                            "models": [model("claude-sonnet-4-5")]
+                        })),
+                        account(json!({
+                            "email": "b@x.com",
+                            "available": true,
+                            "totalSuccesses": 5,
+                            "models": [model("claude-opus-5")]
+                        }))
+                    ]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    let column = |needle: &str| -> usize {
+        let line = visible
+            .lines()
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("row for {needle}"));
+        line.find("5 ok")
+            .unwrap_or_else(|| panic!("ok cell: {line}"))
+    };
+    // The shorter name sits on the wider account's column, not its own.
+    assert_eq!(
+        column("claude-sonnet-4-5"),
+        column("claude-opus-5"),
+        "columns disagree inside one panel:\n{visible}"
+    );
+}
+
+/// consistent-panels AC-1: one header grammar for every rich panel —
+/// `<subject>` or `<subject> ─ <qualifier>`, never a colon.
+#[test]
+fn every_rich_header_uses_one_grammar() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "
+  commandcode:
+    base-url: https://api.commandcode.ai/v1",
+    );
+    let mut runtime = FakeRuntime {
+        rich: true,
+        ..FakeRuntime::default()
+    };
+
+    let mut headers = Vec::new();
+    let mut collect = |argv: &[&str], runtime: &mut FakeRuntime| {
+        let outcome = run_style(argv, tmp.path(), runtime, Style::Rich);
+        assert_eq!(outcome.code, 0, "{argv:?} failed");
+        for line in strip_ansi(&outcome.stdout).lines() {
+            if let Some(rest) = line.strip_prefix("┌─ ") {
+                headers.push(rest.trim_end_matches(['─', '┐', ' ']).trim().to_string());
+            }
+        }
+    };
+    collect(&["status"], &mut runtime);
+    collect(&["accounts"], &mut runtime);
+    collect(&["service", "status"], &mut runtime);
+    collect(&["service", "restart"], &mut runtime);
+    collect(&["update", "--check"], &mut runtime);
+    collect(&["config", "path"], &mut runtime);
+    collect(
+        &["login", "--provider", "commandcode", "--key", "sk-secret"],
+        &mut runtime,
+    );
+
+    assert!(headers.len() >= 7, "collected: {headers:?}");
+    for header in &headers {
+        assert!(
+            !header.contains(':'),
+            "header keeps a colon: {header:?} (all: {headers:?})"
+        );
+    }
+    // The qualifier, when present, is separated by the same rule glyph.
+    assert!(
+        headers.iter().any(|h| h.contains(" ─ ")),
+        "no qualified header: {headers:?}"
+    );
+}
+
+/// consistent-panels AC-3/AC-9: `status` rows are labelled facts, values
+/// aligned in one column down the whole box.
+#[test]
+fn status_rows_are_labelled_facts_in_one_column() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "0.0.0.0", 8318);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalRequests": 907,
+                        "totalSuccesses": 900,
+                        "totalInputTokens": 1_000,
+                        "totalOutputTokens": 2_000
+                    }))]
+                },
+                "commandcode": {
+                    "account_count": 2,
+                    "accounts": [account(json!({
+                        "email": "k@x.com",
+                        "available": true,
+                        "totalRequests": 239,
+                        "totalSuccesses": 212
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["status"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    let value_column = |label: &str| -> usize {
+        let line = visible
+            .lines()
+            .find(|line| line.contains(&format!("│ {label}")))
+            .unwrap_or_else(|| panic!("row {label:?} missing:\n{visible}"));
+        // Column where the value starts: past "│ " + label + padding.
+        let after_label = line.find(label).expect("label") + label.chars().count();
+        line[after_label..]
+            .find(|c: char| !c.is_whitespace())
+            .expect("value")
+            + after_label
+    };
+
+    // AC-3: the facts status reports, each on a labelled row.
+    for label in ["config", "url", "server", "requests", "tokens", "total"] {
+        assert!(
+            visible.contains(&format!("│ {label}")),
+            "missing labelled row {label:?}:\n{visible}"
+        );
+    }
+    // AC-3: one row per pool, labelled by pool name.
+    assert!(visible.contains("│ anthropic"));
+    assert!(visible.contains("│ commandcode"));
+    // AC-9: every value starts in the same column.
+    let columns: Vec<usize> = ["config", "url", "server", "anthropic", "requests", "total"]
+        .into_iter()
+        .map(value_column)
+        .collect();
+    assert!(
+        columns.windows(2).all(|pair| pair[0] == pair[1]),
+        "values not aligned: {columns:?}\n{visible}"
+    );
+    // AC-2: the glyph marks the state value, not a plain fact.
+    let server_row = visible
+        .lines()
+        .find(|line| line.contains("│ server"))
+        .expect("server row");
+    assert!(server_row.contains('●'), "no glyph: {server_row}");
+    let url_row = visible
+        .lines()
+        .find(|line| line.contains("│ url"))
+        .expect("url row");
+    assert!(!url_row.contains('●'), "glyph on a plain fact: {url_row}");
+}
+
+/// consistent-panels AC-4/AC-5: `service status`, the action panels,
+/// `login`, `update` and `config` all speak the same row grammar.
+#[test]
+fn action_and_service_panels_use_the_same_row_grammar() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "
+  commandcode:
+    base-url: https://api.commandcode.ai/v1",
+    );
+    let mut runtime = FakeRuntime {
+        rich: true,
+        service_status_text: Some(
+            "● pengepul.service - pengepul API relay\n     Loaded: loaded (/x/pengepul.service; enabled; preset: enabled)\n     Active: active (running) since Sat 2026-09-05 14:48:16 WIB; 22min ago\n   Main PID: 3477298 (pengepul)\n      Tasks: 7 (limit: 14306)\n     Memory: 48.6M (peak: 49.9M)\n        CPU: 11.417s\n"
+                .to_string(),
+        ),
+        ..FakeRuntime::default()
+    };
+
+    // AC-4: service status facts are labelled rows.
+    let status = run_style(
+        &["service", "status"],
+        tmp.path(),
+        &mut runtime,
+        Style::Rich,
+    );
+    let visible = strip_ansi(&status.stdout);
+    for label in [
+        "state", "enabled", "pid", "memory", "cpu", "tasks", "uptime",
+    ] {
+        assert!(
+            visible.contains(&format!("│ {label}")),
+            "service status missing {label:?}:\n{visible}"
+        );
+    }
+    assert!(
+        visible
+            .lines()
+            .find(|l| l.contains("│ state"))
+            .expect("state row")
+            .contains('●')
+    );
+
+    // AC-5: an action names its state, then its subject.
+    let restart = run_style(
+        &["service", "restart"],
+        tmp.path(),
+        &mut runtime,
+        Style::Rich,
+    );
+    let visible = strip_ansi(&restart.stdout);
+    assert!(visible.contains("│ state"), "{visible}");
+    assert!(visible.contains("restarted"), "{visible}");
+
+    let update = run_style(
+        &["update", "--check"],
+        tmp.path(),
+        &mut runtime,
+        Style::Rich,
+    );
+    let visible = strip_ansi(&update.stdout);
+    assert!(visible.contains("│ state"), "{visible}");
+    assert!(visible.contains("│ version"), "{visible}");
+
+    let login = run_style(
+        &["login", "--provider", "commandcode", "--key", "sk-secret"],
+        tmp.path(),
+        &mut runtime,
+        Style::Rich,
+    );
+    let visible = strip_ansi(&login.stdout);
+    assert!(visible.contains("│ state"), "{visible}");
+    assert!(visible.contains("│ account"), "{visible}");
+
+    // AC-6: config facts keep their content under the same grammar.
+    let config = run_style(&["config", "path"], tmp.path(), &mut runtime, Style::Rich);
+    let visible = strip_ansi(&config.stdout);
+    assert!(visible.contains("│ path"), "{visible}");
+}
+
+/// consistent-panels AC-9 + status-total-only AC-3: an operator-chosen
+/// provider key can be long. The label must not push the value column out
+/// of line, and must never amputate the token figure.
+#[test]
+fn status_survives_a_long_pool_name() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "0.0.0.0", 8318);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "a-very-long-provider-name-here": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalRequests": 640,
+                        "totalInputTokens": 22_100_000,
+                        "totalOutputTokens": 401_200
+                    }))]
+                },
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "b@x.com",
+                        "available": true,
+                        "totalRequests": 10,
+                        "totalInputTokens": 10
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["status"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    // The token figure survives: a silently truncated number is a lie.
+    let long_row = visible
+        .lines()
+        .find(|line| line.contains("a-very-long"))
+        .expect("long pool row");
+    assert!(
+        long_row.contains("22.5M"),
+        "token figure amputated: {long_row}"
+    );
+    // AC-9: every value starts in the same column, long label included.
+    // Measured in visible columns, not bytes — the clip ellipsis is one
+    // column but three bytes, which byte offsets would count as three.
+    let value_column = |needle: &str| -> usize {
+        let line = visible
+            .lines()
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("row {needle:?}:\n{visible}"));
+        let body: Vec<char> = line.chars().skip(2).collect();
+        let gap = body
+            .windows(2)
+            .position(|pair| pair == [' ', ' '])
+            .expect("label/value gap");
+        body[gap..]
+            .iter()
+            .position(|c| !c.is_whitespace())
+            .expect("value")
+            + gap
+    };
+    assert_eq!(
+        value_column("a-very-long"),
+        value_column("config"),
+        "long label breaks the column:\n{visible}"
+    );
+}
+
+/// consistent-panels AC-2/AC-9: the `accounts` panel's footer facts obey
+/// the same grammar as every other panel — one label column, values
+/// aligned down the box.
+#[test]
+fn accounts_footer_rows_use_the_row_grammar() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalRequests": 640,
+                        "totalSuccesses": 638,
+                        "totalInputTokens": 22_100_000,
+                        "totalOutputTokens": 401_200,
+                        "totalReasoningOutputTokens": 64_000
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    let lines: Vec<&str> = visible.lines().collect();
+    // The footer starts after the mid-panel separator; searching the whole
+    // panel would match the per-account `tokens`/`reasoning` rows instead
+    // and could not detect a footer row drifting out of column.
+    let separator = lines
+        .iter()
+        .position(|line| line.starts_with('\u{251c}'))
+        .expect("mid-panel separator");
+    let value_column = |label: &str| -> usize {
+        let needle = format!("│ {label}");
+        let line = lines[separator..]
+            .iter()
+            .find(|line| line.contains(&needle))
+            .unwrap_or_else(|| panic!("footer row {label:?}:\n{visible}"));
+        let after = line.find(label).expect("label") + label.chars().count();
+        line[after..]
+            .find(|c: char| !c.is_whitespace())
+            .expect("value")
+            + after
+    };
+    let columns: Vec<usize> = ["requests", "tokens", "reasoning", "total"]
+        .into_iter()
+        .map(value_column)
+        .collect();
+    assert!(
+        columns.windows(2).all(|pair| pair[0] == pair[1]),
+        "footer values not aligned: {columns:?}\n{visible}"
+    );
+}
+
+/// consistent-panels AC-9: a value too wide for the box is marked, never
+/// silently amputated. `rich-everywhere` AC-9 had exempted the config and
+/// url lines from clipping entirely; putting them in a box removed that
+/// exemption, so the clip must at least be visible.
+#[test]
+fn a_value_too_wide_for_the_panel_is_marked_not_amputated() {
+    let tmp = tempdir().expect("tempdir");
+    // A config path an operator could plausibly pass to --config.
+    let deep = tmp
+        .path()
+        .join("home/kognos/work/projects/relays/pengepul/config");
+    std::fs::create_dir_all(&deep).expect("mkdir");
+    let config = deep.join("production-relay.yaml");
+    std::fs::write(
+        &config,
+        "host: 127.0.0.1\nport: 8318\napi-keys:\n  - sk-test\ndebug: \"off\"\n",
+    )
+    .expect("write config");
+    let mut runtime = FakeRuntime {
+        rich: true,
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_with_env(
+        &["--config", config.to_str().expect("utf8"), "status"],
+        tmp.path(),
+        tmp.path(),
+        &mut runtime,
+        Style::Rich,
+    )
+    .expect("status runs");
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    // Located by label: the path text is exactly what the clip removes, so
+    // a needle inside it survives only for short TMPDIRs (it panicked on
+    // macOS and under any TMPDIR past 22 chars).
+    let config_row = visible
+        .lines()
+        .find(|line| line.contains("\u{2502} config"))
+        .expect("config row");
+    // The row still fits the box.
+    assert_eq!(
+        config_row.chars().count(),
+        64,
+        "row off the fixed width: {config_row}"
+    );
+    // And the truncation is visible: a silently cut path reads as a real
+    // path that does not exist.
+    assert!(
+        config_row.contains('\u{2026}'),
+        "clip not marked: {config_row}"
+    );
+}
+
+/// consistent-panels AC-4: the `service` header carries no state
+/// qualifier — `state ● active (running)` is already a row, and the
+/// header would only repeat it truncated and uncolored. The general rule:
+/// a qualifier must add a fact the rows do not carry.
+#[test]
+fn the_service_header_does_not_repeat_the_state_row() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime = FakeRuntime {
+        rich: true,
+        service_status_text: Some(
+            "● pengepul.service - pengepul API relay\n     Loaded: loaded (/x/pengepul.service; enabled; preset: enabled)\n     Active: active (running) since Sat 2026-09-05 14:48:16 WIB; 22min ago\n   Main PID: 3477298 (pengepul)\n"
+                .to_string(),
+        ),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(
+        &["service", "status"],
+        tmp.path(),
+        &mut runtime,
+        Style::Rich,
+    );
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    let header = visible.lines().next().expect("header");
+    // The state belongs to its row, not to the header.
+    assert!(
+        !header.contains("active"),
+        "header repeats the state row: {header}"
+    );
+    assert!(header.starts_with("┌─ service ─────"), "header: {header}");
+    assert!(
+        visible.contains("│ state    ● active (running)"),
+        "{visible}"
+    );
+}
+
+/// consistent-panels AC-8: `--version` is the one plain surface with no
+/// test at all, and it is the surface most likely to be parsed by a
+/// script. It leaves through clap's own exit path, never the verb
+/// dispatch, so neither Style can turn it into a panel.
+#[test]
+fn version_prints_the_same_bytes_in_both_styles() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime = FakeRuntime::default();
+
+    let mut text = |style: Style| -> String {
+        let error = run_with_env(&["--version"], tmp.path(), tmp.path(), &mut runtime, style)
+            .expect_err("--version leaves through clap");
+        error.to_string()
+    };
+
+    let plain = text(Style::Plain);
+    assert_eq!(
+        plain.trim_end(),
+        format!("pengepul {}", env!("CARGO_PKG_VERSION"))
+    );
+    // Same bytes under a rich terminal: a version string is machine-read.
+    assert_eq!(plain, text(Style::Rich));
+}
+
+/// consistent-panels AC-9: an over-long *header* is marked when clipped,
+/// like every other truncation. Without the mark the header can cut an
+/// account count mid-digit and report `─ 1` for a pool holding 12.
+#[test]
+fn an_over_long_panel_header_is_marked_not_amputated() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let long_id = "p".repeat(49);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                long_id.clone(): {
+                    "account_count": 12,
+                    "accounts": (0..12).map(|n| account(json!({
+                        "email": format!("k{n}@x.com"),
+                        "available": true,
+                        "totalRequests": 1
+                    }))).collect::<Vec<_>>()
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    let header = visible.lines().next().expect("header");
+    assert_eq!(header.chars().count(), 64, "header width: {header}");
+    // The clip must be marked: a header reading "─ 1" for a 12-account
+    // pool is the same lie as a truncated token figure.
+    assert!(header.contains('\u{2026}'), "clip not marked: {header}");
+    assert!(
+        !header.contains("─ 1 ") || header.contains("─ 12"),
+        "count truncated mid-digit: {header}"
+    );
+}
+
+/// status-total-only AC-3 + usage-by-model AC-7: plain output is what a
+/// script parses, so it never clips a provider key. An ellipsis inside a
+/// pool name would be read as part of the id.
+#[test]
+fn plain_status_never_clips_a_pool_name() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "0.0.0.0", 8318);
+    let long_id = "openrouter-eu-west-frankfurt-1";
+    let mut runtime = FakeRuntime {
+        accounts_payload: Some(json!({
+            "providers": {
+                long_id: {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalRequests": 5
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run(&["status"], tmp.path(), &mut runtime);
+
+    assert_eq!(outcome.code, 0);
+    assert!(
+        outcome.stdout.contains(long_id),
+        "plain clipped the pool name:\n{}",
+        outcome.stdout
+    );
+    assert!(
+        !outcome.stdout.contains('\u{2026}'),
+        "ellipsis in script-parsed output:\n{}",
+        outcome.stdout
+    );
+}
+
+/// consistent-panels AC-8: a control character in an operator string must
+/// not split a panel row. A newline is legal in a Unix path, and a split
+/// row is neither 64 columns nor a box.
+#[test]
+fn a_control_character_cannot_split_a_panel_row() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "0.0.0.0", 8318);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "an\nthropic\tpool": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalRequests": 5
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["status"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    for line in visible.lines() {
+        assert_eq!(
+            line.chars().count(),
+            64,
+            "control character split the box: {line:?}"
+        );
+    }
 }

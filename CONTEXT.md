@@ -58,8 +58,12 @@ _Avoid_: retry, fallback, attempt budget
 The set of Accounts of one Provider behind the relay, spread across by Rotation.
 _Avoid_: account list, fleet, grouping
 
+**Panel**:
+One 64-column box of rich CLI output. Its header is `<subject>` or `<subject> ─ <qualifier>` and never carries a colon; a qualifier must add a fact the rows do not carry. Its fact rows are `<label>  <value>` with the label column fitted to that panel; it may also carry list rows — account and model tables with their own fitted columns. The status glyph marks a state value only. Plain output is not a panel and follows a separate, byte-stable contract.
+_Avoid_: card, box, widget
+
 **Usage counters**:
-The running per-account totals — requests, successes, failures, tokens in/out/cache/reasoning — shown in `status`/`accounts` and persisted to `usage.json` in the provider's auth directory so they survive restarts and upgrades. Cooldowns and failure streaks are not persisted: a fresh process always retries.
+The running per-account totals — requests, successes, failures, tokens in/out/cache/reasoning — broken down per model for the successes, summed relay-wide in `status` and shown per account in `accounts`, and persisted to `usage.json` in the provider's auth directory so they survive restarts and upgrades. Counters recorded before per-model attribution existed stay only in the account totals. Cooldowns and failure streaks are not persisted: a fresh process always retries.
 _Avoid_: stats file, metrics, telemetry
 
 ### Access and billing identity
@@ -119,4 +123,4 @@ _Avoid_: billing classifier, detector, filter
 - "refresh" names both the secret an account holds and the act of replacing its expiring access token. Resolved: **Refresh** is the act. The secret is the refresh token.
 - "round-robin with sticky windows" survives in `docs/`, contradicting the README. Resolved: **Rotation** has no stickiness. Selection resumes after the last-used account and advances on every request, with no client or session key anywhere.
 - "pool" and "pooling" name both the whole relay and one provider's accounts. Resolved: **Pool** is one Provider's set of Accounts; the process serving every pool is the relay.
-- The CLI printed cooldown accounts as "unavailable". Resolved: operator-facing output says "on cooldown" with the remaining time; "unavailable" is on the avoid list.
+- The CLI printed cooldown accounts as "unavailable". Resolved: operator-facing output says "on cooldown" with the remaining time; "unavailable" is on the avoid list. **One exception survives by necessity:** plain `accounts` prints "unavailable" for an account with no future cooldown, because plain bytes are frozen for scripts (`consistent-panels` non-goals) and cannot be changed without breaking one. Rich says "unresponsive" for the same state.

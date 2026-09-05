@@ -215,6 +215,7 @@ async fn usage_counters_survive_a_manager_rebuild() {
             cache_read_input_tokens: 4,
             reasoning_output_tokens: 13,
         }),
+        "claude-fable-5-1",
     );
     manager.record_failure("k@example.com", "upstream", Some("boom"));
 
@@ -294,7 +295,7 @@ async fn token_refresh_keeps_the_counters() {
     let mut manager = never_refresh_manager(tmp.path().to_path_buf());
     manager.load().expect("load");
     manager.record_attempt("k@example.com");
-    manager.record_success("k@example.com", None);
+    manager.record_success("k@example.com", None, "claude-fable-5-1");
     assert_eq!(manager.snapshots()[0]["totalRequests"], 1);
 
     // Spec: token rotation must not reset usage counters. Rotate for
@@ -310,4 +311,180 @@ async fn token_refresh_keeps_the_counters() {
     manager.reload().expect("reload");
     assert_eq!(manager.snapshots()[0]["totalRequests"], 1);
     assert_eq!(manager.snapshots()[0]["totalSuccesses"], 1);
+}
+
+/// usage-by-model AC-1/AC-2: successes accumulate per model, per account.
+#[tokio::test]
+async fn per_model_counters_accumulate_per_account() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("a@example.com")).expect("save token");
+    save_token(tmp.path(), &static_token("b@example.com")).expect("save token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+
+    let usage = |input: i64| UsageData {
+        input_tokens: input,
+        output_tokens: 10,
+        cache_creation_input_tokens: 1,
+        cache_read_input_tokens: 2,
+        reasoning_output_tokens: 3,
+    };
+    manager.record_success("a@example.com", Some(&usage(100)), "claude-fable-5-1");
+    manager.record_success("a@example.com", Some(&usage(200)), "claude-fable-5-1");
+    manager.record_success("a@example.com", Some(&usage(400)), "claude-sonnet-4-5");
+    manager.record_success("b@example.com", Some(&usage(800)), "claude-fable-5-1");
+
+    let snapshots = manager.snapshots();
+    let by_email = |email: &str| -> Value {
+        snapshots
+            .iter()
+            .find(|snapshot| snapshot["email"] == email)
+            .expect("account present")
+            .clone()
+    };
+
+    // AC-3: name-sorted array of per-model counters.
+    let a_models = by_email("a@example.com")["models"].clone();
+    assert_eq!(a_models[0]["model"], "claude-fable-5-1");
+    assert_eq!(a_models[0]["successes"], 2);
+    assert_eq!(a_models[0]["inputTokens"], 300);
+    assert_eq!(a_models[0]["outputTokens"], 20);
+    assert_eq!(a_models[0]["cacheCreationInputTokens"], 2);
+    assert_eq!(a_models[0]["cacheReadInputTokens"], 4);
+    assert_eq!(a_models[0]["reasoningOutputTokens"], 6);
+    assert_eq!(a_models[1]["model"], "claude-sonnet-4-5");
+    assert_eq!(a_models[1]["successes"], 1);
+    assert_eq!(a_models[1]["inputTokens"], 400);
+
+    // AC-2: the same model on another account stays separate.
+    let b_models = by_email("b@example.com")["models"].clone();
+    assert_eq!(b_models.as_array().expect("array").len(), 1);
+    assert_eq!(b_models[0]["inputTokens"], 800);
+}
+
+/// usage-by-model AC-4: per-model counters survive a manager rebuild, and a
+/// pre-existing file without `models` loads with totals intact.
+#[tokio::test]
+async fn per_model_counters_persist_and_tolerate_legacy_files() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    manager.record_success(
+        "k@example.com",
+        Some(&UsageData {
+            input_tokens: 33,
+            output_tokens: 120,
+            cache_creation_input_tokens: 7,
+            cache_read_input_tokens: 4,
+            reasoning_output_tokens: 13,
+        }),
+        "claude-fable-5-1",
+    );
+
+    let usage_file = tmp.path().join("commandcode").join("usage.json");
+    let stored = persisted(&usage_file);
+    assert_eq!(
+        stored["k@example.com"]["models"]["claude-fable-5-1"]["input_tokens"],
+        33
+    );
+
+    let mut rebuilt = never_refresh_manager(tmp.path().to_path_buf());
+    rebuilt.load().expect("reload");
+    let models = rebuilt.snapshots()[0]["models"].clone();
+    assert_eq!(models[0]["model"], "claude-fable-5-1");
+    assert_eq!(models[0]["successes"], 1);
+    assert_eq!(models[0]["outputTokens"], 120);
+
+    // AC-4 second half: a file written before this change has no `models`
+    // key; the account totals still load and the model list is empty.
+    fs::write(
+        &usage_file,
+        json!({
+            "k@example.com": {
+                "total_requests": 9,
+                "total_successes": 8,
+                "total_failures": 1,
+                "total_input_tokens": 500,
+                "total_output_tokens": 600,
+                "total_cache_creation_input_tokens": 1,
+                "total_cache_read_input_tokens": 2,
+                "total_reasoning_output_tokens": 3
+            }
+        })
+        .to_string(),
+    )
+    .expect("write legacy usage.json");
+    let mut legacy = never_refresh_manager(tmp.path().to_path_buf());
+    legacy.load().expect("load legacy");
+    let snapshot = &legacy.snapshots()[0];
+    assert_eq!(snapshot["totalRequests"], 9);
+    assert_eq!(snapshot["totalInputTokens"], 500);
+    assert_eq!(
+        snapshot["models"].as_array().expect("array").len(),
+        0,
+        "no attribution for pre-existing history"
+    );
+}
+
+/// usage-by-model: a success with no usage block (the count-tokens route,
+/// or a 2xx whose usage will not parse) still belongs to the model that
+/// served it. Without this, per-model `ok` counts drift below the
+/// account's for reasons unrelated to the no-backfill gap.
+#[tokio::test]
+async fn a_success_without_usage_still_counts_against_its_model() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+
+    manager.record_success("k@example.com", None, "claude-fable-5-1");
+    manager.record_success(
+        "k@example.com",
+        Some(&UsageData {
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            reasoning_output_tokens: 0,
+        }),
+        "claude-fable-5-1",
+    );
+
+    let snapshot = &manager.snapshots()[0];
+    assert_eq!(snapshot["totalSuccesses"], 2);
+    let models = snapshot["models"].clone();
+    assert_eq!(models[0]["model"], "claude-fable-5-1");
+    // Both successes counted; only the second carried tokens.
+    assert_eq!(models[0]["successes"], 2);
+    assert_eq!(models[0]["inputTokens"], 10);
+    assert_eq!(models[0]["outputTokens"], 20);
+}
+
+/// usage-by-model AC-4: a `models` sub-object that is not an object, or
+/// holds junk entries, degrades to no attribution — never a failed load.
+#[tokio::test]
+async fn a_corrupt_models_block_loads_as_no_attribution() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let usage_file = tmp.path().join("commandcode").join("usage.json");
+    fs::create_dir_all(usage_file.parent().expect("parent")).expect("mkdir");
+    fs::write(
+        &usage_file,
+        json!({
+            "k@example.com": {
+                "total_requests": 5,
+                "total_successes": 5,
+                "models": "not-an-object"
+            }
+        })
+        .to_string(),
+    )
+    .expect("write");
+
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    let snapshot = &manager.snapshots()[0];
+    assert_eq!(snapshot["totalRequests"], 5);
+    assert_eq!(snapshot["models"].as_array().expect("array").len(), 0);
 }

@@ -123,6 +123,8 @@ struct StreamAccounting {
     state: AppState,
     provider: ProviderId,
     account: AvailableAccount,
+    /// The upstream model name: what per-model counters are keyed by.
+    model: String,
 }
 
 #[derive(Debug, Clone)]
@@ -976,7 +978,9 @@ async fn count_tokens(State(state): State<AppState>, headers: HeaderMap, body: B
     {
         Ok(response) => {
             if response.status.is_success() {
-                record_provider_success(&state, provider.clone(), &account, None).await;
+                // Token counting bills no usage; the success still clears
+                // the account's failure streak.
+                record_provider_success(&state, provider.clone(), &account, None, &model).await;
             } else {
                 record_provider_failure(&state, provider.clone(), &account, response.status, None)
                     .await;
@@ -1230,9 +1234,14 @@ async fn route_generic_chat_request(
             .await
         {
             Ok(response) => {
-                let accounting =
-                    stream_accounting(state, account.provider.clone(), account, response.status)
-                        .await;
+                let accounting = stream_accounting(
+                    state,
+                    account.provider.clone(),
+                    account,
+                    response.status,
+                    model,
+                )
+                .await;
                 sse_upstream_response(
                     response,
                     account.provider.clone(),
@@ -1258,7 +1267,7 @@ async fn route_generic_chat_request(
         .await
     {
         Ok(response) => {
-            record_json_result(state, account.provider.clone(), account, &response).await;
+            record_json_result(state, account.provider.clone(), account, &response, model).await;
             json_upstream_response(
                 response,
                 &account.provider,
@@ -1295,9 +1304,14 @@ async fn route_codex_request(
             .await
         {
             Ok(response) => {
-                let accounting =
-                    stream_accounting(state, account.provider.clone(), account, response.status)
-                        .await;
+                let accounting = stream_accounting(
+                    state,
+                    account.provider.clone(),
+                    account,
+                    response.status,
+                    model,
+                )
+                .await;
                 sse_upstream_response(
                     response,
                     account.provider.clone(),
@@ -1323,7 +1337,7 @@ async fn route_codex_request(
         .await
     {
         Ok(response) => {
-            record_json_result(state, account.provider.clone(), account, &response).await;
+            record_json_result(state, account.provider.clone(), account, &response, model).await;
             json_upstream_response(response, &account.provider, route, model, &BTreeMap::new())
         }
         Err(error) => {
@@ -1364,9 +1378,14 @@ async fn route_anthropic_request(
             .await
         {
             Ok(response) => {
-                let accounting =
-                    stream_accounting(state, account.provider.clone(), account, response.status)
-                        .await;
+                let accounting = stream_accounting(
+                    state,
+                    account.provider.clone(),
+                    account,
+                    response.status,
+                    model,
+                )
+                .await;
                 sse_upstream_response(
                     response,
                     account.provider.clone(),
@@ -1392,7 +1411,7 @@ async fn route_anthropic_request(
         .await
     {
         Ok(response) => {
-            record_json_result(state, account.provider.clone(), account, &response).await;
+            record_json_result(state, account.provider.clone(), account, &response, model).await;
             json_upstream_response(response, &account.provider, route, model, &tool_reverse)
         }
         Err(error) => {
@@ -1406,12 +1425,14 @@ async fn stream_accounting(
     provider: ProviderId,
     account: &AvailableAccount,
     status: StatusCode,
+    model: &str,
 ) -> Option<StreamAccounting> {
     if status.is_success() {
         Some(StreamAccounting {
             state: state.clone(),
             provider,
             account: account.clone(),
+            model: model.to_string(),
         })
     } else {
         record_provider_failure(state, provider, account, status, None).await;
@@ -1424,6 +1445,7 @@ async fn record_json_result(
     provider: ProviderId,
     account: &AvailableAccount,
     response: &UpstreamJsonResponse,
+    model: &str,
 ) {
     if response.status.is_success() {
         record_provider_success(
@@ -1431,6 +1453,7 @@ async fn record_json_result(
             provider,
             account,
             usage_from_response(&response.body),
+            model,
         )
         .await;
     } else {
@@ -1633,6 +1656,7 @@ async fn record_provider_success(
     provider: ProviderId,
     account: &AvailableAccount,
     usage: Option<UsageData>,
+    model: &str,
 ) {
     let mut manager = match provider.kind {
         ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
@@ -1644,7 +1668,7 @@ async fn record_provider_success(
             manager.lock().await
         }
     };
-    manager.record_success(account.token.email.as_str(), usage.as_ref());
+    manager.record_success(account.token.email.as_str(), usage.as_ref(), model);
 }
 
 async fn record_provider_failure(
@@ -1965,6 +1989,7 @@ async fn record_stream_success(accounting: Option<&StreamAccounting>, usage: &Us
             accounting.provider.clone(),
             &accounting.account,
             Some(usage.clone()),
+            &accounting.model,
         )
         .await;
     }

@@ -85,22 +85,30 @@ pub(crate) const INNER_WIDTH: usize = PANEL_WIDTH - 4;
 /// One `│ … │` row. The colored content is kept verbatim; only its *visible*
 /// width is measured, and tail padding is added after it, so escape bytes
 /// never fool the geometry. A row whose visible text overruns the fixed
-/// width degrades to uncolored, clipped text — box integrity wins over
-/// content, and the renderer's own columns never overrun.
+/// width degrades to uncolored text clipped with an ellipsis — box
+/// integrity wins over content, but the clip is always *marked*: a
+/// silently cut path or url reads as a real one that does not exist.
 pub(crate) fn panel_row(content: &str) -> String {
     let plain = strip_ansi(content);
     let visible = plain.chars().count();
     if visible > INNER_WIDTH {
-        let clipped: String = plain.chars().take(INNER_WIDTH).collect();
-        format!("│ {clipped} │")
-    } else {
-        let tail = " ".repeat(INNER_WIDTH - visible);
-        format!("│ {content}{tail} │")
+        return format!("│ {} │", pad(&plain, INNER_WIDTH));
     }
+    // A control character would split the row in two, neither half a box.
+    // The sanitized text is the only safe thing to print, at the cost of
+    // this row's color — the same trade the clip branch makes.
+    let raw_control = content.chars().any(|c| c.is_control() && c != '\x1b');
+    let tail = " ".repeat(INNER_WIDTH - visible);
+    let body = if raw_control { &plain } else { content };
+    format!("│ {body}{tail} │")
 }
 
-/// Strip ANSI escape sequences, keeping the visible text. Lives with the
-/// render code so measurement and tests share one definition.
+/// Strip ANSI escape sequences, keeping the visible text, and neutralise
+/// control characters. A newline or tab is legal in an operator string (a
+/// `--config` path, a `providers:` key) and would otherwise split a panel
+/// row in two, neither half a box: `chars().count()` measures them as one
+/// column while the terminal acts on them. Lives with the render code so
+/// measurement and tests share one definition.
 pub(crate) fn strip_ansi(text: &str) -> String {
     let mut out = String::new();
     let mut chars = text.chars().peekable();
@@ -112,6 +120,8 @@ pub(crate) fn strip_ansi(text: &str) -> String {
                     break;
                 }
             }
+        } else if character.is_control() {
+            out.push(' ');
         } else {
             out.push(character);
         }
@@ -122,15 +132,17 @@ pub(crate) fn strip_ansi(text: &str) -> String {
 /// Top rule with a header inside: `┌─ <header> ─…┐`, filled to the same
 /// width as a panel row. Box integrity wins over content, as in
 /// `panel_row`: an oversized header (operator strings) is truncated to
-/// the fixed width instead of underflowing the fill.
+/// the fixed width — and, as in `panel_row`, the truncation is *marked*.
+/// An unmarked cut can land mid-number: `pool <49 chars> ─ 1` for a pool
+/// holding 12 accounts is the same lie as a truncated token figure.
 pub(crate) fn top_rule(header: &str) -> String {
-    let header: String = {
-        let characters: Vec<char> = header.chars().collect();
-        if characters.len() > INNER_WIDTH - 2 {
-            characters[..INNER_WIDTH - 2].iter().collect()
-        } else {
-            header.to_string()
-        }
+    // Sanitized first: a control character in an operator string would
+    // split the rule, and its width is measured here.
+    let header = strip_ansi(header);
+    let header: String = if header.chars().count() > INNER_WIDTH - 2 {
+        pad(&header, INNER_WIDTH - 2)
+    } else {
+        header
     };
     let fill = INNER_WIDTH.saturating_sub(header.chars().count() + 1);
     let mut top = format!("┌─ {header} ");
@@ -139,13 +151,58 @@ pub(crate) fn top_rule(header: &str) -> String {
     top
 }
 
-/// The one panel every action command shares: a header rule, one row per
-/// fact (`<label>  <glyphed outcome>`), and the bottom rule. Pure over
-/// its inputs; printing is the caller's job.
-pub(crate) fn action_panel(subject: &str, rows: &[String]) -> Vec<String> {
+/// One labelled fact: the row shape every rich panel uses. The label is
+/// the constant, the value the variable — a reader learns one grammar and
+/// carries it across every verb (`consistent-panels`).
+pub(crate) struct Fact {
+    pub(crate) label: String,
+    pub(crate) value: String,
+}
+
+impl Fact {
+    pub(crate) fn new(label: &str, value: &str) -> Self {
+        Self {
+            label: label.to_string(),
+            value: value.to_string(),
+        }
+    }
+}
+
+/// The widest a label column may grow before the value column suffers.
+/// Labels are short nouns by construction — except a pool name, which is
+/// an operator's config key and can be any length. Past this the label
+/// clips; the value never does, because a truncated number is a lie.
+const LABEL_WIDTH_CAP: usize = 14;
+
+/// The label column for one panel: the longest label present plus two
+/// columns of air, capped. Computed once per panel so values align down
+/// the whole box rather than per section (AC-9).
+pub(crate) fn label_column(facts: &[Fact]) -> usize {
+    facts
+        .iter()
+        .map(|fact| strip_ansi(&fact.label).chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(LABEL_WIDTH_CAP)
+        + 2
+}
+
+/// One fact as a panel row: the label clipped and padded to the panel's
+/// column, then the value. Clipping the label is what keeps the value
+/// column aligned and keeps an over-long label from pushing the value out
+/// of the box, where `panel_row` would amputate it. Labels are plain text
+/// by construction; the value carries the paint.
+pub(crate) fn fact_row(fact: &Fact, column: usize) -> String {
+    let label = pad(&strip_ansi(&fact.label), column.saturating_sub(2));
+    format!("{label}  {}", fact.value)
+}
+
+/// A panel of labelled facts: header, aligned rows, bottom rule.
+pub(crate) fn fact_panel(subject: &str, facts: &[Fact]) -> Vec<String> {
+    let column = label_column(facts);
     let mut lines = vec![top_rule(subject)];
-    for row in rows {
-        lines.push(panel_row(row));
+    for fact in facts {
+        lines.push(panel_row(&fact_row(fact, column)));
     }
     lines.push(format!("└{}┘", "─".repeat(INNER_WIDTH + 2)));
     lines
@@ -192,8 +249,13 @@ pub(crate) fn paint(color: &str, text: &str) -> String {
 }
 
 /// Clamp to exactly `width` display columns: spaces pad short text and an
-/// ellipsis replaces the last visible character of long text.
+/// ellipsis replaces the last visible character of long text. A zero
+/// width yields the empty string rather than underflowing — the guard
+/// lives here, at the seam, not in every caller.
 pub(crate) fn pad(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
     let characters: Vec<char> = text.chars().collect();
     if characters.len() > width {
         let mut clipped: String = characters[..width - 1].iter().collect();
@@ -232,12 +294,6 @@ impl Output {
     pub(crate) fn line(&mut self, value: &str) {
         self.stdout.push_str(value);
         self.stdout.push('\n');
-    }
-
-    /// Whether nothing has been printed yet, so leading blank separators
-    /// can be skipped.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.stdout.is_empty()
     }
 }
 
