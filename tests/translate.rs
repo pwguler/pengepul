@@ -728,3 +728,52 @@ fn an_empty_reply_carries_no_invented_blocks() {
     assert_eq!(out["content"].as_array().expect("content").len(), 0);
     assert_eq!(out["stop_reason"], "end_turn");
 }
+
+#[test]
+fn a_tool_result_follows_its_call_with_nothing_in_between() {
+    // A Messages turn may put text before the result it carries. Flushing
+    // that text first wedged a user message between the assistant's
+    // tool_calls and the tool reply, which strict gateways reject.
+    let body = json!({
+        "messages": [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "call_1", "name": "read", "input": {}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "text", "text": "here is what it said"},
+                {"type": "tool_result", "tool_use_id": "call_1", "content": "contents"}
+            ]}
+        ]
+    });
+
+    let out = anthropic_to_chat_request(&body);
+    let messages = out["messages"].as_array().expect("messages");
+
+    assert_eq!(messages[0]["role"], "assistant");
+    assert!(messages[0].get("tool_calls").is_some());
+    assert_eq!(messages[1]["role"], "tool", "{messages:?}");
+    assert_eq!(messages[1]["tool_call_id"], "call_1");
+    // The turn's own text still travels, after the answer it accompanied.
+    assert_eq!(messages[2]["role"], "user");
+    assert_eq!(messages[2]["content"], "here is what it said");
+}
+
+#[test]
+fn an_assistant_turn_of_pure_tool_calls_sends_null_content() {
+    // Not `""`: several gateways reject an empty string alongside
+    // tool_calls.
+    let body = json!({
+        "messages": [{"role": "assistant", "content": [
+            {"type": "tool_use", "id": "call_1", "name": "read", "input": {"path": "a"}}
+        ]}]
+    });
+
+    let out = anthropic_to_chat_request(&body);
+
+    assert!(
+        out["messages"][0]["content"].is_null(),
+        "{}",
+        out["messages"][0]
+    );
+    assert_eq!(out["messages"][0]["tool_calls"][0]["id"], "call_1");
+}

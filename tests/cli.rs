@@ -121,6 +121,10 @@ impl CliRuntime for FakeRuntime {
         self.rich
     }
 
+    fn can_ask(&mut self) -> bool {
+        self.rich
+    }
+
     fn reload_accounts(&mut self, base_url: &str, api_key: &str) -> Result<Value> {
         self.calls.push(format!("reload:{base_url}:{api_key}"));
         Ok(json!({"reloaded": {"anthropic": {"added": [], "updated": [], "unchanged": []}}}))
@@ -4516,30 +4520,6 @@ fn launch_claude_moves_every_model_tier() {
 }
 
 #[test]
-fn launch_claude_keeps_a_built_in_prefix() {
-    // `anthropic/` and `codex/` name built-ins, not `providers:` entries, and
-    // both serve Messages — the guard above must not fire on them.
-    let tmp = tempdir().expect("tempdir");
-    write_config_with_providers(
-        tmp.path(),
-        "  groq:\n    base-url: https://api.groq.com/openai/v1\n",
-    );
-    let mut runtime = FakeRuntime::default();
-
-    let outcome = run(
-        &["launch", "claude", "--model", "anthropic/claude-opus-5"],
-        tmp.path(),
-        &mut runtime,
-    );
-
-    assert_eq!(outcome.code, 0);
-    assert_eq!(
-        env_value(&launched(&runtime), "ANTHROPIC_MODEL"),
-        Some("anthropic/claude-opus-5")
-    );
-}
-
-#[test]
 fn launch_pi_names_the_relay_provider_and_the_model() {
     let tmp = tempdir().expect("tempdir");
     write_config(tmp.path(), "127.0.0.1", 8317);
@@ -4716,6 +4696,9 @@ fn help_launch_names_the_harnesses() {
     assert!(outcome.stdout.contains("claude"), "{}", outcome.stdout);
     assert!(outcome.stdout.contains("pi"), "{}", outcome.stdout);
     assert!(outcome.stdout.contains("--model"), "{}", outcome.stdout);
+    // And the separator, which is how anything reaches the harness.
+    assert!(outcome.stdout.contains("--"), "{}", outcome.stdout);
+    assert!(outcome.stdout.contains("FORWARDED"), "{}", outcome.stdout);
 }
 
 /// A relay catalog: two anthropic models and one from a configured
@@ -4806,8 +4789,8 @@ fn the_picker_offers_the_whole_catalog_to_claude() {
 
 #[test]
 fn a_configured_provider_model_is_an_ordinary_choice_for_claude() {
-    // This was refused before the relay could serve Messages from such an
-    // endpoint. Nothing refuses it now.
+    // A configured endpoint's model is served to a Messages client by
+    // translation, so nothing about the id makes it special here.
     let tmp = tempdir().expect("tempdir");
     write_config_with_providers(
         tmp.path(),

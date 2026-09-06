@@ -76,6 +76,15 @@ impl CliRuntime for RealRuntime {
         std::io::IsTerminal::is_terminal(&std::io::stdout())
     }
 
+    fn can_ask(&mut self) -> bool {
+        // The picker paints to stderr and reads stdin, so those are what
+        // decide whether there is anyone to ask. Gating on stdout instead
+        // meant `launch claude 2>/dev/null` took raw mode and threw every
+        // frame away: a blank, frozen terminal with no visible way out.
+        std::io::IsTerminal::is_terminal(&std::io::stderr())
+            && std::io::IsTerminal::is_terminal(&std::io::stdin())
+    }
+
     fn accounts(&mut self, base_url: &str, api_key: &str) -> Result<Value> {
         self.runtime.block_on(request_json(
             Method::Get,
@@ -395,8 +404,13 @@ fn draw_picker(
         String::new(),
     ];
 
+    // One line of its own, counted against the same budget as a row, so
+    // the frame stays exactly as tall as the terminal and the heading with
+    // its counter is not scrolled away at the moment it is needed.
+    let mut painted = 0;
     if matching.is_empty() {
         frame.push(paint(DIM, "    nothing matches"));
+        painted += 1;
     }
     for (offset, choice) in matching.iter().skip(*scroll).take(rows).enumerate() {
         let selected = *scroll + offset == cursor;
@@ -414,8 +428,9 @@ fn draw_picker(
             paint(DIM, &choice.price),
         );
         frame.push(row);
+        painted += 1;
     }
-    for _ in matching.len().saturating_sub(*scroll).min(rows)..rows {
+    for _ in painted..rows {
         frame.push(String::new());
     }
     frame.push(paint(DIM, "  ↑↓ move   ⏎ run   esc cancel"));
@@ -444,7 +459,7 @@ fn paint_id(padded: &str, selected: bool) -> String {
     format!("{}{rest}", paint(DIM, prefix))
 }
 
-/// Become the harness./// Become the harness. `exec` leaves the terminal, the signal handling and
+/// Become the harness. `exec` leaves the terminal, the signal handling and
 /// the exit code with it rather than proxying all three through pengepul, so
 /// this returns only when the program could not be started at all.
 fn launch_harness(plan: &LaunchPlan) -> Result<()> {
@@ -1048,6 +1063,133 @@ fn unpack_over(
 }
 #[cfg(test)]
 mod tests {
+    use super::picker_loop;
+    use crate::cli::ModelChoice;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+    fn choices() -> Vec<ModelChoice> {
+        [
+            "anthropic/claude-opus-5",
+            "anthropic/claude-haiku-4-5",
+            "groq/llama",
+        ]
+        .iter()
+        .map(|id| ModelChoice {
+            id: (*id).to_string(),
+            context: "1.0M ctx".to_string(),
+            price: String::new(),
+        })
+        .collect()
+    }
+
+    fn press(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// Drive the picker's key loop over a scripted sequence, discarding
+    /// what it paints. Running out of keys is an error rather than a
+    /// silent cancel, so a test cannot pass by exhausting the script.
+    fn drive(keys: Vec<Event>) -> Option<String> {
+        let mut screen = Vec::new();
+        let mut queued = keys.into_iter();
+        picker_loop(&mut screen, "claude", &choices(), &mut || {
+            queued
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("ran out of keys"))
+        })
+        .expect("the picker loop")
+    }
+
+    #[test]
+    fn enter_takes_the_highlighted_row() {
+        assert_eq!(
+            drive(vec![press(KeyCode::Enter)]).as_deref(),
+            Some("anthropic/claude-opus-5")
+        );
+    }
+
+    #[test]
+    fn the_arrows_move_the_highlight() {
+        assert_eq!(
+            drive(vec![press(KeyCode::Down), press(KeyCode::Enter)]).as_deref(),
+            Some("anthropic/claude-haiku-4-5")
+        );
+        // Up at the top stays at the top rather than wrapping or panicking.
+        assert_eq!(
+            drive(vec![press(KeyCode::Up), press(KeyCode::Enter)]).as_deref(),
+            Some("anthropic/claude-opus-5")
+        );
+        assert_eq!(
+            drive(vec![press(KeyCode::End), press(KeyCode::Enter)]).as_deref(),
+            Some("groq/llama")
+        );
+    }
+
+    #[test]
+    fn typing_narrows_and_backspace_widens() {
+        assert_eq!(
+            drive(vec![
+                press(KeyCode::Char('h')),
+                press(KeyCode::Char('a')),
+                press(KeyCode::Enter)
+            ])
+            .as_deref(),
+            Some("anthropic/claude-haiku-4-5")
+        );
+        // `ha` then a backspace leaves `h`, which still excludes opus.
+        assert_eq!(
+            drive(vec![
+                press(KeyCode::Char('z')),
+                press(KeyCode::Backspace),
+                press(KeyCode::Enter)
+            ])
+            .as_deref(),
+            Some("anthropic/claude-opus-5")
+        );
+    }
+
+    #[test]
+    fn esc_and_ctrl_c_cancel() {
+        assert_eq!(drive(vec![press(KeyCode::Esc)]), None);
+        assert_eq!(
+            drive(vec![Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL
+            ))]),
+            None
+        );
+    }
+
+    #[test]
+    fn enter_on_no_match_neither_picks_nor_panics() {
+        assert_eq!(
+            drive(vec![
+                press(KeyCode::Char('z')),
+                press(KeyCode::Enter),
+                press(KeyCode::Backspace),
+                press(KeyCode::Enter)
+            ])
+            .as_deref(),
+            Some("anthropic/claude-opus-5")
+        );
+    }
+
+    #[test]
+    fn a_key_release_is_not_a_second_press() {
+        // Terminals that report both would otherwise move twice per press.
+        let mut release = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+        assert_eq!(
+            drive(vec![
+                press(KeyCode::Down),
+                Event::Key(release),
+                press(KeyCode::Enter)
+            ])
+            .as_deref(),
+            Some("anthropic/claude-haiku-4-5")
+        );
+    }
+
     use super::{unpack_over, verify_checksum};
 
     #[test]

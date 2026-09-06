@@ -70,11 +70,11 @@ in files.
   dispatch too: `launch_plan` turns a harness name into the binary, the
   arguments and the environment that point it at the relay, and the runtime
   `exec`s that plan — the whole of the per-harness knowledge is that one
-  table. Its model picker splits the same way: `cli.rs` decides which rows
-  exist and which the harness cannot be given (`model_choices`) and owns
-  the search rule (`matching_choices`); the runtime fetches `/v1/models`
-  and drives the keys, so what a test asserts is the list that was
-  offered and the row that came back.
+  table. Its model picker splits the same way: `cli.rs` turns the catalog
+  into rows (`model_choices`) and owns the search rule
+  (`matching_choices`); the runtime fetches `/v1/models` and drives the
+  keys, so what a test asserts is the list that was offered and the row
+  that came back.
 - **Render** (`render.rs`) — the panel language every verb prints with: the
   64-column box, the `Fact` row (`<label>  <value>`) and `fact_panel` that
   every rich *fact* surface is built from, the three-color palette, glyphs,
@@ -213,9 +213,8 @@ in files.
   per-process — openclaw and hermes can only be redirected in their config
   files, so they stay the README's manual step (ADR-0007 still holds: the
   client adapts, and `launch` only writes that adaptation into one process
-  instead of onto disk). It is also why `launch claude --model` refuses a
-  configured provider. The picker
-  offers every advertised model to either harness, because every one of them
-  can be run: the relay translates Messages onto a configured endpoint rather
-  than refusing it. It opens nothing at all when stdout is not a terminal,
-  where raw mode would seize a terminal nobody is watching.
+  instead of onto disk). Its picker offers every advertised model to either
+  harness, because every one of them can be run: the relay translates
+  Messages onto a configured endpoint rather than refusing it (ADR-0016). It
+  opens nothing at all unless stderr and stdin are both terminals, since
+  raw mode would otherwise seize a terminal nobody is watching.

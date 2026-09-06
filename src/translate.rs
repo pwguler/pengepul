@@ -787,6 +787,7 @@ fn push_chat_messages(messages: &mut Vec<Value>, message: &Value) {
     };
     let mut parts = Vec::new();
     let mut tool_calls = Vec::new();
+    let mut tool_results = Vec::new();
     for block in blocks {
         match block.get("type").and_then(Value::as_str) {
             Some("text") => parts.push(json!({
@@ -807,26 +808,38 @@ fn push_chat_messages(messages: &mut Vec<Value>, message: &Value) {
                         .unwrap_or_else(|_| "{}".to_string())
                 }
             })),
-            // Whatever text came before it is flushed first, so the result
-            // still follows the turn that asked for it.
-            Some("tool_result") => {
-                flush_chat_parts(messages, role, &mut parts);
-                messages.push(json!({
-                    "role": "tool",
-                    "tool_call_id": block.get("tool_use_id").cloned().unwrap_or(Value::Null),
-                    "content": text_from_content(block.get("content").unwrap_or(&Value::Null))
-                }));
-            }
+            // Held back, not written where it sits. A `tool` message must
+            // follow the assistant turn that called for it with nothing in
+            // between, and a Messages turn is free to put text before the
+            // result. Flushing that text first wedged a `user` message
+            // between the call and its answer, which strict gateways reject
+            // with "'tool' must be a response to a preceding message with
+            // 'tool_calls'".
+            Some("tool_result") => tool_results.push(json!({
+                "role": "tool",
+                "tool_call_id": block.get("tool_use_id").cloned().unwrap_or(Value::Null),
+                "content": text_from_content(block.get("content").unwrap_or(&Value::Null))
+            })),
             // Thinking blocks are the model's own prior reasoning. This
             // dialect has nowhere to put them on the way up, and echoing
             // them back as text would change the transcript.
             _ => {}
         }
     }
+    // Results first, then whatever else the turn carried.
+    messages.append(&mut tool_results);
     if tool_calls.is_empty() {
         flush_chat_parts(messages, role, &mut parts);
     } else {
-        let mut assistant = json!({"role": "assistant", "content": chat_parts_text(&parts)});
+        let text = chat_parts_text(&parts);
+        let mut assistant = json!({"role": "assistant"});
+        // Null, not an empty string: several gateways reject `content: ""`
+        // alongside `tool_calls`.
+        assistant["content"] = if text.is_empty() {
+            Value::Null
+        } else {
+            Value::String(text)
+        };
         assistant["tool_calls"] = Value::Array(tool_calls);
         messages.push(assistant);
     }

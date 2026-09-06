@@ -791,6 +791,9 @@ fn a_chat_stream_opens_and_closes_a_messages_message() {
 fn a_chat_stream_tool_call_becomes_one_tool_use_block() {
     let mut state = AnthropicStreamState::new("glm-5.3");
 
+    // The call is assembled across chunks and written out when the turn
+    // ends: Messages blocks cannot interleave, and this dialect gives no
+    // promise about the order a call's pieces arrive in.
     let open = chat_sse_to_anthropic(
         &json!({"choices": [{"delta": {"tool_calls": [{
             "index": 0,
@@ -800,33 +803,98 @@ fn a_chat_stream_tool_call_becomes_one_tool_use_block() {
         &mut state,
     );
     assert!(
-        open.iter()
-            .any(|chunk| chunk.contains("\"type\":\"tool_use\"")),
-        "{open:?}"
-    );
-    assert!(
-        open.iter().any(|chunk| chunk.contains("call_1")),
-        "{open:?}"
+        !open.join("").contains("content_block"),
+        "no block opens mid-call: {open:?}"
     );
 
-    // The arguments arrive in pieces after it, keyed by the same index, and
-    // land on the block that index opened.
     let piece = chat_sse_to_anthropic(
         &json!({"choices": [{"delta": {"tool_calls": [{
             "index": 0,
-            "function": {"arguments": "{\"path\":"}
+            "function": {"arguments": "{\"path\":\"a.txt\"}"}
         }]}}]}),
         &mut state,
     );
-    assert_eq!(piece.len(), 1, "{piece:?}");
-    assert!(piece[0].contains("input_json_delta"), "{piece:?}");
-    assert!(piece[0].contains("\"index\":0"), "{piece:?}");
+    assert!(piece.is_empty(), "{piece:?}");
 
-    let done = chat_sse_to_anthropic(
+    let stream = chat_sse_to_anthropic(
         &json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
         &mut state,
+    )
+    .join("");
+
+    assert!(stream.contains("\"type\":\"tool_use\""), "{stream}");
+    assert!(stream.contains("\"id\":\"call_1\""), "{stream}");
+    assert!(stream.contains("\"name\":\"read\""), "{stream}");
+    assert!(stream.contains("input_json_delta"), "{stream}");
+    assert!(stream.contains("a.txt"), "{stream}");
+    assert!(stream.contains("\"stop_reason\":\"tool_use\""), "{stream}");
+}
+
+#[test]
+fn parallel_tool_calls_each_get_a_whole_block() {
+    // A gateway may announce every call in one chunk and only then stream
+    // their arguments. Opening a block per announcement closed the first
+    // call before its own arguments arrived, and a client that finalizes on
+    // content_block_stop then ran that tool with an empty input.
+    let mut state = AnthropicStreamState::new("glm-5.3");
+
+    let opened = chat_sse_to_anthropic(
+        &json!({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "a", "function": {"name": "Read", "arguments": ""}},
+            {"index": 1, "id": "b", "function": {"name": "Grep", "arguments": ""}}
+        ]}}]}),
+        &mut state,
     );
-    assert!(done[1].contains("\"stop_reason\":\"tool_use\""), "{done:?}");
+    let late = chat_sse_to_anthropic(
+        &json!({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "function": {"arguments": "{\"path\":\"a.txt\"}"}}
+        ]}}]}),
+        &mut state,
+    );
+    let stream = chat_sse_to_anthropic(
+        &json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+        &mut state,
+    )
+    .join("");
+
+    assert!(!opened.join("").contains("content_block"), "{opened:?}");
+    assert!(late.is_empty(), "{late:?}");
+
+    for index in [0, 1] {
+        assert_eq!(
+            stream
+                .matches(&format!(
+                    "\"index\":{index},\"type\":\"content_block_start\""
+                ))
+                .count(),
+            1,
+            "block {index} must start once: {stream}"
+        );
+        assert_eq!(
+            stream
+                .matches(&format!(
+                    "\"index\":{index},\"type\":\"content_block_stop\""
+                ))
+                .count(),
+            1,
+            "block {index} must stop once: {stream}"
+        );
+    }
+    assert!(
+        stream.contains("\"id\":\"a\"") && stream.contains("\"id\":\"b\""),
+        "{stream}"
+    );
+
+    // The first call's arguments land inside the first call's own block,
+    // which is the whole point: everything before block 1 opens.
+    let block_zero = stream
+        .split("\"index\":1,\"type\":\"content_block_start\"")
+        .next()
+        .expect("the first block");
+    assert!(
+        block_zero.contains("input_json_delta") && block_zero.contains("a.txt"),
+        "the first call's arguments did not land in its own block: {stream}"
+    );
 }
 
 #[test]

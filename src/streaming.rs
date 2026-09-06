@@ -61,6 +61,9 @@ pub struct AnthropicStreamState {
     tool_call_blocks: BTreeMap<i64, i64>,
     tool_argument_delta_indexes: BTreeSet<i64>,
     has_tool_use: bool,
+    /// Chat Completions tool calls, by the `index` their chunks carry,
+    /// held until the turn ends. See `flush_chat_tool_calls`.
+    pending_tool_calls: BTreeMap<i64, PendingToolCall>,
     /// Whether `message_start` has gone out. The Responses dialect has an
     /// event that opens a message; Chat Completions has none, so the first
     /// chunk is what opens it.
@@ -78,9 +81,18 @@ impl AnthropicStreamState {
             tool_call_blocks: BTreeMap::new(),
             tool_argument_delta_indexes: BTreeSet::new(),
             has_tool_use: false,
+            pending_tool_calls: BTreeMap::new(),
             started: false,
         }
     }
+}
+
+/// One Chat Completions tool call being assembled across chunks.
+#[derive(Debug, Clone, Default)]
+struct PendingToolCall {
+    id: String,
+    name: String,
+    arguments: String,
 }
 
 #[derive(Debug, Clone)]
@@ -705,54 +717,77 @@ pub fn responses_sse_to_anthropic(
     }
 }
 
-/// One `tool_calls` entry from a chunk. The id and name arrive on the
-/// chunk that opens the call and the arguments trickle in after it, both
-/// keyed by the `index` the chunks carry, so the block a call belongs to
-/// is remembered against that index rather than guessed from position.
-fn chat_tool_call_events(call: &Value, state: &mut AnthropicStreamState) -> Vec<String> {
+/// Take in one `tool_calls` entry from a chunk. Nothing is emitted here.
+///
+/// Messages content blocks do not interleave: one opens, takes its deltas,
+/// and stops before the next may start. Chat Completions is under no such
+/// rule — a gateway may announce every call in one chunk and only then
+/// stream their arguments, keyed by `index`. Emitting a block per
+/// announcement closed the first call before its own arguments arrived, so
+/// a client finalizing on `content_block_stop` ran that tool with an empty
+/// input. The calls are therefore assembled here and written out whole
+/// when the turn ends.
+fn record_chat_tool_call(call: &Value, state: &mut AnthropicStreamState) {
+    let entry = state
+        .pending_tool_calls
+        .entry(int_field(call, "index"))
+        .or_default();
+    state.has_tool_use = true;
+    // Only what a chunk actually carries: the id and name arrive once, on
+    // the chunk that opens the call, and later chunks leave them empty.
+    if let Some(id) = call
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
+        entry.id = id.to_string();
+    }
+    let function = call.get("function").unwrap_or(&Value::Null);
+    if let Some(name) = function
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+    {
+        entry.name = name.to_string();
+    }
+    if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+        entry.arguments.push_str(arguments);
+    }
+}
+
+/// Write the assembled tool calls out as content blocks, in the order
+/// their indexes give, each one whole: start, its arguments, stop.
+fn flush_chat_tool_calls(state: &mut AnthropicStreamState) -> Vec<String> {
+    let pending = std::mem::take(&mut state.pending_tool_calls);
     let mut chunks = Vec::new();
-    let position = int_field(call, "index");
-    if !state.tool_call_blocks.contains_key(&position) {
+    for call in pending.into_values() {
         chunks.extend(stop_active_block(state));
         let index = state.next_index;
         state.next_index += 1;
         state.active_block = Some(BlockType::ToolUse);
-        state.has_tool_use = true;
-        state.tool_call_blocks.insert(position, index);
-        let function = call.get("function").unwrap_or(&Value::Null);
         chunks.push(sse(
             &json!({
                 "type": "content_block_start",
                 "index": index,
                 "content_block": {
                     "type": "tool_use",
-                    "id": call.get("id").cloned().unwrap_or(Value::Null),
-                    "name": function.get("name").cloned().unwrap_or(Value::Null),
+                    "id": call.id,
+                    "name": call.name,
                     "input": {}
                 }
             }),
             Some("content_block_start"),
         ));
-    }
-    let block_index = state
-        .tool_call_blocks
-        .get(&position)
-        .copied()
-        .unwrap_or(state.next_index - 1);
-    if let Some(arguments) = call
-        .get("function")
-        .and_then(|function| function.get("arguments"))
-        .and_then(Value::as_str)
-        .filter(|arguments| !arguments.is_empty())
-    {
-        chunks.push(sse(
-            &json!({
-                "type": "content_block_delta",
-                "index": block_index,
-                "delta": {"type": "input_json_delta", "partial_json": arguments}
-            }),
-            Some("content_block_delta"),
-        ));
+        if !call.arguments.is_empty() {
+            chunks.push(sse(
+                &json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "input_json_delta", "partial_json": call.arguments}
+                }),
+                Some("content_block_delta"),
+            ));
+        }
     }
     chunks
 }
@@ -839,10 +874,11 @@ pub fn chat_sse_to_anthropic(data: &Value, state: &mut AnthropicStreamState) -> 
         .and_then(Value::as_array)
         .unwrap_or(&empty)
     {
-        chunks.extend(chat_tool_call_events(call, state));
+        record_chat_tool_call(call, state);
     }
 
     if let Some(finish) = choice.get("finish_reason").and_then(Value::as_str) {
+        chunks.extend(flush_chat_tool_calls(state));
         chunks.extend(stop_active_block(state));
         chunks.push(sse(
             &json!({

@@ -87,6 +87,11 @@ pub trait CliRuntime {
     /// Asked once at the edge; the CLI core only sees the answer.
     fn stdout_is_tty(&mut self) -> bool;
 
+    /// Whether there is an operator to put a question to. Separate from
+    /// `stdout_is_tty` because the picker paints to stderr and reads
+    /// stdin, and those are what must be terminals for it to work.
+    fn can_ask(&mut self) -> bool;
+
     /// Reload runtime account state.
     ///
     /// # Errors
@@ -1097,10 +1102,10 @@ fn launch(
     let chosen = match model {
         Some(model) => Some(model.to_string()),
         // Nobody named a model, so offer the ones the relay actually
-        // serves. Piped, there is nobody to ask: the picker would consume
-        // a line of somebody's script, so it is skipped and each harness
-        // does what it does with no model at all.
-        None if runtime.stdout_is_tty() => {
+        // serves. With no terminal there is nobody to ask, and raw mode
+        // would seize one nobody is watching, so the picker is skipped and
+        // each harness does what it does with no model at all.
+        None if runtime.can_ask() => {
             let catalog = runtime.models(&base_url, &api_key)?;
             let choices = model_choices(&catalog);
             if choices.is_empty() {
@@ -1307,4 +1312,71 @@ fn unix_now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |duration| duration.as_secs_f64())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ModelChoice, matching_choices};
+
+    fn rows(ids: &[&str]) -> Vec<ModelChoice> {
+        ids.iter()
+            .map(|id| ModelChoice {
+                id: (*id).to_string(),
+                context: String::new(),
+                price: String::new(),
+            })
+            .collect()
+    }
+
+    fn ids(choices: &[ModelChoice]) -> Vec<&str> {
+        choices.iter().map(|choice| choice.id.as_str()).collect()
+    }
+
+    #[test]
+    fn an_empty_filter_keeps_every_row_in_order() {
+        let all = rows(&["anthropic/claude-opus-5", "commandcode/z-ai/glm-5.3-flash"]);
+        assert_eq!(
+            ids(&matching_choices(&all, "")),
+            ["anthropic/claude-opus-5", "commandcode/z-ai/glm-5.3-flash"]
+        );
+    }
+
+    #[test]
+    fn a_filter_matches_anywhere_in_the_id_and_ignores_case() {
+        let all = rows(&["commandcode/zai-org/GLM-5.3", "anthropic/claude-opus-5"]);
+        assert_eq!(
+            ids(&matching_choices(&all, "glm")),
+            ["commandcode/zai-org/GLM-5.3"]
+        );
+        assert_eq!(
+            ids(&matching_choices(&all, "OPUS")),
+            ["anthropic/claude-opus-5"]
+        );
+    }
+
+    #[test]
+    fn words_narrow_together_rather_than_replacing_each_other() {
+        // The picker appends what is typed to the filter, so `glm` then
+        // `flash` must mean the flash one among the glm rows. An earlier
+        // version replaced instead, and widened 6 matches back to 14.
+        let all = rows(&[
+            "commandcode/z-ai/glm-5.3-flash",
+            "commandcode/zai-org/GLM-5.3",
+            "commandcode/google/gemini-3.8-flash",
+        ]);
+
+        assert_eq!(matching_choices(&all, "glm").len(), 2);
+        assert_eq!(matching_choices(&all, "flash").len(), 2);
+        assert_eq!(
+            ids(&matching_choices(&all, "glm flash")),
+            ["commandcode/z-ai/glm-5.3-flash"],
+            "two words must intersect, not union"
+        );
+    }
+
+    #[test]
+    fn a_filter_nothing_carries_matches_nothing() {
+        let all = rows(&["anthropic/claude-opus-5"]);
+        assert!(matching_choices(&all, "zzz").is_empty());
+    }
 }

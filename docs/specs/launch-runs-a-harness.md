@@ -220,6 +220,22 @@ Setiap kriteria butuh tes yang gagal ketika perbaikannya dibalik.
 
 ## Revisions
 
+- **Judge menolak ronde pertama: parallel tool call merusak stream.**
+  `chat_sse_to_anthropic` membuka satu blok per pengumuman tool call.
+  Gateway boleh mengumumkan semua panggilan dalam satu chunk lalu baru
+  mengalirkan argumennya, jadi panggilan kedua menutup blok panggilan
+  pertama sebelum argumen milik blok itu datang — klien yang
+  memfinalisasi di `content_block_stop` menjalankan tool pertama dengan
+  input kosong. Blok Messages memang tidak boleh bersarang, jadi
+  panggilan sekarang dirakit dulu dan ditulis utuh saat giliran selesai.
+  Dibuktikan ulang: satu giliran dengan dua tool di atas model
+  commandcode membaca dua file dan menjawab keduanya benar.
+- **Dan tiga cacat terjemahan lain di ronde yang sama.** `tool_result`
+  ditulis di tempatnya, sehingga pesan `user` terselip antara panggilan
+  dan jawabannya (gateway ketat menolaknya 400); giliran assistant yang
+  hanya berisi tool call mengirim `content: ""` bukan `null`; dan picker
+  digerbangi `stdout` padahal ia melukis ke `stderr`, jadi
+  `2>/dev/null` mengambil raw mode lalu membuang tiap frame.
 - **Model yang ditandai jadi model yang jalan.** Menampilkan 67 baris
   `chat completions only` menjawab pertanyaan yang salah: operator tidak
   ingin tahu kenapa mereka mati, ia ingin mereka hidup. Jadi relay yang

@@ -2348,8 +2348,8 @@ fn transform_sse_event(
             |_| Vec::new(),
             |data| responses_sse_to_anthropic(event, &data, anthropic_state),
         ),
-        // A generic endpoint's Chat Completions stream passes through unchanged
-        // (slice 4 tests this path end to end).
+        // A generic endpoint answers in Chat Completions, so a Chat client
+        // reads its stream unchanged.
         (ProviderKind::Generic, RequestRoute::Chat) => parsed.map_or_else(
             |_| Vec::new(),
             |data| vec![sse(&data, passthrough_event(event))],
