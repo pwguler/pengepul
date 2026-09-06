@@ -1270,7 +1270,7 @@ async fn route_generic_chat_request(
     account: &AvailableAccount,
     client_wants_stream: bool,
 ) -> Response {
-    let mut upstream_body = generic_request_body(body, model, route);
+    let mut upstream_body = upstream_request_body(ProviderKind::Generic, route, body, model);
     if let Some(object) = upstream_body.as_object_mut() {
         object.insert("stream".to_string(), Value::Bool(client_wants_stream));
     }
@@ -1337,7 +1337,7 @@ async fn route_codex_request(
     account: &AvailableAccount,
     client_wants_stream: bool,
 ) -> Response {
-    let body = codex_request_body(body, model, route);
+    let body = upstream_request_body(ProviderKind::Codex, route, body, model);
     if client_wants_stream {
         return match state
             .upstream
@@ -1401,7 +1401,7 @@ async fn route_anthropic_request(
     account: &AvailableAccount,
     client_wants_stream: bool,
 ) -> Response {
-    let body = anthropic_request_body(body, model, route);
+    let body = upstream_request_body(ProviderKind::Anthropic, route, body, model);
     // Masquerade openclaw's own tool names and bot-persona system prompt as a
     // first-party Claude Code request so the subscription billing classifier does
     // not reject it. Only the Messages route carries these; the reverse map
@@ -1913,32 +1913,12 @@ fn json_upstream_response(
     if !response.status.is_success() {
         return (response.status, Json(response.body)).into_response();
     }
-    let body = match (provider.kind, route) {
-        (ProviderKind::Anthropic, RequestRoute::Chat) => anthropic_to_openai(&response.body, model),
-        (ProviderKind::Anthropic, RequestRoute::Responses) => {
-            anthropic_to_responses(&response.body, model)
-        }
-        (ProviderKind::Anthropic, RequestRoute::Messages) => {
-            let mut body = response.body;
-            restore_tool_use_names(&mut body, tool_reverse);
-            body
-        }
-        (ProviderKind::Codex, RequestRoute::Responses) => response.body,
-        (ProviderKind::Codex, RequestRoute::Chat) => {
-            responses_to_chat_completion(&response.body, model)
-        }
-        (ProviderKind::Codex, RequestRoute::Messages) => {
-            responses_to_anthropic_message(&response.body, model)
-        }
-        // A generic endpoint answers in Chat Completions, so a Chat client
-        // gets it unchanged and a Messages client gets it translated.
-        // Responses never reaches here: it is refused at routing.
-        (ProviderKind::Generic, RequestRoute::Messages) => {
-            chat_to_anthropic_message(&response.body, model)
-        }
-        #[allow(clippy::match_same_arms)]
-        (ProviderKind::Generic, _) => response.body,
-    };
+    // The Messages route restores the tool names the sanitizer renamed;
+    // every other pair is the matrix and nothing else.
+    let mut body = Translation::between(provider.kind, route).response(response.body, model);
+    if provider.kind == ProviderKind::Anthropic && matches!(route, RequestRoute::Messages) {
+        restore_tool_use_names(&mut body, tool_reverse);
+    }
     (response.status, Json(body)).into_response()
 }
 
@@ -2117,7 +2097,7 @@ fn transformed_sse_stream(
         // here and nowhere else: a stream that stopped before any
         // finish_reason still owes the client the tool calls it announced
         // and a message_stop, and usage often arrives after finish_reason.
-        if matches!((provider.kind, route), (ProviderKind::Generic, RequestRoute::Messages)) {
+        if Translation::between(provider.kind, route).closes_its_own_stream() {
             for chunk in finish_chat_stream(&mut states.anthropic) {
                 yield Bytes::from(chunk);
             }
@@ -2435,32 +2415,97 @@ fn body_with_model(body: &Value, model: &str) -> Value {
     next_body
 }
 
-fn anthropic_request_body(body: &Value, model: &str, route: RequestRoute) -> Value {
-    let translated = match route {
-        RequestRoute::Chat => openai_to_anthropic(body),
-        RequestRoute::Responses => responses_to_anthropic(body),
-        RequestRoute::Messages => body.clone(),
-    };
-    body_with_model(&translated, model)
+/// What one (Inbound dialect, Provider) pair does, in one place.
+///
+/// The four stages of serving a request each used to carry their own match
+/// over the pair: the request body, the whole response, each stream event,
+/// and closing the stream. Four matches meant a new pair could be added to
+/// three of them and nobody would know — which is what happened to the
+/// stream finaliser. Each stage now asks this, so the pair is stated once
+/// and the compiler carries it to every stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Translation {
+    /// The dialect the provider speaks: nothing to translate.
+    Native,
+    ChatToAnthropic,
+    ResponsesToAnthropic,
+    AnthropicToChat,
+    AnthropicToResponses,
+    ChatToResponses,
 }
 
-/// What a configured endpoint is handed. Chat arrives in its own dialect;
-/// Messages is translated onto it. Responses never reaches here.
-fn generic_request_body(body: &Value, model: &str, route: RequestRoute) -> Value {
-    let translated = match route {
-        RequestRoute::Messages => anthropic_to_chat_request(body),
-        RequestRoute::Chat | RequestRoute::Responses => body.clone(),
-    };
-    body_with_model(&translated, model)
+impl Translation {
+    /// The pair, resolved once. A pair the relay refuses never reaches
+    /// here: routing answers it 501 before an account is chosen.
+    const fn between(provider: ProviderKind, route: RequestRoute) -> Self {
+        match (provider, route) {
+            (ProviderKind::Anthropic, RequestRoute::Chat) => Self::ChatToAnthropic,
+            (ProviderKind::Anthropic, RequestRoute::Responses) => Self::ResponsesToAnthropic,
+            (ProviderKind::Codex, RequestRoute::Chat) => Self::ChatToResponses,
+            (ProviderKind::Codex, RequestRoute::Messages) => Self::AnthropicToResponses,
+            (ProviderKind::Generic, RequestRoute::Messages) => Self::AnthropicToChat,
+            // The three pairs where the client already speaks the
+            // upstream's dialect, and (Generic, Responses), which routing
+            // refuses before an account is chosen — the arm is here so the
+            // match is total, not because it is reachable.
+            (ProviderKind::Anthropic, RequestRoute::Messages)
+            | (ProviderKind::Codex, RequestRoute::Responses)
+            | (ProviderKind::Generic, RequestRoute::Chat | RequestRoute::Responses) => Self::Native,
+        }
+    }
+
+    /// The client's body in the dialect the upstream speaks.
+    fn request(self, body: &Value) -> Value {
+        match self {
+            Self::Native => body.clone(),
+            Self::ChatToAnthropic => openai_to_anthropic(body),
+            Self::ResponsesToAnthropic => responses_to_anthropic(body),
+            Self::AnthropicToChat => anthropic_to_chat_request(body),
+            Self::AnthropicToResponses => anthropic_to_responses_request(body),
+            Self::ChatToResponses => chat_to_responses_request(body),
+        }
+    }
+
+    /// The upstream's whole reply in the dialect the client asked in.
+    /// Each name says which way the request went, so the reply is its
+    /// inverse: a Chat request served by anthropic comes back as Messages
+    /// and has to leave as Chat.
+    fn response(self, body: Value, model: &str) -> Value {
+        match self {
+            Self::Native => body,
+            Self::ChatToAnthropic => anthropic_to_openai(&body, model),
+            Self::ResponsesToAnthropic => anthropic_to_responses(&body, model),
+            Self::AnthropicToChat => chat_to_anthropic_message(&body, model),
+            Self::AnthropicToResponses => responses_to_anthropic_message(&body, model),
+            Self::ChatToResponses => responses_to_chat_completion(&body, model),
+        }
+    }
+
+    /// Whether the stream this pair produces owes a closing act after the
+    /// last event. Only the Messages-from-Chat arm does: that dialect names
+    /// no event that closes a message.
+    const fn closes_its_own_stream(self) -> bool {
+        matches!(self, Self::AnthropicToChat)
+    }
 }
 
-fn codex_request_body(body: &Value, model: &str, route: RequestRoute) -> Value {
-    let translated = match route {
-        RequestRoute::Chat => chat_to_responses_request(body),
-        RequestRoute::Responses => body.clone(),
-        RequestRoute::Messages => anthropic_to_responses_request(body),
-    };
-    let mut normalized = normalize_codex_responses_body(&body_with_model(&translated, model));
+/// The body an upstream is handed: the client's, in the dialect that
+/// upstream speaks, carrying the resolved model id.
+fn upstream_request_body(
+    provider: ProviderKind,
+    route: RequestRoute,
+    body: &Value,
+    model: &str,
+) -> Value {
+    let translated = Translation::between(provider, route).request(body);
+    let body = body_with_model(&translated, model);
+    if provider != ProviderKind::Codex {
+        return body;
+    }
+    // Codex takes the Responses dialect with its own shape on top: it is
+    // streamed whatever the client asked for, and rejects two fields the
+    // translation is free to have produced.
+    let mut normalized = normalize_codex_responses_body(&body);
     if let Some(object) = normalized.as_object_mut() {
         object.insert("stream".to_string(), Value::Bool(true));
         object.remove("max_output_tokens");

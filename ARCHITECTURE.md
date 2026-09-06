@@ -54,7 +54,11 @@ in files.
   Inbound and upstream **Dialect**, whole-document and one SSE event at a time;
   pure JSON, no I/O. Every pair the route table can produce has a translation,
   Messages↔Chat Completions included, so a configured endpoint serves a
-  Messages client by translation rather than by refusal.
+  Messages client by translation rather than by refusal. Which translation a
+  pair gets is `app.rs`'s `Translation` enum, resolved once from
+  (Provider, Inbound dialect): the request body, the whole response, each
+  stream event and the stream's close all ask it, so a new pair is stated in
+  one place instead of four that could disagree.
 - **Config** (`config.rs`) — parses `config.yaml`, including the `providers:`
   section, which is the only Provider registry: there is no database table.
   It also writes it: `register_provider` adds one entry for `login

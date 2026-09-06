@@ -59,19 +59,13 @@ pub struct AnthropicStreamState {
     active_block: Option<BlockType>,
     next_index: i64,
     tool_call_blocks: BTreeMap<i64, i64>,
-    tool_argument_delta_indexes: BTreeSet<i64>,
     has_tool_use: bool,
-    /// Chat Completions tool calls, by the `index` their chunks carry,
-    /// held until the turn ends. See `flush_chat_tool_calls`.
-    pending_tool_calls: BTreeMap<i64, PendingToolCall>,
-    /// The stop reason the upstream gave, held until the stream ends so a
-    /// trailing usage-only chunk can still be counted. `None` means the
-    /// message has not been closed yet.
-    pending_stop_reason: Option<String>,
-    /// Whether `message_delta`/`message_stop` have gone out.
-    closed: bool,
-    /// The last usage the stream carried, from wherever it carried it.
-    output_tokens: i64,
+    /// What only one of the two inbound paths needs. Both build the same
+    /// Messages events out of the fields above; each keeps its own
+    /// bookkeeping here rather than in a struct where half the fields are
+    /// dead whichever path is running.
+    from_responses: ResponsesArrival,
+    from_chat: ChatArrival,
     /// Whether `message_start` has gone out. The Responses dialect has an
     /// event that opens a message; Chat Completions has none, so the first
     /// chunk is what opens it.
@@ -87,15 +81,37 @@ impl AnthropicStreamState {
             active_block: None,
             next_index: 0,
             tool_call_blocks: BTreeMap::new(),
-            tool_argument_delta_indexes: BTreeSet::new(),
             has_tool_use: false,
-            pending_tool_calls: BTreeMap::new(),
-            pending_stop_reason: None,
-            closed: false,
-            output_tokens: 0,
+            from_responses: ResponsesArrival::default(),
+            from_chat: ChatArrival::default(),
             started: false,
         }
     }
+}
+
+/// What the Responses arm carries between events: which output indexes
+/// have already sent an argument delta, so a `done` event does not repeat
+/// what a `delta` already said.
+#[derive(Debug, Clone, Default)]
+struct ResponsesArrival {
+    tool_argument_delta_indexes: BTreeSet<i64>,
+}
+
+/// What the Chat Completions arm carries between events. This dialect
+/// names no events, opens no message and closes none, so all four of these
+/// exist because the arrival is unstructured where Responses is explicit.
+#[derive(Debug, Clone, Default)]
+struct ChatArrival {
+    /// Tool calls by the `index` their chunks carry, held until the turn
+    /// ends. See `flush_chat_tool_calls`.
+    pending_tool_calls: BTreeMap<i64, PendingToolCall>,
+    /// The stop reason the upstream gave, held until the stream ends so a
+    /// trailing usage-only chunk can still be counted.
+    pending_stop_reason: Option<String>,
+    /// Whether `message_delta`/`message_stop` have gone out.
+    closed: bool,
+    /// The last usage the stream carried, from wherever it carried it.
+    output_tokens: i64,
 }
 
 /// One Chat Completions tool call being assembled across chunks.
@@ -662,7 +678,10 @@ pub fn responses_sse_to_anthropic(
         }
         "response.function_call_arguments.delta" => {
             let output_index = int_field(data, "output_index");
-            state.tool_argument_delta_indexes.insert(output_index);
+            state
+                .from_responses
+                .tool_argument_delta_indexes
+                .insert(output_index);
             let block_index = state
                 .tool_call_blocks
                 .get(&output_index)
@@ -679,7 +698,11 @@ pub fn responses_sse_to_anthropic(
         }
         "response.function_call_arguments.done" => {
             let output_index = int_field(data, "output_index");
-            if state.tool_argument_delta_indexes.contains(&output_index) {
+            if state
+                .from_responses
+                .tool_argument_delta_indexes
+                .contains(&output_index)
+            {
                 return Vec::new();
             }
             let item = data.get("item").unwrap_or(data);
@@ -760,7 +783,7 @@ fn record_chat_tool_call(call: &Value, position: i64, state: &mut AnthropicStrea
         .get("index")
         .and_then(Value::as_i64)
         .unwrap_or(position);
-    let entry = state.pending_tool_calls.entry(key).or_default();
+    let entry = state.from_chat.pending_tool_calls.entry(key).or_default();
     state.has_tool_use = true;
     // Only what a chunk actually carries: the id and name arrive once, on
     // the chunk that opens the call, and later chunks leave them empty.
@@ -788,7 +811,7 @@ fn chat_tool_arguments(function: &Value) -> String {
 /// Write the assembled tool calls out as content blocks, in the order
 /// their indexes give, each one whole: start, its arguments, stop.
 fn flush_chat_tool_calls(state: &mut AnthropicStreamState) -> Vec<String> {
-    let pending = std::mem::take(&mut state.pending_tool_calls);
+    let pending = std::mem::take(&mut state.from_chat.pending_tool_calls);
     let mut chunks = Vec::new();
     for call in pending.into_values() {
         chunks.extend(stop_active_block(state));
@@ -860,7 +883,7 @@ pub fn chat_sse_to_anthropic(data: &Value, state: &mut AnthropicStreamState) -> 
 
     let reported = int_field(usage, "completion_tokens");
     if reported > 0 {
-        state.output_tokens = reported;
+        state.from_chat.output_tokens = reported;
     }
 
     let choices = data
@@ -923,7 +946,7 @@ pub fn chat_sse_to_anthropic(data: &Value, state: &mut AnthropicStreamState) -> 
         // streamed turn.
         chunks.extend(flush_chat_tool_calls(state));
         chunks.extend(stop_active_block(state));
-        state.pending_stop_reason =
+        state.from_chat.pending_stop_reason =
             Some(anthropic_stop_reason(Some(finish), state.has_tool_use).to_string());
     }
     chunks
@@ -938,13 +961,14 @@ pub fn chat_sse_to_anthropic(data: &Value, state: &mut AnthropicStreamState) -> 
 /// content is lost.
 #[must_use]
 pub fn finish_chat_stream(state: &mut AnthropicStreamState) -> Vec<String> {
-    if !state.started || state.closed {
+    if !state.started || state.from_chat.closed {
         return Vec::new();
     }
-    state.closed = true;
+    state.from_chat.closed = true;
     let mut chunks = flush_chat_tool_calls(state);
     chunks.extend(stop_active_block(state));
     let stop_reason = state
+        .from_chat
         .pending_stop_reason
         .clone()
         .unwrap_or_else(|| anthropic_stop_reason(None, state.has_tool_use).to_string());
@@ -952,7 +976,7 @@ pub fn finish_chat_stream(state: &mut AnthropicStreamState) -> Vec<String> {
         &json!({
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": Value::Null},
-            "usage": {"output_tokens": state.output_tokens}
+            "usage": {"output_tokens": state.from_chat.output_tokens}
         }),
         Some("message_delta"),
     ));
