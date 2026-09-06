@@ -64,6 +64,14 @@ pub struct AnthropicStreamState {
     /// Chat Completions tool calls, by the `index` their chunks carry,
     /// held until the turn ends. See `flush_chat_tool_calls`.
     pending_tool_calls: BTreeMap<i64, PendingToolCall>,
+    /// The stop reason the upstream gave, held until the stream ends so a
+    /// trailing usage-only chunk can still be counted. `None` means the
+    /// message has not been closed yet.
+    pending_stop_reason: Option<String>,
+    /// Whether `message_delta`/`message_stop` have gone out.
+    closed: bool,
+    /// The last usage the stream carried, from wherever it carried it.
+    output_tokens: i64,
     /// Whether `message_start` has gone out. The Responses dialect has an
     /// event that opens a message; Chat Completions has none, so the first
     /// chunk is what opens it.
@@ -82,6 +90,9 @@ impl AnthropicStreamState {
             tool_argument_delta_indexes: BTreeSet::new(),
             has_tool_use: false,
             pending_tool_calls: BTreeMap::new(),
+            pending_stop_reason: None,
+            closed: false,
+            output_tokens: 0,
             started: false,
         }
     }
@@ -727,31 +738,50 @@ pub fn responses_sse_to_anthropic(
 /// a client finalizing on `content_block_stop` ran that tool with an empty
 /// input. The calls are therefore assembled here and written out whole
 /// when the turn ends.
-fn record_chat_tool_call(call: &Value, state: &mut AnthropicStreamState) {
-    let entry = state
-        .pending_tool_calls
-        .entry(int_field(call, "index"))
-        .or_default();
+fn record_chat_tool_call(call: &Value, position: i64, state: &mut AnthropicStreamState) {
+    let function = call.get("function").unwrap_or(&Value::Null);
+    let arguments = chat_tool_arguments(function);
+    let id = call.get("id").and_then(Value::as_str).unwrap_or_default();
+    let name = function
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    // An entry with nothing in it is not a tool call. Creating one anyway
+    // produced a block with an empty id and name, and forced the turn's
+    // stop reason to `tool_use` even where the upstream said `stop`.
+    if id.is_empty() && name.is_empty() && arguments.is_empty() {
+        return;
+    }
+    // `index` is what keys a call across chunks, but it is optional. Falling
+    // back to 0 collapsed every unindexed call in a chunk into one, whose
+    // arguments were then concatenated into unparseable JSON; the position
+    // within the chunk keeps them apart.
+    let key = call
+        .get("index")
+        .and_then(Value::as_i64)
+        .unwrap_or(position);
+    let entry = state.pending_tool_calls.entry(key).or_default();
     state.has_tool_use = true;
     // Only what a chunk actually carries: the id and name arrive once, on
     // the chunk that opens the call, and later chunks leave them empty.
-    if let Some(id) = call
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
-    {
+    if !id.is_empty() {
         entry.id = id.to_string();
     }
-    let function = call.get("function").unwrap_or(&Value::Null);
-    if let Some(name) = function
-        .get("name")
-        .and_then(Value::as_str)
-        .filter(|name| !name.is_empty())
-    {
+    if !name.is_empty() {
         entry.name = name.to_string();
     }
-    if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
-        entry.arguments.push_str(arguments);
+    entry.arguments.push_str(&arguments);
+}
+
+/// A tool call's arguments as the string this dialect nominally sends.
+/// Several servers (vLLM, Ollama and proxies in front of them) send the
+/// object itself instead, and reading only the string form dropped those
+/// silently, leaving the tool to run with no input at all.
+fn chat_tool_arguments(function: &Value) -> String {
+    match function.get("arguments") {
+        Some(Value::String(arguments)) => arguments.clone(),
+        Some(Value::Null) | None => String::new(),
+        Some(other) => serde_json::to_string(other).unwrap_or_default(),
     }
 }
 
@@ -828,11 +858,18 @@ pub fn chat_sse_to_anthropic(data: &Value, state: &mut AnthropicStreamState) -> 
         ));
     }
 
+    let reported = int_field(usage, "completion_tokens");
+    if reported > 0 {
+        state.output_tokens = reported;
+    }
+
     let choices = data
         .get("choices")
         .and_then(Value::as_array)
         .unwrap_or(&empty);
     let Some(choice) = choices.first() else {
+        // A trailing usage-only chunk carries no content; its numbers were
+        // taken above.
         return chunks;
     };
     let delta = choice.get("delta").unwrap_or(&Value::Null);
@@ -869,30 +906,57 @@ pub fn chat_sse_to_anthropic(data: &Value, state: &mut AnthropicStreamState) -> 
         ));
     }
 
-    for call in delta
+    for (position, call) in delta
         .get("tool_calls")
         .and_then(Value::as_array)
         .unwrap_or(&empty)
+        .iter()
+        .enumerate()
     {
-        record_chat_tool_call(call, state);
+        record_chat_tool_call(call, i64::try_from(position).unwrap_or(0), state);
     }
 
     if let Some(finish) = choice.get("finish_reason").and_then(Value::as_str) {
+        // The content is complete, so it is written out. The message is not
+        // closed yet: a gateway commonly reports usage in a chunk after
+        // this one, and closing here reported zero output tokens for every
+        // streamed turn.
         chunks.extend(flush_chat_tool_calls(state));
         chunks.extend(stop_active_block(state));
-        chunks.push(sse(
-            &json!({
-                "type": "message_delta",
-                "delta": {
-                    "stop_reason": anthropic_stop_reason(Some(finish), state.has_tool_use),
-                    "stop_sequence": Value::Null
-                },
-                "usage": {"output_tokens": int_field(usage, "completion_tokens")}
-            }),
-            Some("message_delta"),
-        ));
-        chunks.push(sse(&json!({"type": "message_stop"}), Some("message_stop")));
+        state.pending_stop_reason =
+            Some(anthropic_stop_reason(Some(finish), state.has_tool_use).to_string());
     }
+    chunks
+}
+
+/// Close the message, whatever the stream did or did not send.
+///
+/// Called once when the stream ends. A stream that stops before any
+/// `finish_reason` — a truncation, a dropped connection, a gateway that
+/// ends on `[DONE]` alone — still has to hand the client the tool calls it
+/// announced and a `message_stop`, or the turn simply never closes and the
+/// content is lost.
+#[must_use]
+pub fn finish_chat_stream(state: &mut AnthropicStreamState) -> Vec<String> {
+    if !state.started || state.closed {
+        return Vec::new();
+    }
+    state.closed = true;
+    let mut chunks = flush_chat_tool_calls(state);
+    chunks.extend(stop_active_block(state));
+    let stop_reason = state
+        .pending_stop_reason
+        .clone()
+        .unwrap_or_else(|| anthropic_stop_reason(None, state.has_tool_use).to_string());
+    chunks.push(sse(
+        &json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": Value::Null},
+            "usage": {"output_tokens": state.output_tokens}
+        }),
+        Some("message_delta"),
+    ));
+    chunks.push(sse(&json!({"type": "message_stop"}), Some("message_stop")));
     chunks
 }
 

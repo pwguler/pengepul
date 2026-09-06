@@ -13,7 +13,7 @@ use crate::oauth::{
     ANTHROPIC_REDIRECT_URI, CODEX_CALLBACK_PATH, CODEX_CALLBACK_PORT, exchange_anthropic_code,
     exchange_codex_code, generate_anthropic_auth_url, generate_codex_auth_url,
 };
-use crate::render::{BOLD, DIM, GREEN, pad, paint};
+use crate::render::{BOLD, DIM, GREEN, Style, pad, paint};
 use crate::service::{ServiceOptions, run_command};
 use crate::tokens::save_token;
 use crate::types::{PkceCodes, ProviderId, ProviderKind};
@@ -77,10 +77,12 @@ impl CliRuntime for RealRuntime {
     }
 
     fn can_ask(&mut self) -> bool {
-        // The picker paints to stderr and reads stdin, so those are what
-        // decide whether there is anyone to ask. Gating on stdout instead
-        // meant `launch claude 2>/dev/null` took raw mode and threw every
-        // frame away: a blank, frozen terminal with no visible way out.
+        // The picker paints to stderr, so stderr is what decides whether
+        // there is anyone to paint for. Gating on stdout meant
+        // `launch claude 2>/dev/null` took raw mode and threw every frame
+        // away: a blank, frozen terminal with no visible way out. Stdin is
+        // deliberately not asked — crossterm reads `/dev/tty` when stdin is
+        // redirected, so the picker still works under `< /dev/null`.
         std::io::IsTerminal::is_terminal(&std::io::stderr())
             && std::io::IsTerminal::is_terminal(&std::io::stdin())
     }
@@ -149,8 +151,13 @@ impl CliRuntime for RealRuntime {
         ))
     }
 
-    fn select_model(&mut self, harness: &str, choices: &[ModelChoice]) -> Result<Option<String>> {
-        pick_model(harness, choices)
+    fn select_model(
+        &mut self,
+        harness: &str,
+        choices: &[ModelChoice],
+        style: Style,
+    ) -> Result<Option<String>> {
+        pick_model(harness, choices, style)
     }
 
     fn service_logs(&mut self, follow: bool, lines: u32) -> Result<()> {
@@ -245,21 +252,48 @@ enum Method {
 /// and raw mode is left again on every exit — the error path included,
 /// which is why the loop's outcome is captured before the terminal is
 /// restored rather than returned through `?`.
-fn pick_model(harness: &str, choices: &[ModelChoice]) -> Result<Option<String>> {
+fn pick_model(harness: &str, choices: &[ModelChoice], style: Style) -> Result<Option<String>> {
     use crossterm::{cursor, event, execute, terminal};
 
     terminal::enable_raw_mode()
         .context("failed to put the terminal in raw mode; pass --model to skip the picker")?;
     let mut screen = std::io::stderr();
+    // From here the terminal is only put back by the guard, so an unwind
+    // through the loop puts it back too.
+    let restore = TerminalGuard;
     let entered = execute!(screen, terminal::EnterAlternateScreen, cursor::Hide);
     let outcome = entered.map_err(anyhow::Error::from).and_then(|()| {
-        picker_loop(&mut screen, harness, choices, &mut || {
+        picker_loop(&mut screen, harness, choices, style, &mut || {
             event::read().map_err(anyhow::Error::from)
         })
     });
-    let _ = execute!(screen, cursor::Show, terminal::LeaveAlternateScreen);
-    let _ = terminal::disable_raw_mode();
+    drop(restore);
     outcome
+}
+
+/// Puts the terminal back however the picker leaves.
+///
+/// Raw mode under the alternate screen is not a state to hand an operator:
+/// no echo, no line editing, Ctrl-C dead, cursor invisible, and `reset`
+/// typed blind the only way out. A guard holds for the error paths and for
+/// a panic unwinding through the loop; two statements after the call do
+/// not.
+///
+/// A signal that terminates the process runs no destructor, so `kill` and
+/// `timeout` still leave the terminal raw. That gap is real, and named in
+/// the spec rather than papered over here.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let mut screen = std::io::stderr();
+        let _ = crossterm::execute!(
+            screen,
+            crossterm::cursor::Show,
+            crossterm::terminal::LeaveAlternateScreen
+        );
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
 }
 
 /// The picker's state machine, over whatever `next_event` yields. Split
@@ -269,6 +303,7 @@ fn picker_loop(
     screen: &mut impl std::io::Write,
     harness: &str,
     choices: &[ModelChoice],
+    style: Style,
     next_event: &mut dyn FnMut() -> Result<crossterm::event::Event>,
 ) -> Result<Option<String>> {
     use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -287,6 +322,7 @@ fn picker_loop(
                 matching: &matching,
                 filter: &filter,
                 cursor,
+                style,
             },
             &mut scroll,
         )?;
@@ -312,12 +348,35 @@ fn picker_loop(
             KeyCode::End => cursor = matching.len().saturating_sub(1),
             KeyCode::Backspace => {
                 filter.pop();
+                cursor = 0;
+                scroll = 0;
+            }
+            // Ctrl-U clears the line everywhere else; crossterm reports it
+            // as Char('u') with CONTROL, so untreated it typed a `u` and
+            // narrowed the list instead of widening it.
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                filter.clear();
+                cursor = 0;
+                scroll = 0;
+            }
+            // `stty erase ^H` and PuTTY send Ctrl-H for Backspace.
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                filter.pop();
+                cursor = 0;
+                scroll = 0;
             }
             KeyCode::Enter => {
                 if let Some(choice) = matching.get(cursor) {
                     return Ok(Some(choice.id.clone()));
                 }
             }
+            // Any other chord is a command this picker does not have, not
+            // text. Typing its bare letter into the search was never what
+            // the operator meant by Ctrl-W or Alt-B.
+            KeyCode::Char(_)
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {}
             KeyCode::Char(character) => {
                 filter.push(character);
                 // A narrower list means the old row number means nothing.
@@ -337,6 +396,7 @@ struct PickerFrame<'a> {
     matching: &'a [ModelChoice],
     filter: &'a str,
     cursor: usize,
+    style: Style,
 }
 
 /// Paint one frame and return how many model rows fit, which is also the
@@ -358,6 +418,7 @@ fn draw_picker(
         matching,
         filter,
         cursor,
+        style,
     } = frame_state;
 
     let (columns, lines) = terminal::size().unwrap_or((80, 24));
@@ -384,23 +445,41 @@ fn draw_picker(
         .max()
         .unwrap_or(0);
 
+    // `paint` writes escapes unconditionally, so the Style decision made
+    // once at the edge is applied here rather than ignored: NO_COLOR and
+    // TERM=dumb reach this surface like every other one.
+    let ink = |colour: &str, text: &str| match style {
+        Style::Plain => text.to_string(),
+        Style::Rich => paint(colour, text),
+    };
+
     let counter = format!("{}/{total}", matching.len());
     let heading = format!(
         "  {}{}{}",
-        paint(BOLD, &format!("launch {harness}")),
+        ink(BOLD, &format!("launch {harness}")),
         " ".repeat(
             width
                 .saturating_sub(2 + 7 + harness.chars().count() + counter.chars().count() + 2)
                 .max(2)
         ),
-        paint(DIM, &counter),
+        ink(DIM, &counter),
     );
     let mut frame = vec![
         heading,
         String::new(),
         // A prompt glyph and a block cursor: the one place typing goes, and
         // it says so without the word "search" in front of it.
-        format!("  {} {filter}{}", paint(GREEN, "›"), paint(BOLD, "█")),
+        {
+            // The tail of a long filter is the part being typed, so that is
+            // the part kept.
+            let room = width.saturating_sub(6);
+            let shown: String = if filter.chars().count() > room {
+                filter.chars().skip(filter.chars().count() - room).collect()
+            } else {
+                filter.to_string()
+            };
+            format!("  {} {shown}{}", ink(GREEN, "›"), ink(BOLD, "█"))
+        },
         String::new(),
     ];
 
@@ -409,7 +488,7 @@ fn draw_picker(
     // its counter is not scrolled away at the moment it is needed.
     let mut painted = 0;
     if matching.is_empty() {
-        frame.push(paint(DIM, "    nothing matches"));
+        frame.push(ink(DIM, "    nothing matches"));
         painted += 1;
     }
     for (offset, choice) in matching.iter().skip(*scroll).take(rows).enumerate() {
@@ -417,15 +496,15 @@ fn draw_picker(
         let row = format!(
             "{} {}  {}  {}",
             if selected {
-                paint(GREEN, "❯")
+                ink(GREEN, "❯")
             } else {
                 " ".to_string()
             },
             // The pool prefix repeats down the whole list, so it is dimmed
             // and the model name keeps the reader's attention.
-            paint_id(&pad(&choice.id, id_width), selected),
-            paint(DIM, &format!("{:>context_width$}", choice.context)),
-            paint(DIM, &choice.price),
+            paint_id(&pad(&choice.id, id_width), selected, style),
+            ink(DIM, &format!("{:>context_width$}", choice.context)),
+            ink(DIM, &choice.price),
         );
         frame.push(row);
         painted += 1;
@@ -433,7 +512,15 @@ fn draw_picker(
     for _ in painted..rows {
         frame.push(String::new());
     }
-    frame.push(paint(DIM, "  ↑↓ move   ⏎ run   esc cancel"));
+    frame.push(ink(DIM, "  ↑↓ move   ⏎ run   esc cancel"));
+
+    // Never taller than the terminal: the heading carries the counter, and
+    // scrolling it away costs the operator the one number that says how
+    // much the search cut.
+    let height = usize::from(lines).max(1);
+    if frame.len() > height {
+        frame.truncate(height);
+    }
 
     execute!(
         screen,
@@ -448,7 +535,10 @@ fn draw_picker(
 /// One model id, already padded: the `<pool>/` prefix dim and the model
 /// name bright, so a column of `commandcode/...` reads as its models
 /// rather than as its pool. The highlighted row is bright throughout.
-fn paint_id(padded: &str, selected: bool) -> String {
+fn paint_id(padded: &str, selected: bool, style: Style) -> String {
+    if style == Style::Plain {
+        return padded.to_string();
+    }
     if selected {
         return paint(BOLD, padded);
     }
@@ -1065,6 +1155,7 @@ fn unpack_over(
 mod tests {
     use super::picker_loop;
     use crate::cli::ModelChoice;
+    use crate::render::Style;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     fn choices() -> Vec<ModelChoice> {
@@ -1092,7 +1183,7 @@ mod tests {
     fn drive(keys: Vec<Event>) -> Option<String> {
         let mut screen = Vec::new();
         let mut queued = keys.into_iter();
-        picker_loop(&mut screen, "claude", &choices(), &mut || {
+        picker_loop(&mut screen, "claude", &choices(), Style::Plain, &mut || {
             queued
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("ran out of keys"))

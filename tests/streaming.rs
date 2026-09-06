@@ -1,6 +1,6 @@
 use pengepul::streaming::{
     AnthropicStreamState, ChatStreamState, ResponsesStreamState, anthropic_sse_to_chat,
-    anthropic_sse_to_responses, chat_sse_to_anthropic, parse_sse_events,
+    anthropic_sse_to_responses, chat_sse_to_anthropic, finish_chat_stream, parse_sse_events,
     responses_sse_to_anthropic, responses_sse_to_chat, responses_sse_to_payload,
 };
 use serde_json::{Value, json};
@@ -774,26 +774,37 @@ fn a_chat_stream_opens_and_closes_a_messages_message() {
     assert_eq!(second.len(), 1, "{second:?}");
     assert!(second[0].contains("\"text\":\"ng\""), "{second:?}");
 
-    let last = chat_sse_to_anthropic(
-        &json!({
-            "choices": [{"delta": {}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 5, "completion_tokens": 2}
-        }),
+    let finish = chat_sse_to_anthropic(
+        &json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
         &mut state,
     );
-    assert!(last[0].contains("content_block_stop"), "{last:?}");
-    assert!(last[1].contains("\"stop_reason\":\"end_turn\""), "{last:?}");
-    assert!(last[1].contains("\"output_tokens\":2"), "{last:?}");
-    assert!(last[2].contains("message_stop"), "{last:?}");
+    assert!(finish[0].contains("content_block_stop"), "{finish:?}");
+    // The message is not closed yet: usage commonly follows finish_reason,
+    // and closing here reported zero output tokens for every turn.
+    assert!(
+        !finish.join("").contains("message_stop"),
+        "closed too early: {finish:?}"
+    );
+
+    let trailing = chat_sse_to_anthropic(
+        &json!({"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 2}}),
+        &mut state,
+    );
+    assert!(trailing.is_empty(), "{trailing:?}");
+
+    let tail = finish_chat_stream(&mut state).join("");
+    assert!(tail.contains("\"stop_reason\":\"end_turn\""), "{tail}");
+    assert!(tail.contains("\"output_tokens\":2"), "{tail}");
+    assert!(tail.contains("message_stop"), "{tail}");
+
+    // Closing twice is not a second message.
+    assert!(finish_chat_stream(&mut state).is_empty());
 }
 
 #[test]
 fn a_chat_stream_tool_call_becomes_one_tool_use_block() {
     let mut state = AnthropicStreamState::new("glm-5.3");
 
-    // The call is assembled across chunks and written out when the turn
-    // ends: Messages blocks cannot interleave, and this dialect gives no
-    // promise about the order a call's pieces arrive in.
     let open = chat_sse_to_anthropic(
         &json!({"choices": [{"delta": {"tool_calls": [{
             "index": 0,
@@ -816,11 +827,12 @@ fn a_chat_stream_tool_call_becomes_one_tool_use_block() {
     );
     assert!(piece.is_empty(), "{piece:?}");
 
-    let stream = chat_sse_to_anthropic(
+    let content = chat_sse_to_anthropic(
         &json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
         &mut state,
     )
     .join("");
+    let stream = format!("{content}{}", finish_chat_stream(&mut state).join(""));
 
     assert!(stream.contains("\"type\":\"tool_use\""), "{stream}");
     assert!(stream.contains("\"id\":\"call_1\""), "{stream}");
@@ -828,6 +840,120 @@ fn a_chat_stream_tool_call_becomes_one_tool_use_block() {
     assert!(stream.contains("input_json_delta"), "{stream}");
     assert!(stream.contains("a.txt"), "{stream}");
     assert!(stream.contains("\"stop_reason\":\"tool_use\""), "{stream}");
+}
+
+#[test]
+fn a_stream_that_never_finishes_still_hands_over_its_tool_calls() {
+    // Truncation, a dropped connection, or a gateway that ends on [DONE]
+    // alone. Buffering the calls turned this from partial content into
+    // total silent loss, so the stream end is where the message closes.
+    let mut state = AnthropicStreamState::new("glm-5.3");
+
+    let _ = chat_sse_to_anthropic(
+        &json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": "call_1",
+            "function": {"name": "Read", "arguments": "{\"path\":\"a\"}"}
+        }]}}]}),
+        &mut state,
+    );
+
+    let tail = finish_chat_stream(&mut state).join("");
+
+    assert!(
+        tail.contains("\"id\":\"call_1\""),
+        "the call was lost: {tail}"
+    );
+    assert!(tail.contains("input_json_delta"), "{tail}");
+    assert!(tail.contains("content_block_stop"), "{tail}");
+    assert!(tail.contains("\"stop_reason\":\"tool_use\""), "{tail}");
+    assert!(
+        tail.contains("message_stop"),
+        "the turn never closed: {tail}"
+    );
+}
+
+#[test]
+fn an_empty_tool_call_entry_makes_no_block_and_no_tool_use() {
+    // An entry carrying neither id, name nor arguments is not a call.
+    // Creating one produced a block with an empty name that the client then
+    // tried to run, and forced stop_reason to tool_use on a turn the
+    // upstream had ended with stop.
+    let mut state = AnthropicStreamState::new("glm-5.3");
+
+    let _ = chat_sse_to_anthropic(
+        &json!({"choices": [{"delta": {"tool_calls": [{"index": 0}]}}]}),
+        &mut state,
+    );
+    let _ = chat_sse_to_anthropic(
+        &json!({"choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}]}),
+        &mut state,
+    );
+    let tail = finish_chat_stream(&mut state).join("");
+
+    assert!(!tail.contains("tool_use"), "{tail}");
+    assert!(tail.contains("\"stop_reason\":\"end_turn\""), "{tail}");
+}
+
+#[test]
+fn tool_calls_without_an_index_stay_separate() {
+    // `index` is optional. Defaulting it to 0 merged distinct calls into
+    // one and concatenated their arguments into unparseable JSON.
+    let mut state = AnthropicStreamState::new("glm-5.3");
+
+    let _ = chat_sse_to_anthropic(
+        &json!({"choices": [{"delta": {"tool_calls": [
+            {"id": "call_a", "function": {"name": "Read", "arguments": "{\"path\":\"a\"}"}},
+            {"id": "call_b", "function": {"name": "Grep", "arguments": "{\"q\":\"z\"}"}}
+        ]}}]}),
+        &mut state,
+    );
+    // The blocks go out with the finish chunk; only the closing tail waits
+    // for the stream to end.
+    let content = chat_sse_to_anthropic(
+        &json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+        &mut state,
+    )
+    .join("");
+    let tail = format!("{content}{}", finish_chat_stream(&mut state).join(""));
+
+    assert!(tail.contains("call_a") && tail.contains("call_b"), "{tail}");
+    assert!(tail.contains("Read") && tail.contains("Grep"), "{tail}");
+    assert_eq!(
+        tail.matches("event: content_block_start").count(),
+        2,
+        "{tail}"
+    );
+    assert!(
+        !tail.contains(r#"{\"path\":\"a\"}{\"q\":\"z\"}"#),
+        "arguments were concatenated: {tail}"
+    );
+}
+
+#[test]
+fn tool_arguments_sent_as_an_object_are_not_dropped() {
+    // vLLM, Ollama and proxies in front of them send the object itself.
+    let mut state = AnthropicStreamState::new("glm-5.3");
+
+    let _ = chat_sse_to_anthropic(
+        &json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": "call_1",
+            "function": {"name": "Read", "arguments": {"path": "a.txt"}}
+        }]}}]}),
+        &mut state,
+    );
+    // The blocks go out with the finish chunk; only the closing tail waits
+    // for the stream to end.
+    let content = chat_sse_to_anthropic(
+        &json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+        &mut state,
+    )
+    .join("");
+    let tail = format!("{content}{}", finish_chat_stream(&mut state).join(""));
+
+    assert!(tail.contains("input_json_delta"), "{tail}");
+    assert!(tail.contains("a.txt"), "the arguments were dropped: {tail}");
 }
 
 #[test]

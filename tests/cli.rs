@@ -85,7 +85,12 @@ impl CliRuntime for FakeRuntime {
             .unwrap_or_else(|| json!({"data": []})))
     }
 
-    fn select_model(&mut self, harness: &str, choices: &[ModelChoice]) -> Result<Option<String>> {
+    fn select_model(
+        &mut self,
+        harness: &str,
+        choices: &[ModelChoice],
+        _style: Style,
+    ) -> Result<Option<String>> {
         self.picker_harness = Some(harness.to_string());
         self.offered = Some(choices.to_vec());
         Ok(self
@@ -4864,7 +4869,10 @@ fn the_picker_carries_the_window_and_the_price() {
 }
 
 #[test]
-fn a_cancelled_picker_leaves_the_model_alone() {
+fn a_cancelled_picker_launches_nothing() {
+    // Esc says cancel, so it cancels the command. It used to fall through
+    // and start the harness on its own default, which is not what the
+    // footer offered and cannot be undone once the process is replaced.
     let tmp = tempdir().expect("tempdir");
     write_config(tmp.path(), "127.0.0.1", 8317);
     let mut runtime = FakeRuntime {
@@ -4878,11 +4886,14 @@ fn a_cancelled_picker_leaves_the_model_alone() {
 
     assert_eq!(outcome.code, 0);
     assert!(runtime.offered.is_some(), "it did ask");
-    assert_eq!(env_value(&launched(&runtime), "ANTHROPIC_MODEL"), None);
+    assert!(runtime.launch_plan.is_none(), "nothing was launched");
+    assert!(outcome.stdout.is_empty(), "{}", outcome.stdout);
 }
 
 #[test]
-fn launch_pi_still_refuses_a_cancelled_picker() {
+fn a_cancelled_picker_launches_nothing_for_pi_either() {
+    // And it is a cancel, not the `--model` error: the operator was handed
+    // a list and stepped back from it.
     let tmp = tempdir().expect("tempdir");
     write_config(tmp.path(), "127.0.0.1", 8317);
     let mut runtime = FakeRuntime {
@@ -4892,9 +4903,9 @@ fn launch_pi_still_refuses_a_cancelled_picker() {
         ..FakeRuntime::default()
     };
 
-    let error = run_err(&["launch", "pi"], tmp.path(), &mut runtime);
+    let outcome = run(&["launch", "pi"], tmp.path(), &mut runtime);
 
-    assert!(error.contains("--model"), "{error}");
+    assert_eq!(outcome.code, 0);
     assert!(runtime.launch_plan.is_none());
 }
 

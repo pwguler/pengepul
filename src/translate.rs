@@ -689,6 +689,16 @@ pub fn anthropic_to_chat_request(body: &Value) -> Value {
             "tool_choice".to_string(),
             chat_tool_choice_from_anthropic(choice),
         );
+        // Anthropic hangs this off tool_choice; this dialect keeps it at the
+        // top level. Dropping it gave a client that asked for one call at a
+        // time several.
+        if choice
+            .get("disable_parallel_tool_use")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            out.insert("parallel_tool_calls".to_string(), Value::Bool(false));
+        }
     }
     Value::Object(out)
 }
@@ -761,13 +771,15 @@ pub(crate) fn anthropic_stop_reason(
     finish_reason: Option<&str>,
     has_tool_use: bool,
 ) -> &'static str {
-    if has_tool_use {
-        return "tool_use";
-    }
+    // The upstream's own reason wins where it names one. A turn cut off at
+    // the token limit mid tool-call is still a cutoff, and reporting
+    // `tool_use` there hid it behind arguments that never finished
+    // arriving.
     match finish_reason {
         Some("length") => "max_tokens",
-        Some("tool_calls" | "function_call") => "tool_use",
         Some("content_filter") => "refusal",
+        Some("tool_calls" | "function_call") => "tool_use",
+        _ if has_tool_use => "tool_use",
         _ => "end_turn",
     }
 }
@@ -815,11 +827,26 @@ fn push_chat_messages(messages: &mut Vec<Value>, message: &Value) {
             // between the call and its answer, which strict gateways reject
             // with "'tool' must be a response to a preceding message with
             // 'tool_calls'".
-            Some("tool_result") => tool_results.push(json!({
-                "role": "tool",
-                "tool_call_id": block.get("tool_use_id").cloned().unwrap_or(Value::Null),
-                "content": text_from_content(block.get("content").unwrap_or(&Value::Null))
-            })),
+            Some("tool_result") => {
+                let content = block.get("content").unwrap_or(&Value::Null);
+                tool_results.push(json!({
+                    "role": "tool",
+                    "tool_call_id": block.get("tool_use_id").cloned().unwrap_or(Value::Null),
+                    "content": text_from_content(content)
+                }));
+                // A `tool` message in this dialect carries text and nothing
+                // else, so an image result would vanish. It follows as a
+                // user turn instead, which is where this dialect puts an
+                // image the model must see.
+                let images = value_array(Some(content))
+                    .into_iter()
+                    .filter(|part| part.get("type").and_then(Value::as_str) == Some("image"))
+                    .filter_map(anthropic_image_to_chat)
+                    .collect::<Vec<_>>();
+                if !images.is_empty() {
+                    tool_results.push(json!({"role": "user", "content": images}));
+                }
+            }
             // Thinking blocks are the model's own prior reasoning. This
             // dialect has nowhere to put them on the way up, and echoing
             // them back as text would change the transcript.
@@ -892,20 +919,19 @@ fn anthropic_image_to_chat(block: &Value) -> Option<Value> {
     Some(json!({"type": "image_url", "image_url": {"url": url}}))
 }
 
-/// One anthropic tool as a Chat Completions function. A vendor server tool
-/// has no equivalent — a configured endpoint never runs one — so it is
-/// dropped rather than offered as a function the model would then call
-/// into nothing.
+/// One anthropic tool as a Chat Completions function.
+///
+/// Only the web-search tool is executed by the vendor (`masquerade.rs`
+/// leaves it alone for exactly that reason), and a configured endpoint
+/// cannot run it, so that one is dropped rather than offered as a function
+/// calling into nothing. `bash`, `computer` and `text_editor` are the
+/// client's own tools whatever their `type` says — dropping those silently
+/// took away tools the harness had offered.
 fn anthropic_tool_to_chat(tool: &Value) -> Option<Value> {
     if tool
         .get("type")
         .and_then(Value::as_str)
-        .is_some_and(|kind| {
-            kind.starts_with("web_search")
-                || kind.starts_with("computer")
-                || kind.starts_with("text_editor")
-                || kind.starts_with("bash")
-        })
+        .is_some_and(|kind| kind.starts_with("web_search"))
     {
         return None;
     }

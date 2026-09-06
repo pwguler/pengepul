@@ -189,13 +189,20 @@ pub trait CliRuntime {
     fn models(&mut self, base_url: &str, api_key: &str) -> Result<Value>;
 
     /// Let the operator move through `choices` and pick one, typing to
-    /// narrow the list. `harness` is what the picker says it is launching.
-    /// `Ok(None)` means they cancelled.
+    /// narrow the list. `harness` is what the picker says it is launching,
+    /// and `style` decides whether it paints in colour — the same decision
+    /// every other surface takes, made once at the edge. `Ok(None)` means
+    /// they cancelled.
     ///
     /// # Errors
     ///
     /// Returns an error if the terminal cannot be driven.
-    fn select_model(&mut self, harness: &str, choices: &[ModelChoice]) -> Result<Option<String>>;
+    fn select_model(
+        &mut self,
+        harness: &str,
+        choices: &[ModelChoice],
+        style: Style,
+    ) -> Result<Option<String>>;
 }
 
 #[derive(Debug, Parser)]
@@ -437,6 +444,7 @@ pub fn run_with_env(
                 model.as_deref(),
                 &forwarded,
                 runtime,
+                style,
             )?;
         }
         Some(Command::Login {
@@ -1085,6 +1093,7 @@ fn launch(
     model: Option<&str>,
     forwarded: &[String],
     runtime: &mut impl CliRuntime,
+    style: Style,
 ) -> Result<()> {
     let config = env.load()?;
     let base_url = base_url(&config);
@@ -1111,7 +1120,13 @@ fn launch(
             if choices.is_empty() {
                 None
             } else {
-                runtime.select_model(harness.name(), &choices)?
+                match runtime.select_model(harness.name(), &choices, style)? {
+                    Some(model) => Some(model),
+                    // Backing out of the picker cancels the command. It used
+                    // to fall through and start claude on its own default,
+                    // which is not what the footer offered.
+                    None => return Ok(()),
+                }
             }
         }
         None => None,
@@ -1132,6 +1147,13 @@ fn model_choices(catalog: &Value) -> Vec<ModelChoice> {
         .iter()
         .filter_map(|entry| {
             let id = entry.get("id").and_then(Value::as_str)?;
+            // A carriage return or an escape in an id repaints the row it
+            // sits on: the list would show one model and enter would launch
+            // another, with nothing printed afterwards to catch it. No real
+            // model id carries one, and the catalog is a remote document.
+            if id.chars().any(char::is_control) {
+                return None;
+            }
             let (context, price) = model_facts(entry);
             Some(ModelChoice {
                 id: id.to_string(),

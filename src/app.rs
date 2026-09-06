@@ -30,8 +30,8 @@ use crate::oauth::{refresh_anthropic_tokens, refresh_codex_tokens};
 use crate::streaming::{
     AnthropicStreamState, ChatStreamState, ResponsesStreamState, anthropic_sse_to_chat,
     anthropic_sse_to_responses, chat_sse_to_anthropic, drain_complete_sse_events,
-    finish_sse_events, responses_sse_to_anthropic, responses_sse_to_chat, responses_sse_to_payload,
-    sse,
+    finish_chat_stream, finish_sse_events, responses_sse_to_anthropic, responses_sse_to_chat,
+    responses_sse_to_payload, sse,
 };
 use crate::translate::{
     anthropic_to_chat_request, anthropic_to_openai, anthropic_to_responses,
@@ -1977,6 +1977,77 @@ fn sse_upstream_response(
         })
 }
 
+/// Everything one SSE translation carries from event to event: the
+/// per-dialect stream states, the usage it accumulates, and the refusal
+/// bookkeeping. One value rather than eight locals, so the streaming loop
+/// and the drain that follows it agree on what a stream in progress is.
+struct SseStreamStates {
+    chat: ChatStreamState,
+    responses: ResponsesStreamState,
+    anthropic: AnthropicStreamState,
+    usage: crate::types::UsageData,
+    completed: bool,
+    refusal_next_index: u64,
+    refusal_open_index: Option<u64>,
+}
+
+impl SseStreamStates {
+    fn new(model: &str) -> Self {
+        Self {
+            chat: ChatStreamState::new(model),
+            responses: ResponsesStreamState::new(model),
+            anthropic: AnthropicStreamState::new(model),
+            usage: crate::types::UsageData::default(),
+            completed: false,
+            refusal_next_index: 0,
+            refusal_open_index: None,
+        }
+    }
+}
+
+/// One upstream event as the events the client should read: its usage
+/// counted, then either the refusal replacement or the dialect transform.
+/// The streaming loop and the drain after it both come through here, which
+/// is what stops the two from drifting apart.
+fn translated_sse_event(
+    states: &mut SseStreamStates,
+    provider: &ProviderId,
+    route: RequestRoute,
+    model: &str,
+    event: &str,
+    raw: &str,
+    tool_reverse: &BTreeMap<String, String>,
+) -> Vec<String> {
+    update_stream_usage(
+        provider,
+        event,
+        raw,
+        &mut states.usage,
+        &mut states.completed,
+    );
+    forward_refusal_event(
+        provider,
+        route,
+        event,
+        raw,
+        &mut states.refusal_next_index,
+        &mut states.refusal_open_index,
+    )
+    .unwrap_or_else(|| {
+        transform_sse_event(
+            provider,
+            route,
+            model,
+            &mut states.chat,
+            &mut states.responses,
+            &mut states.anthropic,
+            event,
+            raw,
+            tool_reverse,
+        )
+    })
+}
+
 fn transformed_sse_stream(
     mut input: UpstreamSseStream,
     provider: ProviderId,
@@ -1987,13 +2058,7 @@ fn transformed_sse_stream(
 ) -> UpstreamSseStream {
     Box::pin(try_stream! {
         let mut buffer = Vec::new();
-        let mut chat_state = ChatStreamState::new(model.clone());
-        let mut responses_state = ResponsesStreamState::new(model.clone());
-        let mut anthropic_state = AnthropicStreamState::new(model.clone());
-        let mut usage = crate::types::UsageData::default();
-        let mut completed = false;
-        let mut refusal_next_index: u64 = 0;
-        let mut refusal_open_index: Option<u64> = None;
+        let mut states = SseStreamStates::new(&model);
 
         while let Some(chunk) = input.next().await {
             let chunk = match chunk {
@@ -2014,29 +2079,15 @@ fn transformed_sse_stream(
                 }
             };
             for (event, raw) in events {
-                update_stream_usage(&provider, &event, &raw, &mut usage, &mut completed);
-                let chunks = match forward_refusal_event(
+                for chunk in translated_sse_event(
+                    &mut states,
                     &provider,
                     route,
+                    &model,
                     &event,
                     &raw,
-                    &mut refusal_next_index,
-                    &mut refusal_open_index,
+                    &tool_reverse,
                 ) {
-                    Some(replacement) => replacement,
-                    None => transform_sse_event(
-                        &provider,
-                        route,
-                        &model,
-                        &mut chat_state,
-                        &mut responses_state,
-                        &mut anthropic_state,
-                        &event,
-                        &raw,
-                        &tool_reverse,
-                    ),
-                };
-                for chunk in chunks {
                     yield Bytes::from(chunk);
                 }
             }
@@ -2050,34 +2101,29 @@ fn transformed_sse_stream(
             }
         };
         for (event, raw) in events {
-            update_stream_usage(&provider, &event, &raw, &mut usage, &mut completed);
-            let chunks = match forward_refusal_event(
+            for chunk in translated_sse_event(
+                &mut states,
                 &provider,
                 route,
+                &model,
                 &event,
                 &raw,
-                &mut refusal_next_index,
-                &mut refusal_open_index,
+                &tool_reverse,
             ) {
-                Some(replacement) => replacement,
-                None => transform_sse_event(
-                    &provider,
-                    route,
-                    &model,
-                    &mut chat_state,
-                    &mut responses_state,
-                    &mut anthropic_state,
-                    &event,
-                    &raw,
-                    &tool_reverse,
-                ),
-            };
-            for chunk in chunks {
                 yield Bytes::from(chunk);
             }
         }
-        if completed {
-            record_stream_success(accounting.as_ref(), &usage).await;
+        // The Messages message a generic endpoint's stream became is closed
+        // here and nowhere else: a stream that stopped before any
+        // finish_reason still owes the client the tool calls it announced
+        // and a message_stop, and usage often arrives after finish_reason.
+        if matches!((provider.kind, route), (ProviderKind::Generic, RequestRoute::Messages)) {
+            for chunk in finish_chat_stream(&mut states.anthropic) {
+                yield Bytes::from(chunk);
+            }
+        }
+        if states.completed {
+            record_stream_success(accounting.as_ref(), &states.usage).await;
         } else {
             record_stream_failure(accounting.as_ref(), "stream terminated before completion").await;
         }
