@@ -53,15 +53,26 @@ pub struct LaunchPlan {
     pub install_hint: String,
 }
 
-/// One row of the model picker: the id a harness will be handed, the facts
-/// that let an operator tell two ids apart, and — when the relay cannot
-/// serve it to this harness — why. An unusable model stays on the list and
-/// says so, rather than going missing and looking like the relay lost it.
+/// One row of the model picker. The two facts that separate ids are kept
+/// apart so the picker can align them into columns; a row the relay cannot
+/// serve to this harness stays on the list carrying its reason, rather
+/// than going missing and looking like the relay lost it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelChoice {
     pub id: String,
-    pub detail: String,
-    pub unavailable: Option<String>,
+    /// `1.0M ctx`, or empty where the catalog does not say.
+    pub context: String,
+    /// `$5.00/$25.00` per million in and out, or empty.
+    pub price: String,
+    pub unavailable: Option<Unavailable>,
+}
+
+/// Why a harness cannot be given a model: a tag short enough to sit on the
+/// row, and the sentence shown if the operator picks it anyway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unavailable {
+    pub tag: String,
+    pub reason: String,
 }
 
 pub trait CliRuntime {
@@ -187,12 +198,13 @@ pub trait CliRuntime {
     fn models(&mut self, base_url: &str, api_key: &str) -> Result<Value>;
 
     /// Let the operator move through `choices` and pick one, typing to
-    /// narrow the list. `Ok(None)` means they cancelled.
+    /// narrow the list. `harness` is what the picker says it is launching.
+    /// `Ok(None)` means they cancelled.
     ///
     /// # Errors
     ///
     /// Returns an error if the terminal cannot be driven.
-    fn select_model(&mut self, choices: &[ModelChoice]) -> Result<Option<String>>;
+    fn select_model(&mut self, harness: &str, choices: &[ModelChoice]) -> Result<Option<String>>;
 }
 
 #[derive(Debug, Parser)]
@@ -292,6 +304,16 @@ enum Harness {
     Claude,
     /// pi
     Pi,
+}
+
+impl Harness {
+    /// The name the operator typed, for the surfaces that name it back.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Pi => "pi",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Subcommand)]
@@ -1120,7 +1142,7 @@ fn launch(
             if choices.is_empty() {
                 None
             } else {
-                runtime.select_model(&choices)?
+                runtime.select_model(harness.name(), &choices)?
             }
         }
         None => None,
@@ -1150,16 +1172,23 @@ fn model_choices(catalog: &Value, harness: Harness, config: &Config) -> Vec<Mode
         .filter_map(|entry| {
             let id = entry.get("id").and_then(Value::as_str)?;
             let unavailable = match harness {
-                Harness::Claude => claude_speaks_messages(id, config).err().map(|_| {
-                    "claude speaks Messages; this endpoint serves only Chat Completions".to_string()
-                }),
+                Harness::Claude => claude_speaks_messages(id, config)
+                    .err()
+                    .map(|_| Unavailable {
+                        tag: "chat completions only".to_string(),
+                        reason: "claude speaks Messages, and this endpoint serves only Chat \
+                             Completions"
+                            .to_string(),
+                    }),
                 // pi's provider picks a wire per model, so every advertised
                 // model is a fair choice there.
                 Harness::Pi => None,
             };
+            let (context, price) = model_facts(entry);
             Some(ModelChoice {
                 id: id.to_string(),
-                detail: model_detail(entry),
+                context,
+                price,
                 unavailable,
             })
         })
@@ -1171,17 +1200,21 @@ fn model_choices(catalog: &Value, harness: Harness, config: &Config) -> Vec<Mode
 }
 
 /// What separates two ids on the list: the context window, and what a
-/// million tokens cost in and out. Left out where the catalog does not
-/// carry them — a configured endpoint publishes what it publishes, and a
-/// blank column is honest where a zero would not be.
-fn model_detail(entry: &Value) -> String {
-    let mut parts = Vec::new();
-    if let Some(window) = entry.get("context_window").and_then(Value::as_u64) {
-        parts.push(format!(
-            "{} ctx",
-            format_count(i64::try_from(window).unwrap_or(i64::MAX))
-        ));
-    }
+/// million tokens cost in and out. Returned apart so the picker can align
+/// each into its own column, and empty where the catalog does not carry
+/// them — a configured endpoint publishes what it publishes, and a blank
+/// column is honest where a zero would not be.
+fn model_facts(entry: &Value) -> (String, String) {
+    let context = entry
+        .get("context_window")
+        .and_then(Value::as_u64)
+        .map(|window| {
+            format!(
+                "{} ctx",
+                format_count(i64::try_from(window).unwrap_or(i64::MAX))
+            )
+        })
+        .unwrap_or_default();
     let pricing = entry.get("pricing");
     let input = pricing
         .and_then(|rates| rates.get("input_per_million"))
@@ -1189,10 +1222,11 @@ fn model_detail(entry: &Value) -> String {
     let output = pricing
         .and_then(|rates| rates.get("output_per_million"))
         .and_then(Value::as_f64);
-    if let (Some(input), Some(output)) = (input, output) {
-        parts.push(format!("${input:.2}/${output:.2}"));
-    }
-    parts.join("  ")
+    let price = match (input, output) {
+        (Some(input), Some(output)) => format!("${input:.2}/${output:.2}"),
+        _ => String::new(),
+    };
+    (context, price)
 }
 
 /// Rows whose id carries every word of the filter, case folded. Words

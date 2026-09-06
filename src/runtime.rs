@@ -13,7 +13,7 @@ use crate::oauth::{
     ANTHROPIC_REDIRECT_URI, CODEX_CALLBACK_PATH, CODEX_CALLBACK_PORT, exchange_anthropic_code,
     exchange_codex_code, generate_anthropic_auth_url, generate_codex_auth_url,
 };
-use crate::render::{BOLD, DIM, PANEL_WIDTH, pad, paint};
+use crate::render::{AMBER, BOLD, DIM, GREEN, pad, paint};
 use crate::service::{ServiceOptions, run_command};
 use crate::tokens::save_token;
 use crate::types::{PkceCodes, ProviderId, ProviderKind};
@@ -140,8 +140,8 @@ impl CliRuntime for RealRuntime {
         ))
     }
 
-    fn select_model(&mut self, choices: &[ModelChoice]) -> Result<Option<String>> {
-        pick_model(choices)
+    fn select_model(&mut self, harness: &str, choices: &[ModelChoice]) -> Result<Option<String>> {
+        pick_model(harness, choices)
     }
 
     fn service_logs(&mut self, follow: bool, lines: u32) -> Result<()> {
@@ -236,7 +236,7 @@ enum Method {
 /// and raw mode is left again on every exit — the error path included,
 /// which is why the loop's outcome is captured before the terminal is
 /// restored rather than returned through `?`.
-fn pick_model(choices: &[ModelChoice]) -> Result<Option<String>> {
+fn pick_model(harness: &str, choices: &[ModelChoice]) -> Result<Option<String>> {
     use crossterm::{cursor, event, execute, terminal};
 
     terminal::enable_raw_mode()
@@ -244,7 +244,7 @@ fn pick_model(choices: &[ModelChoice]) -> Result<Option<String>> {
     let mut screen = std::io::stderr();
     let entered = execute!(screen, terminal::EnterAlternateScreen, cursor::Hide);
     let outcome = entered.map_err(anyhow::Error::from).and_then(|()| {
-        picker_loop(&mut screen, choices, &mut || {
+        picker_loop(&mut screen, harness, choices, &mut || {
             event::read().map_err(anyhow::Error::from)
         })
     });
@@ -258,6 +258,7 @@ fn pick_model(choices: &[ModelChoice]) -> Result<Option<String>> {
 /// setup is the part with the cleanup.
 fn picker_loop(
     screen: &mut impl std::io::Write,
+    harness: &str,
     choices: &[ModelChoice],
     next_event: &mut dyn FnMut() -> Result<crossterm::event::Event>,
 ) -> Result<Option<String>> {
@@ -272,12 +273,15 @@ fn picker_loop(
         cursor = cursor.min(matching.len().saturating_sub(1));
         let rows = draw_picker(
             screen,
-            choices.len(),
-            &matching,
-            &filter,
-            cursor,
+            &PickerFrame {
+                harness,
+                total: choices.len(),
+                matching: &matching,
+                filter: &filter,
+                cursor,
+                note: &note,
+            },
             &mut scroll,
-            &note,
         )?;
         note.clear();
         let Event::Key(key) = next_event()? else {
@@ -309,7 +313,9 @@ fn picker_loop(
                 // The row stays on the list so the reason has somewhere to
                 // be read.
                 Some(choice) if choice.unavailable.is_some() => {
-                    note = choice.unavailable.clone().unwrap_or_default();
+                    if let Some(unavailable) = &choice.unavailable {
+                        note.clone_from(&unavailable.reason);
+                    }
                 }
                 Some(choice) => return Ok(Some(choice.id.clone())),
             },
@@ -324,23 +330,43 @@ fn picker_loop(
     }
 }
 
+/// What one frame of the picker is drawn from. `scroll` stays out of it:
+/// the frame decides it from the cursor and hands it back to the loop.
+struct PickerFrame<'a> {
+    harness: &'a str,
+    total: usize,
+    matching: &'a [ModelChoice],
+    filter: &'a str,
+    cursor: usize,
+    note: &'a str,
+}
+
 /// Paint one frame and return how many model rows fit, which is also the
 /// page size the loop pages by.
+///
+/// Three zones with air between them: what you are doing and how much of
+/// the catalog is left, what you have typed, and the list. Everything but
+/// the list recedes, because the list is what is being read.
 fn draw_picker(
     screen: &mut impl std::io::Write,
-    total: usize,
-    matching: &[ModelChoice],
-    filter: &str,
-    cursor: usize,
+    frame_state: &PickerFrame<'_>,
     scroll: &mut usize,
-    note: &str,
 ) -> Result<usize> {
     use crossterm::{cursor as term_cursor, execute, terminal};
 
+    let &PickerFrame {
+        harness,
+        total,
+        matching,
+        filter,
+        cursor,
+        note,
+    } = frame_state;
+
     let (columns, lines) = terminal::size().unwrap_or((80, 24));
     let width = usize::from(columns).max(20);
-    // Row 0 is the heading, rows 1 to 3 are the search box, and the last
-    // row is the hint. What is left is the list.
+    // Heading, blank, query, blank, and the footer: five rows that are not
+    // the list.
     let rows = usize::from(lines).saturating_sub(5).max(1);
     if cursor < *scroll {
         *scroll = cursor;
@@ -354,59 +380,66 @@ fn draw_picker(
         .map(|choice| choice.id.chars().count())
         .max()
         .unwrap_or(0)
-        .min(width.saturating_sub(30).max(12));
+        .clamp(12, width.saturating_sub(34).max(12));
+    let context_width = matching
+        .iter()
+        .map(|choice| choice.context.chars().count())
+        .max()
+        .unwrap_or(0);
 
-    let heading = if filter.is_empty() {
-        format!("pengepul — {total} models")
-    } else {
-        format!("pengepul — {} of {total} models", matching.len())
-    };
-    // The typed text gets a box rather than a label: it is the one field
-    // on the screen, and a box says so without a word.
-    // The project already has one measure for a box, so the field uses it
-    // rather than stretching across a wide terminal.
-    let box_width = width.saturating_sub(4).clamp(8, PANEL_WIDTH - 2);
-    let rule = "─".repeat(box_width);
-    let mut frame = vec![
-        paint(BOLD, &pad(&heading, width)),
-        pad(&format!("  ┌{rule}┐"), width),
-        pad(
-            &format!("  │{}│", pad(&format!(" {filter}▏"), box_width)),
-            width,
+    let counter = format!("{}/{total}", matching.len());
+    let heading = format!(
+        "  {}{}{}",
+        paint(BOLD, &format!("launch {harness}")),
+        " ".repeat(
+            width
+                .saturating_sub(2 + 7 + harness.chars().count() + counter.chars().count() + 2)
+                .max(2)
         ),
-        pad(&format!("  └{rule}┘"), width),
+        paint(DIM, &counter),
+    );
+    let mut frame = vec![
+        heading,
+        String::new(),
+        // A prompt glyph and a block cursor: the one place typing goes, and
+        // it says so without the word "search" in front of it.
+        format!("  {} {filter}{}", paint(GREEN, "›"), paint(BOLD, "█")),
+        String::new(),
     ];
+
+    if matching.is_empty() {
+        frame.push(paint(DIM, "    nothing matches"));
+    }
     for (offset, choice) in matching.iter().skip(*scroll).take(rows).enumerate() {
         let selected = *scroll + offset == cursor;
-        let marker = if selected { "❯" } else { " " };
-        let tail = if choice.unavailable.is_some() {
-            "  unavailable".to_string()
-        } else if choice.detail.is_empty() {
-            String::new()
-        } else {
-            format!("  {}", choice.detail)
+        let blocked = choice.unavailable.is_some();
+        let tail = match &choice.unavailable {
+            Some(unavailable) => paint(AMBER, &unavailable.tag),
+            None => paint(DIM, &choice.price),
         };
-        let line = pad(
-            &format!("{marker} {}{tail}", pad(&choice.id, id_width)),
-            width,
+        let row = format!(
+            "{} {}  {}  {tail}",
+            if selected {
+                paint(GREEN, "❯")
+            } else {
+                " ".to_string()
+            },
+            // The pool prefix repeats down the whole list, so it is dimmed
+            // and the model name keeps the reader's attention.
+            paint_id(&pad(&choice.id, id_width), selected, blocked),
+            paint(DIM, &format!("{:>context_width$}", choice.context)),
         );
-        frame.push(if selected {
-            paint(BOLD, &line)
-        } else if choice.unavailable.is_some() {
-            paint(DIM, &line)
-        } else {
-            line
-        });
+        frame.push(row);
     }
     for _ in matching.len().saturating_sub(*scroll).min(rows)..rows {
-        frame.push(" ".repeat(width));
+        frame.push(String::new());
     }
-    let hint = if note.is_empty() {
-        "↑↓ move   type to search   ⌫ delete   enter run   esc cancel"
+    let footer = if note.is_empty() {
+        paint(DIM, "  ↑↓ move   ⏎ run   esc cancel")
     } else {
-        note
+        paint(AMBER, &format!("  {note}"))
     };
-    frame.push(paint(DIM, &pad(&format!("  {hint}"), width)));
+    frame.push(footer);
 
     execute!(
         screen,
@@ -418,7 +451,25 @@ fn draw_picker(
     Ok(rows)
 }
 
-/// Become the harness. `exec` leaves the terminal, the signal handling and
+/// One model id, already padded: the `<pool>/` prefix dim and the model
+/// name bright, so a column of `commandcode/...` reads as its models
+/// rather than as its pool. A blocked row is dim throughout; the
+/// highlighted one is bright throughout.
+fn paint_id(padded: &str, selected: bool, blocked: bool) -> String {
+    if blocked {
+        return paint(DIM, padded);
+    }
+    if selected {
+        return paint(BOLD, padded);
+    }
+    let Some(slash) = padded.find('/') else {
+        return padded.to_string();
+    };
+    let (prefix, rest) = padded.split_at(slash + 1);
+    format!("{}{rest}", paint(DIM, prefix))
+}
+
+/// Become the harness./// Become the harness. `exec` leaves the terminal, the signal handling and
 /// the exit code with it rather than proxying all three through pengepul, so
 /// this returns only when the program could not be started at all.
 fn launch_harness(plan: &LaunchPlan) -> Result<()> {

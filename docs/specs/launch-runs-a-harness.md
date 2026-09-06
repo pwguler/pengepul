@@ -28,19 +28,20 @@ Tanpa `--model`, relay ditanya modelnya dan operator memilih dengan
 tombol panah, sambil mengetik untuk mencari:
 
 ```
-pengepul — 8 of 78 models
-  ┌──────────────────────────────────────────────────────────────┐
-  │ opus▏                                                        │
-  └──────────────────────────────────────────────────────────────┘
+  launch claude                                                     8/78
+
+  › opus█
+
   anthropic/claude-opus-4-5-20251101  200.0K ctx  $5.00/$25.00
-❯ anthropic/claude-opus-4-6           1.0M ctx  $5.00/$25.00
-  anthropic/claude-opus-4-7           1.0M ctx  $5.00/$25.00
-  anthropic/claude-opus-4-8           1.0M ctx  $5.00/$25.00
-  anthropic/claude-opus-5             1.0M ctx  $5.00/$25.00
-  commandcode/claude-opus-5           unavailable
-  commandcode/claude-opus-4-8         unavailable
-  commandcode/claude-opus-4-7         unavailable
-  ↑↓ move   type to search   ⌫ delete   enter run   esc cancel
+❯ anthropic/claude-opus-4-6             1.0M ctx  $5.00/$25.00
+  anthropic/claude-opus-4-7             1.0M ctx  $5.00/$25.00
+  anthropic/claude-opus-4-8             1.0M ctx  $5.00/$25.00
+  anthropic/claude-opus-5               1.0M ctx  $5.00/$25.00
+  commandcode/claude-opus-5             1.0M ctx  chat completions only
+  commandcode/claude-opus-4-8           1.0M ctx  chat completions only
+  commandcode/claude-opus-4-7           1.0M ctx  chat completions only
+
+  ↑↓ move   ⏎ run   esc cancel
 ```
 
 Berhasil berarti tidak mencetak apa-apa: prosesnya berubah menjadi
@@ -77,9 +78,21 @@ hanya penolakan.
   baris tidak bisa diambil dengan mengetik nomor, dan raw mode tidak bisa
   ditulis tangan di crate yang melarang `unsafe`. Fiturnya dipangkas ke
   `events` saja.
-- **Kotak, bukan label.** Yang diketik masuk ke satu kotak selebar panel
-  proyek ini, bukan ke belakang kata `search:`. Di layar itu cuma ada satu
-  tempat mengetik, dan kotaknya sudah mengatakan itu tanpa kata.
+- **Tiga zona, dan yang bukan daftar mundur ke belakang.** Kepala menyebut
+  apa yang sedang dijalankan dan berapa sisa katalognya, satu baris
+  menampung yang diketik, sisanya daftar. Yang diketik dapat satu glyph
+  `›` dan kursor blok, bukan label dan bukan kotak: di layar itu tidak ada
+  tempat mengetik yang lain.
+- **Kolomnya rata.** Lebar konteks dan lebar id dihitung dari baris yang
+  tampil, jadi angka sejajar dengan angka dan mata membaca ke bawah, bukan
+  menyusuri baris. Karena itu `ModelChoice` menyimpan konteks dan harga
+  terpisah, bukan satu kalimat.
+- **Prefiks pool diredupkan.** `commandcode/` berulang di puluhan baris dan
+  bukan itu yang dibaca. Prefiksnya redup, nama modelnya terang.
+- **Alasannya di barisnya sendiri.** Baris yang tak terlayani membawa tag
+  pendek (`chat completions only`) di kolom harga; kalimat panjangnya
+  muncul di kaki layar kalau enter tetap ditekan. Itu sebabnya
+  `Unavailable` punya dua field, bukan satu.
 - **Layar alternatif, dan dikembalikan di setiap jalan keluar.**
   Scrollback operator selamat, dan raw mode dilepas juga pada jalur error
   — itu sebabnya hasil loop ditangkap dulu, bukan dilempar lewat `?`.
@@ -178,9 +191,11 @@ hanya penolakan.
 - AC-18: Dengan output di-pipe, tidak ada picker dan tidak ada permintaan
   `/v1/models`; perilakunya sama seperti sebelum picker ada.
 - AC-19: `--model` yang eksplisit melewati picker sepenuhnya.
-- AC-20: Terminal dikembalikan — raw mode lepas, layar alternatif
+- AC-20: Baris yang tak terlayani membawa tag pendeknya di daftar, dan
+  kalimat panjangnya hanya muncul saat baris itu dipilih.
+- AC-21: Terminal dikembalikan — raw mode lepas, layar alternatif
   ditinggalkan, kursor kembali — termasuk saat picker gagal.
-- AC-21: `launch` sendiri tidak menulis file apa pun: tidak ada config
+- AC-22: `launch` sendiri tidak menulis file apa pun: tidak ada config
   harness yang berubah karena satu peluncuran. Apa yang ditulis harness
   setelah mengambil alih proses adalah urusannya sendiri.
 
@@ -213,6 +228,11 @@ Setiap kriteria butuh tes yang gagal ketika perbaikannya dibalik.
 
 ## Revisions
 
+- **Kotak pencarian dibuang, lalu seluruh tampilannya dirancang ulang.**
+  Kotak di sekeliling teks yang diketik hanya menambah tiga baris tanpa
+  menambah arti. Yang menggantikannya bukan sekadar mengembalikan label:
+  kolom dirapikan, prefiks pool diredupkan, kepala membawa penghitung
+  `8/78`, dan alasan baris yang tak terlayani pindah ke barisnya sendiri.
 - **Nomor diganti pilihan.** Versi pertama mencetak daftar bernomor dan
   membaca satu baris. Operator memintanya jadi pilihan sungguhan, dan itu
   benar: 78 baris tidak diambil dengan mengetik angka. `crossterm` masuk,

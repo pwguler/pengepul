@@ -43,6 +43,7 @@ struct FakeRuntime {
     /// `None` is a cancel.
     picks: Option<usize>,
     offered: Option<Vec<ModelChoice>>,
+    picker_harness: Option<String>,
 }
 
 impl CliRuntime for FakeRuntime {
@@ -85,7 +86,8 @@ impl CliRuntime for FakeRuntime {
             .unwrap_or_else(|| json!({"data": []})))
     }
 
-    fn select_model(&mut self, choices: &[ModelChoice]) -> Result<Option<String>> {
+    fn select_model(&mut self, harness: &str, choices: &[ModelChoice]) -> Result<Option<String>> {
+        self.picker_harness = Some(harness.to_string());
         self.offered = Some(choices.to_vec());
         Ok(self
             .picks
@@ -4874,8 +4876,11 @@ fn the_picker_offers_the_whole_catalog_and_marks_what_claude_cannot_use() {
         .iter()
         .find(|choice| choice.id.starts_with("groq/"))
         .expect("the configured endpoint's model is listed");
-    let reason = groq.unavailable.as_deref().expect("marked unavailable");
-    assert!(reason.contains("Chat Completions"), "{reason}");
+    let blocked = groq.unavailable.as_ref().expect("marked unavailable");
+    // A tag short enough for the row, and a sentence for when it is chosen.
+    assert_eq!(blocked.tag, "chat completions only");
+    assert!(blocked.reason.contains("Chat Completions"), "{blocked:?}");
+    assert!(blocked.tag.len() < blocked.reason.len());
     // And the ones that work sort first, so the arrow keys land on those.
     assert!(choices[0].unavailable.is_none());
     assert!(choices[1].unavailable.is_none());
@@ -4916,13 +4921,18 @@ fn the_picker_carries_the_window_and_the_price() {
     run(&["launch", "claude"], tmp.path(), &mut runtime);
 
     let choices = offered(&runtime);
-    assert_eq!(choices[0].detail, "1.0M ctx  $5.00/$25.00");
+    // Kept apart so the picker can align each into its own column.
+    assert_eq!(choices[0].context, "1.0M ctx");
+    assert_eq!(choices[0].price, "$5.00/$25.00");
     // A row the catalog carries no numbers for shows none rather than zeros.
     let bare = choices
         .iter()
         .find(|choice| choice.id.starts_with("groq/"))
         .expect("the bare row");
-    assert_eq!(bare.detail, "");
+    assert_eq!(bare.context, "");
+    assert_eq!(bare.price, "");
+    // And the picker is told which harness it is choosing for.
+    assert_eq!(runtime.picker_harness.as_deref(), Some("claude"));
 }
 
 #[test]
