@@ -129,9 +129,12 @@ hanya penolakan.
   panel, tidak ada mouse, tidak ada preview.
 - **Bukan mengingat pilihan terakhir.** Itu berarti menulis sesuatu ke
   disk, dan verb ini tidak meninggalkan apa-apa.
-- **Tidak memvalidasi model lewat jaringan.** `launch` tidak bertanya ke
-  `/v1/models` apakah id itu ada. Yang diperiksa hanya dialeknya, dan itu
-  bisa dijawab dari config. Request pertama yang membuktikan sisanya.
+- **Tidak memvalidasi `--model`.** Id yang disebut di baris perintah
+  diteruskan apa adanya; tidak ada yang mengecek dulu apakah relay
+  melayaninya. Picker memang membaca `/v1/models`, tapi itu untuk
+  menawarkan daftar, bukan untuk menghakimi sebuah id — dan picker tidak
+  jalan kalau `--model` sudah disebut. Request pertama yang
+  membuktikannya.
 - **Tidak menyalakan relay.** Relay yang mati adalah penolakan yang
   menyebut perintahnya, bukan sesuatu yang `launch` benahi sendiri.
 - **Tidak memasang harness.** Biner yang tidak ada jadi pesan yang
@@ -172,19 +175,19 @@ hanya penolakan.
   dan menawarkan **seluruh** isinya; panah memilih, enter menjalankan.
 - AC-14: Daftarnya sama untuk kedua harness, dalam urutan yang
   diiklankan relay, dan tidak ada baris yang ditandai.
-- AC-16: Mengetik menyaring seketika; kata-kata menyempit bersama.
-- AC-17: Esc dan Ctrl-C membatalkan. Batal berarti claude memakai
+- AC-15: Mengetik menyaring seketika; kata-kata menyempit bersama.
+- AC-16: Esc dan Ctrl-C membatalkan. Batal berarti claude memakai
   defaultnya sendiri, dan pi menolak dengan pesan `--model`.
-- AC-18: Dengan output di-pipe, tidak ada picker dan tidak ada permintaan
+- AC-17: Dengan output di-pipe, tidak ada picker dan tidak ada permintaan
   `/v1/models`; perilakunya sama seperti sebelum picker ada.
-- AC-19: `--model` yang eksplisit melewati picker sepenuhnya.
-- AC-20: Permintaan Messages untuk provider terkonfigurasi sampai ke
+- AC-18: `--model` yang eksplisit melewati picker sepenuhnya.
+- AC-19: Permintaan Messages untuk provider terkonfigurasi sampai ke
   endpoint-nya sebagai Chat Completions — `system` jadi pesan sistem,
   `tool_use` jadi `tool_calls`, `tool_result` jadi pesan `tool` sendiri —
   dan jawabannya, utuh maupun streaming, kembali sebagai Messages.
-- AC-21: Terminal dikembalikan — raw mode lepas, layar alternatif
+- AC-20: Terminal dikembalikan — raw mode lepas, layar alternatif
   ditinggalkan, kursor kembali — termasuk saat picker gagal.
-- AC-22: `launch` sendiri tidak menulis file apa pun: tidak ada config
+- AC-21: `launch` sendiri tidak menulis file apa pun: tidak ada config
   harness yang berubah karena satu peluncuran. Apa yang ditulis harness
   setelah mengambil alih proses adalah urusannya sendiri.
 

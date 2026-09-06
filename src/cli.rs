@@ -5,10 +5,7 @@ use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 
-use crate::config::{
-    Config, load_config, normalize_base_url, register_provider, selected_config_path,
-    validate_provider_id,
-};
+use crate::config::{Config, load_config, register_provider, selected_config_path};
 pub use crate::render::Style;
 use crate::render::{
     ActionGlyph, BOLD, DIM, Fact, Output, fact_panel, format_count, paint, status_glyph,
@@ -20,7 +17,7 @@ use crate::usage_view::{
     Connection, print_accounts, print_pool_rich, print_relay_total_plain, print_relay_total_rich,
     print_trend_plain, print_trend_rich,
 };
-use crate::utils::{local_today, sanitize_email, sha256_hex};
+use crate::utils::{local_today, sha256_hex};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunOutcome {
@@ -932,33 +929,11 @@ fn login(
     if base_url.is_some() && key.is_none() {
         bail!("--base-url registers {provider} and needs --key to be usable");
     }
-    // Before any write. `save_token` builds its directory from the id
-    // verbatim (`ProviderId::storage_dir`), so an unvalidated id here
-    // writes a credential into another provider's pool — or, with `..`,
-    // outside the auth-dir entirely. This branch made the guard below
-    // conditional on `base_url.is_none()`, which is what opened that
-    // door.
-    if let Some(url) = base_url {
-        validate_provider_id(provider)?;
-        if normalize_base_url(url).is_empty() {
-            bail!("providers: {provider} is missing base-url");
-        }
-    }
-    // A conflicting registration is refused before the credential is
-    // written. The token-before-config order below rests on the orphan
-    // being harmless because the provider is unconfigured; on this path
-    // it IS configured and live, so a foreign key would join its pool at
-    // the next reload and answer with 401s (AC-3).
-    if let (Some(requested), Some(existing)) = (base_url, config.providers.get(provider)) {
-        // The same function `register_provider` stores with. Two copies of
-        // this rule drifted by one call and this guard, which runs first,
-        // was the one missing it.
-        let requested = normalize_base_url(requested);
-        let existing = normalize_base_url(&existing.base_url);
-        if requested != existing {
-            bail!("{provider} already points at {existing}; edit the config to change it");
-        }
-    }
+    // Every rule about the id, the URL and a conflicting registration
+    // lives in `register_provider`, which now runs before `save_token`
+    // and refuses without writing. `login` used to carry its own copies
+    // because the credential was written first; two of them drifted, and
+    // that was rounds 5 and 6.
     if base_url.is_none() && !config.providers.contains_key(provider) {
         bail!(
             "{provider} is not configured; configured providers: {}",
@@ -1006,46 +981,46 @@ fn login(
     // the config, which disagrees whenever a pool outlives its config
     // entry — the normal state after a hand-removal, since removing a
     // provider is not a verb this tool has.
-    let pool = config.auth_dir.join(provider);
-    // Named by the same function `save_token` names it with, so the two
-    // cannot drift apart.
-    let credential_is_new = !pool
-        .join(format!("{}.json", sanitize_email(&label)))
-        .exists();
-    let written = save_token(&config.auth_dir, &token)?;
+    // Config first, credential second.
+    //
+    // The other order needs a rollback: a credential written before a
+    // failed registration has to be taken back, which means deciding
+    // whether this command created that file. Four review rounds found a
+    // different wrong answer to that question — the config disagreeing
+    // with the filesystem, a pool that outlived its entry, a rollback
+    // that deleted what it had only overwritten.
+    //
+    // This way the undo is restoring bytes already in hand. A registered
+    // provider whose credential never arrived is visible in `accounts`,
+    // costs nothing, and is fixed by re-running the command; a credential
+    // in a pool the config never gained is invisible and joins rotation.
     let mut registered = false;
+    let mut restore: Option<(PathBuf, String)> = None;
     if let Some(base_url) = base_url {
         // The path `env.load()` read. With a legacy config that load has
-        // just migrated it to the home path, so this resolves there \u2014 the
+        // just migrated it to the home path, so this resolves there — the
         // file the next load will read, not the shadowed original.
         let path = selected_config_path(env.config_path, Some(env.home), env.cwd);
-        if let Err(error) = register_provider(&path, provider, base_url) {
-            // The token was written first so a refusal could never leave a
-            // registered provider without an account. When the write
-            // itself fails the mirror problem appears: a credential in a
-            // pool the config never gained, invisible to the operator.
-            //
-            // Only a credential this command created. Repeating a command
-            // overwrites an existing file, and rolling that back would
-            // destroy what predates the command — the opposite of the
-            // guarantee that repeating is safe (AC-4).
-            if credential_is_new {
-                if let Err(cleanup) = fs::remove_file(&written) {
-                    return Err(error.context(format!(
-                        "left a credential at {} that could not be removed: {cleanup}",
-                        written.display()
-                    )));
-                }
-                // And the directory, which this command also created.
-                // `remove_dir` refuses a non-empty one, so a pool that
-                // gained other keys meanwhile is left alone.
-                if let Some(pool) = written.parent() {
-                    let _ = fs::remove_dir(pool);
-                }
-            }
-            return Err(error);
-        }
+        // The bytes `register_provider` read under its own lock, not a
+        // read of our own: reading here would capture the file before a
+        // racing registration and undo theirs along with ours.
+        let before = register_provider(&path, provider, base_url)?;
+        restore = Some((path, before));
         registered = true;
+    }
+    if let Err(error) = save_token(&config.auth_dir, &token) {
+        if let Some((path, before)) = restore {
+            // Bytes this command read moments ago, under the same lock
+            // `register_provider` took. Nothing is deduced about what a
+            // file means.
+            if let Err(undo) = fs::write(&path, before) {
+                return Err(error.context(format!(
+                    "left {provider} registered in {} and could not undo it: {undo}",
+                    path.display()
+                )));
+            }
+        }
+        return Err(error);
     }
     print_login_saved(provider, &label, registered, output, style);
     Ok(())

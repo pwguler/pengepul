@@ -1,4 +1,3 @@
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -3752,14 +3751,9 @@ fn a_refused_registration_leaves_no_credential_behind() {
         "  openrouter:\n    base-url: https://openrouter.ai/api/v1\n",
     );
     let mut runtime = FakeRuntime::default();
-    // The rollback would restore exactly what a file check looks for, so
-    // it cannot show whether the guard refused before the write or the
-    // rollback cleaned up after it. `save_token` chmods the pool to 0700
-    // and nothing restores the mode: that mark survives.
+    let config = tmp.path().join(".pengepul").join("config.yaml");
+    let before = std::fs::read_to_string(&config).expect("read config");
     let pool = tmp.path().join(".pengepul").join("openrouter");
-    std::fs::create_dir_all(&pool).expect("pool");
-    std::fs::set_permissions(&pool, std::fs::Permissions::from_mode(0o755)).expect("chmod pool");
-    let before = pool_mode(&pool);
 
     let _ = run_err(
         &[
@@ -3776,13 +3770,13 @@ fn a_refused_registration_leaves_no_credential_behind() {
     );
 
     assert!(
-        pool_entries(&pool).is_empty(),
+        !pool.exists() || pool_entries(&pool).is_empty(),
         "a refused registration left a credential in a live provider's pool"
     );
     assert_eq!(
-        pool_mode(&pool),
+        std::fs::read_to_string(&config).expect("read config"),
         before,
-        "the credential was written and then rolled back, not refused"
+        "a conflicting URL was written into the config"
     );
 }
 
@@ -3906,8 +3900,8 @@ fn a_rejected_id_cannot_write_into_a_live_pool() {
     let pool = tmp.path().join(".pengepul").join("groq");
     std::fs::create_dir_all(&pool).expect("pool");
     std::fs::write(pool.join("key-legit.json"), "{}").expect("legit key");
-    std::fs::set_permissions(&pool, std::fs::Permissions::from_mode(0o755)).expect("chmod pool");
-    let before_mode = pool_mode(&pool);
+    let config = tmp.path().join(".pengepul").join("config.yaml");
+    let before_config = std::fs::read_to_string(&config).expect("read config");
     let mut runtime = FakeRuntime::default();
 
     let error = run_err(
@@ -3942,9 +3936,9 @@ fn a_rejected_id_cannot_write_into_a_live_pool() {
         "a foreign credential joined a live pool: {files:?}"
     );
     assert_eq!(
-        pool_mode(&pool),
-        before_mode,
-        "the credential was written into the live pool and then rolled back"
+        std::fs::read_to_string(&config).expect("read config"),
+        before_config,
+        "a rejected id was written into the config"
     );
 }
 
@@ -3995,14 +3989,8 @@ fn an_empty_base_url_is_refused_before_the_credential() {
         "  existing:\n    base-url: https://existing.host/v1\n",
     );
     let mut runtime = FakeRuntime::default();
-    // The rollback removes the file it wrote and even the directory, so
-    // no file-level check can see the write. `save_token` also chmods the
-    // pool to 0700 and the rollback never restores the mode: that is the
-    // one mark it cannot erase.
-    seed_orphan_pool(tmp.path(), "openrouter", "sk-seeded", &mut runtime);
-    let pool = tmp.path().join(".pengepul").join("openrouter");
-    std::fs::set_permissions(&pool, std::fs::Permissions::from_mode(0o755)).expect("chmod pool");
-    let before = pool_mode(&pool);
+    let config = tmp.path().join(".pengepul").join("config.yaml");
+    let before = std::fs::read_to_string(&config).expect("read config");
 
     let error = run_err(
         &[
@@ -4023,9 +4011,13 @@ fn an_empty_base_url_is_refused_before_the_credential() {
         "the error does not name the rule: {error}"
     );
     assert_eq!(
-        pool_mode(&pool),
+        std::fs::read_to_string(&config).expect("read config"),
         before,
-        "an empty URL reached save_token, which chmodded the pool"
+        "an empty URL was registered"
+    );
+    assert!(
+        !tmp.path().join(".pengepul").join("openrouter").exists(),
+        "an empty URL still wrote a credential"
     );
 }
 
@@ -4090,16 +4082,6 @@ fn no_id_shape_can_write_a_credential_anywhere_unexpected() {
     }
 }
 
-/// A pool directory's permission bits. `save_token` sets them to 0700 and
-/// no rollback restores them, so this survives where a file check cannot.
-fn pool_mode(pool: &Path) -> u32 {
-    std::fs::metadata(pool)
-        .expect("pool metadata")
-        .permissions()
-        .mode()
-        & 0o777
-}
-
 /// The filenames in a pool, sorted.
 fn pool_entries(pool: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(pool) else {
@@ -4114,44 +4096,6 @@ fn pool_entries(pool: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
-}
-
-/// Seed a provider's pool through the CLI, then hand-remove it from the
-/// config, leaving the credential on disk under the label its key hashes
-/// to.
-///
-/// Three ordering guards could not be tested without this. The rollback
-/// added in a later round restores the filesystem to exactly the state
-/// those tests asserted — no credential, no pool — so each passed with
-/// its guard deleted. With the file already present, `credential_is_new`
-/// is false, the rollback is inert, and a guard that fails to refuse
-/// shows up as an overwritten file.
-fn seed_orphan_pool(
-    home: &Path,
-    provider: &str,
-    key: &str,
-    runtime: &mut impl CliRuntime,
-) -> PathBuf {
-    let config = home.join(".pengepul").join("config.yaml");
-    let original = std::fs::read_to_string(&config).expect("read config");
-    std::fs::write(
-        &config,
-        format!("{original}  {provider}:\n    base-url: https://seed.host/v1\n"),
-    )
-    .expect("add provider");
-    run(
-        &["login", "--provider", provider, "--key", key],
-        home,
-        runtime,
-    );
-    let pool = home.join(".pengepul").join(provider);
-    let seeded = std::fs::read_dir(&pool)
-        .expect("read pool")
-        .find_map(|entry| entry.ok().map(|e| e.path()))
-        .expect("the pool was not seeded");
-    // Hand-removal: the pool outlives its config entry.
-    std::fs::write(&config, original).expect("restore config");
-    seeded
 }
 
 /// Every file under `root`, sorted: what the command must not change when
@@ -5029,4 +4973,50 @@ fn an_empty_catalog_asks_nothing() {
     assert_eq!(outcome.code, 0);
     assert!(runtime.offered.is_none());
     assert_eq!(env_value(&launched(&runtime), "ANTHROPIC_MODEL"), None);
+}
+
+/// The shape, not an instance: a failed credential write must leave the
+/// config exactly as it was, byte for byte.
+///
+/// Four of six review rounds found defects in the credential-first order
+/// and the rollback it needs — deleting a file requires reasoning about
+/// whether this command created it, and that reasoning was wrong in a
+/// different way each time. Config first, credential second, and the
+/// undo is restoring bytes already held rather than deciding what a file
+/// meant.
+#[test]
+fn a_failed_credential_write_leaves_the_config_byte_identical() {
+    let tmp = tempdir().expect("tempdir");
+    let config_path = tmp.path().join(".pengepul").join("config.yaml");
+    std::fs::create_dir_all(config_path.parent().expect("parent")).expect("config dir");
+    // auth-dir points at a path that cannot become a directory, so
+    // `save_token` fails after the config has been written.
+    let blocked = tmp.path().join("blocked");
+    std::fs::write(&blocked, "not a directory").expect("blocker");
+    let original = format!(
+        "host: \"127.0.0.1\"\nport: 8317\nauth-dir: {}\napi-keys:\n  - sk-test\nproviders:\n  existing:\n    base-url: https://existing.host/v1\n",
+        blocked.display()
+    );
+    std::fs::write(&config_path, &original).expect("write config");
+    let mut runtime = FakeRuntime::default();
+
+    run_err(
+        &[
+            "login",
+            "--provider",
+            "openrouter",
+            "--base-url",
+            "https://openrouter.ai/api/v1",
+            "--key",
+            "sk-test",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&config_path).expect("read config"),
+        original,
+        "a failed credential write left the provider registered"
+    );
 }

@@ -174,7 +174,7 @@ pub fn selected_config_path(
 /// Returns an error when the config cannot be read, parsed, or written,
 /// when `base_url` is empty, or when `id` is already registered with a
 /// different `base-url`.
-pub fn register_provider(path: &Path, id: &str, base_url: &str) -> Result<()> {
+pub fn register_provider(path: &Path, id: &str, base_url: &str) -> Result<String> {
     // Read-modify-write on one shared file. Two registrations racing each
     // other each read, insert, and write the whole file back, so the
     // slower one silently drops the faster one's provider while both
@@ -194,11 +194,19 @@ pub fn register_provider(path: &Path, id: &str, base_url: &str) -> Result<()> {
     // slash, which some hosts answer with a 404 that names nothing
     // (AC-5).
     let base_url = normalize_base_url(base_url);
+    // Before the file is read. `validate_providers` below would catch an
+    // empty URL with the same message, but only after parsing the config
+    // and inserting the entry: refusing here keeps a bad argument from
+    // touching the operator's file at all.
     if base_url.is_empty() {
         bail!("providers: {id} is missing base-url");
     }
     let text =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    // Returned so a caller that must undo this restores what the file held
+    // *under this lock*. Reading it outside would capture a racing
+    // writer's absence and erase their registration on undo.
+    let before = text.clone();
     let mut raw: RawConfig = if text.trim().is_empty() {
         RawConfig::default()
     } else {
@@ -219,7 +227,8 @@ pub fn register_provider(path: &Path, id: &str, base_url: &str) -> Result<()> {
     // The same validation the load path applies, so a name this file
     // would reject cannot enter through this door (AC-7).
     validate_providers(&raw.providers)?;
-    write_config(path, &raw, false)
+    write_config(path, &raw, false)?;
+    Ok(before)
 }
 
 /// Load config from an explicit path, the default home config, or legacy workspace config.
@@ -482,7 +491,27 @@ fn write_config(path: &Path, raw: &RawConfig, private_parent: bool) -> Result<()
     }
 
     let text = serde_yaml::to_string(raw).context("failed to encode config YAML")?;
-    fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))?;
+    // Temp file plus rename, as `usage.json` is written. `fs::write`
+    // truncates first, so a concurrent reader sees an empty file, decides
+    // `api-keys` is missing, generates a fresh key and writes a whole new
+    // config over everything — verified: eight concurrent registrations
+    // left four, each having silently replaced the file.
+    //
+    // A rename replaces the file rather than writing through it, so a
+    // read-only config would be silently replaced and its mode reset.
+    // Refuse first: an operator who chmods a file means it.
+    if let Ok(existing) = fs::metadata(path)
+        && existing.permissions().readonly()
+    {
+        bail!("failed to write {}: Permission denied", path.display());
+    }
+    let temp = path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    fs::write(&temp, text).with_context(|| format!("failed to write {}", temp.display()))?;
+    fs::rename(&temp, path)
+        .with_context(|| format!("failed to move {} into place", temp.display()))?;
     set_mode(path, 0o600)
 }
 
@@ -661,6 +690,78 @@ mod register_tests {
             !dir.path().join("x.lock.lock").exists(),
             "the lock outlived the registration"
         );
+    }
+
+    /// An empty URL is refused before the config is read, not after it is
+    /// parsed and the entry inserted. `validate_providers` catches it
+    /// too, with the same message — so the message cannot tell the two
+    /// apart, and only the untouched file can.
+    #[test]
+    fn an_empty_url_is_refused_without_reading_the_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yaml");
+        // Not valid YAML: reaching the parser at all is a failure, and it
+        // would report `invalid config` rather than the missing URL.
+        fs::write(&path, "{not yaml at all").expect("write config");
+
+        let error = register_provider(&path, "groq", "   ").expect_err("an empty URL was accepted");
+
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("missing base-url"),
+            "the config was read before the URL was checked: {error}"
+        );
+    }
+
+    /// `fs::write` truncates before it writes, so a concurrent reader saw
+    /// an empty file, concluded `api-keys` was missing, generated a fresh
+    /// key and wrote a whole new config over everything. Eight concurrent
+    /// registrations left four, each silently replacing the file — and
+    /// the lock could not prevent it, because `load_config` runs before
+    /// the lock is taken.
+    #[test]
+    fn a_reader_never_sees_a_half_written_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yaml");
+        let original =
+            "host: \"127.0.0.1\"\nport: 8317\napi-keys:\n  - sk-original\nproviders: {}\n";
+        fs::write(&path, original).expect("write config");
+
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let writer_path = path.clone();
+                scope.spawn(move || {
+                    register_provider(
+                        &writer_path,
+                        &format!("p{index}"),
+                        &format!("https://h{index}/v1"),
+                    )
+                    .expect("register");
+                });
+                // A reader racing every writer: it must never observe a
+                // file that parses as empty.
+                let reader_path = path.clone();
+                scope.spawn(move || {
+                    for _ in 0..20 {
+                        if let Ok(text) = fs::read_to_string(&reader_path) {
+                            assert!(
+                                text.contains("api-keys"),
+                                "a reader saw a half-written config: {text:?}"
+                            );
+                        }
+                    }
+                });
+            }
+        });
+
+        let after = fs::read_to_string(&path).expect("read config");
+        assert!(
+            after.contains("sk-original"),
+            "the original api-key was replaced: {after}"
+        );
+        for index in 0..8 {
+            assert!(after.contains(&format!("p{index}:")), "p{index} was lost");
+        }
     }
 
     /// The same URL is not a conflict, so a caller repeating itself is
