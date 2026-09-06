@@ -108,9 +108,12 @@ in files.
 
 - **A configured endpoint serves every dialect its models can carry.** It
   speaks only Chat Completions upstream, so a Messages request is translated
-  onto it — request, whole response, and the SSE stream — rather than refused.
-  Responses and `count_tokens` stay 501 there: no client asks for the first,
-  and the second is anthropic's own endpoint.
+  onto it — request, whole response, and the SSE stream — rather than refused
+  (ADR-0016, which supersedes ADR-0011's inbound clause). Responses and
+  `count_tokens` stay 501 there: no client asks for the first, and the second is
+  anthropic's own endpoint. Two losses in that translation are deliberate:
+  anthropic server tools are dropped, and thinking blocks do not travel back
+  upstream.
 - **Cloaking runs in two layers.** The sanitizer (`masquerade_request`) runs on
   the `/messages` route only; the vendor-identity inject (`apply_cloaking`) runs
   inside the Upstream client for anthropic on every dialect. A Chat- or
