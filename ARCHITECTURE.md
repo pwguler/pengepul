@@ -48,7 +48,8 @@ in files.
 - **Model catalog** (`models.rs`) — resolves a model id to exactly one Provider,
   and advertises every served model under its `<provider>/` prefix with the
   per-model metadata the client needs (context window, output cap, modalities,
-  pricing).
+  pricing). It also decides the name the vendor is told: `upstream_model`
+  removes the `<provider>/` prefix and any trailing client thinking level.
 - **Translation** (`translate.rs`, `streaming.rs`) — rewrites a body between
   Inbound and upstream **Dialect**, whole-document and one SSE event at a time;
   pure JSON, no I/O.
@@ -111,6 +112,12 @@ in files.
 - **One model id resolves to exactly one Provider**, and an id nobody claims is
   refused 400 before any Account is touched. A bare id never routes to a
   configured endpoint — only an explicit `<provider>/` prefix does.
+- **A client's vocabulary does not reach the vendor.** `upstream_model` strips
+  the `<provider>/` prefix and a trailing `:<thinking level>` — pi's shorthand,
+  which no vendor parses — so the request asks for a model the vendor has and
+  Usage counters key on that one name rather than one row per level. Only the
+  seven levels pi defines are a suffix: an id ending in anything else, such as
+  the served `LongCat-2.0:free`, is a name and travels whole.
 - **Failover only moves a request between Accounts of the same Provider**,
   resolved once before the attempt loop.
 - **Every route authenticates before it parses a body.** `/health` is the only
