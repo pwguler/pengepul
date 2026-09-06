@@ -568,3 +568,32 @@ fn a_client_already_at_budget_keeps_every_breakpoint_it_asked_for() {
     assert_eq!(total, 4);
     assert_eq!(marked, vec![10, 24], "the client's own markers moved");
 }
+
+#[test]
+fn the_checkpoint_inherits_the_retention_the_client_asked_for() {
+    // The marker is lifted to 1h before it is reallocated, so a checkpoint
+    // placed in the conversation lives as long as the prefix it came from.
+    // A bare `ephemeral` here would expire in five minutes behind an
+    // hour-long client breakpoint and buy nothing after that.
+    let long = json!({"type": "ephemeral", "ttl": "1h"});
+    let mut body = conversation_body(25);
+    body["system"][0]["cache_control"] = long.clone();
+    body["tools"][0]["cache_control"] = long.clone();
+    let last = body["messages"].as_array().unwrap().len() - 1;
+    body["messages"][last]["content"][0]["cache_control"] = long.clone();
+
+    let cloaked = apply_cloaking(
+        &body,
+        &BTreeMap::new(),
+        &account(ProviderId::anthropic()),
+        &config(),
+    );
+
+    let (marked, total) = breakpoints(&cloaked);
+    assert_eq!(total, 4);
+    assert_eq!(marked, vec![20, 24]);
+    assert_eq!(
+        cloaked["messages"][20]["content"][0]["cache_control"], long,
+        "the checkpoint dropped the client's 1h retention"
+    );
+}

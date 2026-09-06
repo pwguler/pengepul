@@ -420,9 +420,12 @@ pub fn apply_cloaking(
         })
     });
     // Anthropic renders tools, then system, then messages, and refuses a 1h
-    // breakpoint that comes after a 5m one. The prefix is always the first
-    // marked block, so a client asking for 1h retention was answered 400 on
-    // every request until the prefix carried the same TTL.
+    // breakpoint that comes after a 5m one. Our marker precedes every client
+    // breakpoint in `messages` wherever it ends up, so a client asking for 1h
+    // retention was answered 400 on every request until it carried the same
+    // TTL. Lifted here, before `reallocate_prefix_breakpoint` may move it
+    // into the conversation, so the checkpoint inherits the client's TTL
+    // rather than expiring in five minutes behind an hour-long prefix.
     if requests_long_retention(body) && prefix.get("cache_control").is_some() {
         prefix["cache_control"] = json!({"type": "ephemeral", "ttl": "1h"});
     }
