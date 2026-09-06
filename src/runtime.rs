@@ -13,7 +13,7 @@ use crate::oauth::{
     ANTHROPIC_REDIRECT_URI, CODEX_CALLBACK_PATH, CODEX_CALLBACK_PORT, exchange_anthropic_code,
     exchange_codex_code, generate_anthropic_auth_url, generate_codex_auth_url,
 };
-use crate::render::{AMBER, BOLD, DIM, GREEN, pad, paint};
+use crate::render::{BOLD, DIM, GREEN, pad, paint};
 use crate::service::{ServiceOptions, run_command};
 use crate::tokens::save_token;
 use crate::types::{PkceCodes, ProviderId, ProviderKind};
@@ -267,7 +267,6 @@ fn picker_loop(
     let mut filter = String::new();
     let mut cursor = 0usize;
     let mut scroll = 0usize;
-    let mut note = String::new();
     loop {
         let matching = matching_choices(choices, &filter);
         cursor = cursor.min(matching.len().saturating_sub(1));
@@ -279,11 +278,9 @@ fn picker_loop(
                 matching: &matching,
                 filter: &filter,
                 cursor,
-                note: &note,
             },
             &mut scroll,
         )?;
-        note.clear();
         let Event::Key(key) = next_event()? else {
             continue;
         };
@@ -307,18 +304,11 @@ fn picker_loop(
             KeyCode::Backspace => {
                 filter.pop();
             }
-            KeyCode::Enter => match matching.get(cursor) {
-                None => {}
-                // Refused here rather than three screens into the harness.
-                // The row stays on the list so the reason has somewhere to
-                // be read.
-                Some(choice) if choice.unavailable.is_some() => {
-                    if let Some(unavailable) = &choice.unavailable {
-                        note.clone_from(&unavailable.reason);
-                    }
+            KeyCode::Enter => {
+                if let Some(choice) = matching.get(cursor) {
+                    return Ok(Some(choice.id.clone()));
                 }
-                Some(choice) => return Ok(Some(choice.id.clone())),
-            },
+            }
             KeyCode::Char(character) => {
                 filter.push(character);
                 // A narrower list means the old row number means nothing.
@@ -338,7 +328,6 @@ struct PickerFrame<'a> {
     matching: &'a [ModelChoice],
     filter: &'a str,
     cursor: usize,
-    note: &'a str,
 }
 
 /// Paint one frame and return how many model rows fit, which is also the
@@ -360,7 +349,6 @@ fn draw_picker(
         matching,
         filter,
         cursor,
-        note,
     } = frame_state;
 
     let (columns, lines) = terminal::size().unwrap_or((80, 24));
@@ -412,13 +400,8 @@ fn draw_picker(
     }
     for (offset, choice) in matching.iter().skip(*scroll).take(rows).enumerate() {
         let selected = *scroll + offset == cursor;
-        let blocked = choice.unavailable.is_some();
-        let tail = match &choice.unavailable {
-            Some(unavailable) => paint(AMBER, &unavailable.tag),
-            None => paint(DIM, &choice.price),
-        };
         let row = format!(
-            "{} {}  {}  {tail}",
+            "{} {}  {}  {}",
             if selected {
                 paint(GREEN, "❯")
             } else {
@@ -426,20 +409,16 @@ fn draw_picker(
             },
             // The pool prefix repeats down the whole list, so it is dimmed
             // and the model name keeps the reader's attention.
-            paint_id(&pad(&choice.id, id_width), selected, blocked),
+            paint_id(&pad(&choice.id, id_width), selected),
             paint(DIM, &format!("{:>context_width$}", choice.context)),
+            paint(DIM, &choice.price),
         );
         frame.push(row);
     }
     for _ in matching.len().saturating_sub(*scroll).min(rows)..rows {
         frame.push(String::new());
     }
-    let footer = if note.is_empty() {
-        paint(DIM, "  ↑↓ move   ⏎ run   esc cancel")
-    } else {
-        paint(AMBER, &format!("  {note}"))
-    };
-    frame.push(footer);
+    frame.push(paint(DIM, "  ↑↓ move   ⏎ run   esc cancel"));
 
     execute!(
         screen,
@@ -453,12 +432,8 @@ fn draw_picker(
 
 /// One model id, already padded: the `<pool>/` prefix dim and the model
 /// name bright, so a column of `commandcode/...` reads as its models
-/// rather than as its pool. A blocked row is dim throughout; the
-/// highlighted one is bright throughout.
-fn paint_id(padded: &str, selected: bool, blocked: bool) -> String {
-    if blocked {
-        return paint(DIM, padded);
-    }
+/// rather than as its pool. The highlighted row is bright throughout.
+fn paint_id(padded: &str, selected: bool) -> String {
     if selected {
         return paint(BOLD, padded);
     }

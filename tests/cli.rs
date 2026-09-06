@@ -4572,34 +4572,6 @@ fn launch_claude_moves_every_model_tier() {
 }
 
 #[test]
-fn launch_claude_refuses_a_chat_completions_only_model() {
-    let tmp = tempdir().expect("tempdir");
-    write_config_with_providers(
-        tmp.path(),
-        "  groq:\n    base-url: https://api.groq.com/openai/v1\n",
-    );
-    let mut runtime = FakeRuntime::default();
-
-    let error = run_err(
-        &[
-            "launch",
-            "claude",
-            "--model",
-            "groq/llama-3.3-70b-versatile",
-        ],
-        tmp.path(),
-        &mut runtime,
-    );
-
-    assert!(error.contains("groq"), "{error}");
-    assert!(error.contains("Chat Completions"), "{error}");
-    assert!(
-        runtime.launch_plan.is_none(),
-        "a harness that would 501 on its first prompt must not start"
-    );
-}
-
-#[test]
 fn launch_claude_keeps_a_built_in_prefix() {
     // `anthropic/` and `codex/` name built-ins, not `providers:` entries, and
     // both serve Messages — the guard above must not fire on them.
@@ -4858,38 +4830,67 @@ fn launch_claude_picks_a_model_from_the_relay() {
 }
 
 #[test]
-fn the_picker_offers_the_whole_catalog_and_marks_what_claude_cannot_use() {
-    // The unusable rows stay on the list carrying their reason. Hiding them
-    // makes two thirds of the relay look missing; the reason is the point.
+fn the_picker_offers_the_whole_catalog_to_claude() {
+    // Every advertised model, in the relay's own order, none of them
+    // marked: the relay translates Messages onto a configured endpoint's
+    // Chat Completions, so what is listed is what can be run.
     let tmp = tempdir().expect("tempdir");
     write_config_with_providers(
         tmp.path(),
         "  groq:\n    base-url: https://api.groq.com/openai/v1\n",
     );
-    let mut runtime = picking(1);
+    let mut runtime = picking(3);
 
-    run(&["launch", "claude"], tmp.path(), &mut runtime);
+    let outcome = run(&["launch", "claude"], tmp.path(), &mut runtime);
 
+    assert_eq!(outcome.code, 0);
     let choices = offered(&runtime);
-    assert_eq!(choices.len(), 3, "every advertised model is on the list");
-    let groq = choices
-        .iter()
-        .find(|choice| choice.id.starts_with("groq/"))
-        .expect("the configured endpoint's model is listed");
-    let blocked = groq.unavailable.as_ref().expect("marked unavailable");
-    // A tag short enough for the row, and a sentence for when it is chosen.
-    assert_eq!(blocked.tag, "chat completions only");
-    assert!(blocked.reason.contains("Chat Completions"), "{blocked:?}");
-    assert!(blocked.tag.len() < blocked.reason.len());
-    // And the ones that work sort first, so the arrow keys land on those.
-    assert!(choices[0].unavailable.is_none());
-    assert!(choices[1].unavailable.is_none());
-    assert!(choices[2].unavailable.is_some());
+    assert_eq!(
+        choices.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+        [
+            "anthropic/claude-opus-5",
+            "anthropic/claude-haiku-4-5",
+            "groq/llama-3.3-70b-versatile"
+        ]
+    );
+    // And the configured endpoint's model is an ordinary choice for claude.
+    assert_eq!(
+        env_value(&launched(&runtime), "ANTHROPIC_MODEL"),
+        Some("groq/llama-3.3-70b-versatile")
+    );
 }
 
 #[test]
-fn the_picker_marks_nothing_for_pi() {
-    // pi's provider picks a wire per model, so every advertised model works.
+fn a_configured_provider_model_is_an_ordinary_choice_for_claude() {
+    // This was refused before the relay could serve Messages from such an
+    // endpoint. Nothing refuses it now.
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  groq:\n    base-url: https://api.groq.com/openai/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+
+    let outcome = run(
+        &[
+            "launch",
+            "claude",
+            "--model",
+            "groq/llama-3.3-70b-versatile",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    assert_eq!(outcome.code, 0);
+    assert_eq!(
+        env_value(&launched(&runtime), "ANTHROPIC_MODEL"),
+        Some("groq/llama-3.3-70b-versatile")
+    );
+}
+
+#[test]
+fn launch_pi_picks_from_the_same_catalog() {
     let tmp = tempdir().expect("tempdir");
     write_config_with_providers(
         tmp.path(),
@@ -4900,7 +4901,7 @@ fn the_picker_marks_nothing_for_pi() {
     let outcome = run(&["launch", "pi"], tmp.path(), &mut runtime);
 
     assert_eq!(outcome.code, 0);
-    assert!(offered(&runtime).iter().all(|c| c.unavailable.is_none()));
+    assert_eq!(offered(&runtime).len(), 3);
     assert_eq!(
         launched(&runtime).args,
         [

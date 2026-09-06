@@ -37,9 +37,9 @@ tombol panah, sambil mengetik untuk mencari:
   anthropic/claude-opus-4-7             1.0M ctx  $5.00/$25.00
   anthropic/claude-opus-4-8             1.0M ctx  $5.00/$25.00
   anthropic/claude-opus-5               1.0M ctx  $5.00/$25.00
-  commandcode/claude-opus-5             1.0M ctx  chat completions only
-  commandcode/claude-opus-4-8           1.0M ctx  chat completions only
-  commandcode/claude-opus-4-7           1.0M ctx  chat completions only
+  commandcode/claude-opus-5             1.0M ctx  $5.00/$25.00
+  commandcode/claude-opus-4-8           1.0M ctx  $5.00/$25.00
+  commandcode/claude-opus-4-7           1.0M ctx  $5.00/$25.00
 
   ↑↓ move   ⏎ run   esc cancel
 ```
@@ -89,20 +89,16 @@ hanya penolakan.
   terpisah, bukan satu kalimat.
 - **Prefiks pool diredupkan.** `commandcode/` berulang di puluhan baris dan
   bukan itu yang dibaca. Prefiksnya redup, nama modelnya terang.
-- **Alasannya di barisnya sendiri.** Baris yang tak terlayani membawa tag
-  pendek (`chat completions only`) di kolom harga; kalimat panjangnya
-  muncul di kaki layar kalau enter tetap ditekan. Itu sebabnya
-  `Unavailable` punya dua field, bukan satu.
+- **Tidak ada baris yang ditandai.** Kolom terakhir selalu harga, karena
+  tidak ada lagi baris yang perlu menjelaskan dirinya.
 - **Layar alternatif, dan dikembalikan di setiap jalan keluar.**
   Scrollback operator selamat, dan raw mode dilepas juga pada jalur error
   — itu sebabnya hasil loop ditangkap dulu, bukan dilempar lewat `?`.
-- **Yang tidak bisa dilayani tetap ditampilkan, dengan alasannya.** Versi
-  pertama menyembunyikan model yang tak bisa menjawab Messages. Dua
-  pertiga katalog lenyap tanpa penjelasan, dan yang terlihat operator
-  adalah relay yang kehilangan modelnya. Sekarang barisnya tetap ada,
-  ditandai `unavailable`, diurutkan di belakang, dan enter di atasnya
-  memunculkan sebabnya, bukan 501 di prompt pertama. Pool tanpa akun
-  memang tidak muncul: `/v1/models` tidak mengiklankannya.
+- **Semua model bisa dipilih, karena semuanya bisa dijalankan.** Daftar
+  ini tidak menandai apa pun: relay menerjemahkan Messages ke Chat
+  Completions untuk endpoint terkonfigurasi, jadi `commandcode/...` di
+  bawah `launch claude` sama sahnya dengan `anthropic/...`. Pool tanpa
+  akun tetap tidak muncul: `/v1/models` tidak mengiklankannya.
 - **Piped berarti tidak bertanya.** Menu di atas pipe akan memakan satu
   baris milik skrip orang. `stdout_is_tty` sudah jadi seam sejak
   `Style::from_tty`, dan verb ini memakainya lagi: tanpa terminal,
@@ -115,11 +111,6 @@ hanya penolakan.
   ada di lingkungan operator mengalahkan `ANTHROPIC_AUTH_TOKEN`, dan
   mengirim harness ke api.anthropic.com dengan meteran per-token — satu
   hal yang justru dihindari verb ini.
-- **Model provider terkonfigurasi ditolak untuk claude.** Claude Code
-  bicara dialek Messages, dan endpoint OpenAI-compatible menjawab 501
-  untuk itu. Id model sudah menyebut providernya, jadi penolakannya lokal
-  dan datang sebelum harness menyala, bukan sebagai 501 di prompt
-  pertama.
 - **Ekstensi pi adalah prasyarat, bukan urusan `launch`.** Provider
   `pengepul` di pi didaftarkan `@pwguler/pi-pengepul-provider`. Menaruh
   `-e npm:@pwguler/pi-pengepul-provider` di baris exec membuat verb ini
@@ -159,9 +150,8 @@ hanya penolakan.
   `ANTHROPIC_DEFAULT_*_MODEL`, dan `CLAUDE_CODE_SUBAGENT_MODEL` ke id
   yang sama.
 - AC-4: `launch claude --model <p>/<m>` dengan `<p>` sebuah entri
-  `providers:` gagal, menyebut nama providernya dan Chat Completions, dan
-  tidak menjalankan apa pun. Prefiks `anthropic/` dan `codex/` lolos:
-  keduanya bawaan, bukan entri config.
+  `providers:` berjalan seperti model lain. Relay yang menutup jaraknya,
+  bukan verb ini.
 - AC-5: `launch pi --model <id>` menjalankan `pi --provider pengepul
   --model <id>` dengan `PENGEPUL_BASE_URL` dan `PENGEPUL_API_KEY` di
   lingkungannya.
@@ -180,19 +170,18 @@ hanya penolakan.
   separator `--`.
 - AC-13: Tanpa `--model` dan di terminal, `launch` membaca `/v1/models`
   dan menawarkan **seluruh** isinya; panah memilih, enter menjalankan.
-- AC-14: Baris yang tidak bisa dilayani harness ini tetap ada di daftar,
-  ditandai beserta sebabnya, dan diurutkan setelah yang bisa. Untuk pi
-  tidak ada yang ditandai.
-- AC-15: Enter di atas baris yang ditandai tidak menjalankan apa pun dan
-  memunculkan sebabnya.
+- AC-14: Daftarnya sama untuk kedua harness, dalam urutan yang
+  diiklankan relay, dan tidak ada baris yang ditandai.
 - AC-16: Mengetik menyaring seketika; kata-kata menyempit bersama.
 - AC-17: Esc dan Ctrl-C membatalkan. Batal berarti claude memakai
   defaultnya sendiri, dan pi menolak dengan pesan `--model`.
 - AC-18: Dengan output di-pipe, tidak ada picker dan tidak ada permintaan
   `/v1/models`; perilakunya sama seperti sebelum picker ada.
 - AC-19: `--model` yang eksplisit melewati picker sepenuhnya.
-- AC-20: Baris yang tak terlayani membawa tag pendeknya di daftar, dan
-  kalimat panjangnya hanya muncul saat baris itu dipilih.
+- AC-20: Permintaan Messages untuk provider terkonfigurasi sampai ke
+  endpoint-nya sebagai Chat Completions — `system` jadi pesan sistem,
+  `tool_use` jadi `tool_calls`, `tool_result` jadi pesan `tool` sendiri —
+  dan jawabannya, utuh maupun streaming, kembali sebagai Messages.
 - AC-21: Terminal dikembalikan — raw mode lepas, layar alternatif
   ditinggalkan, kursor kembali — termasuk saat picker gagal.
 - AC-22: `launch` sendiri tidak menulis file apa pun: tidak ada config
@@ -228,6 +217,15 @@ Setiap kriteria butuh tes yang gagal ketika perbaikannya dibalik.
 
 ## Revisions
 
+- **Model yang ditandai jadi model yang jalan.** Menampilkan 67 baris
+  `chat completions only` menjawab pertanyaan yang salah: operator tidak
+  ingin tahu kenapa mereka mati, ia ingin mereka hidup. Jadi relay yang
+  berubah, bukan pickernya — `anthropic_to_chat_request`,
+  `chat_to_anthropic_message` dan `chat_sse_to_anthropic` menutup jarak
+  dialeknya, dan seluruh gagasan `unavailable` ikut hilang bersama
+  tagnya. Dibuktikan dengan Claude Code menjalankan satu giliran
+  ber-tool di atas model commandcode: Read dipanggil, hasilnya kembali,
+  jawabannya benar.
 - **Kotak pencarian dibuang, lalu seluruh tampilannya dirancang ulang.**
   Kotak di sekeliling teks yang diketik hanya menambah tiga baris tanpa
   menambah arti. Yang menggantikannya bukan sekadar mengembalikan label:
@@ -257,13 +255,9 @@ Setiap kriteria butuh tes yang gagal ketika perbaikannya dibalik.
 - **Harness yang butuh file config.** openclaw dan hermes menunggu
   keputusan soal cadangan dan penggabungan — pertanyaan yang sama yang
   `register_provider` sudah bayar mahal untuk `config.yaml`.
-- **Messages untuk provider terkonfigurasi.** Ini yang membuat 67 model
-  itu `unavailable`: `route_request` hanya mengirim `RequestRoute::Chat`
-  ke `ProviderKind::Generic`, jadi Claude Code — yang bicara Messages —
-  tidak bisa memakainya sama sekali. Menjadikannya bisa berarti dua
-  terjemahan baru (permintaan Messages ke Chat Completions, dan
-  jawabannya kembali) plus jalur SSE-nya, di jalur yang melayani. Bukan
-  urusan verb ini; dicatat karena verb ini yang membuatnya kelihatan.
+- **Responses untuk provider terkonfigurasi.** Messages sudah
+  diterjemahkan; Responses belum, dan tetap 501. Belum ada klien yang
+  memintanya lewat jalur itu.
 - **Pool kosong di balik `--model`.** `launch claude --model gpt-5.4` ke
   relay tanpa akun codex membuat relay menjawab 503 — rutenya benar,
   poolnya yang kosong — dan Claude Code mengulanginya dengan backoff, jadi

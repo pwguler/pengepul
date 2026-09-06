@@ -102,7 +102,7 @@ _Avoid_: billing classifier, detector, filter
 - **Cloaking** applies to requests bound for the anthropic and codex **Upstreams**; configured OpenAI-compatible endpoints are never cloaked. The **Local API key** applies to requests arriving from a client.
 - One pengepul endpoint accepts exactly one **Inbound dialect**; one **Provider** accepts exactly one **Dialect** upstream.
 - A **Harness** reaches the relay through its own configuration, never through a route made for it (ADR-0007). `pengepul launch` writes that configuration into one process instead of onto disk, so it covers only the **Harnesses** that can be redirected per-process.
-- Any **Inbound dialect** may be served by anthropic or codex, and **Translation** is what closes the gap. A configured OpenAI-compatible endpoint accepts only the Chat Completions dialect and answers 501 for the others. count_tokens is anthropic-only and answers 501 elsewhere.
+- Any **Inbound dialect** may be served by anthropic or codex, and **Translation** is what closes the gap. A configured OpenAI-compatible endpoint speaks only Chat Completions upstream, so Messages is translated onto it and Responses answers 501. count_tokens is anthropic-only and answers 501 elsewhere.
 
 ## Example dialogue
 

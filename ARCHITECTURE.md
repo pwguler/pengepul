@@ -51,7 +51,9 @@ in files.
   pricing).
 - **Translation** (`translate.rs`, `streaming.rs`) — rewrites a body between
   Inbound and upstream **Dialect**, whole-document and one SSE event at a time;
-  pure JSON, no I/O.
+  pure JSON, no I/O. Every pair the route table can produce has a translation,
+  Messages↔Chat Completions included, so a configured endpoint serves a
+  Messages client by translation rather than by refusal.
 - **Config** (`config.rs`) — parses `config.yaml`, including the `providers:`
   section, which is the only Provider registry: there is no database table.
   It also writes it: `register_provider` adds one entry for `login
@@ -103,6 +105,11 @@ in files.
 
 ## Invariants
 
+- **A configured endpoint serves every dialect its models can carry.** It
+  speaks only Chat Completions upstream, so a Messages request is translated
+  onto it — request, whole response, and the SSE stream — rather than refused.
+  Responses and `count_tokens` stay 501 there: no client asks for the first,
+  and the second is anthropic's own endpoint.
 - **Cloaking runs in two layers.** The sanitizer (`masquerade_request`) runs on
   the `/messages` route only; the vendor-identity inject (`apply_cloaking`) runs
   inside the Upstream client for anthropic on every dialect. A Chat- or
@@ -197,9 +204,8 @@ in files.
   files, so they stay the README's manual step (ADR-0007 still holds: the
   client adapts, and `launch` only writes that adaptation into one process
   instead of onto disk). It is also why `launch claude --model` refuses a
-  configured provider: Claude Code speaks Messages, which such an endpoint
-  answers 501 for, and the model id already names the provider. The picker
-  lists such a model as `unavailable` and refuses it at the keystroke:
-  hiding it made two thirds of the catalog look lost. It opens nothing at
-  all when stdout is not a terminal, where raw mode would seize a terminal
-  nobody is watching.
+  configured provider. The picker
+  offers every advertised model to either harness, because every one of them
+  can be run: the relay translates Messages onto a configured endpoint rather
+  than refusing it. It opens nothing at all when stdout is not a terminal,
+  where raw mode would seize a terminal nobody is watching.

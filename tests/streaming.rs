@@ -1,7 +1,7 @@
 use pengepul::streaming::{
     AnthropicStreamState, ChatStreamState, ResponsesStreamState, anthropic_sse_to_chat,
-    anthropic_sse_to_responses, parse_sse_events, responses_sse_to_anthropic,
-    responses_sse_to_chat, responses_sse_to_payload,
+    anthropic_sse_to_responses, chat_sse_to_anthropic, parse_sse_events,
+    responses_sse_to_anthropic, responses_sse_to_chat, responses_sse_to_payload,
 };
 use serde_json::{Value, json};
 
@@ -750,5 +750,100 @@ fn codex_response_failed_terminates_the_chat_stream() {
     assert!(
         joined.contains("data: [DONE]"),
         "stream must terminate with the sentinel: {joined}"
+    );
+}
+
+#[test]
+fn a_chat_stream_opens_and_closes_a_messages_message() {
+    let mut state = AnthropicStreamState::new("glm-5.3");
+
+    let first = chat_sse_to_anthropic(
+        &json!({"choices": [{"delta": {"role": "assistant", "content": "po"}}]}),
+        &mut state,
+    );
+    // No event in this dialect opens a message, so the first chunk does.
+    assert!(first[0].contains("message_start"), "{first:?}");
+    assert!(first[1].contains("content_block_start"), "{first:?}");
+    assert!(first[2].contains("text_delta"), "{first:?}");
+
+    let second = chat_sse_to_anthropic(
+        &json!({"choices": [{"delta": {"content": "ng"}}]}),
+        &mut state,
+    );
+    // The block is already open, so only the delta goes out.
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert!(second[0].contains("\"text\":\"ng\""), "{second:?}");
+
+    let last = chat_sse_to_anthropic(
+        &json!({
+            "choices": [{"delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2}
+        }),
+        &mut state,
+    );
+    assert!(last[0].contains("content_block_stop"), "{last:?}");
+    assert!(last[1].contains("\"stop_reason\":\"end_turn\""), "{last:?}");
+    assert!(last[1].contains("\"output_tokens\":2"), "{last:?}");
+    assert!(last[2].contains("message_stop"), "{last:?}");
+}
+
+#[test]
+fn a_chat_stream_tool_call_becomes_one_tool_use_block() {
+    let mut state = AnthropicStreamState::new("glm-5.3");
+
+    let open = chat_sse_to_anthropic(
+        &json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": "call_1",
+            "function": {"name": "read", "arguments": ""}
+        }]}}]}),
+        &mut state,
+    );
+    assert!(
+        open.iter()
+            .any(|chunk| chunk.contains("\"type\":\"tool_use\"")),
+        "{open:?}"
+    );
+    assert!(
+        open.iter().any(|chunk| chunk.contains("call_1")),
+        "{open:?}"
+    );
+
+    // The arguments arrive in pieces after it, keyed by the same index, and
+    // land on the block that index opened.
+    let piece = chat_sse_to_anthropic(
+        &json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "function": {"arguments": "{\"path\":"}
+        }]}}]}),
+        &mut state,
+    );
+    assert_eq!(piece.len(), 1, "{piece:?}");
+    assert!(piece[0].contains("input_json_delta"), "{piece:?}");
+    assert!(piece[0].contains("\"index\":0"), "{piece:?}");
+
+    let done = chat_sse_to_anthropic(
+        &json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+        &mut state,
+    );
+    assert!(done[1].contains("\"stop_reason\":\"tool_use\""), "{done:?}");
+}
+
+#[test]
+fn a_chat_stream_reasoning_delta_becomes_a_thinking_block() {
+    let mut state = AnthropicStreamState::new("glm-5.3");
+
+    let chunks = chat_sse_to_anthropic(
+        &json!({"choices": [{"delta": {"reasoning_content": "hmm"}}]}),
+        &mut state,
+    );
+
+    assert!(
+        chunks.iter().any(|c| c.contains("\"type\":\"thinking\"")),
+        "{chunks:?}"
+    );
+    assert!(
+        chunks.iter().any(|c| c.contains("thinking_delta")),
+        "{chunks:?}"
     );
 }

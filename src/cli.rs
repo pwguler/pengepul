@@ -54,9 +54,7 @@ pub struct LaunchPlan {
 }
 
 /// One row of the model picker. The two facts that separate ids are kept
-/// apart so the picker can align them into columns; a row the relay cannot
-/// serve to this harness stays on the list carrying its reason, rather
-/// than going missing and looking like the relay lost it.
+/// apart so the picker can align them into columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelChoice {
     pub id: String,
@@ -64,15 +62,6 @@ pub struct ModelChoice {
     pub context: String,
     /// `$5.00/$25.00` per million in and out, or empty.
     pub price: String,
-    pub unavailable: Option<Unavailable>,
-}
-
-/// Why a harness cannot be given a model: a tag short enough to sit on the
-/// row, and the sentence shown if the operator picks it anyway.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Unavailable {
-    pub tag: String,
-    pub reason: String,
 }
 
 pub trait CliRuntime {
@@ -1138,7 +1127,7 @@ fn launch(
         // does what it does with no model at all.
         None if runtime.stdout_is_tty() => {
             let catalog = runtime.models(&base_url, &api_key)?;
-            let choices = model_choices(&catalog, harness, &config);
+            let choices = model_choices(&catalog);
             if choices.is_empty() {
                 None
             } else {
@@ -1147,56 +1136,30 @@ fn launch(
         }
         None => None,
     };
-    let plan = launch_plan(
-        harness,
-        &base_url,
-        &api_key,
-        chosen.as_deref(),
-        forwarded,
-        &config,
-    )?;
+    let plan = launch_plan(harness, &base_url, &api_key, chosen.as_deref(), forwarded)?;
     runtime.launch(&plan)
 }
 
-/// Every model the relay advertises, each carrying whether this harness
-/// can be given it. claude speaks Messages, which a configured endpoint
-/// does not serve, so those rows come back marked rather than removed: the
-/// operator sees the whole catalog and the reason, instead of wondering
-/// where two thirds of it went. Selectable rows sort first.
-fn model_choices(catalog: &Value, harness: Harness, config: &Config) -> Vec<ModelChoice> {
+/// Every model the relay advertises, in the order it advertises them.
+/// Every one of them is a fair choice for either harness: the relay serves
+/// Messages from a configured endpoint by translating onto its Chat
+/// Completions dialect, so what is on the list is what can be run.
+fn model_choices(catalog: &Value) -> Vec<ModelChoice> {
     let Some(entries) = catalog.get("data").and_then(Value::as_array) else {
         return Vec::new();
     };
-    let mut choices: Vec<ModelChoice> = entries
+    entries
         .iter()
         .filter_map(|entry| {
             let id = entry.get("id").and_then(Value::as_str)?;
-            let unavailable = match harness {
-                Harness::Claude => claude_speaks_messages(id, config)
-                    .err()
-                    .map(|_| Unavailable {
-                        tag: "chat completions only".to_string(),
-                        reason: "claude speaks Messages, and this endpoint serves only Chat \
-                             Completions"
-                            .to_string(),
-                    }),
-                // pi's provider picks a wire per model, so every advertised
-                // model is a fair choice there.
-                Harness::Pi => None,
-            };
             let (context, price) = model_facts(entry);
             Some(ModelChoice {
                 id: id.to_string(),
                 context,
                 price,
-                unavailable,
             })
         })
-        .collect();
-    // A stable partition, so the catalog's own order survives inside each
-    // half and the list does not reshuffle between runs.
-    choices.sort_by_key(|choice| choice.unavailable.is_some());
-    choices
+        .collect()
 }
 
 /// What separates two ids on the list: the context window, and what a
@@ -1251,7 +1214,6 @@ fn launch_plan(
     api_key: &str,
     model: Option<&str>,
     forwarded: &[String],
-    config: &Config,
 ) -> Result<LaunchPlan> {
     match harness {
         Harness::Claude => {
@@ -1265,7 +1227,6 @@ fn launch_plan(
                 ("ANTHROPIC_API_KEY".to_string(), String::new()),
             ];
             if let Some(model) = model {
-                claude_speaks_messages(model, config)?;
                 // Every tier, not only the default one. The operator named
                 // one model; a `/model sonnet` that quietly went somewhere
                 // else would be the same silence this verb removes.
@@ -1316,23 +1277,6 @@ fn launch_plan(
             })
         }
     }
-}
-
-/// Claude Code speaks the Messages dialect, and a configured
-/// OpenAI-compatible endpoint answers 501 for it — Chat Completions is the
-/// only dialect it accepts. The model id already names its provider, so the
-/// refusal needs no network and arrives before the harness starts.
-fn claude_speaks_messages(model: &str, config: &Config) -> Result<()> {
-    let Some((prefix, _)) = model.split_once('/') else {
-        return Ok(());
-    };
-    if config.providers.contains_key(prefix) {
-        bail!(
-            "{prefix} serves only the Chat Completions dialect and claude speaks Messages; \
-             name an anthropic or codex model, or run this one under `pengepul launch pi`"
-        );
-    }
-    Ok(())
 }
 
 fn help_text(topic: &[String]) -> Result<String> {

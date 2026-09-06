@@ -1,6 +1,7 @@
 use pengepul::translate::{
-    anthropic_to_responses, anthropic_to_responses_request, chat_to_responses_request,
-    openai_to_anthropic, responses_to_anthropic, responses_to_anthropic_message,
+    anthropic_to_chat_request, anthropic_to_responses, anthropic_to_responses_request,
+    chat_to_anthropic_message, chat_to_responses_request, openai_to_anthropic,
+    responses_to_anthropic, responses_to_anthropic_message,
 };
 use serde_json::json;
 
@@ -557,4 +558,173 @@ fn chat_image_content_converts_to_responses_input_parts() {
         parts[1]["image_url"], "https://example.com/a.png",
         "responses wants a flat url string"
     );
+}
+
+#[test]
+fn a_messages_request_becomes_a_chat_completions_request() {
+    let body = json!({
+        "model": "llama-3.3-70b",
+        "max_tokens": 64,
+        "stop_sequences": ["STOP"],
+        "system": [{"type": "text", "text": "be brief"}],
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "looking"},
+                {"type": "tool_use", "id": "call_1", "name": "read", "input": {"path": "a.txt"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_1", "content": "contents"}
+            ]}
+        ],
+        "tools": [{
+            "name": "read",
+            "description": "read a file",
+            "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}
+        }],
+        "tool_choice": {"type": "any"}
+    });
+
+    let out = anthropic_to_chat_request(&body);
+
+    // The system block leads as a system message; this dialect has no
+    // `system` field of its own.
+    assert_eq!(out["messages"][0]["role"], "system");
+    assert_eq!(out["messages"][0]["content"], "be brief");
+    assert_eq!(out["messages"][1]["role"], "user");
+    assert_eq!(out["messages"][1]["content"], "hi");
+    // A tool_use block becomes a tool_calls entry with stringified arguments.
+    assert_eq!(out["messages"][2]["role"], "assistant");
+    assert_eq!(out["messages"][2]["content"], "looking");
+    assert_eq!(out["messages"][2]["tool_calls"][0]["id"], "call_1");
+    assert_eq!(
+        out["messages"][2]["tool_calls"][0]["function"]["name"],
+        "read"
+    );
+    assert_eq!(
+        out["messages"][2]["tool_calls"][0]["function"]["arguments"],
+        "{\"path\":\"a.txt\"}"
+    );
+    // And a tool_result leaves the user turn to become its own message.
+    assert_eq!(out["messages"][3]["role"], "tool");
+    assert_eq!(out["messages"][3]["tool_call_id"], "call_1");
+    assert_eq!(out["messages"][3]["content"], "contents");
+    assert_eq!(out["messages"].as_array().expect("messages").len(), 4);
+
+    assert_eq!(out["stop"][0], "STOP");
+    assert_eq!(out["max_tokens"], 64);
+    assert_eq!(out["tools"][0]["type"], "function");
+    assert_eq!(out["tools"][0]["function"]["name"], "read");
+    assert_eq!(
+        out["tools"][0]["function"]["parameters"]["properties"]["path"]["type"],
+        "string"
+    );
+    assert_eq!(out["tool_choice"], "required");
+}
+
+#[test]
+fn a_messages_image_becomes_a_data_url_part() {
+    let body = json!({
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image", "source": {
+                "type": "base64", "media_type": "image/png", "data": "AAAA"
+            }}
+        ]}]
+    });
+
+    let out = anthropic_to_chat_request(&body);
+
+    // Mixed content stays an array; text-only turns collapse to a string.
+    assert_eq!(out["messages"][0]["content"][0]["text"], "what is this");
+    assert_eq!(out["messages"][0]["content"][1]["type"], "image_url");
+    assert_eq!(
+        out["messages"][0]["content"][1]["image_url"]["url"],
+        "data:image/png;base64,AAAA"
+    );
+}
+
+#[test]
+fn a_vendor_server_tool_is_dropped_rather_than_offered() {
+    // A configured endpoint cannot run anthropic's own server tools, and a
+    // function the model calls into nothing is worse than no function.
+    let body = json!({
+        "messages": [],
+        "tools": [
+            {"type": "web_search_20250305", "name": "web_search"},
+            {"name": "read", "input_schema": {"type": "object"}}
+        ]
+    });
+
+    let out = anthropic_to_chat_request(&body);
+
+    let tools = out["tools"].as_array().expect("tools");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["function"]["name"], "read");
+}
+
+#[test]
+fn a_chat_completion_becomes_a_messages_reply() {
+    let payload = json!({
+        "id": "chatcmpl_1",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "reasoning_content": "thinking it over",
+                "content": "here you go",
+                "tool_calls": [{
+                    "id": "call_9",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": "{\"path\":\"a.txt\"}"}
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {"prompt_tokens": 11, "completion_tokens": 7}
+    });
+
+    let out = chat_to_anthropic_message(&payload, "glm-5.3");
+
+    assert_eq!(out["type"], "message");
+    assert_eq!(out["model"], "glm-5.3");
+    assert_eq!(out["content"][0]["type"], "thinking");
+    assert_eq!(out["content"][0]["thinking"], "thinking it over");
+    assert_eq!(out["content"][1]["type"], "text");
+    assert_eq!(out["content"][1]["text"], "here you go");
+    assert_eq!(out["content"][2]["type"], "tool_use");
+    assert_eq!(out["content"][2]["id"], "call_9");
+    // The arguments string is parsed back into the object this dialect wants.
+    assert_eq!(out["content"][2]["input"]["path"], "a.txt");
+    assert_eq!(out["stop_reason"], "tool_use");
+    assert_eq!(out["usage"]["input_tokens"], 11);
+    assert_eq!(out["usage"]["output_tokens"], 7);
+}
+
+#[test]
+fn a_finish_reason_carries_over_under_its_messages_name() {
+    for (finish, expected) in [
+        ("stop", "end_turn"),
+        ("length", "max_tokens"),
+        ("content_filter", "refusal"),
+    ] {
+        let payload = json!({
+            "choices": [{"message": {"content": "x"}, "finish_reason": finish}]
+        });
+        assert_eq!(
+            chat_to_anthropic_message(&payload, "m")["stop_reason"],
+            expected,
+            "{finish}"
+        );
+    }
+}
+
+#[test]
+fn an_empty_reply_carries_no_invented_blocks() {
+    let payload = json!({"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]});
+
+    let out = chat_to_anthropic_message(&payload, "m");
+
+    assert_eq!(out["content"].as_array().expect("content").len(), 0);
+    assert_eq!(out["stop_reason"], "end_turn");
 }

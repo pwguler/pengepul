@@ -1805,22 +1805,63 @@ async fn a_model_prefix_no_configured_provider_claims_is_unknown() {
 }
 
 #[tokio::test]
-async fn generic_models_answer_501_on_messages_responses_and_count_tokens() {
+async fn a_messages_request_reaches_a_generic_endpoint_as_chat_completions() {
     let tmp = tempfile::tempdir().expect("tempdir");
     save_token(tmp.path(), &groq_key_token()).expect("save groq key");
     let upstream = Arc::new(GenericUpstream::default());
     let app =
         create_app_with_upstream(config_with_groq(tmp.path().to_path_buf()), upstream.clone());
 
+    let (status, body) = json_response(
+        app,
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1024")
+            .body(Body::from(
+                json!({
+                    "model": "groq/llama-3.3-70b",
+                    "max_tokens": 16,
+                    "system": "be brief",
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    // What went up is the endpoint's own dialect: a system message rather
+    // than a `system` field, and the bare model id.
+    let sent = upstream.calls().first().cloned().expect("one call");
+    assert_eq!(sent.body["model"], "llama-3.3-70b");
+    assert!(sent.body.get("system").is_none(), "{}", sent.body);
+    assert_eq!(sent.body["messages"][0]["role"], "system");
+    assert_eq!(sent.body["messages"][0]["content"], "be brief");
+    assert_eq!(sent.body["messages"][1]["role"], "user");
+    assert_eq!(sent.body["max_tokens"], 16);
+    // And what came back is Messages again, which is what the client reads.
+    assert_eq!(body["type"], "message");
+    assert_eq!(body["role"], "assistant");
+    assert_eq!(body["content"][0]["type"], "text");
+    assert_eq!(body["stop_reason"], "end_turn");
+}
+
+#[tokio::test]
+async fn generic_models_answer_501_on_responses_and_count_tokens() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &groq_key_token()).expect("save groq key");
+    let upstream = Arc::new(GenericUpstream::default());
+    let app =
+        create_app_with_upstream(config_with_groq(tmp.path().to_path_buf()), upstream.clone());
+
+    // Messages is served now, by translation onto Chat Completions. These
+    // two are not: Responses has no client asking for it, and count_tokens
+    // is anthropic's own endpoint.
     for (uri, body) in [
-        (
-            "/v1/messages",
-            json!({
-                "model": "groq/llama-3.3-70b",
-                "max_tokens": 16,
-                "messages": [{"role": "user", "content": "hi"}]
-            }),
-        ),
         (
             "/v1/responses",
             json!({"model": "groq/llama-3.3-70b", "input": "hi"}),
@@ -2768,17 +2809,15 @@ async fn a_501_refusal_reconciles_and_spares_the_account() {
         app.clone(),
         axum::http::Request::builder()
             .method("POST")
-            .uri("/v1/messages")
+            // Responses, because Messages is served now: a configured
+            // endpoint answers Chat Completions and the relay translates
+            // onto it. Responses is the dialect still refused.
+            .uri("/v1/responses")
             .header("authorization", "Bearer sk-test")
             .header("content-type", "application/json")
             .header("content-length", "1")
             .body(Body::from(
-                json!({
-                    "model": "groq/llama-3.3-70b",
-                    "max_tokens": 16,
-                    "messages": [{"role": "user", "content": "hi"}]
-                })
-                .to_string(),
+                json!({"model": "groq/llama-3.3-70b", "input": "hi"}).to_string(),
             ))
             .unwrap(),
     )

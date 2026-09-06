@@ -110,9 +110,9 @@ Without `--model` on a terminal, `launch` lists everything the relay serves and 
 pick: arrows move, typing searches, enter runs, esc cancels. Piped, nothing is asked — the
 harness gets its own default, so scripts behave as they always did.
 
-Claude Code speaks Anthropic Messages, which a configured OpenAI-compatible endpoint does
-not serve, so those models are listed as `unavailable` and cannot be selected for it. They
-are ordinary choices under `launch pi`, whose provider picks a wire per model.
+Every model the relay serves is on both lists. Claude Code speaks Anthropic Messages and a
+configured OpenAI-compatible endpoint speaks Chat Completions; pengepul translates between
+them, so a `groq/…` or `openrouter/…` model runs under `launch claude` like any other.
 
 `launch pi` needs pi's pengepul provider, installed once with `pi install
 npm:@pwguler/pi-pengepul-provider`; without it pi refuses with `Unknown provider
@@ -223,9 +223,9 @@ the local API key, as either `Authorization: Bearer <key>` or `x-api-key: <key>`
 The provider is chosen by model id: `gpt-5`, `gpt-5.*`, `gpt-5-*`, `o<N>` and `codex-*`
 route to Codex, `claude-*` to Anthropic, and `<id>/<model>` routes to the configured
 provider `id` (`groq/llama-3.3-70b-versatile`). A request with no `model` is rejected
-with 400, as is a prefix no configured provider claims. `count_tokens` and the Messages
-and Responses routes answer 501 for configured providers; they accept only Chat
-Completions.
+with 400, as is a prefix no configured provider claims. A configured provider speaks
+Chat Completions upstream: a Messages request is translated onto it, while
+`count_tokens` and Responses answer 501 there.
 
 `GET /v1/models` entries also carry optional per-model metadata when pengepul knows it:
 `context_window`, `max_output_tokens`, `input_modalities` and `pricing` (per-million
