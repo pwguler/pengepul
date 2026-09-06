@@ -70,11 +70,16 @@ in files.
   dispatch too: `launch_plan` turns a harness name into the binary, the
   arguments and the environment that point it at the relay, and the runtime
   `exec`s that plan — the whole of the per-harness knowledge is that one
-  table. Its model picker splits the same way: `cli.rs` turns the catalog
-  into rows (`model_choices`) and owns the search rule
-  (`matching_choices`); the runtime fetches `/v1/models` and drives the
-  keys, so what a test asserts is the list that was offered and the row
-  that came back.
+  table. `cli.rs` turns the catalog into rows (`model_choices`) and owns
+  the search rule (`matching_choices`); the runtime fetches `/v1/models`
+  and hands the picker over, so what a CLI test asserts is the list that
+  was offered and the row that came back.
+- **Picker** (`picker.rs`) — the list `launch` offers when no model was
+  named, and the keys that move through it. Not a Panel: a menu the
+  operator answers, in the palette but outside the box. Its whole interface
+  is `pick_model`; the frame it paints takes the terminal size as a value
+  rather than asking the terminal, so a test puts the frame in a six-row
+  window and reads what comes out. That is how the overflows were found.
 - **Render** (`render.rs`) — the panel language every verb prints with: the
   64-column box, the `Fact` row (`<label>  <value>`) and `fact_panel` that
   every rich *fact* surface is built from, the three-color palette, glyphs,
@@ -209,7 +214,9 @@ in files.
 - **`launch` leaves nothing behind.** A harness is pointed at the relay by the
   environment and the arguments of one process, never by a file: the same
   binary started any other way still resolves its own accounts and its own
-  models. That is what bounds the verb to harnesses which can be redirected
+  models, and a model id carrying a control character is dropped from the
+  list rather than painted, so what the picker shows is what enter runs.
+  That is what bounds the verb to harnesses which can be redirected
   per-process — openclaw and hermes can only be redirected in their config
   files, so they stay the README's manual step (ADR-0007 still holds: the
   client adapts, and `launch` only writes that adaptation into one process

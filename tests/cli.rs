@@ -4854,16 +4854,19 @@ fn the_picker_carries_the_window_and_the_price() {
     run(&["launch", "claude"], tmp.path(), &mut runtime);
 
     let choices = offered(&runtime);
-    // Kept apart so the picker can align each into its own column.
-    assert_eq!(choices[0].context, "1.0M ctx");
-    assert_eq!(choices[0].price, "$5.00/$25.00");
-    // A row the catalog carries no numbers for shows none rather than zeros.
+    // Numbers, not strings: the picker renders them, because it is the only
+    // thing that knows how wide a column may be.
+    assert_eq!(choices[0].context_window, Some(1_000_000));
+    let price = choices[0].price.expect("a price");
+    assert!((price.input - 5.0).abs() < f64::EPSILON);
+    assert!((price.output - 25.0).abs() < f64::EPSILON);
+    // A row the catalog carries no numbers for carries none, not zeros.
     let bare = choices
         .iter()
         .find(|choice| choice.id.starts_with("groq/"))
         .expect("the bare row");
-    assert_eq!(bare.context, "");
-    assert_eq!(bare.price, "");
+    assert_eq!(bare.context_window, None);
+    assert_eq!(bare.price, None);
     // And the picker is told which harness it is choosing for.
     assert_eq!(runtime.picker_harness.as_deref(), Some("claude"));
 }

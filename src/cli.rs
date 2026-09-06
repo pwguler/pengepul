@@ -7,9 +7,7 @@ use serde_json::Value;
 
 use crate::config::{Config, load_config, register_provider, selected_config_path};
 pub use crate::render::Style;
-use crate::render::{
-    ActionGlyph, BOLD, DIM, Fact, Output, fact_panel, format_count, paint, status_glyph,
-};
+use crate::render::{ActionGlyph, BOLD, DIM, Fact, Output, fact_panel, paint, status_glyph};
 use crate::service::service_status_panel;
 use crate::tokens::save_token;
 use crate::types::{ProviderId, ProviderKind, TokenData};
@@ -50,15 +48,22 @@ pub struct LaunchPlan {
     pub install_hint: String,
 }
 
-/// One row of the model picker. The two facts that separate ids are kept
-/// apart so the picker can align them into columns.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One row of the model picker: an id and the two facts that tell two ids
+/// apart. The facts stay numbers — rendering them is the picker's business,
+/// and it is the only thing that knows how wide a column may be. `None`
+/// where the catalog does not carry them, which is not the same as zero.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelChoice {
     pub id: String,
-    /// `1.0M ctx`, or empty where the catalog does not say.
-    pub context: String,
-    /// `$5.00/$25.00` per million in and out, or empty.
-    pub price: String,
+    pub context_window: Option<u64>,
+    pub price: Option<ModelPrice>,
+}
+
+/// What a million tokens costs, in and out.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelPrice {
+    pub input: f64,
+    pub output: f64,
 }
 
 pub trait CliRuntime {
@@ -1154,44 +1159,24 @@ fn model_choices(catalog: &Value) -> Vec<ModelChoice> {
             if id.chars().any(char::is_control) {
                 return None;
             }
-            let (context, price) = model_facts(entry);
             Some(ModelChoice {
                 id: id.to_string(),
-                context,
-                price,
+                context_window: entry.get("context_window").and_then(Value::as_u64),
+                price: model_price(entry),
             })
         })
         .collect()
 }
 
-/// What separates two ids on the list: the context window, and what a
-/// million tokens cost in and out. Returned apart so the picker can align
-/// each into its own column, and empty where the catalog does not carry
-/// them — a configured endpoint publishes what it publishes, and a blank
-/// column is honest where a zero would not be.
-fn model_facts(entry: &Value) -> (String, String) {
-    let context = entry
-        .get("context_window")
-        .and_then(Value::as_u64)
-        .map(|window| {
-            format!(
-                "{} ctx",
-                format_count(i64::try_from(window).unwrap_or(i64::MAX))
-            )
-        })
-        .unwrap_or_default();
-    let pricing = entry.get("pricing");
-    let input = pricing
-        .and_then(|rates| rates.get("input_per_million"))
-        .and_then(Value::as_f64);
-    let output = pricing
-        .and_then(|rates| rates.get("output_per_million"))
-        .and_then(Value::as_f64);
-    let price = match (input, output) {
-        (Some(input), Some(output)) => format!("${input:.2}/${output:.2}"),
-        _ => String::new(),
-    };
-    (context, price)
+/// What a million tokens costs at this model, when the catalog says. A
+/// configured endpoint publishes what it publishes, and half a rate is not
+/// a price: both halves or nothing.
+fn model_price(entry: &Value) -> Option<ModelPrice> {
+    let pricing = entry.get("pricing")?;
+    Some(ModelPrice {
+        input: pricing.get("input_per_million").and_then(Value::as_f64)?,
+        output: pricing.get("output_per_million").and_then(Value::as_f64)?,
+    })
 }
 
 /// Rows whose id carries every word of the filter, case folded. Words
@@ -1344,8 +1329,8 @@ mod tests {
         ids.iter()
             .map(|id| ModelChoice {
                 id: (*id).to_string(),
-                context: String::new(),
-                price: String::new(),
+                context_window: None,
+                price: None,
             })
             .collect()
     }

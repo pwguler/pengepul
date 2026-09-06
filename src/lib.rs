@@ -6,6 +6,7 @@ pub mod config;
 pub mod masquerade;
 pub mod models;
 pub mod oauth;
+pub mod picker;
 pub mod render;
 pub mod runtime;
 pub mod service;
