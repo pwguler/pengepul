@@ -43,5 +43,13 @@ unhandled. The cap subsumes both.
 - Stripping the earliest rather than the latest is deliberate: Anthropic caches the
   prefix ending at each breakpoint, so the later breakpoints cover more content.
   Keeping them and dropping the earliest preserves the most caching.
+- `system` is stripped before `tools`, which is **not** Anthropic's render order
+  (tools, then system, then messages) and is not an oversight. Coverage is not the
+  only axis: a client's `tools` breakpoint caches a prefix shared by every
+  conversation using that tool set, while any breakpoint at or after our injected
+  prefix is conversation-specific, because `billing_header` is derived from the
+  first user message. Dropping the `tools` marker to keep a longer but
+  per-conversation one trades a shared cache entry for a private one. Reordering
+  these two to "fix" the render order is a regression, not a correction.
 - `apply_cloaking_caps_cache_control_at_four_across_system_tools_messages` pins the
   cross-location count and that the prefix, not a client block, is the one dropped.
