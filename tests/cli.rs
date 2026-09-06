@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use pengepul::cli::{CliRuntime, RunOutcome, ServiceInstallRequest, Style, run_with_env};
+use pengepul::cli::{
+    CliRuntime, LaunchPlan, ModelChoice, RunOutcome, ServiceInstallRequest, Style, run_with_env,
+};
 use pengepul::config::Config;
 use pengepul::types::ProviderId;
 use serde_json::{Value, json};
@@ -33,6 +35,14 @@ struct FakeRuntime {
     installed: Option<(String, String)>,
     accounts_payload: Option<Value>,
     rich: bool,
+    health_error: Option<String>,
+    launch_plan: Option<LaunchPlan>,
+    models_payload: Option<Value>,
+    /// Which row the operator highlights when the picker opens, 1-based.
+    /// `None` is a cancel.
+    picks: Option<usize>,
+    offered: Option<Vec<ModelChoice>>,
+    picker_harness: Option<String>,
 }
 
 impl CliRuntime for FakeRuntime {
@@ -56,7 +66,32 @@ impl CliRuntime for FakeRuntime {
 
     fn health(&mut self, base_url: &str) -> Result<Value> {
         self.health_url = Some(base_url.to_string());
+        if let Some(error) = &self.health_error {
+            anyhow::bail!("{error}");
+        }
         Ok(json!({"status": "ok"}))
+    }
+
+    fn launch(&mut self, plan: &LaunchPlan) -> Result<()> {
+        self.launch_plan = Some(plan.clone());
+        Ok(())
+    }
+
+    fn models(&mut self, base_url: &str, api_key: &str) -> Result<Value> {
+        self.calls.push(format!("models:{base_url}:{api_key}"));
+        Ok(self
+            .models_payload
+            .clone()
+            .unwrap_or_else(|| json!({"data": []})))
+    }
+
+    fn select_model(&mut self, harness: &str, choices: &[ModelChoice]) -> Result<Option<String>> {
+        self.picker_harness = Some(harness.to_string());
+        self.offered = Some(choices.to_vec());
+        Ok(self
+            .picks
+            .and_then(|row| choices.get(row - 1))
+            .map(|choice| choice.id.clone()))
     }
 
     fn accounts(&mut self, base_url: &str, api_key: &str) -> Result<Value> {
@@ -83,6 +118,10 @@ impl CliRuntime for FakeRuntime {
     }
 
     fn stdout_is_tty(&mut self) -> bool {
+        self.rich
+    }
+
+    fn can_ask(&mut self) -> bool {
         self.rich
     }
 
@@ -4411,6 +4450,512 @@ fn a_pool_that_outlives_its_config_entry_is_not_rolled_back() {
         after, seeded,
         "the rollback took a credential it did not create: {after:?}"
     );
+}
+
+/// One variable out of a launch plan. Order is the plan's business, not a
+/// test's, so nothing here asserts on position.
+fn env_value<'a>(plan: &'a LaunchPlan, name: &str) -> Option<&'a str> {
+    plan.env
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.as_str())
+}
+
+fn launched(runtime: &FakeRuntime) -> LaunchPlan {
+    runtime.launch_plan.clone().expect("a launch plan")
+}
+
+#[test]
+fn launch_claude_points_the_harness_at_the_relay() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime::default();
+
+    let outcome = run(&["launch", "claude"], tmp.path(), &mut runtime);
+
+    assert_eq!(outcome.code, 0);
+    // Nothing is printed: the process is about to become the harness, and a
+    // panel under its first frame is noise (`serve` prints nothing either).
+    assert!(outcome.stdout.is_empty(), "{}", outcome.stdout);
+    let plan = launched(&runtime);
+    assert_eq!(plan.program, "claude");
+    assert!(plan.args.is_empty(), "{:?}", plan.args);
+    assert_eq!(
+        env_value(&plan, "ANTHROPIC_BASE_URL"),
+        Some("http://127.0.0.1:8317")
+    );
+    assert_eq!(env_value(&plan, "ANTHROPIC_AUTH_TOKEN"), Some("sk-test"));
+    // Emptied, not absent: a key already in the operator's environment
+    // outranks the token and would route to the vendor on a per-token meter.
+    assert_eq!(env_value(&plan, "ANTHROPIC_API_KEY"), Some(""));
+    // No model was named, so the harness keeps its own.
+    assert_eq!(env_value(&plan, "ANTHROPIC_MODEL"), None);
+    // The relay answered before the plan was built.
+    assert_eq!(runtime.health_url.as_deref(), Some("http://127.0.0.1:8317"));
+}
+
+#[test]
+fn launch_claude_moves_every_model_tier() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime::default();
+
+    let outcome = run(
+        &["launch", "claude", "--model", "gpt-5.4"],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    assert_eq!(outcome.code, 0);
+    let plan = launched(&runtime);
+    for name in [
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+    ] {
+        assert_eq!(env_value(&plan, name), Some("gpt-5.4"), "{name}");
+    }
+}
+
+#[test]
+fn launch_pi_names_the_relay_provider_and_the_model() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime::default();
+
+    let outcome = run(
+        &["launch", "pi", "--model", "anthropic/claude-opus-5"],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    assert_eq!(outcome.code, 0);
+    let plan = launched(&runtime);
+    assert_eq!(plan.program, "pi");
+    assert_eq!(
+        plan.args,
+        [
+            "--provider",
+            "pengepul",
+            "--model",
+            "anthropic/claude-opus-5"
+        ]
+    );
+    assert_eq!(
+        env_value(&plan, "PENGEPUL_BASE_URL"),
+        Some("http://127.0.0.1:8317")
+    );
+    assert_eq!(env_value(&plan, "PENGEPUL_API_KEY"), Some("sk-test"));
+}
+
+#[test]
+fn launch_pi_without_a_model_is_refused() {
+    // pi binds `--provider` only together with a model; on its own the flag
+    // is ignored and pi answers from its own settings, which is the silence
+    // this verb exists to remove.
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime::default();
+
+    let error = run_err(&["launch", "pi"], tmp.path(), &mut runtime);
+
+    assert!(error.contains("--model"), "{error}");
+    assert!(runtime.launch_plan.is_none());
+}
+
+#[test]
+fn launch_forwards_arguments_after_the_separator() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime::default();
+
+    let outcome = run(
+        &["launch", "claude", "--", "--resume", "abc"],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    assert_eq!(outcome.code, 0);
+    assert_eq!(launched(&runtime).args, ["--resume", "abc"]);
+}
+
+#[test]
+fn launch_pi_forwards_arguments_after_its_own() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime::default();
+
+    let outcome = run(
+        &["launch", "pi", "--model", "opus-5", "--", "--continue"],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    assert_eq!(outcome.code, 0);
+    assert_eq!(
+        launched(&runtime).args,
+        ["--provider", "pengepul", "--model", "opus-5", "--continue"]
+    );
+}
+
+#[test]
+fn launch_refuses_when_the_relay_is_not_answering() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        health_error: Some("connection refused".to_string()),
+        ..FakeRuntime::default()
+    };
+
+    let error = run_err(&["launch", "claude"], tmp.path(), &mut runtime);
+
+    assert!(
+        error.contains("relay is not answering at http://127.0.0.1:8317"),
+        "{error}"
+    );
+    assert!(error.contains("pengepul service start"), "{error}");
+    assert!(
+        runtime.launch_plan.is_none(),
+        "no harness starts against a dead relay"
+    );
+}
+
+#[test]
+fn launch_reads_the_config_it_is_given() {
+    let tmp = tempdir().expect("tempdir");
+    // The home config would send it somewhere else, so a plan built from the
+    // override proves which file was read.
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let config_path = tmp.path().join("other.yaml");
+    std::fs::write(
+        &config_path,
+        "host: \"127.0.0.1\"\nport: 9317\nauth-dir: ~/.pengepul\napi-keys:\n  - sk-other\n",
+    )
+    .expect("write config");
+    let mut runtime = FakeRuntime::default();
+
+    let outcome = run_with_env(
+        &[
+            "launch",
+            "--config",
+            config_path.to_str().expect("path"),
+            "claude",
+        ],
+        tmp.path(),
+        tmp.path(),
+        &mut runtime,
+        Style::Plain,
+    )
+    .expect("cli run");
+
+    assert_eq!(outcome.code, 0);
+    let plan = launched(&runtime);
+    assert_eq!(
+        env_value(&plan, "ANTHROPIC_BASE_URL"),
+        Some("http://127.0.0.1:9317")
+    );
+    assert_eq!(env_value(&plan, "ANTHROPIC_AUTH_TOKEN"), Some("sk-other"));
+}
+
+#[test]
+fn launch_refuses_a_harness_it_does_not_know() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime::default();
+
+    let error = run_with_env(
+        &["launch", "openclaw"],
+        tmp.path(),
+        tmp.path(),
+        &mut runtime,
+        Style::Plain,
+    )
+    .expect_err("an unknown harness must be rejected");
+
+    let error = format!("{error:#}");
+    assert!(error.contains("claude"), "{error}");
+    assert!(error.contains("pi"), "{error}");
+    assert!(runtime.launch_plan.is_none());
+}
+
+#[test]
+fn help_launch_names_the_harnesses() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime = FakeRuntime::default();
+
+    let outcome = run(&["help", "launch"], tmp.path(), &mut runtime);
+
+    assert_eq!(outcome.code, 0);
+    assert!(
+        outcome.stdout.starts_with("Usage: pengepul launch"),
+        "{}",
+        outcome.stdout
+    );
+    assert!(outcome.stdout.contains("claude"), "{}", outcome.stdout);
+    assert!(outcome.stdout.contains("pi"), "{}", outcome.stdout);
+    assert!(outcome.stdout.contains("--model"), "{}", outcome.stdout);
+    // And the separator, which is how anything reaches the harness.
+    assert!(outcome.stdout.contains("--"), "{}", outcome.stdout);
+    assert!(outcome.stdout.contains("FORWARDED"), "{}", outcome.stdout);
+}
+
+/// A relay catalog: two anthropic models and one from a configured
+/// endpoint, which is the split every picker assertion turns on.
+fn catalog() -> Value {
+    json!({"data": [
+        {
+            "id": "anthropic/claude-opus-5",
+            "context_window": 1_000_000,
+            "pricing": {"input_per_million": 5.0, "output_per_million": 25.0}
+        },
+        {
+            "id": "anthropic/claude-haiku-4-5",
+            "context_window": 200_000,
+            "pricing": {"input_per_million": 1.0, "output_per_million": 5.0}
+        },
+        {"id": "groq/llama-3.3-70b-versatile"}
+    ]})
+}
+
+/// A runtime on a terminal, whose operator highlights `row` and hits enter.
+fn picking(row: usize) -> FakeRuntime {
+    FakeRuntime {
+        rich: true,
+        models_payload: Some(catalog()),
+        picks: Some(row),
+        ..FakeRuntime::default()
+    }
+}
+
+fn offered(runtime: &FakeRuntime) -> Vec<ModelChoice> {
+    runtime.offered.clone().expect("a picker")
+}
+
+#[test]
+fn launch_claude_picks_a_model_from_the_relay() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = picking(1);
+
+    let outcome = run(&["launch", "claude"], tmp.path(), &mut runtime);
+
+    assert_eq!(outcome.code, 0);
+    assert_eq!(
+        env_value(&launched(&runtime), "ANTHROPIC_MODEL"),
+        Some("anthropic/claude-opus-5")
+    );
+    // The catalog came from the relay, with the same key every verb uses.
+    assert!(
+        runtime
+            .calls
+            .contains(&"models:http://127.0.0.1:8317:sk-test".to_string()),
+        "{:?}",
+        runtime.calls
+    );
+}
+
+#[test]
+fn the_picker_offers_the_whole_catalog_to_claude() {
+    // Every advertised model, in the relay's own order, none of them
+    // marked: the relay translates Messages onto a configured endpoint's
+    // Chat Completions, so what is listed is what can be run.
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  groq:\n    base-url: https://api.groq.com/openai/v1\n",
+    );
+    let mut runtime = picking(3);
+
+    let outcome = run(&["launch", "claude"], tmp.path(), &mut runtime);
+
+    assert_eq!(outcome.code, 0);
+    let choices = offered(&runtime);
+    assert_eq!(
+        choices.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+        [
+            "anthropic/claude-opus-5",
+            "anthropic/claude-haiku-4-5",
+            "groq/llama-3.3-70b-versatile"
+        ]
+    );
+    // And the configured endpoint's model is an ordinary choice for claude.
+    assert_eq!(
+        env_value(&launched(&runtime), "ANTHROPIC_MODEL"),
+        Some("groq/llama-3.3-70b-versatile")
+    );
+}
+
+#[test]
+fn a_configured_provider_model_is_an_ordinary_choice_for_claude() {
+    // A configured endpoint's model is served to a Messages client by
+    // translation, so nothing about the id makes it special here.
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  groq:\n    base-url: https://api.groq.com/openai/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+
+    let outcome = run(
+        &[
+            "launch",
+            "claude",
+            "--model",
+            "groq/llama-3.3-70b-versatile",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    assert_eq!(outcome.code, 0);
+    assert_eq!(
+        env_value(&launched(&runtime), "ANTHROPIC_MODEL"),
+        Some("groq/llama-3.3-70b-versatile")
+    );
+}
+
+#[test]
+fn launch_pi_picks_from_the_same_catalog() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  groq:\n    base-url: https://api.groq.com/openai/v1\n",
+    );
+    let mut runtime = picking(3);
+
+    let outcome = run(&["launch", "pi"], tmp.path(), &mut runtime);
+
+    assert_eq!(outcome.code, 0);
+    assert_eq!(offered(&runtime).len(), 3);
+    assert_eq!(
+        launched(&runtime).args,
+        [
+            "--provider",
+            "pengepul",
+            "--model",
+            "groq/llama-3.3-70b-versatile"
+        ]
+    );
+}
+
+#[test]
+fn the_picker_carries_the_window_and_the_price() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = picking(1);
+
+    run(&["launch", "claude"], tmp.path(), &mut runtime);
+
+    let choices = offered(&runtime);
+    // Kept apart so the picker can align each into its own column.
+    assert_eq!(choices[0].context, "1.0M ctx");
+    assert_eq!(choices[0].price, "$5.00/$25.00");
+    // A row the catalog carries no numbers for shows none rather than zeros.
+    let bare = choices
+        .iter()
+        .find(|choice| choice.id.starts_with("groq/"))
+        .expect("the bare row");
+    assert_eq!(bare.context, "");
+    assert_eq!(bare.price, "");
+    // And the picker is told which harness it is choosing for.
+    assert_eq!(runtime.picker_harness.as_deref(), Some("claude"));
+}
+
+#[test]
+fn a_cancelled_picker_leaves_the_model_alone() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        models_payload: Some(catalog()),
+        picks: None,
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run(&["launch", "claude"], tmp.path(), &mut runtime);
+
+    assert_eq!(outcome.code, 0);
+    assert!(runtime.offered.is_some(), "it did ask");
+    assert_eq!(env_value(&launched(&runtime), "ANTHROPIC_MODEL"), None);
+}
+
+#[test]
+fn launch_pi_still_refuses_a_cancelled_picker() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        models_payload: Some(catalog()),
+        picks: None,
+        ..FakeRuntime::default()
+    };
+
+    let error = run_err(&["launch", "pi"], tmp.path(), &mut runtime);
+
+    assert!(error.contains("--model"), "{error}");
+    assert!(runtime.launch_plan.is_none());
+}
+
+#[test]
+fn the_picker_does_not_run_when_output_is_piped() {
+    // Raw mode on a pipe would take over a terminal nobody is watching.
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        models_payload: Some(catalog()),
+        picks: Some(1),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run(&["launch", "claude"], tmp.path(), &mut runtime);
+
+    assert_eq!(outcome.code, 0);
+    assert!(runtime.offered.is_none());
+    assert!(
+        !runtime.calls.iter().any(|call| call.starts_with("models:")),
+        "{:?}",
+        runtime.calls
+    );
+    assert_eq!(env_value(&launched(&runtime), "ANTHROPIC_MODEL"), None);
+}
+
+#[test]
+fn an_explicit_model_skips_the_picker() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = picking(1);
+
+    run(
+        &["launch", "claude", "--model", "anthropic/claude-opus-4-8"],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    assert!(runtime.offered.is_none());
+    assert_eq!(
+        env_value(&launched(&runtime), "ANTHROPIC_MODEL"),
+        Some("anthropic/claude-opus-4-8")
+    );
+}
+
+#[test]
+fn an_empty_catalog_asks_nothing() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        models_payload: Some(json!({"data": []})),
+        picks: Some(1),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run(&["launch", "claude"], tmp.path(), &mut runtime);
+
+    assert_eq!(outcome.code, 0);
+    assert!(runtime.offered.is_none());
+    assert_eq!(env_value(&launched(&runtime), "ANTHROPIC_MODEL"), None);
 }
 
 /// The shape, not an instance: a failed credential write must leave the

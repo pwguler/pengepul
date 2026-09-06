@@ -29,13 +29,15 @@ use crate::models::{
 use crate::oauth::{refresh_anthropic_tokens, refresh_codex_tokens};
 use crate::streaming::{
     AnthropicStreamState, ChatStreamState, ResponsesStreamState, anthropic_sse_to_chat,
-    anthropic_sse_to_responses, drain_complete_sse_events, finish_sse_events,
-    responses_sse_to_anthropic, responses_sse_to_chat, responses_sse_to_payload, sse,
+    anthropic_sse_to_responses, chat_sse_to_anthropic, drain_complete_sse_events,
+    finish_sse_events, responses_sse_to_anthropic, responses_sse_to_chat, responses_sse_to_payload,
+    sse,
 };
 use crate::translate::{
-    anthropic_to_openai, anthropic_to_responses, anthropic_to_responses_request,
-    chat_to_responses_request, openai_to_anthropic, responses_to_anthropic,
-    responses_to_anthropic_message, responses_to_chat_completion,
+    anthropic_to_chat_request, anthropic_to_openai, anthropic_to_responses,
+    anthropic_to_responses_request, chat_to_anthropic_message, chat_to_responses_request,
+    openai_to_anthropic, responses_to_anthropic, responses_to_anthropic_message,
+    responses_to_chat_completion,
 };
 use crate::types::{AvailableAccount, ProviderId, ProviderKind, UsageData};
 use crate::upstream::{
@@ -1080,11 +1082,17 @@ async fn route_provider_request(
         };
         let mut response = match provider.kind {
             ProviderKind::Generic => {
-                if matches!(route, RequestRoute::Chat) {
+                // Chat Completions is the only dialect a configured endpoint
+                // speaks, so Messages is translated onto it rather than
+                // refused: a harness that speaks Messages is the reason the
+                // relay exists. Responses has no client asking for it and
+                // stays a Refusal.
+                if matches!(route, RequestRoute::Chat | RequestRoute::Messages) {
                     route_generic_chat_request(
                         state,
                         headers,
                         body,
+                        route,
                         &model,
                         &account,
                         client_wants_stream,
@@ -1257,11 +1265,12 @@ async fn route_generic_chat_request(
     state: &AppState,
     headers: &HeaderMap,
     body: &Value,
+    route: RequestRoute,
     model: &str,
     account: &AvailableAccount,
     client_wants_stream: bool,
 ) -> Response {
-    let mut upstream_body = body_with_model(body, model);
+    let mut upstream_body = generic_request_body(body, model, route);
     if let Some(object) = upstream_body.as_object_mut() {
         object.insert("stream".to_string(), Value::Bool(client_wants_stream));
     }
@@ -1288,7 +1297,7 @@ async fn route_generic_chat_request(
                 sse_upstream_response(
                     response,
                     account.provider.clone(),
-                    RequestRoute::Chat,
+                    route,
                     model,
                     accounting,
                     Arc::new(BTreeMap::new()),
@@ -1311,13 +1320,7 @@ async fn route_generic_chat_request(
     {
         Ok(response) => {
             record_json_result(state, account.provider.clone(), account, &response, model).await;
-            json_upstream_response(
-                response,
-                &account.provider,
-                RequestRoute::Chat,
-                model,
-                &BTreeMap::new(),
-            )
+            json_upstream_response(response, &account.provider, route, model, &BTreeMap::new())
         }
         Err(error) => {
             upstream_failure_response(state, account.provider.clone(), account, &error).await
@@ -1927,11 +1930,12 @@ fn json_upstream_response(
         (ProviderKind::Codex, RequestRoute::Messages) => {
             responses_to_anthropic_message(&response.body, model)
         }
-        // A generic endpoint speaks Chat Completions; its success body passes
-        // through unchanged (slice 4 tests this path end to end). The arm is
-        // unreachable until generic routing lands, but it is the honest shape of
-        // the response matrix: Generic only ever arrives with Chat, and that
-        // body is already a Chat completion.
+        // A generic endpoint answers in Chat Completions, so a Chat client
+        // gets it unchanged and a Messages client gets it translated.
+        // Responses never reaches here: it is refused at routing.
+        (ProviderKind::Generic, RequestRoute::Messages) => {
+            chat_to_anthropic_message(&response.body, model)
+        }
         #[allow(clippy::match_same_arms)]
         (ProviderKind::Generic, _) => response.body,
     };
@@ -2344,11 +2348,15 @@ fn transform_sse_event(
             |_| Vec::new(),
             |data| responses_sse_to_anthropic(event, &data, anthropic_state),
         ),
-        // A generic endpoint's Chat Completions stream passes through unchanged
-        // (slice 4 tests this path end to end).
+        // A generic endpoint answers in Chat Completions, so a Chat client
+        // reads its stream unchanged.
         (ProviderKind::Generic, RequestRoute::Chat) => parsed.map_or_else(
             |_| Vec::new(),
             |data| vec![sse(&data, passthrough_event(event))],
+        ),
+        (ProviderKind::Generic, RequestRoute::Messages) => parsed.map_or_else(
+            |_| Vec::new(),
+            |data| chat_sse_to_anthropic(&data, anthropic_state),
         ),
         (ProviderKind::Generic, _) => parsed.map_or_else(
             |_| Vec::new(),
@@ -2386,6 +2394,16 @@ fn anthropic_request_body(body: &Value, model: &str, route: RequestRoute) -> Val
         RequestRoute::Chat => openai_to_anthropic(body),
         RequestRoute::Responses => responses_to_anthropic(body),
         RequestRoute::Messages => body.clone(),
+    };
+    body_with_model(&translated, model)
+}
+
+/// What a configured endpoint is handed. Chat arrives in its own dialect;
+/// Messages is translated onto it. Responses never reaches here.
+fn generic_request_body(body: &Value, model: &str, route: RequestRoute) -> Value {
+    let translated = match route {
+        RequestRoute::Messages => anthropic_to_chat_request(body),
+        RequestRoute::Chat | RequestRoute::Responses => body.clone(),
     };
     body_with_model(&translated, model)
 }

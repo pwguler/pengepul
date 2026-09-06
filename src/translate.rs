@@ -627,6 +627,316 @@ pub fn responses_to_anthropic_message(payload: &Value, model: &str) -> Value {
     })
 }
 
+/// Anthropic Messages request → `OpenAI` Chat Completions request: what a
+/// configured endpoint has to be handed for a harness that speaks Messages
+/// to reach it. The inverse of `openai_to_anthropic`, so the two read
+/// together — a system block becomes a system message, a `tool_use` block
+/// becomes a `tool_calls` entry, and a `tool_result` block leaves its user
+/// turn to become a `tool` message of its own, which is where this dialect
+/// keeps them.
+#[must_use]
+pub fn anthropic_to_chat_request(body: &Value) -> Value {
+    let mut out = Map::new();
+    insert_if_some(&mut out, "model", body.get("model").cloned());
+    copy_if_present(body, &mut out, "stream");
+    copy_if_present(body, &mut out, "temperature");
+    copy_if_present(body, &mut out, "top_p");
+    copy_if_present(body, &mut out, "max_tokens");
+    if let Some(stop) = body.get("stop_sequences") {
+        out.insert("stop".to_string(), stop.clone());
+    }
+    let thinking = body.get("thinking").unwrap_or(&Value::Null);
+    if thinking.get("type").and_then(Value::as_str) == Some("enabled") {
+        out.insert(
+            "reasoning_effort".to_string(),
+            Value::String(
+                effort_from_budget(thinking.get("budget_tokens").and_then(Value::as_i64))
+                    .to_string(),
+            ),
+        );
+    }
+
+    let mut messages = Vec::new();
+    if let Some(system) = body.get("system") {
+        let text = system.as_str().map_or_else(
+            || {
+                value_array(Some(system))
+                    .into_iter()
+                    .map(text_from_content)
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            },
+            ToString::to_string,
+        );
+        if !text.is_empty() {
+            messages.push(json!({"role": "system", "content": text}));
+        }
+    }
+    for message in value_array(body.get("messages")) {
+        push_chat_messages(&mut messages, message);
+    }
+    out.insert("messages".to_string(), Value::Array(messages));
+
+    let tools = value_array(body.get("tools"))
+        .into_iter()
+        .filter_map(anthropic_tool_to_chat)
+        .collect::<Vec<_>>();
+    if !tools.is_empty() {
+        out.insert("tools".to_string(), Value::Array(tools));
+    }
+    if let Some(choice) = body.get("tool_choice") {
+        out.insert(
+            "tool_choice".to_string(),
+            chat_tool_choice_from_anthropic(choice),
+        );
+    }
+    Value::Object(out)
+}
+
+/// `OpenAI` Chat Completions reply → Anthropic Messages reply, the inverse of
+/// `anthropic_to_openai`.
+#[must_use]
+pub fn chat_to_anthropic_message(payload: &Value, model: &str) -> Value {
+    let choices = value_array(payload.get("choices"));
+    let null = Value::Null;
+    let choice = choices.first().copied().unwrap_or(&null);
+    let message = choice.get("message").unwrap_or(&null);
+
+    let mut content = Vec::new();
+    // Reasoning arrives under one name or the other depending on the
+    // gateway; both become one thinking block, and neither is invented.
+    let reasoning = message
+        .get("reasoning_content")
+        .or_else(|| message.get("reasoning"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !reasoning.is_empty() {
+        content.push(json!({"type": "thinking", "thinking": reasoning}));
+    }
+    let text = text_from_content(message.get("content").unwrap_or(&null));
+    if !text.is_empty() {
+        content.push(json!({"type": "text", "text": text}));
+    }
+    let mut has_tool_use = false;
+    for call in value_array(message.get("tool_calls")) {
+        has_tool_use = true;
+        let function = call.get("function").unwrap_or(&null);
+        let arguments = function
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or("{}");
+        content.push(json!({
+            "type": "tool_use",
+            "id": call.get("id").cloned().unwrap_or(Value::Null),
+            "name": function.get("name").cloned().unwrap_or(Value::Null),
+            "input": serde_json::from_str::<Value>(arguments).unwrap_or_else(|_| json!({}))
+        }));
+    }
+
+    let usage = payload.get("usage").unwrap_or(&null);
+    json!({
+        "id": payload.get("id").cloned().unwrap_or_else(
+            || Value::String(format!("msg_{}", uuid::Uuid::new_v4().simple()))
+        ),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content,
+        "stop_reason": anthropic_stop_reason(
+            choice.get("finish_reason").and_then(Value::as_str),
+            has_tool_use
+        ),
+        "stop_sequence": Value::Null,
+        "usage": {
+            "input_tokens": int_field(usage, "prompt_tokens"),
+            "output_tokens": int_field(usage, "completion_tokens")
+        }
+    })
+}
+
+/// A Chat Completions finish reason under its Messages name. A stream and a
+/// whole document both settle it, so both call this.
+#[must_use]
+pub(crate) fn anthropic_stop_reason(
+    finish_reason: Option<&str>,
+    has_tool_use: bool,
+) -> &'static str {
+    if has_tool_use {
+        return "tool_use";
+    }
+    match finish_reason {
+        Some("length") => "max_tokens",
+        Some("tool_calls" | "function_call") => "tool_use",
+        Some("content_filter") => "refusal",
+        _ => "end_turn",
+    }
+}
+
+/// One Messages turn as the one or more Chat Completions messages it
+/// becomes. A turn holding a `tool_result` splits: this dialect keeps tool
+/// results in messages of their own, after the turn that asked for them.
+fn push_chat_messages(messages: &mut Vec<Value>, message: &Value) {
+    let role = message
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("user");
+    let content = message.get("content").unwrap_or(&Value::Null);
+    let Some(blocks) = content.as_array() else {
+        messages.push(json!({"role": role, "content": content.clone()}));
+        return;
+    };
+    let mut parts = Vec::new();
+    let mut tool_calls = Vec::new();
+    let mut tool_results = Vec::new();
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => parts.push(json!({
+                "type": "text",
+                "text": block.get("text").cloned().unwrap_or_else(|| json!(""))
+            })),
+            Some("image") => {
+                if let Some(image) = anthropic_image_to_chat(block) {
+                    parts.push(image);
+                }
+            }
+            Some("tool_use") => tool_calls.push(json!({
+                "id": block.get("id").cloned().unwrap_or(Value::Null),
+                "type": "function",
+                "function": {
+                    "name": block.get("name").cloned().unwrap_or(Value::Null),
+                    "arguments": serde_json::to_string(block.get("input").unwrap_or(&json!({})))
+                        .unwrap_or_else(|_| "{}".to_string())
+                }
+            })),
+            // Held back, not written where it sits. A `tool` message must
+            // follow the assistant turn that called for it with nothing in
+            // between, and a Messages turn is free to put text before the
+            // result. Flushing that text first wedged a `user` message
+            // between the call and its answer, which strict gateways reject
+            // with "'tool' must be a response to a preceding message with
+            // 'tool_calls'".
+            Some("tool_result") => tool_results.push(json!({
+                "role": "tool",
+                "tool_call_id": block.get("tool_use_id").cloned().unwrap_or(Value::Null),
+                "content": text_from_content(block.get("content").unwrap_or(&Value::Null))
+            })),
+            // Thinking blocks are the model's own prior reasoning. This
+            // dialect has nowhere to put them on the way up, and echoing
+            // them back as text would change the transcript.
+            _ => {}
+        }
+    }
+    // Results first, then whatever else the turn carried.
+    messages.append(&mut tool_results);
+    if tool_calls.is_empty() {
+        flush_chat_parts(messages, role, &mut parts);
+    } else {
+        let text = chat_parts_text(&parts);
+        let mut assistant = json!({"role": "assistant"});
+        // Null, not an empty string: several gateways reject `content: ""`
+        // alongside `tool_calls`.
+        assistant["content"] = if text.is_empty() {
+            Value::Null
+        } else {
+            Value::String(text)
+        };
+        assistant["tool_calls"] = Value::Array(tool_calls);
+        messages.push(assistant);
+    }
+}
+
+/// One turn's parts as this dialect prefers them: a bare string when it is
+/// only text, an array when an image is among it. A gateway that accepts
+/// only the older string form therefore still sees a string for the text
+/// turns, which is most of them.
+fn flush_chat_parts(messages: &mut Vec<Value>, role: &str, parts: &mut Vec<Value>) {
+    if parts.is_empty() {
+        return;
+    }
+    let only_text = parts
+        .iter()
+        .all(|part| part.get("type").and_then(Value::as_str) == Some("text"));
+    let content = if only_text {
+        Value::String(chat_parts_text(parts))
+    } else {
+        Value::Array(parts.clone())
+    };
+    messages.push(json!({"role": role, "content": content}));
+    parts.clear();
+}
+
+fn chat_parts_text(parts: &[Value]) -> String {
+    parts
+        .iter()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// An anthropic image block as a Chat Completions image part. A base64
+/// source becomes the data URL this dialect carries images in.
+fn anthropic_image_to_chat(block: &Value) -> Option<Value> {
+    let source = block.get("source")?;
+    let url = if source.get("type").and_then(Value::as_str) == Some("url") {
+        source.get("url")?.as_str()?.to_string()
+    } else {
+        format!(
+            "data:{};base64,{}",
+            source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .unwrap_or("image/png"),
+            source.get("data").and_then(Value::as_str)?
+        )
+    };
+    Some(json!({"type": "image_url", "image_url": {"url": url}}))
+}
+
+/// One anthropic tool as a Chat Completions function. A vendor server tool
+/// has no equivalent — a configured endpoint never runs one — so it is
+/// dropped rather than offered as a function the model would then call
+/// into nothing.
+fn anthropic_tool_to_chat(tool: &Value) -> Option<Value> {
+    if tool
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| {
+            kind.starts_with("web_search")
+                || kind.starts_with("computer")
+                || kind.starts_with("text_editor")
+                || kind.starts_with("bash")
+        })
+    {
+        return None;
+    }
+    let mut function = Map::new();
+    function.insert("name".to_string(), tool.get("name")?.clone());
+    insert_if_some(
+        &mut function,
+        "description",
+        tool.get("description").cloned(),
+    );
+    function.insert(
+        "parameters".to_string(),
+        tool.get("input_schema")
+            .cloned()
+            .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+    );
+    Some(json!({"type": "function", "function": Value::Object(function)}))
+}
+
+fn chat_tool_choice_from_anthropic(choice: &Value) -> Value {
+    match choice.get("type").and_then(Value::as_str) {
+        Some("any") => Value::String("required".to_string()),
+        Some("none") => Value::String("none".to_string()),
+        Some("tool") => json!({
+            "type": "function",
+            "function": {"name": choice.get("name").cloned().unwrap_or(Value::Null)}
+        }),
+        _ => Value::String("auto".to_string()),
+    }
+}
+
 fn thinking_from_effort(effort: Option<&str>, summary: Option<&str>) -> Option<Value> {
     let effort = effort?;
     let budget = match effort {

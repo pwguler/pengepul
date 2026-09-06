@@ -7,12 +7,13 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use crate::app::create_app;
-use crate::cli::{CliRuntime, ServiceInstallRequest};
+use crate::cli::{CliRuntime, LaunchPlan, ModelChoice, ServiceInstallRequest, matching_choices};
 use crate::config::{Config, DebugMode};
 use crate::oauth::{
     ANTHROPIC_REDIRECT_URI, CODEX_CALLBACK_PATH, CODEX_CALLBACK_PORT, exchange_anthropic_code,
     exchange_codex_code, generate_anthropic_auth_url, generate_codex_auth_url,
 };
+use crate::render::{BOLD, DIM, GREEN, pad, paint};
 use crate::service::{ServiceOptions, run_command};
 use crate::tokens::save_token;
 use crate::types::{PkceCodes, ProviderId, ProviderKind};
@@ -75,6 +76,15 @@ impl CliRuntime for RealRuntime {
         std::io::IsTerminal::is_terminal(&std::io::stdout())
     }
 
+    fn can_ask(&mut self) -> bool {
+        // The picker paints to stderr and reads stdin, so those are what
+        // decide whether there is anyone to ask. Gating on stdout instead
+        // meant `launch claude 2>/dev/null` took raw mode and threw every
+        // frame away: a blank, frozen terminal with no visible way out.
+        std::io::IsTerminal::is_terminal(&std::io::stderr())
+            && std::io::IsTerminal::is_terminal(&std::io::stdin())
+    }
+
     fn accounts(&mut self, base_url: &str, api_key: &str) -> Result<Value> {
         self.runtime.block_on(request_json(
             Method::Get,
@@ -124,6 +134,23 @@ impl CliRuntime for RealRuntime {
     fn uninstall_service(&mut self) -> Result<PathBuf> {
         let home = home_dir()?;
         uninstall_platform_service(&home)
+    }
+
+    fn launch(&mut self, plan: &LaunchPlan) -> Result<()> {
+        launch_harness(plan)
+    }
+
+    fn models(&mut self, base_url: &str, api_key: &str) -> Result<Value> {
+        self.runtime.block_on(request_json(
+            Method::Get,
+            base_url,
+            "/v1/models",
+            Some(api_key),
+        ))
+    }
+
+    fn select_model(&mut self, harness: &str, choices: &[ModelChoice]) -> Result<Option<String>> {
+        pick_model(harness, choices)
     }
 
     fn service_logs(&mut self, follow: bool, lines: u32) -> Result<()> {
@@ -209,6 +236,251 @@ impl CliRuntime for RealRuntime {
 enum Method {
     Get,
     Post,
+}
+
+/// Drive the model picker on the terminal: arrows move, typing narrows,
+/// enter takes the highlighted row.
+///
+/// It runs on the alternate screen so the operator's scrollback survives,
+/// and raw mode is left again on every exit — the error path included,
+/// which is why the loop's outcome is captured before the terminal is
+/// restored rather than returned through `?`.
+fn pick_model(harness: &str, choices: &[ModelChoice]) -> Result<Option<String>> {
+    use crossterm::{cursor, event, execute, terminal};
+
+    terminal::enable_raw_mode()
+        .context("failed to put the terminal in raw mode; pass --model to skip the picker")?;
+    let mut screen = std::io::stderr();
+    let entered = execute!(screen, terminal::EnterAlternateScreen, cursor::Hide);
+    let outcome = entered.map_err(anyhow::Error::from).and_then(|()| {
+        picker_loop(&mut screen, harness, choices, &mut || {
+            event::read().map_err(anyhow::Error::from)
+        })
+    });
+    let _ = execute!(screen, cursor::Show, terminal::LeaveAlternateScreen);
+    let _ = terminal::disable_raw_mode();
+    outcome
+}
+
+/// The picker's state machine, over whatever `next_event` yields. Split
+/// from the terminal setup so the loop is the part with the logic and the
+/// setup is the part with the cleanup.
+fn picker_loop(
+    screen: &mut impl std::io::Write,
+    harness: &str,
+    choices: &[ModelChoice],
+    next_event: &mut dyn FnMut() -> Result<crossterm::event::Event>,
+) -> Result<Option<String>> {
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+
+    let mut filter = String::new();
+    let mut cursor = 0usize;
+    let mut scroll = 0usize;
+    loop {
+        let matching = matching_choices(choices, &filter);
+        cursor = cursor.min(matching.len().saturating_sub(1));
+        let rows = draw_picker(
+            screen,
+            &PickerFrame {
+                harness,
+                total: choices.len(),
+                matching: &matching,
+                filter: &filter,
+                cursor,
+            },
+            &mut scroll,
+        )?;
+        let Event::Key(key) = next_event()? else {
+            continue;
+        };
+        // A key repeats as Press and Release on terminals that report both;
+        // acting on one of them keeps a single press from moving twice.
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        let page = rows.max(1);
+        match key.code {
+            KeyCode::Esc => return Ok(None),
+            KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Ok(None);
+            }
+            KeyCode::Up => cursor = cursor.saturating_sub(1),
+            KeyCode::Down => cursor = (cursor + 1).min(matching.len().saturating_sub(1)),
+            KeyCode::PageUp => cursor = cursor.saturating_sub(page),
+            KeyCode::PageDown => cursor = (cursor + page).min(matching.len().saturating_sub(1)),
+            KeyCode::Home => cursor = 0,
+            KeyCode::End => cursor = matching.len().saturating_sub(1),
+            KeyCode::Backspace => {
+                filter.pop();
+            }
+            KeyCode::Enter => {
+                if let Some(choice) = matching.get(cursor) {
+                    return Ok(Some(choice.id.clone()));
+                }
+            }
+            KeyCode::Char(character) => {
+                filter.push(character);
+                // A narrower list means the old row number means nothing.
+                cursor = 0;
+                scroll = 0;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// What one frame of the picker is drawn from. `scroll` stays out of it:
+/// the frame decides it from the cursor and hands it back to the loop.
+struct PickerFrame<'a> {
+    harness: &'a str,
+    total: usize,
+    matching: &'a [ModelChoice],
+    filter: &'a str,
+    cursor: usize,
+}
+
+/// Paint one frame and return how many model rows fit, which is also the
+/// page size the loop pages by.
+///
+/// Three zones with air between them: what you are doing and how much of
+/// the catalog is left, what you have typed, and the list. Everything but
+/// the list recedes, because the list is what is being read.
+fn draw_picker(
+    screen: &mut impl std::io::Write,
+    frame_state: &PickerFrame<'_>,
+    scroll: &mut usize,
+) -> Result<usize> {
+    use crossterm::{cursor as term_cursor, execute, terminal};
+
+    let &PickerFrame {
+        harness,
+        total,
+        matching,
+        filter,
+        cursor,
+    } = frame_state;
+
+    let (columns, lines) = terminal::size().unwrap_or((80, 24));
+    let width = usize::from(columns).max(20);
+    // Heading, blank, query, blank, and the footer: five rows that are not
+    // the list.
+    let rows = usize::from(lines).saturating_sub(5).max(1);
+    if cursor < *scroll {
+        *scroll = cursor;
+    } else if cursor >= *scroll + rows {
+        *scroll = cursor + 1 - rows;
+    }
+    *scroll = (*scroll).min(matching.len().saturating_sub(rows.min(matching.len())));
+
+    let id_width = matching
+        .iter()
+        .map(|choice| choice.id.chars().count())
+        .max()
+        .unwrap_or(0)
+        .clamp(12, width.saturating_sub(34).max(12));
+    let context_width = matching
+        .iter()
+        .map(|choice| choice.context.chars().count())
+        .max()
+        .unwrap_or(0);
+
+    let counter = format!("{}/{total}", matching.len());
+    let heading = format!(
+        "  {}{}{}",
+        paint(BOLD, &format!("launch {harness}")),
+        " ".repeat(
+            width
+                .saturating_sub(2 + 7 + harness.chars().count() + counter.chars().count() + 2)
+                .max(2)
+        ),
+        paint(DIM, &counter),
+    );
+    let mut frame = vec![
+        heading,
+        String::new(),
+        // A prompt glyph and a block cursor: the one place typing goes, and
+        // it says so without the word "search" in front of it.
+        format!("  {} {filter}{}", paint(GREEN, "›"), paint(BOLD, "█")),
+        String::new(),
+    ];
+
+    // One line of its own, counted against the same budget as a row, so
+    // the frame stays exactly as tall as the terminal and the heading with
+    // its counter is not scrolled away at the moment it is needed.
+    let mut painted = 0;
+    if matching.is_empty() {
+        frame.push(paint(DIM, "    nothing matches"));
+        painted += 1;
+    }
+    for (offset, choice) in matching.iter().skip(*scroll).take(rows).enumerate() {
+        let selected = *scroll + offset == cursor;
+        let row = format!(
+            "{} {}  {}  {}",
+            if selected {
+                paint(GREEN, "❯")
+            } else {
+                " ".to_string()
+            },
+            // The pool prefix repeats down the whole list, so it is dimmed
+            // and the model name keeps the reader's attention.
+            paint_id(&pad(&choice.id, id_width), selected),
+            paint(DIM, &format!("{:>context_width$}", choice.context)),
+            paint(DIM, &choice.price),
+        );
+        frame.push(row);
+        painted += 1;
+    }
+    for _ in painted..rows {
+        frame.push(String::new());
+    }
+    frame.push(paint(DIM, "  ↑↓ move   ⏎ run   esc cancel"));
+
+    execute!(
+        screen,
+        term_cursor::MoveTo(0, 0),
+        terminal::Clear(terminal::ClearType::All)
+    )?;
+    screen.write_all(frame.join("\r\n").as_bytes())?;
+    screen.flush()?;
+    Ok(rows)
+}
+
+/// One model id, already padded: the `<pool>/` prefix dim and the model
+/// name bright, so a column of `commandcode/...` reads as its models
+/// rather than as its pool. The highlighted row is bright throughout.
+fn paint_id(padded: &str, selected: bool) -> String {
+    if selected {
+        return paint(BOLD, padded);
+    }
+    let Some(slash) = padded.find('/') else {
+        return padded.to_string();
+    };
+    let (prefix, rest) = padded.split_at(slash + 1);
+    format!("{}{rest}", paint(DIM, prefix))
+}
+
+/// Become the harness. `exec` leaves the terminal, the signal handling and
+/// the exit code with it rather than proxying all three through pengepul, so
+/// this returns only when the program could not be started at all.
+fn launch_harness(plan: &LaunchPlan) -> Result<()> {
+    use std::os::unix::process::CommandExt as _;
+
+    let mut command = std::process::Command::new(&plan.program);
+    command.args(&plan.args);
+    for (name, value) in &plan.env {
+        command.env(name, value);
+    }
+    let error = command.exec();
+    // The one failure worth translating: the operating system says "no such
+    // file", and what the operator needs is the install line.
+    if error.kind() == std::io::ErrorKind::NotFound {
+        bail!(
+            "{} is not installed; install it with: {}",
+            plan.program,
+            plan.install_hint
+        );
+    }
+    Err(error).with_context(|| format!("failed to run {}", plan.program))
 }
 
 async fn request_json(
@@ -791,6 +1063,133 @@ fn unpack_over(
 }
 #[cfg(test)]
 mod tests {
+    use super::picker_loop;
+    use crate::cli::ModelChoice;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+    fn choices() -> Vec<ModelChoice> {
+        [
+            "anthropic/claude-opus-5",
+            "anthropic/claude-haiku-4-5",
+            "groq/llama",
+        ]
+        .iter()
+        .map(|id| ModelChoice {
+            id: (*id).to_string(),
+            context: "1.0M ctx".to_string(),
+            price: String::new(),
+        })
+        .collect()
+    }
+
+    fn press(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// Drive the picker's key loop over a scripted sequence, discarding
+    /// what it paints. Running out of keys is an error rather than a
+    /// silent cancel, so a test cannot pass by exhausting the script.
+    fn drive(keys: Vec<Event>) -> Option<String> {
+        let mut screen = Vec::new();
+        let mut queued = keys.into_iter();
+        picker_loop(&mut screen, "claude", &choices(), &mut || {
+            queued
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("ran out of keys"))
+        })
+        .expect("the picker loop")
+    }
+
+    #[test]
+    fn enter_takes_the_highlighted_row() {
+        assert_eq!(
+            drive(vec![press(KeyCode::Enter)]).as_deref(),
+            Some("anthropic/claude-opus-5")
+        );
+    }
+
+    #[test]
+    fn the_arrows_move_the_highlight() {
+        assert_eq!(
+            drive(vec![press(KeyCode::Down), press(KeyCode::Enter)]).as_deref(),
+            Some("anthropic/claude-haiku-4-5")
+        );
+        // Up at the top stays at the top rather than wrapping or panicking.
+        assert_eq!(
+            drive(vec![press(KeyCode::Up), press(KeyCode::Enter)]).as_deref(),
+            Some("anthropic/claude-opus-5")
+        );
+        assert_eq!(
+            drive(vec![press(KeyCode::End), press(KeyCode::Enter)]).as_deref(),
+            Some("groq/llama")
+        );
+    }
+
+    #[test]
+    fn typing_narrows_and_backspace_widens() {
+        assert_eq!(
+            drive(vec![
+                press(KeyCode::Char('h')),
+                press(KeyCode::Char('a')),
+                press(KeyCode::Enter)
+            ])
+            .as_deref(),
+            Some("anthropic/claude-haiku-4-5")
+        );
+        // `ha` then a backspace leaves `h`, which still excludes opus.
+        assert_eq!(
+            drive(vec![
+                press(KeyCode::Char('z')),
+                press(KeyCode::Backspace),
+                press(KeyCode::Enter)
+            ])
+            .as_deref(),
+            Some("anthropic/claude-opus-5")
+        );
+    }
+
+    #[test]
+    fn esc_and_ctrl_c_cancel() {
+        assert_eq!(drive(vec![press(KeyCode::Esc)]), None);
+        assert_eq!(
+            drive(vec![Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL
+            ))]),
+            None
+        );
+    }
+
+    #[test]
+    fn enter_on_no_match_neither_picks_nor_panics() {
+        assert_eq!(
+            drive(vec![
+                press(KeyCode::Char('z')),
+                press(KeyCode::Enter),
+                press(KeyCode::Backspace),
+                press(KeyCode::Enter)
+            ])
+            .as_deref(),
+            Some("anthropic/claude-opus-5")
+        );
+    }
+
+    #[test]
+    fn a_key_release_is_not_a_second_press() {
+        // Terminals that report both would otherwise move twice per press.
+        let mut release = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+        assert_eq!(
+            drive(vec![
+                press(KeyCode::Down),
+                Event::Key(release),
+                press(KeyCode::Enter)
+            ])
+            .as_deref(),
+            Some("anthropic/claude-haiku-4-5")
+        );
+    }
+
     use super::{unpack_over, verify_checksum};
 
     #[test]

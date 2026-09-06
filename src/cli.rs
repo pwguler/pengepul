@@ -2,12 +2,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 
 use crate::config::{Config, load_config, register_provider, selected_config_path};
 pub use crate::render::Style;
-use crate::render::{ActionGlyph, BOLD, DIM, Fact, Output, fact_panel, paint, status_glyph};
+use crate::render::{
+    ActionGlyph, BOLD, DIM, Fact, Output, fact_panel, format_count, paint, status_glyph,
+};
 use crate::service::service_status_panel;
 use crate::tokens::save_token;
 use crate::types::{ProviderId, ProviderKind, TokenData};
@@ -31,6 +33,32 @@ pub struct ServiceInstallRequest {
     pub port: Option<u16>,
     pub start: bool,
     pub enable: bool,
+}
+
+/// The process `launch` becomes: the harness binary, its arguments, and the
+/// variables that point it at the relay. Everything the verb decided, so the
+/// runtime decides nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchPlan {
+    pub program: String,
+    pub args: Vec<String>,
+    /// Added to the operator's environment rather than replacing it: the
+    /// harness keeps its own configuration, and only its upstream moves.
+    pub env: Vec<(String, String)>,
+    /// How to install `program`, for the one failure the runtime can name
+    /// better than the operating system does.
+    pub install_hint: String,
+}
+
+/// One row of the model picker. The two facts that separate ids are kept
+/// apart so the picker can align them into columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelChoice {
+    pub id: String,
+    /// `1.0M ctx`, or empty where the catalog does not say.
+    pub context: String,
+    /// `$5.00/$25.00` per million in and out, or empty.
+    pub price: String,
 }
 
 pub trait CliRuntime {
@@ -58,6 +86,11 @@ pub trait CliRuntime {
     /// Whether stdout is a terminal, so the pool views may render panels.
     /// Asked once at the edge; the CLI core only sees the answer.
     fn stdout_is_tty(&mut self) -> bool;
+
+    /// Whether there is an operator to put a question to. Separate from
+    /// `stdout_is_tty` because the picker paints to stderr and reads
+    /// stdin, and those are what must be terminals for it to work.
+    fn can_ask(&mut self) -> bool;
 
     /// Reload runtime account state.
     ///
@@ -139,6 +172,30 @@ pub trait CliRuntime {
     ///
     /// Returns an error if the download, verification, or replacement fails.
     fn install_release(&mut self, tag: &str, asset: &str) -> Result<PathBuf>;
+
+    /// Replace this process with the harness the plan names.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the program cannot be run. It does not return
+    /// when the program starts: the harness has the process from there on.
+    fn launch(&mut self, plan: &LaunchPlan) -> Result<()>;
+
+    /// The relay's advertised model catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    fn models(&mut self, base_url: &str, api_key: &str) -> Result<Value>;
+
+    /// Let the operator move through `choices` and pick one, typing to
+    /// narrow the list. `harness` is what the picker says it is launching.
+    /// `Ok(None)` means they cancelled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the terminal cannot be driven.
+    fn select_model(&mut self, harness: &str, choices: &[ModelChoice]) -> Result<Option<String>>;
 }
 
 #[derive(Debug, Parser)]
@@ -174,6 +231,20 @@ enum Command {
         /// register a new OpenAI-compatible provider at this URL; needs --key
         #[arg(long = "base-url")]
         base_url: Option<String>,
+    },
+    /// run a coding harness on the relay
+    Launch {
+        #[arg(long = "config")]
+        command_config: Option<PathBuf>,
+        /// harness to run
+        #[arg(value_enum)]
+        harness: Harness,
+        /// model the harness runs on; required for pi
+        #[arg(long)]
+        model: Option<String>,
+        /// arguments forwarded to the harness, after `--`
+        #[arg(last = true)]
+        forwarded: Vec<String>,
     },
     /// show local server status
     Status {
@@ -213,6 +284,27 @@ enum Command {
         #[arg(trailing_var_arg = true)]
         topic: Vec<String>,
     },
+}
+
+/// The harnesses `launch` knows how to point at the relay. Each one is a
+/// table entry in `launch_plan`: a binary, the variables that redirect it,
+/// and how it is told which model to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Harness {
+    /// Claude Code
+    Claude,
+    /// pi
+    Pi,
+}
+
+impl Harness {
+    /// The name the operator typed, for the surfaces that name it back.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Pi => "pi",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Subcommand)]
@@ -332,6 +424,20 @@ pub fn run_with_env(
         }
         Some(Command::Help { topic }) => {
             output.line(&help_text(&topic)?);
+        }
+        Some(Command::Launch {
+            command_config,
+            harness,
+            model,
+            forwarded,
+        }) => {
+            launch(
+                root_env.with_override(command_config.as_deref()),
+                harness,
+                model.as_deref(),
+                &forwarded,
+                runtime,
+            )?;
         }
         Some(Command::Login {
             command_config,
@@ -961,6 +1067,198 @@ fn print_login_saved(
     }
 }
 
+/// The provider name the pi extension registers the relay under, and the
+/// package that registers it. pi resolves `--provider` against what its
+/// extensions declared, so without the package a launch dies at pi's own
+/// provider lookup — loudly, which is why nothing here checks for it first.
+const PI_PROVIDER: &str = "pengepul";
+const PI_PROVIDER_PACKAGE: &str = "npm:@pwguler/pi-pengepul-provider";
+
+/// Run a harness on the relay.
+///
+/// Nothing persists. The harness is handed an environment and an argument
+/// list for one process, so the same binary started without `launch` still
+/// finds its own accounts and its own models.
+fn launch(
+    env: CommandEnv<'_>,
+    harness: Harness,
+    model: Option<&str>,
+    forwarded: &[String],
+    runtime: &mut impl CliRuntime,
+) -> Result<()> {
+    let config = env.load()?;
+    let base_url = base_url(&config);
+    let api_key = first_api_key(&config)?;
+    // The relay is the whole of what this verb hands over, so a dead one is
+    // its refusal to make. Left to the harness the same fact arrives as a
+    // connection error inside a TUI, several screens from anything that
+    // names pengepul.
+    runtime.health(&base_url).with_context(|| {
+        format!(
+            "relay is not answering at {base_url}; start it with `pengepul serve` \
+             or `pengepul service start`"
+        )
+    })?;
+    let chosen = match model {
+        Some(model) => Some(model.to_string()),
+        // Nobody named a model, so offer the ones the relay actually
+        // serves. With no terminal there is nobody to ask, and raw mode
+        // would seize one nobody is watching, so the picker is skipped and
+        // each harness does what it does with no model at all.
+        None if runtime.can_ask() => {
+            let catalog = runtime.models(&base_url, &api_key)?;
+            let choices = model_choices(&catalog);
+            if choices.is_empty() {
+                None
+            } else {
+                runtime.select_model(harness.name(), &choices)?
+            }
+        }
+        None => None,
+    };
+    let plan = launch_plan(harness, &base_url, &api_key, chosen.as_deref(), forwarded)?;
+    runtime.launch(&plan)
+}
+
+/// Every model the relay advertises, in the order it advertises them.
+/// Every one of them is a fair choice for either harness: the relay serves
+/// Messages from a configured endpoint by translating onto its Chat
+/// Completions dialect, so what is on the list is what can be run.
+fn model_choices(catalog: &Value) -> Vec<ModelChoice> {
+    let Some(entries) = catalog.get("data").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let id = entry.get("id").and_then(Value::as_str)?;
+            let (context, price) = model_facts(entry);
+            Some(ModelChoice {
+                id: id.to_string(),
+                context,
+                price,
+            })
+        })
+        .collect()
+}
+
+/// What separates two ids on the list: the context window, and what a
+/// million tokens cost in and out. Returned apart so the picker can align
+/// each into its own column, and empty where the catalog does not carry
+/// them — a configured endpoint publishes what it publishes, and a blank
+/// column is honest where a zero would not be.
+fn model_facts(entry: &Value) -> (String, String) {
+    let context = entry
+        .get("context_window")
+        .and_then(Value::as_u64)
+        .map(|window| {
+            format!(
+                "{} ctx",
+                format_count(i64::try_from(window).unwrap_or(i64::MAX))
+            )
+        })
+        .unwrap_or_default();
+    let pricing = entry.get("pricing");
+    let input = pricing
+        .and_then(|rates| rates.get("input_per_million"))
+        .and_then(Value::as_f64);
+    let output = pricing
+        .and_then(|rates| rates.get("output_per_million"))
+        .and_then(Value::as_f64);
+    let price = match (input, output) {
+        (Some(input), Some(output)) => format!("${input:.2}/${output:.2}"),
+        _ => String::new(),
+    };
+    (context, price)
+}
+
+/// Rows whose id carries every word of the filter, case folded. Words
+/// narrow together, so `opus 4` finds the 4-series opus ids without naming
+/// their exact shape.
+pub(crate) fn matching_choices(choices: &[ModelChoice], filter: &str) -> Vec<ModelChoice> {
+    let words: Vec<String> = filter.split_whitespace().map(str::to_lowercase).collect();
+    choices
+        .iter()
+        .filter(|choice| {
+            let id = choice.id.to_lowercase();
+            words.iter().all(|word| id.contains(word))
+        })
+        .cloned()
+        .collect()
+}
+
+/// What each harness needs to run on the relay instead of its own upstream.
+fn launch_plan(
+    harness: Harness,
+    base_url: &str,
+    api_key: &str,
+    model: Option<&str>,
+    forwarded: &[String],
+) -> Result<LaunchPlan> {
+    match harness {
+        Harness::Claude => {
+            let mut env = vec![
+                ("ANTHROPIC_BASE_URL".to_string(), base_url.to_string()),
+                ("ANTHROPIC_AUTH_TOKEN".to_string(), api_key.to_string()),
+                // Emptied rather than left alone. A key already in the
+                // operator's environment outranks the token above, and
+                // sends the harness to api.anthropic.com on a per-token
+                // meter — the one outcome this verb exists to prevent.
+                ("ANTHROPIC_API_KEY".to_string(), String::new()),
+            ];
+            if let Some(model) = model {
+                // Every tier, not only the default one. The operator named
+                // one model; a `/model sonnet` that quietly went somewhere
+                // else would be the same silence this verb removes.
+                for name in [
+                    "ANTHROPIC_MODEL",
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                    "CLAUDE_CODE_SUBAGENT_MODEL",
+                ] {
+                    env.push((name.to_string(), model.to_string()));
+                }
+            }
+            Ok(LaunchPlan {
+                program: "claude".to_string(),
+                args: forwarded.to_vec(),
+                env,
+                install_hint: "npm install -g @anthropic-ai/claude-code".to_string(),
+            })
+        }
+        Harness::Pi => {
+            // pi binds `--provider` only when a model comes with it: run
+            // with a provider alone it answers from the one in its own
+            // settings and says nothing. Without a model this verb would
+            // start a pi that looked pointed at the relay and was not.
+            let model = model.context(
+                "pi needs --model: it binds a provider only together with one, and \
+                 without it pi keeps the provider from its own settings",
+            )?;
+            let mut args = vec![
+                "--provider".to_string(),
+                PI_PROVIDER.to_string(),
+                "--model".to_string(),
+                model.to_string(),
+            ];
+            args.extend_from_slice(forwarded);
+            Ok(LaunchPlan {
+                program: "pi".to_string(),
+                args,
+                env: vec![
+                    ("PENGEPUL_BASE_URL".to_string(), base_url.to_string()),
+                    ("PENGEPUL_API_KEY".to_string(), api_key.to_string()),
+                ],
+                install_hint: format!(
+                    "npm install -g @earendil-works/pi-coding-agent, then \
+                     pi install {PI_PROVIDER_PACKAGE}"
+                ),
+            })
+        }
+    }
+}
+
 fn help_text(topic: &[String]) -> Result<String> {
     let mut command = Args::command();
     for item in topic {
@@ -1014,4 +1312,71 @@ fn unix_now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |duration| duration.as_secs_f64())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ModelChoice, matching_choices};
+
+    fn rows(ids: &[&str]) -> Vec<ModelChoice> {
+        ids.iter()
+            .map(|id| ModelChoice {
+                id: (*id).to_string(),
+                context: String::new(),
+                price: String::new(),
+            })
+            .collect()
+    }
+
+    fn ids(choices: &[ModelChoice]) -> Vec<&str> {
+        choices.iter().map(|choice| choice.id.as_str()).collect()
+    }
+
+    #[test]
+    fn an_empty_filter_keeps_every_row_in_order() {
+        let all = rows(&["anthropic/claude-opus-5", "commandcode/z-ai/glm-5.3-flash"]);
+        assert_eq!(
+            ids(&matching_choices(&all, "")),
+            ["anthropic/claude-opus-5", "commandcode/z-ai/glm-5.3-flash"]
+        );
+    }
+
+    #[test]
+    fn a_filter_matches_anywhere_in_the_id_and_ignores_case() {
+        let all = rows(&["commandcode/zai-org/GLM-5.3", "anthropic/claude-opus-5"]);
+        assert_eq!(
+            ids(&matching_choices(&all, "glm")),
+            ["commandcode/zai-org/GLM-5.3"]
+        );
+        assert_eq!(
+            ids(&matching_choices(&all, "OPUS")),
+            ["anthropic/claude-opus-5"]
+        );
+    }
+
+    #[test]
+    fn words_narrow_together_rather_than_replacing_each_other() {
+        // The picker appends what is typed to the filter, so `glm` then
+        // `flash` must mean the flash one among the glm rows. An earlier
+        // version replaced instead, and widened 6 matches back to 14.
+        let all = rows(&[
+            "commandcode/z-ai/glm-5.3-flash",
+            "commandcode/zai-org/GLM-5.3",
+            "commandcode/google/gemini-3.8-flash",
+        ]);
+
+        assert_eq!(matching_choices(&all, "glm").len(), 2);
+        assert_eq!(matching_choices(&all, "flash").len(), 2);
+        assert_eq!(
+            ids(&matching_choices(&all, "glm flash")),
+            ["commandcode/z-ai/glm-5.3-flash"],
+            "two words must intersect, not union"
+        );
+    }
+
+    #[test]
+    fn a_filter_nothing_carries_matches_nothing() {
+        let all = rows(&["anthropic/claude-opus-5"]);
+        assert!(matching_choices(&all, "zzz").is_empty());
+    }
 }

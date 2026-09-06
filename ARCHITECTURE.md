@@ -52,7 +52,9 @@ in files.
   removes the `<provider>/` prefix and any trailing client thinking level.
 - **Translation** (`translate.rs`, `streaming.rs`) — rewrites a body between
   Inbound and upstream **Dialect**, whole-document and one SSE event at a time;
-  pure JSON, no I/O.
+  pure JSON, no I/O. Every pair the route table can produce has a translation,
+  Messages↔Chat Completions included, so a configured endpoint serves a
+  Messages client by translation rather than by refusal.
 - **Config** (`config.rs`) — parses `config.yaml`, including the `providers:`
   section, which is the only Provider registry: there is no database table.
   It also writes it: `register_provider` adds one entry for `login
@@ -64,7 +66,15 @@ in files.
 - **CLI + Runtime + Service** (`cli.rs`, `runtime.rs`, `service.rs`) — command
   parsing and dispatch (pure), the `CliRuntime` adapter that makes a verb touch
   the real world, and the per-user systemd/launchd unit — including the parser
-  that turns the platform tool's status text into panel rows.
+  that turns the platform tool's status text into panel rows. `launch` is
+  dispatch too: `launch_plan` turns a harness name into the binary, the
+  arguments and the environment that point it at the relay, and the runtime
+  `exec`s that plan — the whole of the per-harness knowledge is that one
+  table. Its model picker splits the same way: `cli.rs` turns the catalog
+  into rows (`model_choices`) and owns the search rule
+  (`matching_choices`); the runtime fetches `/v1/models` and drives the
+  keys, so what a test asserts is the list that was offered and the row
+  that came back.
 - **Render** (`render.rs`) — the panel language every verb prints with: the
   64-column box, the `Fact` row (`<label>  <value>`) and `fact_panel` that
   every rich *fact* surface is built from, the three-color palette, glyphs,
@@ -96,6 +106,14 @@ in files.
 
 ## Invariants
 
+- **A configured endpoint serves every dialect its models can carry.** It
+  speaks only Chat Completions upstream, so a Messages request is translated
+  onto it — request, whole response, and the SSE stream — rather than refused
+  (ADR-0016, which supersedes ADR-0011's inbound clause). Responses and
+  `count_tokens` stay 501 there: no client asks for the first, and the second is
+  anthropic's own endpoint. Two losses in that translation are deliberate:
+  anthropic server tools are dropped, and thinking blocks do not travel back
+  upstream.
 - **Cloaking runs in two layers.** The sanitizer (`masquerade_request`) runs on
   the `/messages` route only; the vendor-identity inject (`apply_cloaking`) runs
   inside the Upstream client for anthropic on every dialect. A Chat- or
@@ -188,3 +206,15 @@ in files.
   display) and `web-fetch` stays for the native tool swap — ADR-0014.
 - **A (Inbound dialect, Provider) pair the relay cannot serve is refused 501 at
   routing**, never sent upstream and never retried.
+- **`launch` leaves nothing behind.** A harness is pointed at the relay by the
+  environment and the arguments of one process, never by a file: the same
+  binary started any other way still resolves its own accounts and its own
+  models. That is what bounds the verb to harnesses which can be redirected
+  per-process — openclaw and hermes can only be redirected in their config
+  files, so they stay the README's manual step (ADR-0007 still holds: the
+  client adapts, and `launch` only writes that adaptation into one process
+  instead of onto disk). Its picker offers every advertised model to either
+  harness, because every one of them can be run: the relay translates
+  Messages onto a configured endpoint rather than refusing it (ADR-0016). It
+  opens nothing at all unless stderr and stdin are both terminals, since
+  raw mode would otherwise seize a terminal nobody is watching.

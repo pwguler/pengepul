@@ -1,6 +1,6 @@
 # 11. Reintroduce a static-key provider class as configurable OpenAI-compatible endpoints
 
-Status: Accepted
+Status: Accepted (inbound-dialect clause superseded by ADR-0016)
 
 ## Context
 

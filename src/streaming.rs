@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::Result;
 use serde_json::{Value, json};
 
+use crate::translate::anthropic_stop_reason;
 use crate::types::UsageData;
 
 #[derive(Debug, Clone)]
@@ -60,6 +61,13 @@ pub struct AnthropicStreamState {
     tool_call_blocks: BTreeMap<i64, i64>,
     tool_argument_delta_indexes: BTreeSet<i64>,
     has_tool_use: bool,
+    /// Chat Completions tool calls, by the `index` their chunks carry,
+    /// held until the turn ends. See `flush_chat_tool_calls`.
+    pending_tool_calls: BTreeMap<i64, PendingToolCall>,
+    /// Whether `message_start` has gone out. The Responses dialect has an
+    /// event that opens a message; Chat Completions has none, so the first
+    /// chunk is what opens it.
+    started: bool,
 }
 
 impl AnthropicStreamState {
@@ -73,8 +81,18 @@ impl AnthropicStreamState {
             tool_call_blocks: BTreeMap::new(),
             tool_argument_delta_indexes: BTreeSet::new(),
             has_tool_use: false,
+            pending_tool_calls: BTreeMap::new(),
+            started: false,
         }
     }
+}
+
+/// One Chat Completions tool call being assembled across chunks.
+#[derive(Debug, Clone, Default)]
+struct PendingToolCall {
+    id: String,
+    name: String,
+    arguments: String,
 }
 
 #[derive(Debug, Clone)]
@@ -697,6 +715,185 @@ pub fn responses_sse_to_anthropic(
         }
         _ => Vec::new(),
     }
+}
+
+/// Take in one `tool_calls` entry from a chunk. Nothing is emitted here.
+///
+/// Messages content blocks do not interleave: one opens, takes its deltas,
+/// and stops before the next may start. Chat Completions is under no such
+/// rule — a gateway may announce every call in one chunk and only then
+/// stream their arguments, keyed by `index`. Emitting a block per
+/// announcement closed the first call before its own arguments arrived, so
+/// a client finalizing on `content_block_stop` ran that tool with an empty
+/// input. The calls are therefore assembled here and written out whole
+/// when the turn ends.
+fn record_chat_tool_call(call: &Value, state: &mut AnthropicStreamState) {
+    let entry = state
+        .pending_tool_calls
+        .entry(int_field(call, "index"))
+        .or_default();
+    state.has_tool_use = true;
+    // Only what a chunk actually carries: the id and name arrive once, on
+    // the chunk that opens the call, and later chunks leave them empty.
+    if let Some(id) = call
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
+        entry.id = id.to_string();
+    }
+    let function = call.get("function").unwrap_or(&Value::Null);
+    if let Some(name) = function
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+    {
+        entry.name = name.to_string();
+    }
+    if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+        entry.arguments.push_str(arguments);
+    }
+}
+
+/// Write the assembled tool calls out as content blocks, in the order
+/// their indexes give, each one whole: start, its arguments, stop.
+fn flush_chat_tool_calls(state: &mut AnthropicStreamState) -> Vec<String> {
+    let pending = std::mem::take(&mut state.pending_tool_calls);
+    let mut chunks = Vec::new();
+    for call in pending.into_values() {
+        chunks.extend(stop_active_block(state));
+        let index = state.next_index;
+        state.next_index += 1;
+        state.active_block = Some(BlockType::ToolUse);
+        chunks.push(sse(
+            &json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": call.id,
+                    "name": call.name,
+                    "input": {}
+                }
+            }),
+            Some("content_block_start"),
+        ));
+        if !call.arguments.is_empty() {
+            chunks.push(sse(
+                &json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "input_json_delta", "partial_json": call.arguments}
+                }),
+                Some("content_block_delta"),
+            ));
+        }
+    }
+    chunks
+}
+
+/// One Chat Completions stream chunk as Anthropic Messages events.
+///
+/// This dialect names no events and opens no message: every chunk arrives
+/// as a bare `data:` frame, so the first one is what emits `message_start`,
+/// and `finish_reason` is what ends it. Tool calls are keyed by the
+/// `index` the chunks carry, because their id and name arrive on the chunk
+/// that opens the call and the arguments trickle in after it.
+#[must_use]
+pub fn chat_sse_to_anthropic(data: &Value, state: &mut AnthropicStreamState) -> Vec<String> {
+    let empty = Vec::new();
+    let mut chunks = Vec::new();
+    let usage = data.get("usage").unwrap_or(&Value::Null);
+
+    if !state.started {
+        state.started = true;
+        chunks.push(sse(
+            &json!({
+                "type": "message_start",
+                "message": {
+                    "id": state.message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": state.model,
+                    "content": [],
+                    "stop_reason": Value::Null,
+                    "stop_sequence": Value::Null,
+                    "usage": {
+                        "input_tokens": int_field(usage, "prompt_tokens"),
+                        "output_tokens": 0
+                    }
+                }
+            }),
+            Some("message_start"),
+        ));
+    }
+
+    let choices = data
+        .get("choices")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
+    let Some(choice) = choices.first() else {
+        return chunks;
+    };
+    let delta = choice.get("delta").unwrap_or(&Value::Null);
+
+    if let Some(reasoning) = delta
+        .get("reasoning_content")
+        .or_else(|| delta.get("reasoning"))
+        .and_then(Value::as_str)
+        .filter(|reasoning| !reasoning.is_empty())
+    {
+        chunks.extend(ensure_anthropic_block(state, BlockType::Thinking));
+        chunks.push(sse(
+            &json!({
+                "type": "content_block_delta",
+                "index": state.next_index - 1,
+                "delta": {"type": "thinking_delta", "thinking": reasoning}
+            }),
+            Some("content_block_delta"),
+        ));
+    }
+    if let Some(text) = delta
+        .get("content")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
+        chunks.extend(ensure_anthropic_block(state, BlockType::Text));
+        chunks.push(sse(
+            &json!({
+                "type": "content_block_delta",
+                "index": state.next_index - 1,
+                "delta": {"type": "text_delta", "text": text}
+            }),
+            Some("content_block_delta"),
+        ));
+    }
+
+    for call in delta
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty)
+    {
+        record_chat_tool_call(call, state);
+    }
+
+    if let Some(finish) = choice.get("finish_reason").and_then(Value::as_str) {
+        chunks.extend(flush_chat_tool_calls(state));
+        chunks.extend(stop_active_block(state));
+        chunks.push(sse(
+            &json!({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": anthropic_stop_reason(Some(finish), state.has_tool_use),
+                    "stop_sequence": Value::Null
+                },
+                "usage": {"output_tokens": int_field(usage, "completion_tokens")}
+            }),
+            Some("message_delta"),
+        ));
+        chunks.push(sse(&json!({"type": "message_stop"}), Some("message_stop")));
+    }
+    chunks
 }
 
 #[must_use]
