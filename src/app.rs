@@ -1895,6 +1895,7 @@ fn usage_from_response(body: &Value) -> Option<UsageData> {
             .get("cache_creation_input_tokens")
             .and_then(Value::as_i64)
             .unwrap_or(0),
+        cache_creation_1h_input_tokens: UsageData::long_cache_write(usage),
         cache_read_input_tokens: usage
             .get("cache_read_input_tokens")
             .or_else(|| {
@@ -2232,6 +2233,7 @@ fn update_anthropic_stream_usage(
                     "cache_creation_input_tokens",
                     usage.cache_creation_input_tokens,
                 );
+                usage.cache_creation_1h_input_tokens = UsageData::long_cache_write(payload);
                 usage.cache_read_input_tokens = int_field_or(
                     payload,
                     "cache_read_input_tokens",
@@ -3242,6 +3244,67 @@ mod tests {
         .expect("usage");
         assert_eq!(usage.output_tokens, 229);
         assert_eq!(usage.reasoning_output_tokens, 145);
+    }
+
+    #[test]
+    fn usage_from_response_splits_cache_writes_by_ttl() {
+        // A 1h write costs 2x base input against 1.25x for 5m (ADR-0018),
+        // so the total alone cannot say what a cache write was worth.
+        // Anthropic breaks it down in `cache_creation`; keep the 1h half.
+        let usage = super::usage_from_response(&json!({
+            "usage": {
+                "input_tokens": 12,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": 10416,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 10416
+                }
+            }
+        }))
+        .expect("usage");
+        assert_eq!(usage.cache_creation_input_tokens, 10416);
+        assert_eq!(usage.cache_creation_1h_input_tokens, 10416);
+    }
+
+    #[test]
+    fn usage_without_a_cache_creation_breakdown_reports_no_long_write() {
+        // Every other dialect, and Anthropic before the 1h TTL: the total
+        // stands and the 1h half is zero, never a guess at the split.
+        let usage = super::usage_from_response(&json!({
+            "usage": {
+                "input_tokens": 12,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": 704,
+                "cache_read_input_tokens": 0
+            }
+        }))
+        .expect("usage");
+        assert_eq!(usage.cache_creation_input_tokens, 704);
+        assert_eq!(usage.cache_creation_1h_input_tokens, 0);
+    }
+
+    #[test]
+    fn anthropic_stream_usage_splits_cache_writes_by_ttl() {
+        // The streamed shape carries the same breakdown on message_start.
+        let mut usage = crate::types::UsageData::default();
+        let mut completed = false;
+        super::update_anthropic_stream_usage(
+            "message_start",
+            &json!({"message": {"usage": {
+                "input_tokens": 9,
+                "cache_creation_input_tokens": 7216,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 216,
+                    "ephemeral_1h_input_tokens": 7000
+                }
+            }}}),
+            &mut usage,
+            &mut completed,
+        );
+        assert_eq!(usage.cache_creation_input_tokens, 7216);
+        assert_eq!(usage.cache_creation_1h_input_tokens, 7000);
     }
 
     #[test]

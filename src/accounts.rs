@@ -82,6 +82,8 @@ struct AccountState {
     total_input_tokens: i64,
     total_output_tokens: i64,
     total_cache_creation_input_tokens: i64,
+    /// The 1h-retention share of the line above (ADR-0018).
+    total_cache_creation_1h_input_tokens: i64,
     total_cache_read_input_tokens: i64,
     total_reasoning_output_tokens: i64,
     /// Per-model successes and their tokens, keyed by upstream model name.
@@ -112,6 +114,7 @@ impl AccountState {
             total_input_tokens: 0,
             total_output_tokens: 0,
             total_cache_creation_input_tokens: 0,
+            total_cache_creation_1h_input_tokens: 0,
             total_cache_read_input_tokens: 0,
             total_reasoning_output_tokens: 0,
             models: BTreeMap::new(),
@@ -188,6 +191,7 @@ impl From<&AccountState> for PersistedUsage {
             input_tokens: state.total_input_tokens,
             output_tokens: state.total_output_tokens,
             cache_creation_input_tokens: state.total_cache_creation_input_tokens,
+            cache_creation_1h_input_tokens: state.total_cache_creation_1h_input_tokens,
             cache_read_input_tokens: state.total_cache_read_input_tokens,
             reasoning_output_tokens: state.total_reasoning_output_tokens,
             models: state.models.clone(),
@@ -389,6 +393,7 @@ impl AccountManager {
             state.total_input_tokens += usage.input_tokens;
             state.total_output_tokens += usage.output_tokens;
             state.total_cache_creation_input_tokens += usage.cache_creation_input_tokens;
+            state.total_cache_creation_1h_input_tokens += usage.cache_creation_1h_input_tokens;
             state.total_cache_read_input_tokens += usage.cache_read_input_tokens;
             state.total_reasoning_output_tokens += usage.reasoning_output_tokens;
             state.day(&day).add_tokens(usage);
@@ -493,6 +498,7 @@ impl AccountManager {
                     "totalInputTokens": state.total_input_tokens,
                     "totalOutputTokens": state.total_output_tokens,
                     "totalCacheCreationInputTokens": state.total_cache_creation_input_tokens,
+                    "totalCacheCreation1hInputTokens": state.total_cache_creation_1h_input_tokens,
                     "totalCacheReadInputTokens": state.total_cache_read_input_tokens,
                     "totalReasoningOutputTokens": state.total_reasoning_output_tokens,
                     "models": state.models.iter().map(|(model, usage)| json!({
@@ -501,6 +507,7 @@ impl AccountManager {
                         "inputTokens": usage.input_tokens,
                         "outputTokens": usage.output_tokens,
                         "cacheCreationInputTokens": usage.cache_creation_input_tokens,
+                        "cacheCreation1hInputTokens": usage.cache_creation_1h_input_tokens,
                         "cacheReadInputTokens": usage.cache_read_input_tokens,
                         "reasoningOutputTokens": usage.reasoning_output_tokens
                     })).collect::<Vec<_>>(),
@@ -512,6 +519,7 @@ impl AccountManager {
                         "inputTokens": day.input_tokens,
                         "outputTokens": day.output_tokens,
                         "cacheCreationInputTokens": day.cache_creation_input_tokens,
+                        "cacheCreation1hInputTokens": day.cache_creation_1h_input_tokens,
                         "cacheReadInputTokens": day.cache_read_input_tokens,
                         "reasoningOutputTokens": day.reasoning_output_tokens
                     })).collect::<Vec<_>>(),
@@ -682,6 +690,7 @@ impl AccountManager {
                 state.total_input_tokens = usage.input_tokens;
                 state.total_output_tokens = usage.output_tokens;
                 state.total_cache_creation_input_tokens = usage.cache_creation_input_tokens;
+                state.total_cache_creation_1h_input_tokens = usage.cache_creation_1h_input_tokens;
                 state.total_cache_read_input_tokens = usage.cache_read_input_tokens;
                 state.total_reasoning_output_tokens = usage.reasoning_output_tokens;
                 state.models = usage.models.clone();

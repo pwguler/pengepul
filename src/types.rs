@@ -134,8 +134,30 @@ pub struct UsageData {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_creation_input_tokens: i64,
+    /// The 1h-retention share of `cache_creation_input_tokens`. A 1h write
+    /// bills at 2x base input against 1.25x for 5m (ADR-0018), so the total
+    /// alone cannot say what a write was worth. The 5m share is the
+    /// remainder: storing one half keeps the two from ever disagreeing.
+    pub cache_creation_1h_input_tokens: i64,
     pub cache_read_input_tokens: i64,
     pub reasoning_output_tokens: i64,
+}
+
+impl UsageData {
+    /// The 1h share Anthropic breaks out in `cache_creation`. Every other
+    /// dialect, and Anthropic before the 1h TTL, omit the object entirely:
+    /// those read zero rather than guessing a split from the total.
+    ///
+    /// One function so the three parse sites — non-streaming, `message_start`,
+    /// and the streaming accumulator — cannot drift apart.
+    #[must_use]
+    pub fn long_cache_write(usage: &serde_json::Value) -> i64 {
+        usage
+            .get("cache_creation")
+            .and_then(|creation| creation.get("ephemeral_1h_input_tokens"))
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
