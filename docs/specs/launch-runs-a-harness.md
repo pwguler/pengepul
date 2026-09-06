@@ -29,7 +29,9 @@ tombol panah, sambil mengetik untuk mencari:
 
 ```
 pengepul — 8 of 78 models
-  search: opus▏
+  ┌──────────────────────────────────────────────────────────────┐
+  │ opus▏                                                        │
+  └──────────────────────────────────────────────────────────────┘
   anthropic/claude-opus-4-5-20251101  200.0K ctx  $5.00/$25.00
 ❯ anthropic/claude-opus-4-6           1.0M ctx  $5.00/$25.00
   anthropic/claude-opus-4-7           1.0M ctx  $5.00/$25.00
@@ -75,6 +77,9 @@ hanya penolakan.
   baris tidak bisa diambil dengan mengetik nomor, dan raw mode tidak bisa
   ditulis tangan di crate yang melarang `unsafe`. Fiturnya dipangkas ke
   `events` saja.
+- **Kotak, bukan label.** Yang diketik masuk ke satu kotak selebar panel
+  proyek ini, bukan ke belakang kata `search:`. Di layar itu cuma ada satu
+  tempat mengetik, dan kotaknya sudah mengatakan itu tanpa kata.
 - **Layar alternatif, dan dikembalikan di setiap jalan keluar.**
   Scrollback operator selamat, dan raw mode dilepas juga pada jalur error
   — itu sebabnya hasil loop ditangkap dulu, bukan dilempar lewat `?`.

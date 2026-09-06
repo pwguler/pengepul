@@ -13,7 +13,7 @@ use crate::oauth::{
     ANTHROPIC_REDIRECT_URI, CODEX_CALLBACK_PATH, CODEX_CALLBACK_PORT, exchange_anthropic_code,
     exchange_codex_code, generate_anthropic_auth_url, generate_codex_auth_url,
 };
-use crate::render::{BOLD, DIM, pad, paint};
+use crate::render::{BOLD, DIM, PANEL_WIDTH, pad, paint};
 use crate::service::{ServiceOptions, run_command};
 use crate::tokens::save_token;
 use crate::types::{PkceCodes, ProviderId, ProviderKind};
@@ -339,9 +339,9 @@ fn draw_picker(
 
     let (columns, lines) = terminal::size().unwrap_or((80, 24));
     let width = usize::from(columns).max(20);
-    // Rows 0 and 1 are the heading and the search line, the last row is the
-    // hint, and one blank line separates the heading from the list.
-    let rows = usize::from(lines).saturating_sub(4).max(1);
+    // Row 0 is the heading, rows 1 to 3 are the search box, and the last
+    // row is the hint. What is left is the list.
+    let rows = usize::from(lines).saturating_sub(5).max(1);
     if cursor < *scroll {
         *scroll = cursor;
     } else if cursor >= *scroll + rows {
@@ -361,10 +361,20 @@ fn draw_picker(
     } else {
         format!("pengepul — {} of {total} models", matching.len())
     };
+    // The typed text gets a box rather than a label: it is the one field
+    // on the screen, and a box says so without a word.
+    // The project already has one measure for a box, so the field uses it
+    // rather than stretching across a wide terminal.
+    let box_width = width.saturating_sub(4).clamp(8, PANEL_WIDTH - 2);
+    let rule = "─".repeat(box_width);
     let mut frame = vec![
         paint(BOLD, &pad(&heading, width)),
-        pad(&format!("  search: {filter}▏"), width),
-        String::new(),
+        pad(&format!("  ┌{rule}┐"), width),
+        pad(
+            &format!("  │{}│", pad(&format!(" {filter}▏"), box_width)),
+            width,
+        ),
+        pad(&format!("  └{rule}┘"), width),
     ];
     for (offset, choice) in matching.iter().skip(*scroll).take(rows).enumerate() {
         let selected = *scroll + offset == cursor;
