@@ -803,7 +803,11 @@ async fn messages_route_rotates_available_anthropic_accounts() {
     let upstream = Arc::new(FakeUpstream::default());
     let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
 
-    for _ in 0..2 {
+    // Two conversations, so two different cacheable prefixes. Identical
+    // requests deliberately do not rotate any more: they share a prefix,
+    // and moving them between accounts throws away the cache each just
+    // paid to write (ADR-0017).
+    for system in ["you are a poet", "you are a lawyer"] {
         let (status, _) = json_response(
             app.clone(),
             axum::http::Request::builder()
@@ -815,6 +819,7 @@ async fn messages_route_rotates_available_anthropic_accounts() {
                 .body(Body::from(
                     json!({
                         "model": "claude-sonnet-4-6",
+                        "system": system,
                         "messages": [{"role": "user", "content": "reply exactly: pong"}]
                     })
                     .to_string(),
@@ -830,6 +835,130 @@ async fn messages_route_rotates_available_anthropic_accounts() {
     assert_ne!(
         calls[0].account.token.access_token,
         calls[1].account.token.access_token
+    );
+}
+
+#[tokio::test]
+async fn one_conversation_stays_on_one_account() {
+    // Each upstream account holds its own prompt cache, so alternating
+    // accounts mid-conversation throws the prefix away on every turn. The
+    // session the client already sends is what pins it.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for (email, access_token) in [
+        ("alice@example.com", "anthropic-access-alice"),
+        ("bob@example.com", "anthropic-access-bob"),
+    ] {
+        save_token(
+            tmp.path(),
+            &TokenData {
+                access_token: access_token.to_string(),
+                refresh_token: format!("{access_token}-refresh"),
+                email: email.to_string(),
+                expires_at: "2030-01-01T00:00:00Z".to_string(),
+                account_uuid: email.to_string(),
+                provider: ProviderId::anthropic(),
+                id_token: None,
+                last_refresh_at: None,
+                plan_type: None,
+            },
+        )
+        .expect("save token");
+    }
+    let upstream = Arc::new(FakeUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    for _ in 0..4 {
+        let (status, _) = json_response(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("authorization", "Bearer sk-test")
+                .header("content-type", "application/json")
+                .header("content-length", "1")
+                .header("x-claude-code-session-id", "conversation-a")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-sonnet-4-6",
+                        "messages": [{"role": "user", "content": "reply exactly: pong"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, 200);
+    }
+
+    let calls = upstream.calls();
+    assert_eq!(calls.len(), 4);
+    let served: std::collections::BTreeSet<&str> = calls
+        .iter()
+        .map(|call| call.account.token.access_token.as_str())
+        .collect();
+    assert_eq!(
+        served.len(),
+        1,
+        "one conversation was split across {} accounts: {served:?}",
+        served.len()
+    );
+}
+
+#[tokio::test]
+async fn a_different_conversation_still_takes_the_next_account() {
+    // Affinity is a preference, not a pin on the pool: two conversations
+    // still spread across the accounts.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for (email, access_token) in [
+        ("alice@example.com", "anthropic-access-alice"),
+        ("bob@example.com", "anthropic-access-bob"),
+    ] {
+        save_token(
+            tmp.path(),
+            &TokenData {
+                access_token: access_token.to_string(),
+                refresh_token: format!("{access_token}-refresh"),
+                email: email.to_string(),
+                expires_at: "2030-01-01T00:00:00Z".to_string(),
+                account_uuid: email.to_string(),
+                provider: ProviderId::anthropic(),
+                id_token: None,
+                last_refresh_at: None,
+                plan_type: None,
+            },
+        )
+        .expect("save token");
+    }
+    let upstream = Arc::new(FakeUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    for session in ["conversation-a", "conversation-b"] {
+        let (status, _) = json_response(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("authorization", "Bearer sk-test")
+                .header("content-type", "application/json")
+                .header("content-length", "1")
+                .header("x-claude-code-session-id", session)
+                .body(Body::from(
+                    json!({
+                        "model": "claude-sonnet-4-6",
+                        "messages": [{"role": "user", "content": "reply exactly: pong"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, 200);
+    }
+
+    let calls = upstream.calls();
+    assert_ne!(
+        calls[0].account.token.access_token, calls[1].account.token.access_token,
+        "two conversations landed on the same account"
     );
 }
 

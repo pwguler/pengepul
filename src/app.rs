@@ -46,6 +46,7 @@ use crate::upstream::{
     generic_chat_headers, normalize_codex_responses_body,
 };
 use crate::utils::now_iso;
+use crate::utils::sha256_hex;
 
 const RATE_LIMIT_WINDOW: Duration = Duration::from_mins(1);
 const RATE_LIMIT_MAX: u32 = 60;
@@ -998,10 +999,13 @@ async fn count_tokens(State(state): State<AppState>, headers: HeaderMap, body: B
         )
         .into_response();
     }
-    let account = match next_provider_account(&state, provider.clone()).await {
-        Ok(account) => account,
-        Err(error) => return error.into_response(),
-    };
+    let account =
+        match next_provider_account(&state, provider.clone(), &conversation_key(&headers, &body))
+            .await
+        {
+            Ok(account) => account,
+            Err(error) => return error.into_response(),
+        };
     let body = body_with_model(&body, &model);
     match state
         .upstream
@@ -1069,10 +1073,13 @@ async fn route_provider_request(
     let model = upstream_model(model_id, &provider).to_string();
     let client_wants_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let attempts = provider_account_count(state, provider.clone()).await.max(1);
+    // One request, one conversation: computed before the attempt loop, not
+    // inside it, because the body does not change between attempts.
+    let conversation = conversation_key(headers, body);
     let mut last_response = None;
 
     for _ in 0..attempts {
-        let account = match next_provider_account(state, provider.clone()).await {
+        let account = match next_provider_account(state, provider.clone(), &conversation).await {
             Ok(account) => account,
             Err(error) if error.error_type == Some("token_refresh_failed") => {
                 last_response = Some(error.into_response());
@@ -1641,9 +1648,37 @@ fn enforce_body_limit(state: &AppState, headers: &HeaderMap) -> Result<(), AppEr
     Ok(())
 }
 
+/// The conversation a request belongs to, for cache affinity.
+///
+/// A harness that names its session is believed. Otherwise the key is a
+/// hash of the cacheable prefix itself — the system blocks and the tool
+/// list, which turns of one conversation repeat byte for byte and which is
+/// exactly what the upstream cache is keyed on. Deriving it from the
+/// client's credential instead would make every request from one key one
+/// conversation, which does not preserve a cache so much as switch
+/// Rotation off.
+fn conversation_key(headers: &HeaderMap, body: &Value) -> String {
+    if let Some(session) = header_str(headers, "x-claude-code-session-id")
+        .or_else(|| header_str(headers, "x-session-id"))
+    {
+        return session.to_string();
+    }
+    let prefix = json!({
+        "system": body.get("system"),
+        "tools": body.get("tools"),
+        "model": body.get("model"),
+    });
+    format!("prefix:{}", sha256_hex(&prefix.to_string()))
+}
+
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
+}
+
 async fn next_provider_account(
     state: &AppState,
     provider: ProviderId,
+    conversation: &str,
 ) -> Result<AvailableAccount, AppError> {
     let mut manager = match provider.kind {
         ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
@@ -1660,7 +1695,7 @@ async fn next_provider_account(
             manager.lock().await
         }
     };
-    let result = manager.next_account_result();
+    let result = manager.account_for(conversation);
     let Some(account) = result.account else {
         return Err(AppError::provider(
             StatusCode::SERVICE_UNAVAILABLE,
