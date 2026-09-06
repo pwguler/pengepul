@@ -11,7 +11,7 @@ use crate::config::{
 };
 pub use crate::render::Style;
 use crate::render::{
-    ActionGlyph, BOLD, DIM, Fact, Output, fact_panel, format_count, pad, paint, status_glyph,
+    ActionGlyph, BOLD, DIM, Fact, Output, fact_panel, format_count, paint, status_glyph,
 };
 use crate::service::service_status_panel;
 use crate::tokens::save_token;
@@ -53,12 +53,15 @@ pub struct LaunchPlan {
     pub install_hint: String,
 }
 
-/// One row of the model picker: the id a harness will be handed, and the
-/// facts that let an operator tell two ids apart.
+/// One row of the model picker: the id a harness will be handed, the facts
+/// that let an operator tell two ids apart, and — when the relay cannot
+/// serve it to this harness — why. An unusable model stays on the list and
+/// says so, rather than going missing and looking like the relay lost it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelChoice {
     pub id: String,
     pub detail: String,
+    pub unavailable: Option<String>,
 }
 
 pub trait CliRuntime {
@@ -183,15 +186,13 @@ pub trait CliRuntime {
     /// Returns an error if the request fails.
     fn models(&mut self, base_url: &str, api_key: &str) -> Result<Value>;
 
-    /// Show `text`, then read one line back.
-    ///
-    /// `Ok(None)` means the input ended, which the caller reads as a
-    /// decline rather than a failure.
+    /// Let the operator move through `choices` and pick one, typing to
+    /// narrow the list. `Ok(None)` means they cancelled.
     ///
     /// # Errors
     ///
-    /// Returns an error if the terminal cannot be written to or read from.
-    fn prompt(&mut self, text: &str) -> Result<Option<String>>;
+    /// Returns an error if the terminal cannot be driven.
+    fn select_model(&mut self, choices: &[ModelChoice]) -> Result<Option<String>>;
 }
 
 #[derive(Debug, Parser)]
@@ -423,7 +424,6 @@ pub fn run_with_env(
                 model.as_deref(),
                 &forwarded,
                 runtime,
-                style,
             )?;
         }
         Some(Command::Login {
@@ -1094,7 +1094,6 @@ fn launch(
     model: Option<&str>,
     forwarded: &[String],
     runtime: &mut impl CliRuntime,
-    style: Style,
 ) -> Result<()> {
     let config = env.load()?;
     let base_url = base_url(&config);
@@ -1117,7 +1116,12 @@ fn launch(
         // does what it does with no model at all.
         None if runtime.stdout_is_tty() => {
             let catalog = runtime.models(&base_url, &api_key)?;
-            choose_model(&catalog, harness, &config, runtime, style)?
+            let choices = model_choices(&catalog, harness, &config);
+            if choices.is_empty() {
+                None
+            } else {
+                runtime.select_model(&choices)?
+            }
         }
         None => None,
     };
@@ -1132,86 +1136,38 @@ fn launch(
     runtime.launch(&plan)
 }
 
-/// How many rows the picker prints before it asks for a filter instead.
-const PICKER_ROWS: usize = 20;
-
-/// Ask which model to run on. The one prompt takes both answers: a row
-/// number picks, anything else narrows the list, so a long catalog needs no
-/// second question. `None` means the operator declined — for claude that is
-/// the harness's own default, and pi refuses further down where the reason
-/// for refusing lives.
-fn choose_model(
-    catalog: &Value,
-    harness: Harness,
-    config: &Config,
-    runtime: &mut impl CliRuntime,
-    style: Style,
-) -> Result<Option<String>> {
-    let all = model_choices(catalog, harness, config);
-    if all.is_empty() {
-        return Ok(None);
-    }
-    let mut filter = String::new();
-    loop {
-        let matching = matching_choices(&all, &filter);
-        let Some(answer) = runtime.prompt(&picker_text(&matching, all.len(), &filter, style))?
-        else {
-            // End of input. Nothing more will be typed, so stop asking.
-            return Ok(None);
-        };
-        let answer = answer.trim();
-        if answer.is_empty() {
-            // A narrowed list is what the empty answer is most likely
-            // aimed at, so it widens back before it declines. Declining
-            // stays reachable: press it twice, or end the input.
-            if filter.is_empty() {
-                return Ok(None);
-            }
-            filter.clear();
-            continue;
-        }
-        if let Some(choice) = answer
-            .parse::<usize>()
-            .ok()
-            .and_then(|row| row.checked_sub(1))
-            .and_then(|index| matching.get(index))
-        {
-            return Ok(Some(choice.id.clone()));
-        }
-        // Not a row on the list, so it is a filter — including a number
-        // too large for the list, which narrows to the ids carrying that
-        // number rather than silently picking nothing.
-        //
-        // It narrows what is already there rather than replacing it: after
-        // a list headed `"glm" (6 of 78)`, typing `flash` plainly means
-        // the flash one among those six. Replacing widened it back to 14
-        // instead, which is how this was found. The empty answer is the
-        // way back out, and the question says so.
-        filter = format!("{filter} {answer}").trim().to_string();
-    }
-}
-
-/// The catalog rows a harness can be handed. claude speaks Messages, so a
-/// configured endpoint's models are never offered: the same rule the
-/// explicit `--model` path refuses on, applied before the operator can
-/// choose one.
+/// Every model the relay advertises, each carrying whether this harness
+/// can be given it. claude speaks Messages, which a configured endpoint
+/// does not serve, so those rows come back marked rather than removed: the
+/// operator sees the whole catalog and the reason, instead of wondering
+/// where two thirds of it went. Selectable rows sort first.
 fn model_choices(catalog: &Value, harness: Harness, config: &Config) -> Vec<ModelChoice> {
     let Some(entries) = catalog.get("data").and_then(Value::as_array) else {
         return Vec::new();
     };
-    entries
+    let mut choices: Vec<ModelChoice> = entries
         .iter()
         .filter_map(|entry| {
             let id = entry.get("id").and_then(Value::as_str)?;
-            if harness == Harness::Claude && claude_speaks_messages(id, config).is_err() {
-                return None;
-            }
+            let unavailable = match harness {
+                Harness::Claude => claude_speaks_messages(id, config).err().map(|_| {
+                    "claude speaks Messages; this endpoint serves only Chat Completions".to_string()
+                }),
+                // pi's provider picks a wire per model, so every advertised
+                // model is a fair choice there.
+                Harness::Pi => None,
+            };
             Some(ModelChoice {
                 id: id.to_string(),
                 detail: model_detail(entry),
+                unavailable,
             })
         })
-        .collect()
+        .collect();
+    // A stable partition, so the catalog's own order survives inside each
+    // half and the list does not reshuffle between runs.
+    choices.sort_by_key(|choice| choice.unavailable.is_some());
+    choices
 }
 
 /// What separates two ids on the list: the context window, and what a
@@ -1242,7 +1198,7 @@ fn model_detail(entry: &Value) -> String {
 /// Rows whose id carries every word of the filter, case folded. Words
 /// narrow together, so `opus 4` finds the 4-series opus ids without naming
 /// their exact shape.
-fn matching_choices(choices: &[ModelChoice], filter: &str) -> Vec<ModelChoice> {
+pub(crate) fn matching_choices(choices: &[ModelChoice], filter: &str) -> Vec<ModelChoice> {
     let words: Vec<String> = filter.split_whitespace().map(str::to_lowercase).collect();
     choices
         .iter()
@@ -1252,63 +1208,6 @@ fn matching_choices(choices: &[ModelChoice], filter: &str) -> Vec<ModelChoice> {
         })
         .cloned()
         .collect()
-}
-
-/// The list and the one question under it. Not a Panel: a Panel carries
-/// facts about one subject, and this is a menu the operator answers, so it
-/// keeps the palette and stays out of the box (CONTEXT.md, Panel).
-fn picker_text(matching: &[ModelChoice], total: usize, filter: &str, style: Style) -> String {
-    let dim = |text: &str| match style {
-        Style::Plain => text.to_string(),
-        Style::Rich => paint(DIM, text),
-    };
-    let bold = |text: &str| match style {
-        Style::Plain => text.to_string(),
-        Style::Rich => paint(BOLD, text),
-    };
-    let header = if filter.is_empty() {
-        format!("models ({total})")
-    } else if matching.is_empty() {
-        format!("models — nothing matches \"{filter}\" (0 of {total})")
-    } else {
-        format!("models — \"{filter}\" ({} of {total})", matching.len())
-    };
-    let shown = &matching[..matching.len().min(PICKER_ROWS)];
-    let id_width = shown
-        .iter()
-        .map(|choice| choice.id.chars().count())
-        .max()
-        .unwrap_or(0)
-        .min(44);
-
-    let mut lines = vec![String::new(), format!("  {}", bold(&header)), String::new()];
-    for (index, choice) in shown.iter().enumerate() {
-        let row = format!("{:>3}", index + 1);
-        let detail = if choice.detail.is_empty() {
-            String::new()
-        } else {
-            format!("  {}", dim(&choice.detail))
-        };
-        lines.push(format!(
-            "  {}  {}{detail}",
-            dim(&row),
-            pad(&choice.id, id_width)
-        ));
-    }
-    let hidden = matching.len().saturating_sub(shown.len());
-    if hidden > 0 {
-        lines.push(format!("  {}", dim(&format!("    {hidden} more"))));
-    }
-    lines.push(String::new());
-    let question = if matching.is_empty() {
-        "type to filter, or enter to clear it"
-    } else if filter.is_empty() {
-        "pick a number, or type to filter"
-    } else {
-        "pick a number, type to filter, or enter to clear it"
-    };
-    lines.push(format!("  {question}: "));
-    lines.join("\n")
 }
 
 /// What each harness needs to run on the relay instead of its own upstream.

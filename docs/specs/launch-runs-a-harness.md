@@ -24,32 +24,21 @@ $ pengepul launch pi --model anthropic/claude-opus-5
 $ pengepul launch claude -- --resume
 ```
 
-Tanpa `--model`, relay ditanya modelnya dan operator memilih:
+Tanpa `--model`, relay ditanya modelnya dan operator memilih dengan
+tombol panah, sambil mengetik untuk mencari:
 
 ```
-$ pengepul launch pi
-
-  models (78)
-
-    1  anthropic/claude-fable-5    1.0M ctx  $10.00/$50.00
-    ...
-   20  commandcode/gpt-5.6-sol     1.0M ctx  $4.00/$20.00
-       58 more
-
-  pick a number, or type to filter: glm
-
-  models — "glm" (6 of 78)
-
-    1  commandcode/z-ai/glm-5.3-flash    1.0M ctx
-    ...
-
-  pick a number, type to filter, or enter to clear it: flash
-
-  models — "glm flash" (1 of 78)
-
-    1  commandcode/z-ai/glm-5.3-flash    1.0M ctx
-
-  pick a number, type to filter, or enter to clear it: 1
+pengepul — 8 of 78 models
+  search: opus▏
+  anthropic/claude-opus-4-5-20251101  200.0K ctx  $5.00/$25.00
+❯ anthropic/claude-opus-4-6           1.0M ctx  $5.00/$25.00
+  anthropic/claude-opus-4-7           1.0M ctx  $5.00/$25.00
+  anthropic/claude-opus-4-8           1.0M ctx  $5.00/$25.00
+  anthropic/claude-opus-5             1.0M ctx  $5.00/$25.00
+  commandcode/claude-opus-5           unavailable
+  commandcode/claude-opus-4-8         unavailable
+  commandcode/claude-opus-4-7         unavailable
+  ↑↓ move   type to search   ⌫ delete   enter run   esc cancel
 ```
 
 Berhasil berarti tidak mencetak apa-apa: prosesnya berubah menjadi
@@ -80,20 +69,22 @@ hanya penolakan.
   modelnya sendiri, dan id itu memang milik anthropic, jadi di sana
   `--model` adalah pilihan. Di terminal, picker yang mengisi keduanya;
   tuntutan pi baru terasa kalau pickernya ditolak atau outputnya di-pipe.
-- **Satu pertanyaan, dua jawaban.** Katalognya 78 model, jadi daftar
-  bernomor saja tidak cukup. Prompt yang sama menerima keduanya: angka
-  memilih baris, teks lain menyaring. Tidak ada mode kedua, tidak ada
-  pertanyaan kedua, dan tidak ada dependensi baru — proyek ini belum
-  pernah menambah satu pun untuk tampilan.
-- **Menyaring itu mempersempit, bukan mengganti.** Setelah daftar berkepala
-  `"glm" (6 of 78)`, mengetik `flash` jelas berarti yang flash di antara
-  keenam itu. Enter mengosongkan seluruh saringan, dan pertanyaannya
-  mengatakan itu.
-- **Yang tidak bisa dilayani tidak ditawarkan.** Daftar untuk claude hanya
-  berisi model yang bisa menjawab Messages, jadi 501 itu tidak bisa
-  dipilih sama sekali — aturan yang sama dengan `--model` eksplisit,
-  dipakai lebih awal. Pool tanpa akun juga tidak muncul: `/v1/models`
-  memang tidak mengiklankannya.
+- **Memilih, bukan mengetik nomor.** Panah menggerakkan kursor, mengetik
+  menyaring seketika, enter menjalankan. Ini menambah `crossterm` —
+  dependensi tampilan pertama proyek ini, dan alasannya cukup: katalog 78
+  baris tidak bisa diambil dengan mengetik nomor, dan raw mode tidak bisa
+  ditulis tangan di crate yang melarang `unsafe`. Fiturnya dipangkas ke
+  `events` saja.
+- **Layar alternatif, dan dikembalikan di setiap jalan keluar.**
+  Scrollback operator selamat, dan raw mode dilepas juga pada jalur error
+  — itu sebabnya hasil loop ditangkap dulu, bukan dilempar lewat `?`.
+- **Yang tidak bisa dilayani tetap ditampilkan, dengan alasannya.** Versi
+  pertama menyembunyikan model yang tak bisa menjawab Messages. Dua
+  pertiga katalog lenyap tanpa penjelasan, dan yang terlihat operator
+  adalah relay yang kehilangan modelnya. Sekarang barisnya tetap ada,
+  ditandai `unavailable`, diurutkan di belakang, dan enter di atasnya
+  memunculkan sebabnya, bukan 501 di prompt pertama. Pool tanpa akun
+  memang tidak muncul: `/v1/models` tidak mengiklankannya.
 - **Piped berarti tidak bertanya.** Menu di atas pipe akan memakan satu
   baris milik skrip orang. `stdout_is_tty` sudah jadi seam sejak
   `Style::from_tty`, dan verb ini memakainya lagi: tanpa terminal,
@@ -125,9 +116,8 @@ hanya penolakan.
   config mereka. Itu janji lain — cadangan, penggabungan dengan isi yang
   sudah ada, komentar yang hilang — dan README tetap menjelaskan caranya
   dengan tangan.
-- **Bukan picker bertombol panah.** Tidak ada raw mode, tidak ada crate
-  TUI baru. Satu daftar, satu pertanyaan, satu baris jawaban — jalan di
-  ssh, di tmux, dan di terminal apa pun yang bisa membaca satu baris.
+- **Bukan TUI penuh.** Satu daftar, satu baris pencarian. Tidak ada
+  panel, tidak ada mouse, tidak ada preview.
 - **Bukan mengingat pilihan terakhir.** Itu berarti menulis sesuatu ke
   disk, dan verb ini tidak meninggalkan apa-apa.
 - **Tidak memvalidasi model lewat jaringan.** `launch` tidak bertanya ke
@@ -170,19 +160,22 @@ hanya penolakan.
 - AC-11: Berhasil berarti stdout kosong.
 - AC-12: `pengepul help launch` menyebut kedua harness, `--model`, dan
   separator `--`.
-- AC-13: Tanpa `--model` dan di terminal, `launch` membaca
-  `/v1/models` dan menawarkan isinya; angka memilih satu baris.
-- AC-14: Daftar untuk claude tidak memuat model dari entri `providers:`;
-  daftar untuk pi memuat semuanya.
-- AC-15: Jawaban yang bukan nomor baris jadi saringan, dan saringan
-  berikutnya mempersempit hasil sebelumnya, bukan menggantikannya.
-- AC-16: Jawaban kosong mengosongkan saringan kalau ada, dan menolak
-  memilih kalau tidak ada. Habisnya input menolak memilih.
-- AC-17: Daftar berhenti di 20 baris dan menyebut berapa yang disimpan.
-- AC-18: Dengan output di-pipe, tidak ada pertanyaan dan tidak ada
-  permintaan `/v1/models`; perilakunya sama seperti sebelum picker ada.
+- AC-13: Tanpa `--model` dan di terminal, `launch` membaca `/v1/models`
+  dan menawarkan **seluruh** isinya; panah memilih, enter menjalankan.
+- AC-14: Baris yang tidak bisa dilayani harness ini tetap ada di daftar,
+  ditandai beserta sebabnya, dan diurutkan setelah yang bisa. Untuk pi
+  tidak ada yang ditandai.
+- AC-15: Enter di atas baris yang ditandai tidak menjalankan apa pun dan
+  memunculkan sebabnya.
+- AC-16: Mengetik menyaring seketika; kata-kata menyempit bersama.
+- AC-17: Esc dan Ctrl-C membatalkan. Batal berarti claude memakai
+  defaultnya sendiri, dan pi menolak dengan pesan `--model`.
+- AC-18: Dengan output di-pipe, tidak ada picker dan tidak ada permintaan
+  `/v1/models`; perilakunya sama seperti sebelum picker ada.
 - AC-19: `--model` yang eksplisit melewati picker sepenuhnya.
-- AC-20: `launch` sendiri tidak menulis file apa pun: tidak ada config
+- AC-20: Terminal dikembalikan — raw mode lepas, layar alternatif
+  ditinggalkan, kursor kembali — termasuk saat picker gagal.
+- AC-21: `launch` sendiri tidak menulis file apa pun: tidak ada config
   harness yang berubah karena satu peluncuran. Apa yang ditulis harness
   setelah mengambil alih proses adalah urusannya sendiri.
 
@@ -215,6 +208,15 @@ Setiap kriteria butuh tes yang gagal ketika perbaikannya dibalik.
 
 ## Revisions
 
+- **Nomor diganti pilihan.** Versi pertama mencetak daftar bernomor dan
+  membaca satu baris. Operator memintanya jadi pilihan sungguhan, dan itu
+  benar: 78 baris tidak diambil dengan mengetik angka. `crossterm` masuk,
+  dan `prompt` di `CliRuntime` berganti jadi `select_model` — loop
+  tombolnya pindah ke runtime, aturan penyaringnya tetap murni di
+  `cli.rs`.
+- **Model yang tak terlayani disembunyikan, sekarang ditandai.** Daftar
+  claude tinggal 11 dari 78 dan tidak mengatakan ke mana 67 sisanya
+  pergi. Ditemukan bukan oleh tes, tapi oleh yang memakainya.
 - **Menyaring dua kali mengganti, bukan mempersempit.** Versi pertama
   menimpa saringan dengan jawaban terakhir. Dijalankan di pty sungguhan:
   `glm` menyisakan 6 baris, lalu `flash` melebar lagi jadi 14 — bukan
@@ -230,6 +232,13 @@ Setiap kriteria butuh tes yang gagal ketika perbaikannya dibalik.
 - **Harness yang butuh file config.** openclaw dan hermes menunggu
   keputusan soal cadangan dan penggabungan — pertanyaan yang sama yang
   `register_provider` sudah bayar mahal untuk `config.yaml`.
+- **Messages untuk provider terkonfigurasi.** Ini yang membuat 67 model
+  itu `unavailable`: `route_request` hanya mengirim `RequestRoute::Chat`
+  ke `ProviderKind::Generic`, jadi Claude Code — yang bicara Messages —
+  tidak bisa memakainya sama sekali. Menjadikannya bisa berarti dua
+  terjemahan baru (permintaan Messages ke Chat Completions, dan
+  jawabannya kembali) plus jalur SSE-nya, di jalur yang melayani. Bukan
+  urusan verb ini; dicatat karena verb ini yang membuatnya kelihatan.
 - **Pool kosong di balik `--model`.** `launch claude --model gpt-5.4` ke
   relay tanpa akun codex membuat relay menjawab 503 — rutenya benar,
   poolnya yang kosong — dan Claude Code mengulanginya dengan backoff, jadi

@@ -3,12 +3,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use pengepul::cli::{
-    CliRuntime, LaunchPlan, RunOutcome, ServiceInstallRequest, Style, run_with_env,
+    CliRuntime, LaunchPlan, ModelChoice, RunOutcome, ServiceInstallRequest, Style, run_with_env,
 };
 use pengepul::config::Config;
 use pengepul::types::ProviderId;
 use serde_json::{Value, json};
-use std::collections::VecDeque;
 use tempfile::tempdir;
 
 fn write_config(home: &Path, host: &str, port: u16) {
@@ -40,8 +39,10 @@ struct FakeRuntime {
     health_error: Option<String>,
     launch_plan: Option<LaunchPlan>,
     models_payload: Option<Value>,
-    prompt_replies: VecDeque<String>,
-    prompts: Vec<String>,
+    /// Which row the operator highlights when the picker opens, 1-based.
+    /// `None` is a cancel.
+    picks: Option<usize>,
+    offered: Option<Vec<ModelChoice>>,
 }
 
 impl CliRuntime for FakeRuntime {
@@ -84,9 +85,12 @@ impl CliRuntime for FakeRuntime {
             .unwrap_or_else(|| json!({"data": []})))
     }
 
-    fn prompt(&mut self, text: &str) -> Result<Option<String>> {
-        self.prompts.push(text.to_string());
-        Ok(self.prompt_replies.pop_front())
+    fn select_model(&mut self, choices: &[ModelChoice]) -> Result<Option<String>> {
+        self.offered = Some(choices.to_vec());
+        Ok(self
+            .picks
+            .and_then(|row| choices.get(row - 1))
+            .map(|choice| choice.id.clone()))
     }
 
     fn accounts(&mut self, base_url: &str, api_key: &str) -> Result<Value> {
@@ -4814,21 +4818,25 @@ fn catalog() -> Value {
     ]})
 }
 
-/// A runtime that is on a terminal and answers the picker with `replies`.
-fn picking(replies: &[&str]) -> FakeRuntime {
+/// A runtime on a terminal, whose operator highlights `row` and hits enter.
+fn picking(row: usize) -> FakeRuntime {
     FakeRuntime {
         rich: true,
         models_payload: Some(catalog()),
-        prompt_replies: replies.iter().map(|reply| (*reply).to_string()).collect(),
+        picks: Some(row),
         ..FakeRuntime::default()
     }
+}
+
+fn offered(runtime: &FakeRuntime) -> Vec<ModelChoice> {
+    runtime.offered.clone().expect("a picker")
 }
 
 #[test]
 fn launch_claude_picks_a_model_from_the_relay() {
     let tmp = tempdir().expect("tempdir");
     write_config(tmp.path(), "127.0.0.1", 8317);
-    let mut runtime = picking(&["1"]);
+    let mut runtime = picking(1);
 
     let outcome = run(&["launch", "claude"], tmp.path(), &mut runtime);
 
@@ -4848,38 +4856,46 @@ fn launch_claude_picks_a_model_from_the_relay() {
 }
 
 #[test]
-fn the_picker_hides_models_claude_cannot_speak_to() {
-    // Claude Code speaks Messages, so a configured endpoint's models are
-    // never on the list — the operator cannot pick the 501.
+fn the_picker_offers_the_whole_catalog_and_marks_what_claude_cannot_use() {
+    // The unusable rows stay on the list carrying their reason. Hiding them
+    // makes two thirds of the relay look missing; the reason is the point.
     let tmp = tempdir().expect("tempdir");
     write_config_with_providers(
         tmp.path(),
         "  groq:\n    base-url: https://api.groq.com/openai/v1\n",
     );
-    let mut runtime = picking(&["1"]);
+    let mut runtime = picking(1);
 
     run(&["launch", "claude"], tmp.path(), &mut runtime);
 
-    let shown = runtime.prompts.first().expect("a prompt");
-    assert!(shown.contains("anthropic/claude-opus-5"), "{shown}");
-    assert!(!shown.contains("groq/"), "{shown}");
-    assert!(shown.contains("models (2)"), "{shown}");
+    let choices = offered(&runtime);
+    assert_eq!(choices.len(), 3, "every advertised model is on the list");
+    let groq = choices
+        .iter()
+        .find(|choice| choice.id.starts_with("groq/"))
+        .expect("the configured endpoint's model is listed");
+    let reason = groq.unavailable.as_deref().expect("marked unavailable");
+    assert!(reason.contains("Chat Completions"), "{reason}");
+    // And the ones that work sort first, so the arrow keys land on those.
+    assert!(choices[0].unavailable.is_none());
+    assert!(choices[1].unavailable.is_none());
+    assert!(choices[2].unavailable.is_some());
 }
 
 #[test]
-fn launch_pi_picks_from_the_whole_catalog() {
-    // pi's provider picks a wire per model, so a Chat Completions endpoint
-    // is a fair choice there.
+fn the_picker_marks_nothing_for_pi() {
+    // pi's provider picks a wire per model, so every advertised model works.
     let tmp = tempdir().expect("tempdir");
     write_config_with_providers(
         tmp.path(),
         "  groq:\n    base-url: https://api.groq.com/openai/v1\n",
     );
-    let mut runtime = picking(&["3"]);
+    let mut runtime = picking(3);
 
     let outcome = run(&["launch", "pi"], tmp.path(), &mut runtime);
 
     assert_eq!(outcome.code, 0);
+    assert!(offered(&runtime).iter().all(|c| c.unavailable.is_none()));
     assert_eq!(
         launched(&runtime).args,
         [
@@ -4892,107 +4908,51 @@ fn launch_pi_picks_from_the_whole_catalog() {
 }
 
 #[test]
-fn the_picker_narrows_on_a_typed_filter() {
+fn the_picker_carries_the_window_and_the_price() {
     let tmp = tempdir().expect("tempdir");
     write_config(tmp.path(), "127.0.0.1", 8317);
-    let mut runtime = picking(&["haiku", "1"]);
+    let mut runtime = picking(1);
 
     run(&["launch", "claude"], tmp.path(), &mut runtime);
 
-    let narrowed = runtime.prompts.get(1).expect("a second prompt");
-    assert!(
-        narrowed.contains("anthropic/claude-haiku-4-5"),
-        "{narrowed}"
-    );
-    assert!(!narrowed.contains("claude-opus-5"), "{narrowed}");
-    // The row numbers are the filtered ones, so `1` is the only match.
-    assert_eq!(
-        env_value(&launched(&runtime), "ANTHROPIC_MODEL"),
-        Some("anthropic/claude-haiku-4-5")
-    );
+    let choices = offered(&runtime);
+    assert_eq!(choices[0].detail, "1.0M ctx  $5.00/$25.00");
+    // A row the catalog carries no numbers for shows none rather than zeros.
+    let bare = choices
+        .iter()
+        .find(|choice| choice.id.starts_with("groq/"))
+        .expect("the bare row");
+    assert_eq!(bare.detail, "");
 }
 
 #[test]
-fn the_picker_narrows_on_every_word() {
+fn a_cancelled_picker_leaves_the_model_alone() {
     let tmp = tempdir().expect("tempdir");
     write_config(tmp.path(), "127.0.0.1", 8317);
-    let mut runtime = picking(&["claude 4-5", "1"]);
-
-    run(&["launch", "claude"], tmp.path(), &mut runtime);
-
-    assert_eq!(
-        env_value(&launched(&runtime), "ANTHROPIC_MODEL"),
-        Some("anthropic/claude-haiku-4-5")
-    );
-}
-
-#[test]
-fn successive_filters_narrow_rather_than_replace() {
-    // Typing a second word after a narrowed list means "the one among
-    // these", not "start again". Found by driving the real picker: `glm`
-    // then `flash` widened 6 matches back to 14.
-    let tmp = tempdir().expect("tempdir");
-    write_config(tmp.path(), "127.0.0.1", 8317);
-    let mut runtime = picking(&["claude", "4-5", "1"]);
-
-    run(&["launch", "claude"], tmp.path(), &mut runtime);
-
-    let narrowed = runtime.prompts.get(2).expect("a third prompt");
-    assert!(narrowed.contains("\"claude 4-5\" (1 of 3)"), "{narrowed}");
-    assert_eq!(
-        env_value(&launched(&runtime), "ANTHROPIC_MODEL"),
-        Some("anthropic/claude-haiku-4-5")
-    );
-}
-
-#[test]
-fn an_answer_that_names_no_row_becomes_a_filter() {
-    let tmp = tempdir().expect("tempdir");
-    write_config(tmp.path(), "127.0.0.1", 8317);
-    let mut runtime = picking(&["99", "", "2"]);
-
-    run(&["launch", "claude"], tmp.path(), &mut runtime);
-
-    let narrowed = runtime.prompts.get(1).expect("a second prompt");
-    assert!(narrowed.contains("nothing matches"), "{narrowed}");
-    // The empty answer widened it again rather than declining.
-    assert_eq!(
-        env_value(&launched(&runtime), "ANTHROPIC_MODEL"),
-        Some("anthropic/claude-haiku-4-5")
-    );
-}
-
-#[test]
-fn an_empty_answer_with_no_filter_leaves_the_model_alone() {
-    let tmp = tempdir().expect("tempdir");
-    write_config(tmp.path(), "127.0.0.1", 8317);
-    let mut runtime = picking(&[""]);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        models_payload: Some(catalog()),
+        picks: None,
+        ..FakeRuntime::default()
+    };
 
     let outcome = run(&["launch", "claude"], tmp.path(), &mut runtime);
 
     assert_eq!(outcome.code, 0);
+    assert!(runtime.offered.is_some(), "it did ask");
     assert_eq!(env_value(&launched(&runtime), "ANTHROPIC_MODEL"), None);
 }
 
 #[test]
-fn the_end_of_input_declines_the_picker() {
-    // No replies left, which is what a closed stdin looks like.
+fn launch_pi_still_refuses_a_cancelled_picker() {
     let tmp = tempdir().expect("tempdir");
     write_config(tmp.path(), "127.0.0.1", 8317);
-    let mut runtime = picking(&[]);
-
-    let outcome = run(&["launch", "claude"], tmp.path(), &mut runtime);
-
-    assert_eq!(outcome.code, 0);
-    assert_eq!(env_value(&launched(&runtime), "ANTHROPIC_MODEL"), None);
-    assert_eq!(runtime.prompts.len(), 1, "it asked once and stopped");
-}
-
-#[test]
-fn launch_pi_still_refuses_a_declined_picker() {
-    let tmp = tempdir().expect("tempdir");
-    write_config(tmp.path(), "127.0.0.1", 8317);
-    let mut runtime = picking(&[""]);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        models_payload: Some(catalog()),
+        picks: None,
+        ..FakeRuntime::default()
+    };
 
     let error = run_err(&["launch", "pi"], tmp.path(), &mut runtime);
 
@@ -5002,18 +4962,19 @@ fn launch_pi_still_refuses_a_declined_picker() {
 
 #[test]
 fn the_picker_does_not_run_when_output_is_piped() {
-    // A menu on a pipe would eat a line of somebody's script.
+    // Raw mode on a pipe would take over a terminal nobody is watching.
     let tmp = tempdir().expect("tempdir");
     write_config(tmp.path(), "127.0.0.1", 8317);
     let mut runtime = FakeRuntime {
         models_payload: Some(catalog()),
+        picks: Some(1),
         ..FakeRuntime::default()
     };
 
     let outcome = run(&["launch", "claude"], tmp.path(), &mut runtime);
 
     assert_eq!(outcome.code, 0);
-    assert!(runtime.prompts.is_empty());
+    assert!(runtime.offered.is_none());
     assert!(
         !runtime.calls.iter().any(|call| call.starts_with("models:")),
         "{:?}",
@@ -5026,7 +4987,7 @@ fn the_picker_does_not_run_when_output_is_piped() {
 fn an_explicit_model_skips_the_picker() {
     let tmp = tempdir().expect("tempdir");
     write_config(tmp.path(), "127.0.0.1", 8317);
-    let mut runtime = picking(&["1"]);
+    let mut runtime = picking(1);
 
     run(
         &["launch", "claude", "--model", "anthropic/claude-opus-4-8"],
@@ -5034,49 +4995,11 @@ fn an_explicit_model_skips_the_picker() {
         &mut runtime,
     );
 
-    assert!(runtime.prompts.is_empty());
+    assert!(runtime.offered.is_none());
     assert_eq!(
         env_value(&launched(&runtime), "ANTHROPIC_MODEL"),
         Some("anthropic/claude-opus-4-8")
     );
-}
-
-#[test]
-fn the_picker_carries_the_window_and_the_price() {
-    let tmp = tempdir().expect("tempdir");
-    write_config(tmp.path(), "127.0.0.1", 8317);
-    let mut runtime = picking(&["1"]);
-
-    run(&["launch", "claude"], tmp.path(), &mut runtime);
-
-    let shown = runtime.prompts.first().expect("a prompt");
-    assert!(shown.contains("1.0M ctx"), "{shown}");
-    assert!(shown.contains("$5.00/$25.00"), "{shown}");
-    // A row the catalog carries no numbers for shows none rather than zeros.
-    assert!(!shown.contains("$0.00"), "{shown}");
-}
-
-#[test]
-fn the_picker_caps_the_rows_and_says_how_many_it_kept_back() {
-    let tmp = tempdir().expect("tempdir");
-    write_config(tmp.path(), "127.0.0.1", 8317);
-    let rows: Vec<Value> = (0..25)
-        .map(|index| json!({"id": format!("anthropic/model-{index:02}")}))
-        .collect();
-    let mut runtime = FakeRuntime {
-        rich: true,
-        models_payload: Some(json!({ "data": rows })),
-        prompt_replies: VecDeque::from(vec!["1".to_string()]),
-        ..FakeRuntime::default()
-    };
-
-    run(&["launch", "claude"], tmp.path(), &mut runtime);
-
-    let shown = runtime.prompts.first().expect("a prompt");
-    assert!(shown.contains("models (25)"), "{shown}");
-    assert!(shown.contains("anthropic/model-19"), "{shown}");
-    assert!(!shown.contains("anthropic/model-20"), "{shown}");
-    assert!(shown.contains("5 more"), "{shown}");
 }
 
 #[test]
@@ -5086,12 +5009,13 @@ fn an_empty_catalog_asks_nothing() {
     let mut runtime = FakeRuntime {
         rich: true,
         models_payload: Some(json!({"data": []})),
+        picks: Some(1),
         ..FakeRuntime::default()
     };
 
     let outcome = run(&["launch", "claude"], tmp.path(), &mut runtime);
 
     assert_eq!(outcome.code, 0);
-    assert!(runtime.prompts.is_empty());
+    assert!(runtime.offered.is_none());
     assert_eq!(env_value(&launched(&runtime), "ANTHROPIC_MODEL"), None);
 }

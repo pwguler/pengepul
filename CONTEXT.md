@@ -59,7 +59,7 @@ The set of Accounts of one Provider behind the relay, spread across by Rotation.
 _Avoid_: account list, fleet, grouping
 
 **Panel**:
-One 64-column box of rich CLI output. Its header is `<subject>` or `<subject> ─ <qualifier>` and never carries a colon; a qualifier must add a fact the rows do not carry. Its fact rows are `<label>  <value>` with the label column fitted to that panel; it may also carry list rows — account and model tables with their own fitted columns. The status glyph marks a state value only. Plain output is not a panel and follows a separate, byte-stable contract, and so does the `launch` model picker — a menu the operator answers, written to stderr in the palette but outside the box.
+One 64-column box of rich CLI output. Its header is `<subject>` or `<subject> ─ <qualifier>` and never carries a colon; a qualifier must add a fact the rows do not carry. Its fact rows are `<label>  <value>` with the label column fitted to that panel; it may also carry list rows — account and model tables with their own fitted columns. The status glyph marks a state value only. Plain output is not a panel and follows a separate, byte-stable contract, and so does the `launch` model picker — a full-screen list the operator moves through, painted on the alternate screen in the palette but outside the box.
 _Avoid_: card, box, widget
 
 **Refusal**:

@@ -7,12 +7,13 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use crate::app::create_app;
-use crate::cli::{CliRuntime, LaunchPlan, ServiceInstallRequest};
+use crate::cli::{CliRuntime, LaunchPlan, ModelChoice, ServiceInstallRequest, matching_choices};
 use crate::config::{Config, DebugMode};
 use crate::oauth::{
     ANTHROPIC_REDIRECT_URI, CODEX_CALLBACK_PATH, CODEX_CALLBACK_PORT, exchange_anthropic_code,
     exchange_codex_code, generate_anthropic_auth_url, generate_codex_auth_url,
 };
+use crate::render::{BOLD, DIM, pad, paint};
 use crate::service::{ServiceOptions, run_command};
 use crate::tokens::save_token;
 use crate::types::{PkceCodes, ProviderId, ProviderKind};
@@ -139,25 +140,8 @@ impl CliRuntime for RealRuntime {
         ))
     }
 
-    fn prompt(&mut self, text: &str) -> Result<Option<String>> {
-        // The question goes to stderr. stdout is the buffer `main` writes
-        // when the verb returns, and every other verb keeps it byte-stable
-        // for scripts; a menu printed there would be neither.
-        let mut stderr = std::io::stderr();
-        stderr
-            .write_all(text.as_bytes())
-            .context("failed to write the prompt")?;
-        stderr.flush().context("failed to flush the prompt")?;
-        let mut answer = String::new();
-        let read = std::io::stdin()
-            .read_line(&mut answer)
-            .context("failed to read the answer")?;
-        // Zero bytes is end of input, not an empty line: nothing more will
-        // ever be typed, so the caller stops asking rather than looping.
-        if read == 0 {
-            return Ok(None);
-        }
-        Ok(Some(answer))
+    fn select_model(&mut self, choices: &[ModelChoice]) -> Result<Option<String>> {
+        pick_model(choices)
     }
 
     fn service_logs(&mut self, follow: bool, lines: u32) -> Result<()> {
@@ -243,6 +227,185 @@ impl CliRuntime for RealRuntime {
 enum Method {
     Get,
     Post,
+}
+
+/// Drive the model picker on the terminal: arrows move, typing narrows,
+/// enter takes the highlighted row.
+///
+/// It runs on the alternate screen so the operator's scrollback survives,
+/// and raw mode is left again on every exit — the error path included,
+/// which is why the loop's outcome is captured before the terminal is
+/// restored rather than returned through `?`.
+fn pick_model(choices: &[ModelChoice]) -> Result<Option<String>> {
+    use crossterm::{cursor, event, execute, terminal};
+
+    terminal::enable_raw_mode()
+        .context("failed to put the terminal in raw mode; pass --model to skip the picker")?;
+    let mut screen = std::io::stderr();
+    let entered = execute!(screen, terminal::EnterAlternateScreen, cursor::Hide);
+    let outcome = entered.map_err(anyhow::Error::from).and_then(|()| {
+        picker_loop(&mut screen, choices, &mut || {
+            event::read().map_err(anyhow::Error::from)
+        })
+    });
+    let _ = execute!(screen, cursor::Show, terminal::LeaveAlternateScreen);
+    let _ = terminal::disable_raw_mode();
+    outcome
+}
+
+/// The picker's state machine, over whatever `next_event` yields. Split
+/// from the terminal setup so the loop is the part with the logic and the
+/// setup is the part with the cleanup.
+fn picker_loop(
+    screen: &mut impl std::io::Write,
+    choices: &[ModelChoice],
+    next_event: &mut dyn FnMut() -> Result<crossterm::event::Event>,
+) -> Result<Option<String>> {
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+
+    let mut filter = String::new();
+    let mut cursor = 0usize;
+    let mut scroll = 0usize;
+    let mut note = String::new();
+    loop {
+        let matching = matching_choices(choices, &filter);
+        cursor = cursor.min(matching.len().saturating_sub(1));
+        let rows = draw_picker(
+            screen,
+            choices.len(),
+            &matching,
+            &filter,
+            cursor,
+            &mut scroll,
+            &note,
+        )?;
+        note.clear();
+        let Event::Key(key) = next_event()? else {
+            continue;
+        };
+        // A key repeats as Press and Release on terminals that report both;
+        // acting on one of them keeps a single press from moving twice.
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        let page = rows.max(1);
+        match key.code {
+            KeyCode::Esc => return Ok(None),
+            KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Ok(None);
+            }
+            KeyCode::Up => cursor = cursor.saturating_sub(1),
+            KeyCode::Down => cursor = (cursor + 1).min(matching.len().saturating_sub(1)),
+            KeyCode::PageUp => cursor = cursor.saturating_sub(page),
+            KeyCode::PageDown => cursor = (cursor + page).min(matching.len().saturating_sub(1)),
+            KeyCode::Home => cursor = 0,
+            KeyCode::End => cursor = matching.len().saturating_sub(1),
+            KeyCode::Backspace => {
+                filter.pop();
+            }
+            KeyCode::Enter => match matching.get(cursor) {
+                None => {}
+                // Refused here rather than three screens into the harness.
+                // The row stays on the list so the reason has somewhere to
+                // be read.
+                Some(choice) if choice.unavailable.is_some() => {
+                    note = choice.unavailable.clone().unwrap_or_default();
+                }
+                Some(choice) => return Ok(Some(choice.id.clone())),
+            },
+            KeyCode::Char(character) => {
+                filter.push(character);
+                // A narrower list means the old row number means nothing.
+                cursor = 0;
+                scroll = 0;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Paint one frame and return how many model rows fit, which is also the
+/// page size the loop pages by.
+fn draw_picker(
+    screen: &mut impl std::io::Write,
+    total: usize,
+    matching: &[ModelChoice],
+    filter: &str,
+    cursor: usize,
+    scroll: &mut usize,
+    note: &str,
+) -> Result<usize> {
+    use crossterm::{cursor as term_cursor, execute, terminal};
+
+    let (columns, lines) = terminal::size().unwrap_or((80, 24));
+    let width = usize::from(columns).max(20);
+    // Rows 0 and 1 are the heading and the search line, the last row is the
+    // hint, and one blank line separates the heading from the list.
+    let rows = usize::from(lines).saturating_sub(4).max(1);
+    if cursor < *scroll {
+        *scroll = cursor;
+    } else if cursor >= *scroll + rows {
+        *scroll = cursor + 1 - rows;
+    }
+    *scroll = (*scroll).min(matching.len().saturating_sub(rows.min(matching.len())));
+
+    let id_width = matching
+        .iter()
+        .map(|choice| choice.id.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(width.saturating_sub(30).max(12));
+
+    let heading = if filter.is_empty() {
+        format!("pengepul — {total} models")
+    } else {
+        format!("pengepul — {} of {total} models", matching.len())
+    };
+    let mut frame = vec![
+        paint(BOLD, &pad(&heading, width)),
+        pad(&format!("  search: {filter}▏"), width),
+        String::new(),
+    ];
+    for (offset, choice) in matching.iter().skip(*scroll).take(rows).enumerate() {
+        let selected = *scroll + offset == cursor;
+        let marker = if selected { "❯" } else { " " };
+        let tail = if choice.unavailable.is_some() {
+            "  unavailable".to_string()
+        } else if choice.detail.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", choice.detail)
+        };
+        let line = pad(
+            &format!("{marker} {}{tail}", pad(&choice.id, id_width)),
+            width,
+        );
+        frame.push(if selected {
+            paint(BOLD, &line)
+        } else if choice.unavailable.is_some() {
+            paint(DIM, &line)
+        } else {
+            line
+        });
+    }
+    for _ in matching.len().saturating_sub(*scroll).min(rows)..rows {
+        frame.push(" ".repeat(width));
+    }
+    let hint = if note.is_empty() {
+        "↑↓ move   type to search   ⌫ delete   enter run   esc cancel"
+    } else {
+        note
+    };
+    frame.push(paint(DIM, &pad(&format!("  {hint}"), width)));
+
+    execute!(
+        screen,
+        term_cursor::MoveTo(0, 0),
+        terminal::Clear(terminal::ClearType::All)
+    )?;
+    screen.write_all(frame.join("\r\n").as_bytes())?;
+    screen.flush()?;
+    Ok(rows)
 }
 
 /// Become the harness. `exec` leaves the terminal, the signal handling and

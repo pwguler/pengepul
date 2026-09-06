@@ -106,20 +106,19 @@ pengepul launch pi --model anthropic/claude-opus-5
 pengepul launch claude -- --resume # arguments after `--` reach the harness
 ```
 
-Without `--model` on a terminal, `launch` lists what the relay serves and asks. The one
-prompt takes both answers: a number picks that row, anything else filters the list, and
-each filter narrows the one before it. Piped, nothing is asked — the harness gets its own
-default, so scripts behave as they always did.
+Without `--model` on a terminal, `launch` lists everything the relay serves and lets you
+pick: arrows move, typing searches, enter runs, esc cancels. Piped, nothing is asked — the
+harness gets its own default, so scripts behave as they always did.
+
+Claude Code speaks Anthropic Messages, which a configured OpenAI-compatible endpoint does
+not serve, so those models are listed as `unavailable` and cannot be selected for it. They
+are ordinary choices under `launch pi`, whose provider picks a wire per model.
 
 `launch pi` needs pi's pengepul provider, installed once with `pi install
 npm:@pwguler/pi-pengepul-provider`; without it pi refuses with `Unknown provider
 "pengepul"`. pi binds a provider only together with a model, so a model is required
 there — from the picker, or from `--model`. Claude Code brings its own model list, so
 both are optional for `claude`.
-
-Claude Code speaks Anthropic Messages, which a configured OpenAI-compatible endpoint
-does not serve, so `launch claude --model <provider>/<model>` is refused before the
-harness starts, and those models are left off its picker. They run under `launch pi`.
 
 ### openclaw
 

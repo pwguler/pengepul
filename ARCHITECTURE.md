@@ -67,10 +67,11 @@ in files.
   dispatch too: `launch_plan` turns a harness name into the binary, the
   arguments and the environment that point it at the relay, and the runtime
   `exec`s that plan — the whole of the per-harness knowledge is that one
-  table. Its model picker is pure too: `cli.rs` filters the catalog and
-  renders the list, and the runtime only fetches `/v1/models`, writes the
-  question to stderr and reads one line back, so the loop is driven by
-  scripted answers in tests.
+  table. Its model picker splits the same way: `cli.rs` decides which rows
+  exist and which the harness cannot be given (`model_choices`) and owns
+  the search rule (`matching_choices`); the runtime fetches `/v1/models`
+  and drives the keys, so what a test asserts is the list that was
+  offered and the row that came back.
 - **Render** (`render.rs`) — the panel language every verb prints with: the
   64-column box, the `Fact` row (`<label>  <value>`) and `fact_panel` that
   every rich *fact* surface is built from, the three-color palette, glyphs,
@@ -198,6 +199,7 @@ in files.
   instead of onto disk). It is also why `launch claude --model` refuses a
   configured provider: Claude Code speaks Messages, which such an endpoint
   answers 501 for, and the model id already names the provider. The picker
-  applies the same rule before the operator can choose, so an unusable
-  model is never on the list; and it asks nothing at all when stdout is
-  not a terminal, where a menu would consume a line of a script.
+  lists such a model as `unavailable` and refuses it at the keystroke:
+  hiding it made two thirds of the catalog look lost. It opens nothing at
+  all when stdout is not a terminal, where raw mode would seize a terminal
+  nobody is watching.
