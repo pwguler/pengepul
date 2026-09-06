@@ -51,7 +51,7 @@ The policy by which each request is handed the account after the one used last, 
 _Avoid_: round-robin, load balancing, sticky windows, account selection
 
 **Failover**:
-Re-serving one client request on a different account of the same provider after the upstream rejects it in a way another account could survive.
+Re-serving one client request on a different account of the same provider after the upstream rejects it in a way another account could survive. Each attempt re-enters **Rotation** rather than reusing the account already held, so a failover also moves the conversation's affinity onto the account that served it (ADR-0017).
 _Avoid_: retry, fallback, attempt budget
 
 **Pool**:

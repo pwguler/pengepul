@@ -53,8 +53,16 @@ groups what actually shares a cache and still spreads unrelated work.
   they share an account. `messages_route_rotates_available_anthropic_accounts` now
   sends two different system prompts to assert the pool is still spread across.
 - **Availability still outranks cache locality.** A pinned account on Cooldown is
-  passed over on the next turn, not waited for; **Failover** is untouched and still
-  moves a rejected request to another account of the same Provider.
+  passed over at the next selection, not waited for.
+- **Failover re-pins, and that is what heals a bad pin.** Its loop re-enters
+  `account_for` on every attempt instead of reusing the account it already holds,
+  so the fall-through that rescues a rejected request also records the rescuer as
+  that conversation's account. A conversation therefore migrates inside the request
+  that hit the bad account, not a turn later, and stays there once the first one
+  recovers. Reusing the already-fetched account to save a lock would look like a
+  harmless optimisation and would instead steer every later turn back into the same
+  rejection; `a_conversation_that_failed_over_stays_on_the_account_that_rescued_it`
+  is the test that fails when it does.
 - The map is bounded (1024 conversations, cleared wholesale when full) and is not
   persisted. A restart re-learns the mapping on the next turn, at the cost of one
   cold read — the same price a restart already pays for Cooldown.

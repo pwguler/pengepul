@@ -1274,3 +1274,84 @@ async fn a_pinned_account_on_cooldown_falls_through_to_rotation() {
         .expect("availability outranks cache locality");
     assert_ne!(after.token.email, pinned);
 }
+
+#[tokio::test]
+async fn a_conversation_that_failed_over_stays_on_the_account_that_rescued_it() {
+    // Failover re-selects through `account_for`, so a fall-through does not
+    // merely pick another account for this attempt -- it re-records the
+    // affinity. That is what heals a bad pin: the conversation moves to the
+    // account that actually served it and stays there once the first one
+    // recovers, instead of steering back into a rejection every turn.
+    //
+    // Only the recovery separates the two behaviours. While the first
+    // account is still benched, a stale pin and a moved pin both yield the
+    // healthy account, so the assertion has to come after it is well again.
+    let tmp = tempdir().expect("tempdir");
+    for email in ["alice@example.com", "bob@example.com"] {
+        save_token(
+            tmp.path(),
+            &TokenData {
+                access_token: format!("access-{email}"),
+                refresh_token: format!("refresh-{email}"),
+                email: email.to_string(),
+                expires_at: "2030-01-01T00:00:00Z".to_string(),
+                account_uuid: email.to_string(),
+                provider: ProviderId::anthropic(),
+                id_token: None,
+                last_refresh_at: None,
+                plan_type: None,
+            },
+        )
+        .expect("save token");
+    }
+    let mut manager = AccountManager::new(
+        tmp.path().to_path_buf(),
+        ProviderId::anthropic(),
+        |_refresh_token| {
+            Box::pin(
+                async move { Err(RefreshTokenExhaustedError::new("unused", None, None).into()) },
+            )
+        },
+        RefreshPolicy {
+            kind: RefreshPolicyKind::ExpiresLead,
+            seconds: 60,
+        },
+    );
+    manager.reload().expect("reload");
+
+    // Attempt one of a request: the conversation is pinned to whoever it drew.
+    let drew = manager
+        .account_for("conversation-a")
+        .account
+        .expect("an account")
+        .token
+        .email
+        .clone();
+
+    // That upstream rejects it, and attempt two of the same request falls
+    // through to the account that goes on to serve the client.
+    manager.record_failure(&drew, "billing", Some("insufficient credits"));
+    let rescued = manager
+        .account_for("conversation-a")
+        .account
+        .expect("failover had no second account")
+        .token
+        .email
+        .clone();
+    assert_ne!(rescued, drew);
+
+    // The first account recovers, so it becomes selectable again.
+    manager.record_success(&drew, None, "claude-sonnet-4-6");
+
+    // The next turn must still go to the rescuer. Reaching for `drew` here
+    // would mean the pin never moved, and every turn would pay a rejected
+    // upstream call before failing over again.
+    let next_turn = manager
+        .account_for("conversation-a")
+        .account
+        .expect("an account");
+    assert_eq!(
+        next_turn.token.email, rescued,
+        "failover did not re-pin: the conversation steered back to {drew}, which rejects it"
+    );
+}
