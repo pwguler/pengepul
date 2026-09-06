@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use crate::app::create_app;
-use crate::cli::{CliRuntime, ServiceInstallRequest};
+use crate::cli::{CliRuntime, LaunchPlan, ServiceInstallRequest};
 use crate::config::{Config, DebugMode};
 use crate::oauth::{
     ANTHROPIC_REDIRECT_URI, CODEX_CALLBACK_PATH, CODEX_CALLBACK_PORT, exchange_anthropic_code,
@@ -126,6 +126,40 @@ impl CliRuntime for RealRuntime {
         uninstall_platform_service(&home)
     }
 
+    fn launch(&mut self, plan: &LaunchPlan) -> Result<()> {
+        launch_harness(plan)
+    }
+
+    fn models(&mut self, base_url: &str, api_key: &str) -> Result<Value> {
+        self.runtime.block_on(request_json(
+            Method::Get,
+            base_url,
+            "/v1/models",
+            Some(api_key),
+        ))
+    }
+
+    fn prompt(&mut self, text: &str) -> Result<Option<String>> {
+        // The question goes to stderr. stdout is the buffer `main` writes
+        // when the verb returns, and every other verb keeps it byte-stable
+        // for scripts; a menu printed there would be neither.
+        let mut stderr = std::io::stderr();
+        stderr
+            .write_all(text.as_bytes())
+            .context("failed to write the prompt")?;
+        stderr.flush().context("failed to flush the prompt")?;
+        let mut answer = String::new();
+        let read = std::io::stdin()
+            .read_line(&mut answer)
+            .context("failed to read the answer")?;
+        // Zero bytes is end of input, not an empty line: nothing more will
+        // ever be typed, so the caller stops asking rather than looping.
+        if read == 0 {
+            return Ok(None);
+        }
+        Ok(Some(answer))
+    }
+
     fn service_logs(&mut self, follow: bool, lines: u32) -> Result<()> {
         platform_service_logs(follow, lines)
     }
@@ -209,6 +243,30 @@ impl CliRuntime for RealRuntime {
 enum Method {
     Get,
     Post,
+}
+
+/// Become the harness. `exec` leaves the terminal, the signal handling and
+/// the exit code with it rather than proxying all three through pengepul, so
+/// this returns only when the program could not be started at all.
+fn launch_harness(plan: &LaunchPlan) -> Result<()> {
+    use std::os::unix::process::CommandExt as _;
+
+    let mut command = std::process::Command::new(&plan.program);
+    command.args(&plan.args);
+    for (name, value) in &plan.env {
+        command.env(name, value);
+    }
+    let error = command.exec();
+    // The one failure worth translating: the operating system says "no such
+    // file", and what the operator needs is the install line.
+    if error.kind() == std::io::ErrorKind::NotFound {
+        bail!(
+            "{} is not installed; install it with: {}",
+            plan.program,
+            plan.install_hint
+        );
+    }
+    Err(error).with_context(|| format!("failed to run {}", plan.program))
 }
 
 async fn request_json(

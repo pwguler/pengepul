@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 
 use crate::config::{
@@ -10,7 +10,9 @@ use crate::config::{
     validate_provider_id,
 };
 pub use crate::render::Style;
-use crate::render::{ActionGlyph, BOLD, DIM, Fact, Output, fact_panel, paint, status_glyph};
+use crate::render::{
+    ActionGlyph, BOLD, DIM, Fact, Output, fact_panel, format_count, pad, paint, status_glyph,
+};
 use crate::service::service_status_panel;
 use crate::tokens::save_token;
 use crate::types::{ProviderId, ProviderKind, TokenData};
@@ -34,6 +36,29 @@ pub struct ServiceInstallRequest {
     pub port: Option<u16>,
     pub start: bool,
     pub enable: bool,
+}
+
+/// The process `launch` becomes: the harness binary, its arguments, and the
+/// variables that point it at the relay. Everything the verb decided, so the
+/// runtime decides nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchPlan {
+    pub program: String,
+    pub args: Vec<String>,
+    /// Added to the operator's environment rather than replacing it: the
+    /// harness keeps its own configuration, and only its upstream moves.
+    pub env: Vec<(String, String)>,
+    /// How to install `program`, for the one failure the runtime can name
+    /// better than the operating system does.
+    pub install_hint: String,
+}
+
+/// One row of the model picker: the id a harness will be handed, and the
+/// facts that let an operator tell two ids apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelChoice {
+    pub id: String,
+    pub detail: String,
 }
 
 pub trait CliRuntime {
@@ -142,6 +167,31 @@ pub trait CliRuntime {
     ///
     /// Returns an error if the download, verification, or replacement fails.
     fn install_release(&mut self, tag: &str, asset: &str) -> Result<PathBuf>;
+
+    /// Replace this process with the harness the plan names.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the program cannot be run. It does not return
+    /// when the program starts: the harness has the process from there on.
+    fn launch(&mut self, plan: &LaunchPlan) -> Result<()>;
+
+    /// The relay's advertised model catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    fn models(&mut self, base_url: &str, api_key: &str) -> Result<Value>;
+
+    /// Show `text`, then read one line back.
+    ///
+    /// `Ok(None)` means the input ended, which the caller reads as a
+    /// decline rather than a failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the terminal cannot be written to or read from.
+    fn prompt(&mut self, text: &str) -> Result<Option<String>>;
 }
 
 #[derive(Debug, Parser)]
@@ -177,6 +227,20 @@ enum Command {
         /// register a new OpenAI-compatible provider at this URL; needs --key
         #[arg(long = "base-url")]
         base_url: Option<String>,
+    },
+    /// run a coding harness on the relay
+    Launch {
+        #[arg(long = "config")]
+        command_config: Option<PathBuf>,
+        /// harness to run
+        #[arg(value_enum)]
+        harness: Harness,
+        /// model the harness runs on; required for pi
+        #[arg(long)]
+        model: Option<String>,
+        /// arguments forwarded to the harness, after `--`
+        #[arg(last = true)]
+        forwarded: Vec<String>,
     },
     /// show local server status
     Status {
@@ -216,6 +280,17 @@ enum Command {
         #[arg(trailing_var_arg = true)]
         topic: Vec<String>,
     },
+}
+
+/// The harnesses `launch` knows how to point at the relay. Each one is a
+/// table entry in `launch_plan`: a binary, the variables that redirect it,
+/// and how it is told which model to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Harness {
+    /// Claude Code
+    Claude,
+    /// pi
+    Pi,
 }
 
 #[derive(Debug, Clone, Copy, Subcommand)]
@@ -335,6 +410,21 @@ pub fn run_with_env(
         }
         Some(Command::Help { topic }) => {
             output.line(&help_text(&topic)?);
+        }
+        Some(Command::Launch {
+            command_config,
+            harness,
+            model,
+            forwarded,
+        }) => {
+            launch(
+                root_env.with_override(command_config.as_deref()),
+                harness,
+                model.as_deref(),
+                &forwarded,
+                runtime,
+                style,
+            )?;
         }
         Some(Command::Login {
             command_config,
@@ -984,6 +1074,332 @@ fn print_login_saved(
             }
         }
     }
+}
+
+/// The provider name the pi extension registers the relay under, and the
+/// package that registers it. pi resolves `--provider` against what its
+/// extensions declared, so without the package a launch dies at pi's own
+/// provider lookup — loudly, which is why nothing here checks for it first.
+const PI_PROVIDER: &str = "pengepul";
+const PI_PROVIDER_PACKAGE: &str = "npm:@pwguler/pi-pengepul-provider";
+
+/// Run a harness on the relay.
+///
+/// Nothing persists. The harness is handed an environment and an argument
+/// list for one process, so the same binary started without `launch` still
+/// finds its own accounts and its own models.
+fn launch(
+    env: CommandEnv<'_>,
+    harness: Harness,
+    model: Option<&str>,
+    forwarded: &[String],
+    runtime: &mut impl CliRuntime,
+    style: Style,
+) -> Result<()> {
+    let config = env.load()?;
+    let base_url = base_url(&config);
+    let api_key = first_api_key(&config)?;
+    // The relay is the whole of what this verb hands over, so a dead one is
+    // its refusal to make. Left to the harness the same fact arrives as a
+    // connection error inside a TUI, several screens from anything that
+    // names pengepul.
+    runtime.health(&base_url).with_context(|| {
+        format!(
+            "relay is not answering at {base_url}; start it with `pengepul serve` \
+             or `pengepul service start`"
+        )
+    })?;
+    let chosen = match model {
+        Some(model) => Some(model.to_string()),
+        // Nobody named a model, so offer the ones the relay actually
+        // serves. Piped, there is nobody to ask: the picker would consume
+        // a line of somebody's script, so it is skipped and each harness
+        // does what it does with no model at all.
+        None if runtime.stdout_is_tty() => {
+            let catalog = runtime.models(&base_url, &api_key)?;
+            choose_model(&catalog, harness, &config, runtime, style)?
+        }
+        None => None,
+    };
+    let plan = launch_plan(
+        harness,
+        &base_url,
+        &api_key,
+        chosen.as_deref(),
+        forwarded,
+        &config,
+    )?;
+    runtime.launch(&plan)
+}
+
+/// How many rows the picker prints before it asks for a filter instead.
+const PICKER_ROWS: usize = 20;
+
+/// Ask which model to run on. The one prompt takes both answers: a row
+/// number picks, anything else narrows the list, so a long catalog needs no
+/// second question. `None` means the operator declined — for claude that is
+/// the harness's own default, and pi refuses further down where the reason
+/// for refusing lives.
+fn choose_model(
+    catalog: &Value,
+    harness: Harness,
+    config: &Config,
+    runtime: &mut impl CliRuntime,
+    style: Style,
+) -> Result<Option<String>> {
+    let all = model_choices(catalog, harness, config);
+    if all.is_empty() {
+        return Ok(None);
+    }
+    let mut filter = String::new();
+    loop {
+        let matching = matching_choices(&all, &filter);
+        let Some(answer) = runtime.prompt(&picker_text(&matching, all.len(), &filter, style))?
+        else {
+            // End of input. Nothing more will be typed, so stop asking.
+            return Ok(None);
+        };
+        let answer = answer.trim();
+        if answer.is_empty() {
+            // A narrowed list is what the empty answer is most likely
+            // aimed at, so it widens back before it declines. Declining
+            // stays reachable: press it twice, or end the input.
+            if filter.is_empty() {
+                return Ok(None);
+            }
+            filter.clear();
+            continue;
+        }
+        if let Some(choice) = answer
+            .parse::<usize>()
+            .ok()
+            .and_then(|row| row.checked_sub(1))
+            .and_then(|index| matching.get(index))
+        {
+            return Ok(Some(choice.id.clone()));
+        }
+        // Not a row on the list, so it is a filter — including a number
+        // too large for the list, which narrows to the ids carrying that
+        // number rather than silently picking nothing.
+        //
+        // It narrows what is already there rather than replacing it: after
+        // a list headed `"glm" (6 of 78)`, typing `flash` plainly means
+        // the flash one among those six. Replacing widened it back to 14
+        // instead, which is how this was found. The empty answer is the
+        // way back out, and the question says so.
+        filter = format!("{filter} {answer}").trim().to_string();
+    }
+}
+
+/// The catalog rows a harness can be handed. claude speaks Messages, so a
+/// configured endpoint's models are never offered: the same rule the
+/// explicit `--model` path refuses on, applied before the operator can
+/// choose one.
+fn model_choices(catalog: &Value, harness: Harness, config: &Config) -> Vec<ModelChoice> {
+    let Some(entries) = catalog.get("data").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let id = entry.get("id").and_then(Value::as_str)?;
+            if harness == Harness::Claude && claude_speaks_messages(id, config).is_err() {
+                return None;
+            }
+            Some(ModelChoice {
+                id: id.to_string(),
+                detail: model_detail(entry),
+            })
+        })
+        .collect()
+}
+
+/// What separates two ids on the list: the context window, and what a
+/// million tokens cost in and out. Left out where the catalog does not
+/// carry them — a configured endpoint publishes what it publishes, and a
+/// blank column is honest where a zero would not be.
+fn model_detail(entry: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(window) = entry.get("context_window").and_then(Value::as_u64) {
+        parts.push(format!(
+            "{} ctx",
+            format_count(i64::try_from(window).unwrap_or(i64::MAX))
+        ));
+    }
+    let pricing = entry.get("pricing");
+    let input = pricing
+        .and_then(|rates| rates.get("input_per_million"))
+        .and_then(Value::as_f64);
+    let output = pricing
+        .and_then(|rates| rates.get("output_per_million"))
+        .and_then(Value::as_f64);
+    if let (Some(input), Some(output)) = (input, output) {
+        parts.push(format!("${input:.2}/${output:.2}"));
+    }
+    parts.join("  ")
+}
+
+/// Rows whose id carries every word of the filter, case folded. Words
+/// narrow together, so `opus 4` finds the 4-series opus ids without naming
+/// their exact shape.
+fn matching_choices(choices: &[ModelChoice], filter: &str) -> Vec<ModelChoice> {
+    let words: Vec<String> = filter.split_whitespace().map(str::to_lowercase).collect();
+    choices
+        .iter()
+        .filter(|choice| {
+            let id = choice.id.to_lowercase();
+            words.iter().all(|word| id.contains(word))
+        })
+        .cloned()
+        .collect()
+}
+
+/// The list and the one question under it. Not a Panel: a Panel carries
+/// facts about one subject, and this is a menu the operator answers, so it
+/// keeps the palette and stays out of the box (CONTEXT.md, Panel).
+fn picker_text(matching: &[ModelChoice], total: usize, filter: &str, style: Style) -> String {
+    let dim = |text: &str| match style {
+        Style::Plain => text.to_string(),
+        Style::Rich => paint(DIM, text),
+    };
+    let bold = |text: &str| match style {
+        Style::Plain => text.to_string(),
+        Style::Rich => paint(BOLD, text),
+    };
+    let header = if filter.is_empty() {
+        format!("models ({total})")
+    } else if matching.is_empty() {
+        format!("models — nothing matches \"{filter}\" (0 of {total})")
+    } else {
+        format!("models — \"{filter}\" ({} of {total})", matching.len())
+    };
+    let shown = &matching[..matching.len().min(PICKER_ROWS)];
+    let id_width = shown
+        .iter()
+        .map(|choice| choice.id.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(44);
+
+    let mut lines = vec![String::new(), format!("  {}", bold(&header)), String::new()];
+    for (index, choice) in shown.iter().enumerate() {
+        let row = format!("{:>3}", index + 1);
+        let detail = if choice.detail.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", dim(&choice.detail))
+        };
+        lines.push(format!(
+            "  {}  {}{detail}",
+            dim(&row),
+            pad(&choice.id, id_width)
+        ));
+    }
+    let hidden = matching.len().saturating_sub(shown.len());
+    if hidden > 0 {
+        lines.push(format!("  {}", dim(&format!("    {hidden} more"))));
+    }
+    lines.push(String::new());
+    let question = if matching.is_empty() {
+        "type to filter, or enter to clear it"
+    } else if filter.is_empty() {
+        "pick a number, or type to filter"
+    } else {
+        "pick a number, type to filter, or enter to clear it"
+    };
+    lines.push(format!("  {question}: "));
+    lines.join("\n")
+}
+
+/// What each harness needs to run on the relay instead of its own upstream.
+fn launch_plan(
+    harness: Harness,
+    base_url: &str,
+    api_key: &str,
+    model: Option<&str>,
+    forwarded: &[String],
+    config: &Config,
+) -> Result<LaunchPlan> {
+    match harness {
+        Harness::Claude => {
+            let mut env = vec![
+                ("ANTHROPIC_BASE_URL".to_string(), base_url.to_string()),
+                ("ANTHROPIC_AUTH_TOKEN".to_string(), api_key.to_string()),
+                // Emptied rather than left alone. A key already in the
+                // operator's environment outranks the token above, and
+                // sends the harness to api.anthropic.com on a per-token
+                // meter — the one outcome this verb exists to prevent.
+                ("ANTHROPIC_API_KEY".to_string(), String::new()),
+            ];
+            if let Some(model) = model {
+                claude_speaks_messages(model, config)?;
+                // Every tier, not only the default one. The operator named
+                // one model; a `/model sonnet` that quietly went somewhere
+                // else would be the same silence this verb removes.
+                for name in [
+                    "ANTHROPIC_MODEL",
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                    "CLAUDE_CODE_SUBAGENT_MODEL",
+                ] {
+                    env.push((name.to_string(), model.to_string()));
+                }
+            }
+            Ok(LaunchPlan {
+                program: "claude".to_string(),
+                args: forwarded.to_vec(),
+                env,
+                install_hint: "npm install -g @anthropic-ai/claude-code".to_string(),
+            })
+        }
+        Harness::Pi => {
+            // pi binds `--provider` only when a model comes with it: run
+            // with a provider alone it answers from the one in its own
+            // settings and says nothing. Without a model this verb would
+            // start a pi that looked pointed at the relay and was not.
+            let model = model.context(
+                "pi needs --model: it binds a provider only together with one, and \
+                 without it pi keeps the provider from its own settings",
+            )?;
+            let mut args = vec![
+                "--provider".to_string(),
+                PI_PROVIDER.to_string(),
+                "--model".to_string(),
+                model.to_string(),
+            ];
+            args.extend_from_slice(forwarded);
+            Ok(LaunchPlan {
+                program: "pi".to_string(),
+                args,
+                env: vec![
+                    ("PENGEPUL_BASE_URL".to_string(), base_url.to_string()),
+                    ("PENGEPUL_API_KEY".to_string(), api_key.to_string()),
+                ],
+                install_hint: format!(
+                    "npm install -g @earendil-works/pi-coding-agent, then \
+                     pi install {PI_PROVIDER_PACKAGE}"
+                ),
+            })
+        }
+    }
+}
+
+/// Claude Code speaks the Messages dialect, and a configured
+/// OpenAI-compatible endpoint answers 501 for it — Chat Completions is the
+/// only dialect it accepts. The model id already names its provider, so the
+/// refusal needs no network and arrives before the harness starts.
+fn claude_speaks_messages(model: &str, config: &Config) -> Result<()> {
+    let Some((prefix, _)) = model.split_once('/') else {
+        return Ok(());
+    };
+    if config.providers.contains_key(prefix) {
+        bail!(
+            "{prefix} serves only the Chat Completions dialect and claude speaks Messages; \
+             name an anthropic or codex model, or run this one under `pengepul launch pi`"
+        );
+    }
+    Ok(())
 }
 
 fn help_text(topic: &[String]) -> Result<String> {

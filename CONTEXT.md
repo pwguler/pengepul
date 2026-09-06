@@ -59,7 +59,7 @@ The set of Accounts of one Provider behind the relay, spread across by Rotation.
 _Avoid_: account list, fleet, grouping
 
 **Panel**:
-One 64-column box of rich CLI output. Its header is `<subject>` or `<subject> ─ <qualifier>` and never carries a colon; a qualifier must add a fact the rows do not carry. Its fact rows are `<label>  <value>` with the label column fitted to that panel; it may also carry list rows — account and model tables with their own fitted columns. The status glyph marks a state value only. Plain output is not a panel and follows a separate, byte-stable contract.
+One 64-column box of rich CLI output. Its header is `<subject>` or `<subject> ─ <qualifier>` and never carries a colon; a qualifier must add a fact the rows do not carry. Its fact rows are `<label>  <value>` with the label column fitted to that panel; it may also carry list rows — account and model tables with their own fitted columns. The status glyph marks a state value only. Plain output is not a panel and follows a separate, byte-stable contract, and so does the `launch` model picker — a menu the operator answers, written to stderr in the palette but outside the box.
 _Avoid_: card, box, widget
 
 **Refusal**:
@@ -69,6 +69,12 @@ _Avoid_: rejection, refused request, bad request
 **Usage counters**:
 The running per-account totals — requests, successes, failures, tokens in/out/cache/reasoning — broken down per model for the successes and bucketed per **local calendar day**, summed relay-wide in `status`, shown per account in `accounts`, shown as a 30-day trend in `usage`, and persisted to `usage.json` in the provider's auth directory so they survive restarts and upgrades. **A counter counts outcomes, never attempts**: `requests` is incremented by the same call that increments `successes` or `failures`, so `requests == successes + failures` holds cumulatively and per day by construction, and a request still in flight is counted nowhere (ADR-0015). An outcome is booked to the day it arrived on. Counters recorded before per-model attribution or daily bucketing existed stay only in the account totals. Daily buckets are kept for 90 days. Cooldowns and failure streaks are not persisted: a fresh process always retries.
 _Avoid_: stats file, metrics, telemetry
+
+### Clients
+
+**Harness**:
+A coding agent that calls the relay — claude, pi, openclaw, hermes — as opposed to the vendor CLI whose traffic Cloaking makes a request resemble. It is what the classifier-rewrite tables are keyed by, and what `pengepul launch` takes as its argument.
+_Avoid_: client (where the coding agent, not any caller, is meant), agent, tool
 
 ### Access and billing identity
 
@@ -95,6 +101,7 @@ _Avoid_: billing classifier, detector, filter
 - One client request is served by one **Account** at a time, and **Failover** only moves it between **Accounts** of the same **Provider**.
 - **Cloaking** applies to requests bound for the anthropic and codex **Upstreams**; configured OpenAI-compatible endpoints are never cloaked. The **Local API key** applies to requests arriving from a client.
 - One pengepul endpoint accepts exactly one **Inbound dialect**; one **Provider** accepts exactly one **Dialect** upstream.
+- A **Harness** reaches the relay through its own configuration, never through a route made for it (ADR-0007). `pengepul launch` writes that configuration into one process instead of onto disk, so it covers only the **Harnesses** that can be redirected per-process.
 - Any **Inbound dialect** may be served by anthropic or codex, and **Translation** is what closes the gap. A configured OpenAI-compatible endpoint accepts only the Chat Completions dialect and answers 501 for the others. count_tokens is anthropic-only and answers 501 elsewhere.
 
 ## Example dialogue

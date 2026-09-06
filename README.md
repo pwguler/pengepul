@@ -26,6 +26,7 @@ pengepul login --provider anthropic # authorize an Anthropic account
 pengepul login --provider codex # authorize a ChatGPT/Codex account
 pengepul serve # binds 127.0.0.1:8317
 pengepul serve --host 0.0.0.0 --port 8317 # reachable across your network
+pengepul launch claude # run Claude Code on the pool
 ```
 
 Log in more than once per provider to pool several accounts; requests round-robin across
@@ -91,6 +92,34 @@ ssh -L 1455:localhost:1455 user@host # codex
 ```
 
 ## Clients
+
+### claude and pi
+
+One command points a harness at the pool for as long as it runs. Nothing is written to
+disk, so `claude` and `pi` started any other way still find their own accounts and their
+own models:
+
+```sh
+pengepul launch claude # pick a model from the relay, then run
+pengepul launch claude --model gpt-5.4 # ... or name one and skip the picker
+pengepul launch pi --model anthropic/claude-opus-5
+pengepul launch claude -- --resume # arguments after `--` reach the harness
+```
+
+Without `--model` on a terminal, `launch` lists what the relay serves and asks. The one
+prompt takes both answers: a number picks that row, anything else filters the list, and
+each filter narrows the one before it. Piped, nothing is asked — the harness gets its own
+default, so scripts behave as they always did.
+
+`launch pi` needs pi's pengepul provider, installed once with `pi install
+npm:@pwguler/pi-pengepul-provider`; without it pi refuses with `Unknown provider
+"pengepul"`. pi binds a provider only together with a model, so a model is required
+there — from the picker, or from `--model`. Claude Code brings its own model list, so
+both are optional for `claude`.
+
+Claude Code speaks Anthropic Messages, which a configured OpenAI-compatible endpoint
+does not serve, so `launch claude --model <provider>/<model>` is refused before the
+harness starts, and those models are left off its picker. They run under `launch pi`.
 
 ### openclaw
 
@@ -171,6 +200,8 @@ pengepul serve # start the relay (the default with no subcommand)
 pengepul login --provider anthropic # authorize an account in a browser (--provider codex for Codex)
 pengepul login --provider groq --key $KEY # save a static key for a configured provider
 pengepul login --provider groq --base-url $URL --key $KEY # register a new OpenAI-compatible provider and save its key
+pengepul launch claude # run Claude Code on the pool (picks a model, --model skips the picker)
+pengepul launch pi # run pi on the pool
 pengepul status # health of the running relay
 pengepul accounts # loaded accounts (--reload re-reads from disk)
 pengepul usage # the last 30 days of tokens, as a sparkline

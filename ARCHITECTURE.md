@@ -63,7 +63,14 @@ in files.
 - **CLI + Runtime + Service** (`cli.rs`, `runtime.rs`, `service.rs`) — command
   parsing and dispatch (pure), the `CliRuntime` adapter that makes a verb touch
   the real world, and the per-user systemd/launchd unit — including the parser
-  that turns the platform tool's status text into panel rows.
+  that turns the platform tool's status text into panel rows. `launch` is
+  dispatch too: `launch_plan` turns a harness name into the binary, the
+  arguments and the environment that point it at the relay, and the runtime
+  `exec`s that plan — the whole of the per-harness knowledge is that one
+  table. Its model picker is pure too: `cli.rs` filters the catalog and
+  renders the list, and the runtime only fetches `/v1/models`, writes the
+  question to stderr and reads one line back, so the loop is driven by
+  scripted answers in tests.
 - **Render** (`render.rs`) — the panel language every verb prints with: the
   64-column box, the `Fact` row (`<label>  <value>`) and `fact_panel` that
   every rich *fact* surface is built from, the three-color palette, glyphs,
@@ -181,3 +188,16 @@ in files.
   display) and `web-fetch` stays for the native tool swap — ADR-0014.
 - **A (Inbound dialect, Provider) pair the relay cannot serve is refused 501 at
   routing**, never sent upstream and never retried.
+- **`launch` leaves nothing behind.** A harness is pointed at the relay by the
+  environment and the arguments of one process, never by a file: the same
+  binary started any other way still resolves its own accounts and its own
+  models. That is what bounds the verb to harnesses which can be redirected
+  per-process — openclaw and hermes can only be redirected in their config
+  files, so they stay the README's manual step (ADR-0007 still holds: the
+  client adapts, and `launch` only writes that adaptation into one process
+  instead of onto disk). It is also why `launch claude --model` refuses a
+  configured provider: Claude Code speaks Messages, which such an endpoint
+  answers 501 for, and the model id already names the provider. The picker
+  applies the same rule before the operator can choose, so an unusable
+  model is never on the list; and it asks nothing at all when stdout is
+  not a terminal, where a menu would consume a line of a script.
