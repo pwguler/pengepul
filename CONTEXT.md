@@ -47,7 +47,7 @@ A period during which an account is passed over by rotation, entered on failure 
 _Avoid_: backoff, lockout, unavailable, cooling down
 
 **Rotation**:
-The policy by which each request is handed the account after the one used last, skipping accounts on cooldown and holding no affinity to a client or session.
+The policy by which each request is handed the account after the one used last, skipping accounts on cooldown. It prefers the account that already holds a conversation's cached prefix, and falls back to the next account whenever that one is on **Cooldown** — availability outranks cache locality (ADR-0017). The preference is keyed by the session a harness names, or by a hash of the request's cacheable prefix when it names none.
 _Avoid_: round-robin, load balancing, sticky windows, account selection
 
 **Failover**:

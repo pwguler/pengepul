@@ -1203,3 +1203,63 @@ async fn a_reauth_lockout_is_not_clobbered_by_the_paired_failure() {
         snapshot["lastError"]
     );
 }
+
+#[tokio::test]
+async fn a_pinned_account_on_cooldown_falls_through_to_rotation() {
+    // Affinity is a preference, never a pin. Cache efficiency does not get
+    // to outrank availability: when the account a conversation was using
+    // goes on Cooldown, the next turn takes another rather than waiting.
+    let tmp = tempdir().expect("tempdir");
+    for email in ["alice@example.com", "bob@example.com"] {
+        save_token(
+            tmp.path(),
+            &TokenData {
+                access_token: format!("access-{email}"),
+                refresh_token: format!("refresh-{email}"),
+                email: email.to_string(),
+                expires_at: "2030-01-01T00:00:00Z".to_string(),
+                account_uuid: email.to_string(),
+                provider: ProviderId::anthropic(),
+                id_token: None,
+                last_refresh_at: None,
+                plan_type: None,
+            },
+        )
+        .expect("save token");
+    }
+    let mut manager = AccountManager::new(
+        tmp.path().to_path_buf(),
+        ProviderId::anthropic(),
+        |_refresh_token| {
+            Box::pin(
+                async move { Err(RefreshTokenExhaustedError::new("unused", None, None).into()) },
+            )
+        },
+        RefreshPolicy {
+            kind: RefreshPolicyKind::ExpiresLead,
+            seconds: 60,
+        },
+    );
+    manager.reload().expect("reload");
+
+    let first = manager
+        .account_for("conversation-a")
+        .account
+        .expect("an account");
+    let pinned = first.token.email.clone();
+
+    // The same conversation keeps the same account while it is healthy.
+    let again = manager
+        .account_for("conversation-a")
+        .account
+        .expect("an account");
+    assert_eq!(again.token.email, pinned);
+
+    // Once it is benched, the conversation moves rather than stalling.
+    manager.record_failure(&pinned, "upstream", Some("503"));
+    let after = manager
+        .account_for("conversation-a")
+        .account
+        .expect("availability outranks cache locality");
+    assert_ne!(after.token.email, pinned);
+}

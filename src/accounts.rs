@@ -30,6 +30,12 @@ const BILLING_COOLDOWN_SECONDS: f64 = 10.0 * 60.0;
 
 const REAUTH_COOLDOWN_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 
+/// How many conversations keep an account preference before the whole map
+/// is dropped. A relay serves a handful of harnesses at once; this is far
+/// above that and still bounded, so a long-lived process cannot grow one
+/// entry per conversation forever.
+const AFFINITY_CAPACITY: usize = 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshPolicyKind {
     ExpiresLead,
@@ -202,6 +208,8 @@ pub struct AccountManager {
     /// account states; never updated afterwards. Writes rebuild the file
     /// from the live accounts, dropping unknown entries.
     persisted_usage: BTreeMap<String, PersistedUsage>,
+    /// Conversation key -> the account that served it last.
+    affinity: BTreeMap<String, String>,
 }
 
 impl AccountManager {
@@ -221,6 +229,7 @@ impl AccountManager {
             order: Vec::new(),
             last_used_index: None,
             persisted_usage: BTreeMap::new(),
+            affinity: BTreeMap::new(),
         }
     }
 
@@ -520,6 +529,44 @@ impl AccountManager {
     }
 
     #[must_use]
+    /// The account a conversation should keep using, when it still can.
+    ///
+    /// Every upstream holds its own prompt cache, so moving a conversation
+    /// between accounts throws away the prefix it just paid to cache.
+    /// Affinity is a preference and never a pin: an account on Cooldown
+    /// falls through to Rotation, which is what keeps availability ahead of
+    /// cache efficiency.
+    pub fn account_for(&mut self, affinity: &str) -> AccountResult {
+        let now = unix_now();
+        if let Some(email) = self.affinity.get(affinity)
+            && let Some(state) = self.accounts.get(email)
+            && state.cooldown_until <= now
+        {
+            let account = self.available_account(state);
+            if let Some(index) = self.order.iter().position(|held| held == email) {
+                self.last_used_index = Some(index);
+            }
+            return AccountResult {
+                account: Some(account),
+                failure_kind: None,
+                retry_after_seconds: None,
+            };
+        }
+        let result = self.next_account_result();
+        if let Some(account) = &result.account {
+            // Bounded by the same rule the pool is: one entry per live
+            // conversation, dropped once it outnumbers the accounts by more
+            // than a working set. Nothing here is persisted — a restart
+            // re-learns it on the next turn, at the price of one cold read.
+            if self.affinity.len() >= AFFINITY_CAPACITY {
+                self.affinity.clear();
+            }
+            self.affinity
+                .insert(affinity.to_string(), account.token.email.clone());
+        }
+        result
+    }
+
     pub fn next_account_result(&mut self) -> AccountResult {
         if self.order.is_empty() {
             return AccountResult {

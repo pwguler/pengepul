@@ -154,6 +154,96 @@ fn apply_cloaking_injects_billing_prefix_and_metadata() {
 }
 
 #[test]
+fn the_injected_prefix_never_precedes_a_longer_client_ttl() {
+    // Anthropic renders tools, then system, then messages, and rejects a
+    // 1h breakpoint that appears after a 5m one. The injected prefix is
+    // always the first marked block, so a client asking for 1h retention
+    // got a hard 400 on every request:
+    //
+    //   system.2.cache_control.ttl: a ttl='1h' cache_control block must not
+    //   come after a ttl='5m' cache_control block
+    //
+    // Reproduced against the live API before this test existed
+    // (req_011CenGRfvYn2iTHLfYKdRat).
+    let body = json!({
+        "system": [{
+            "type": "text",
+            "text": "sys",
+            "cache_control": {"type": "ephemeral", "ttl": "1h"}
+        }],
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+
+    let cloaked = apply_cloaking(
+        &body,
+        &BTreeMap::new(),
+        &account(ProviderId::anthropic()),
+        &config(),
+    );
+
+    let ttls: Vec<Option<&str>> = cloaked["system"]
+        .as_array()
+        .expect("system")
+        .iter()
+        .filter_map(|block| block.get("cache_control"))
+        .map(|control| control.get("ttl").and_then(Value::as_str))
+        .collect();
+    // Once a 1h breakpoint has been seen, nothing after it may be shorter,
+    // and nothing before it may be a default-5m marker.
+    let mut seen_long = false;
+    for ttl in &ttls {
+        match ttl {
+            Some("1h") => seen_long = true,
+            _ => assert!(!seen_long, "a 5m breakpoint follows a 1h one: {ttls:?}"),
+        }
+    }
+    assert!(
+        ttls.first().is_none_or(|ttl| *ttl == Some("1h")),
+        "the injected prefix is marked 5m ahead of the client's 1h block: {ttls:?}"
+    );
+}
+
+#[test]
+fn a_long_ttl_marked_only_in_messages_still_lifts_the_prefix() {
+    // The ordering rule is one-directional: 5m-then-1h is refused, 1h-then-5m
+    // is fine. `system` renders before `messages`, so a client that marks 1h
+    // only on a message — without marking `system` at all — is the case that
+    // puts our 5m prefix in front of a 1h block. pi marks all three.
+    let body = json!({
+        "system": [{"type": "text", "text": "sys"}],
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": "hi",
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }]
+        }]
+    });
+
+    let cloaked = apply_cloaking(
+        &body,
+        &BTreeMap::new(),
+        &account(ProviderId::anthropic()),
+        &config(),
+    );
+
+    let prefix_ttl = cloaked["system"]
+        .as_array()
+        .expect("system")
+        .iter()
+        .find_map(|block| block.get("cache_control"))
+        .and_then(|control| control.get("ttl"))
+        .and_then(Value::as_str);
+    assert_eq!(
+        prefix_ttl,
+        Some("1h"),
+        "the prefix stayed 5m ahead of a 1h message block: {}",
+        cloaked["system"]
+    );
+}
+
+#[test]
 fn apply_cloaking_caps_cache_control_at_four_across_system_tools_messages() {
     // Anthropic sums cache_control across system + tools + messages. A client (e.g.
     // hermes on a follow-up turn) spends the full budget of 4 spread across all three;

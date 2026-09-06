@@ -147,6 +147,13 @@ in files.
   the served `LongCat-2.0:free`, is a name and travels whole.
 - **Failover only moves a request between Accounts of the same Provider**,
   resolved once before the attempt loop.
+- **Rotation prefers the Account holding the cache, and never waits for it.**
+  Each upstream keeps its own prompt cache, so a conversation stays on the
+  Account that served it last while that Account is off Cooldown, and takes
+  the next one the moment it is not (ADR-0017). The preference is keyed by
+  the session a harness names, or by a hash of the cacheable prefix —
+  `system`, `tools`, `model` — when it names none. It is bounded and not
+  persisted: a restart re-learns it at the cost of one cold read.
 - **Every route authenticates before it parses a body.** `/health` is the only
   unauthenticated route.
 - **One Account holds exactly one credential**, on disk at `0600` and never
