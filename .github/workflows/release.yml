@@ -124,9 +124,14 @@ jobs:
           else
             link="https://github.com/${GITHUB_REPOSITORY}/commits/${GITHUB_REF_NAME}"
           fi
+          # The title is set explicitly: with none, the release has no name
+          # and the page renders the tag followed by the commit subject.
           notes="**Full Changelog**: ${link}"
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --notes "${notes}"
+            gh release edit "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" \
+              --notes "${notes}"
             gh release upload "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" \
               --clobber \
@@ -134,6 +139,7 @@ jobs:
           else
             gh release create "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" \
               --notes "${notes}" \
               --verify-tag \
               *.tar.gz checksums.txt
