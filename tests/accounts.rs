@@ -210,6 +210,7 @@ async fn usage_counters_survive_a_manager_rebuild() {
             input_tokens: 33,
             output_tokens: 120,
             cache_creation_input_tokens: 7,
+            cache_creation_1h_input_tokens: 5,
             cache_read_input_tokens: 4,
             reasoning_output_tokens: 13,
         }),
@@ -227,6 +228,9 @@ async fn usage_counters_survive_a_manager_rebuild() {
     assert_eq!(snapshot["totalInputTokens"], 33);
     assert_eq!(snapshot["totalOutputTokens"], 120);
     assert_eq!(snapshot["totalCacheCreationInputTokens"], 7);
+    // The long-retention share travels under the name the status view reads;
+    // a value distinct from the total so a crossed field cannot pass.
+    assert_eq!(snapshot["totalCacheCreation1hInputTokens"], 5);
     assert_eq!(snapshot["totalCacheReadInputTokens"], 4);
     assert_eq!(snapshot["totalReasoningOutputTokens"], 13);
     // AC-2: the failure wall itself is not persisted — fresh process retries.
@@ -323,6 +327,7 @@ async fn per_model_counters_accumulate_per_account() {
         input_tokens: input,
         output_tokens: 10,
         cache_creation_input_tokens: 1,
+        cache_creation_1h_input_tokens: 0,
         cache_read_input_tokens: 2,
         reasoning_output_tokens: 3,
     };
@@ -374,6 +379,7 @@ async fn per_model_counters_persist_and_tolerate_legacy_files() {
             input_tokens: 33,
             output_tokens: 120,
             cache_creation_input_tokens: 7,
+            cache_creation_1h_input_tokens: 0,
             cache_read_input_tokens: 4,
             reasoning_output_tokens: 13,
         }),
@@ -443,6 +449,7 @@ async fn a_success_without_usage_still_counts_against_its_model() {
             input_tokens: 10,
             output_tokens: 20,
             cache_creation_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
             cache_read_input_tokens: 0,
             reasoning_output_tokens: 0,
         }),
@@ -503,6 +510,7 @@ async fn outcomes_accumulate_into_one_bucket_per_local_day() {
             input_tokens: 10,
             output_tokens: 20,
             cache_creation_input_tokens: 1,
+            cache_creation_1h_input_tokens: 0,
             cache_read_input_tokens: 2,
             reasoning_output_tokens: 3,
         }),
@@ -514,6 +522,7 @@ async fn outcomes_accumulate_into_one_bucket_per_local_day() {
             input_tokens: 100,
             output_tokens: 200,
             cache_creation_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
             cache_read_input_tokens: 0,
             reasoning_output_tokens: 0,
         }),
@@ -886,6 +895,7 @@ async fn no_sequence_of_outcomes_can_break_the_invariant() {
         input_tokens: 1,
         output_tokens: 1,
         cache_creation_input_tokens: 0,
+        cache_creation_1h_input_tokens: 0,
         cache_read_input_tokens: 0,
         reasoning_output_tokens: 0,
     };
@@ -1154,6 +1164,7 @@ async fn two_attempts_in_flight_both_reach_an_outcome() {
         input_tokens: 100,
         output_tokens: 10,
         cache_creation_input_tokens: 0,
+        cache_creation_1h_input_tokens: 0,
         cache_read_input_tokens: 0,
         reasoning_output_tokens: 0,
     };

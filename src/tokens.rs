@@ -257,6 +257,8 @@ pub(crate) struct PersistedUsage {
     pub(crate) input_tokens: i64,
     pub(crate) output_tokens: i64,
     pub(crate) cache_creation_input_tokens: i64,
+    /// The 1h-retention share of the line above.
+    pub(crate) cache_creation_1h_input_tokens: i64,
     pub(crate) cache_read_input_tokens: i64,
     pub(crate) reasoning_output_tokens: i64,
     /// Per-model successes and their tokens, keyed by upstream model name.
@@ -293,6 +295,8 @@ pub(crate) struct ModelUsage {
     pub(crate) input_tokens: i64,
     pub(crate) output_tokens: i64,
     pub(crate) cache_creation_input_tokens: i64,
+    /// The 1h-retention share of the line above.
+    pub(crate) cache_creation_1h_input_tokens: i64,
     pub(crate) cache_read_input_tokens: i64,
     pub(crate) reasoning_output_tokens: i64,
 }
@@ -309,6 +313,8 @@ pub(crate) struct DayUsage {
     pub(crate) input_tokens: i64,
     pub(crate) output_tokens: i64,
     pub(crate) cache_creation_input_tokens: i64,
+    /// The 1h-retention share of the line above.
+    pub(crate) cache_creation_1h_input_tokens: i64,
     pub(crate) cache_read_input_tokens: i64,
     pub(crate) reasoning_output_tokens: i64,
 }
@@ -320,6 +326,7 @@ impl DayUsage {
         self.input_tokens += usage.input_tokens;
         self.output_tokens += usage.output_tokens;
         self.cache_creation_input_tokens += usage.cache_creation_input_tokens;
+        self.cache_creation_1h_input_tokens += usage.cache_creation_1h_input_tokens;
         self.cache_read_input_tokens += usage.cache_read_input_tokens;
         self.reasoning_output_tokens += usage.reasoning_output_tokens;
     }
@@ -333,6 +340,7 @@ impl ModelUsage {
         self.input_tokens += usage.input_tokens;
         self.output_tokens += usage.output_tokens;
         self.cache_creation_input_tokens += usage.cache_creation_input_tokens;
+        self.cache_creation_1h_input_tokens += usage.cache_creation_1h_input_tokens;
         self.cache_read_input_tokens += usage.cache_read_input_tokens;
         self.reasoning_output_tokens += usage.reasoning_output_tokens;
     }
@@ -376,6 +384,7 @@ fn parse_persisted_usage(entry: &Value) -> Option<PersistedUsage> {
         input_tokens: field("total_input_tokens"),
         output_tokens: field("total_output_tokens"),
         cache_creation_input_tokens: field("total_cache_creation_input_tokens"),
+        cache_creation_1h_input_tokens: field("total_cache_creation_1h_input_tokens"),
         cache_read_input_tokens: field("total_cache_read_input_tokens"),
         reasoning_output_tokens: field("total_reasoning_output_tokens"),
         models: parse_persisted_models(object.get("models")),
@@ -403,6 +412,7 @@ fn parse_persisted_days(entry: Option<&Value>) -> BTreeMap<String, DayUsage> {
                     input_tokens: field("input_tokens"),
                     output_tokens: field("output_tokens"),
                     cache_creation_input_tokens: field("cache_creation_input_tokens"),
+                    cache_creation_1h_input_tokens: field("cache_creation_1h_input_tokens"),
                     cache_read_input_tokens: field("cache_read_input_tokens"),
                     reasoning_output_tokens: field("reasoning_output_tokens"),
                 },
@@ -430,6 +440,7 @@ fn parse_persisted_models(entry: Option<&Value>) -> BTreeMap<String, ModelUsage>
                     input_tokens: field("input_tokens"),
                     output_tokens: field("output_tokens"),
                     cache_creation_input_tokens: field("cache_creation_input_tokens"),
+                    cache_creation_1h_input_tokens: field("cache_creation_1h_input_tokens"),
                     cache_read_input_tokens: field("cache_read_input_tokens"),
                     reasoning_output_tokens: field("reasoning_output_tokens"),
                 },
@@ -462,6 +473,7 @@ pub(crate) fn save_usage(
                     "input_tokens": counters.input_tokens,
                     "output_tokens": counters.output_tokens,
                     "cache_creation_input_tokens": counters.cache_creation_input_tokens,
+                    "cache_creation_1h_input_tokens": counters.cache_creation_1h_input_tokens,
                     "cache_read_input_tokens": counters.cache_read_input_tokens,
                     "reasoning_output_tokens": counters.reasoning_output_tokens,
                 }),
@@ -478,6 +490,7 @@ pub(crate) fn save_usage(
                     "input_tokens": day.input_tokens,
                     "output_tokens": day.output_tokens,
                     "cache_creation_input_tokens": day.cache_creation_input_tokens,
+                    "cache_creation_1h_input_tokens": day.cache_creation_1h_input_tokens,
                     "cache_read_input_tokens": day.cache_read_input_tokens,
                     "reasoning_output_tokens": day.reasoning_output_tokens,
                 }),
@@ -492,6 +505,7 @@ pub(crate) fn save_usage(
                 "total_input_tokens": usage.input_tokens,
                 "total_output_tokens": usage.output_tokens,
                 "total_cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                "total_cache_creation_1h_input_tokens": usage.cache_creation_1h_input_tokens,
                 "total_cache_read_input_tokens": usage.cache_read_input_tokens,
                 "total_reasoning_output_tokens": usage.reasoning_output_tokens,
                 "models": models,
@@ -510,9 +524,65 @@ pub(crate) fn save_usage(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{
-        ProviderId, ProviderKind, TokenData, load_all_tokens, migrate_legacy_layout, save_token,
+        DayUsage, ModelUsage, PersistedUsage, ProviderId, ProviderKind, TokenData, load_all_tokens,
+        load_usage, migrate_legacy_layout, save_token, save_usage,
     };
+    use crate::types::UsageData;
+
+    #[test]
+    fn usage_round_trips_the_long_cache_write_at_every_level() {
+        // The 1h share is what makes a cache write's price readable: 2x base
+        // input against 1.25x for 5m (ADR-0018). A restart that drops it
+        // silently understates what long retention cost, so it has to survive
+        // the file in the totals, the day bucket, and the per-model counters.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = ProviderId::generic("commandcode");
+        let usage = UsageData {
+            input_tokens: 12,
+            output_tokens: 5,
+            cache_creation_input_tokens: 10416,
+            cache_creation_1h_input_tokens: 7216,
+            cache_read_input_tokens: 0,
+            reasoning_output_tokens: 0,
+        };
+
+        let mut model = ModelUsage::default();
+        model.add_tokens(&usage);
+        model.add_tokens(&usage);
+        let mut day = DayUsage::default();
+        day.add_tokens(&usage);
+        let record = PersistedUsage {
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            cache_creation_1h_input_tokens: usage.cache_creation_1h_input_tokens,
+            models: BTreeMap::from([("claude-sonnet-5".to_string(), model)]),
+            days: BTreeMap::from([("2026-09-06".to_string(), day)]),
+            ..PersistedUsage::default()
+        };
+        save_usage(
+            dir.path(),
+            &provider,
+            &BTreeMap::from([("k@example.com".to_string(), record)]),
+        )
+        .expect("save usage");
+
+        let loaded = load_usage(dir.path(), &provider);
+        let back = loaded.get("k@example.com").expect("the account");
+        assert_eq!(back.cache_creation_1h_input_tokens, 7216);
+        assert_eq!(back.days["2026-09-06"].cache_creation_1h_input_tokens, 7216);
+        assert_eq!(
+            back.models["claude-sonnet-5"].cache_creation_1h_input_tokens, 14432,
+            "add_tokens replaced the long-write counter instead of folding into it"
+        );
+        // The 5m share is the remainder, never a second stored number that
+        // could disagree with the total.
+        assert_eq!(
+            back.cache_creation_input_tokens - back.cache_creation_1h_input_tokens,
+            3200
+        );
+    }
 
     fn token(provider: ProviderId, email: &str) -> TokenData {
         TokenData {

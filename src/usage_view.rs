@@ -138,6 +138,10 @@ pub(crate) struct PoolTotals {
     output: i64,
     cache_read: i64,
     cache_write: i64,
+    /// The 1h-retention share of `cache_write`. Named separately because it
+    /// bills at 2x base input against 1.25x for 5m (ADR-0018): folded into
+    /// one figure, a cache write's price cannot be read back.
+    cache_write_1h: i64,
     reasoning: i64,
 }
 
@@ -158,6 +162,7 @@ impl PoolTotals {
         self.output += i64_field(account, "totalOutputTokens");
         self.cache_read += i64_field(account, "totalCacheReadInputTokens");
         self.cache_write += i64_field(account, "totalCacheCreationInputTokens");
+        self.cache_write_1h += i64_field(account, "totalCacheCreation1hInputTokens");
         self.reasoning += i64_field(account, "totalReasoningOutputTokens");
     }
 }
@@ -582,10 +587,11 @@ pub(crate) fn print_relay_total_rich(
     facts.push(Fact::new(
         "tokens",
         &format!(
-            "in {}  out {}  cache {}",
+            "in {}  out {}  cache {}{}",
             paint(BOLD, &format_count(pool.input)),
             paint(BOLD, &format_count(pool.output)),
-            format_count(pool.cache_read + pool.cache_write)
+            format_count(pool.cache_read + pool.cache_write),
+            long_write_suffix(pool)
         ),
     ));
     if pool.reasoning != 0 {
@@ -603,6 +609,17 @@ pub(crate) fn print_relay_total_rich(
     }
 }
 
+/// ` 1h write 7.2K`, or nothing at all when no pool asked for long
+/// retention. Silent by default on purpose: a relay serving only 5m
+/// traffic reads exactly as it did before the split existed, and the line
+/// appears the moment the 2x write starts being paid for (ADR-0018).
+fn long_write_suffix(pool: &PoolTotals) -> String {
+    if pool.cache_write_1h == 0 {
+        return String::new();
+    }
+    format!("  1h write {}", format_count(pool.cache_write_1h))
+}
+
 /// The relay-wide rollup, plain: requests, tokens, reasoning when non-zero,
 /// and the carried-load total.
 fn aggregate_lines(totals: &RelayTotals) -> Vec<String> {
@@ -615,10 +632,11 @@ fn aggregate_lines(totals: &RelayTotals) -> Vec<String> {
             format_exact(pool.failures)
         ),
         format!(
-            "tokens in {}  out {}  cache {}",
+            "tokens in {}  out {}  cache {}{}",
             format_count(pool.input),
             format_count(pool.output),
-            format_count(pool.cache_read + pool.cache_write)
+            format_count(pool.cache_read + pool.cache_write),
+            long_write_suffix(pool)
         ),
     ];
     if pool.reasoning != 0 {
@@ -963,8 +981,44 @@ pub(crate) fn print_trend_plain(payload: &Value, output: &mut Output, today: &st
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::cooldown_label;
     use crate::render::strip_ansi;
+    #[test]
+    fn the_rollup_names_the_long_cache_write_only_when_a_pool_made_one() {
+        // A 1h write bills at 2x base input against 1.25x for 5m (ADR-0018).
+        // Folded into one `cache` figure that price is unreadable, so the
+        // long share gets named — and only when a pool actually wrote one,
+        // which leaves a 5m-only relay's output exactly as it was.
+        let payload = |long: i64| {
+            json!({"providers": {"anthropic": {
+                "account_count": 1,
+                "accounts": [{
+                    "email": "k@example.com",
+                    "totalRequests": 2,
+                    "totalSuccesses": 2,
+                    "totalInputTokens": 100,
+                    "totalCacheCreationInputTokens": 10416,
+                    "totalCacheCreation1hInputTokens": long,
+                    "totalCacheReadInputTokens": 0
+                }]
+            }}})
+        };
+
+        let long = super::aggregate_lines(&super::RelayTotals::from_payload(&payload(7216)));
+        assert!(
+            long.iter().any(|line| line.contains("1h write 7.2K")),
+            "the long-retention share is not named: {long:?}"
+        );
+
+        let short = super::aggregate_lines(&super::RelayTotals::from_payload(&payload(0)));
+        assert!(
+            short.iter().all(|line| !line.contains("1h write")),
+            "a 5m-only pool grew a 1h line: {short:?}"
+        );
+    }
+
     #[test]
     fn cooldown_label_rounds_down_to_minutes_and_seconds() {
         let now = 1_000_000.0;
