@@ -455,3 +455,116 @@ fn generic_base_url_trims_trailing_slash() {
     );
     assert_eq!(generic_base_url(&cfg, "missing"), None);
 }
+
+/// A conversation of `count` messages, the last one marked like a client
+/// that spends its budget on system, tools, and the tail.
+fn conversation_body(count: usize) -> Value {
+    let cc = json!({"type": "ephemeral"});
+    let messages: Vec<Value> = (0..count)
+        .map(|i| {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            let mut block = json!({"type": "text", "text": format!("turn {i}")});
+            if i + 1 == count {
+                block["cache_control"] = cc.clone();
+            }
+            json!({"role": role, "content": [block]})
+        })
+        .collect();
+    json!({
+        "system": [{"type": "text", "text": "client system", "cache_control": cc}],
+        "tools": [{"name": "read_file", "description": "d", "input_schema": {}, "cache_control": cc}],
+        "messages": messages
+    })
+}
+
+/// Every message index carrying a breakpoint, and the total across the body.
+fn breakpoints(cloaked: &Value) -> (Vec<usize>, usize) {
+    let arr_cc = |v: &Value| {
+        v.as_array().map_or(0, |a| {
+            a.iter()
+                .filter(|b| b.get("cache_control").is_some())
+                .count()
+        })
+    };
+    let mut marked = Vec::new();
+    let mut total = arr_cc(&cloaked["system"]) + arr_cc(&cloaked["tools"]);
+    for (i, m) in cloaked["messages"].as_array().unwrap().iter().enumerate() {
+        let n = arr_cc(&m["content"]);
+        if n > 0 {
+            marked.push(i);
+        }
+        total += n;
+    }
+    (marked, total)
+}
+
+#[test]
+fn a_spare_breakpoint_reallocates_from_the_prefix_to_the_conversation() {
+    // Our prefix's marker caches a ten-token static line the client's next
+    // breakpoint already covers (ADR-0006). Meanwhile the conversation has
+    // no intermediate entry at all: a client marking only its tail leaves
+    // the cache holding system+tools and system+tools+everything, nothing
+    // between, so any tail miss re-reads the whole history. Spending our
+    // one marker inside the conversation buys that middle entry instead.
+    let cloaked = apply_cloaking(
+        &conversation_body(25),
+        &BTreeMap::new(),
+        &account(ProviderId::anthropic()),
+        &config(),
+    );
+
+    let (marked, total) = breakpoints(&cloaked);
+    assert_eq!(total, 4, "the four Anthropic accepts, no more");
+    assert!(
+        cloaked["system"][1].get("cache_control").is_none(),
+        "the prefix kept a marker it does not need"
+    );
+    assert_eq!(
+        marked,
+        vec![20, 24],
+        "expected a checkpoint behind the client's tail marker"
+    );
+}
+
+#[test]
+fn the_conversation_checkpoint_holds_its_place_as_turns_are_added() {
+    // A checkpoint that moves every turn is never read twice, so it buys
+    // nothing. It re-anchors only once a full stride has passed.
+    let anchor = |count: usize| {
+        let cloaked = apply_cloaking(
+            &conversation_body(count),
+            &BTreeMap::new(),
+            &account(ProviderId::anthropic()),
+            &config(),
+        );
+        breakpoints(&cloaked).0[0]
+    };
+    assert_eq!(anchor(23), 20);
+    assert_eq!(anchor(25), 20);
+    assert_eq!(anchor(41), 20, "anchor moved before a full stride elapsed");
+    assert_eq!(anchor(43), 40, "anchor never advanced");
+}
+
+#[test]
+fn a_client_already_at_budget_keeps_every_breakpoint_it_asked_for() {
+    // No spare marker to reallocate: ours is dropped by the cap, exactly as
+    // ADR-0006 says, and the client's four survive untouched.
+    let cc = json!({"type": "ephemeral"});
+    let mut body = conversation_body(25);
+    body["system"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type": "text", "text": "more system", "cache_control": cc}));
+    body["messages"][10]["content"][0]["cache_control"] = cc;
+
+    let cloaked = apply_cloaking(
+        &body,
+        &BTreeMap::new(),
+        &account(ProviderId::anthropic()),
+        &config(),
+    );
+
+    let (marked, total) = breakpoints(&cloaked);
+    assert_eq!(total, 4);
+    assert_eq!(marked, vec![10, 24], "the client's own markers moved");
+}

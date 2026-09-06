@@ -181,6 +181,96 @@ pub fn detect_classifier_tripping_in_messages(body: &Value) -> bool {
 /// prefix would push it over. Strip the earliest markers first — our prefix is the
 /// first `cache_control` block in `system` — so the client's later, larger-prefix
 /// breakpoints survive.
+/// How many messages a conversation checkpoint holds its position for.
+/// Long enough that the anchor is read back many turns running, short
+/// enough that re-anchoring throws away little.
+const CHECKPOINT_STRIDE: usize = 20;
+
+/// Every `cache_control` block Anthropic counts, across the whole body.
+fn breakpoint_total(object: &serde_json::Map<String, Value>) -> usize {
+    let count = |value: Option<&Value>| {
+        value.and_then(Value::as_array).map_or(0, |blocks| {
+            blocks
+                .iter()
+                .filter(|block| block.get("cache_control").is_some())
+                .count()
+        })
+    };
+    let mut total = count(object.get("system")) + count(object.get("tools"));
+    if let Some(messages) = object.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            total += count(message.get("content"));
+        }
+    }
+    total
+}
+
+/// Where a conversation checkpoint goes: an index that stays put for a
+/// whole stride, so its cached prefix is read again on every turn until it
+/// re-anchors. A checkpoint that tracked the tail would be written once and
+/// never read.
+fn checkpoint_index(messages: &[Value]) -> Option<usize> {
+    let tail = messages.len().checked_sub(1)?;
+    let mut anchor = (tail / CHECKPOINT_STRIDE) * CHECKPOINT_STRIDE;
+    if anchor >= tail {
+        // Landing on the tail would make the anchor follow it. Step back a
+        // whole stride rather than one message, which would do the same.
+        anchor = anchor.checked_sub(CHECKPOINT_STRIDE)?;
+    }
+    (1..=anchor).rev().find(|&index| {
+        messages[index]
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|content| !content.is_empty())
+    })
+}
+
+/// Spend our one breakpoint inside the conversation instead of on the
+/// injected prefix.
+///
+/// The prefix's marker caches a ten-token static line that the client's
+/// next breakpoint already covers (ADR-0006). The conversation, meanwhile,
+/// often has no intermediate entry at all: a client that marks only its
+/// tail leaves the cache holding `system + tools` and `system + tools +
+/// every message`, with nothing between, so any tail miss re-reads the
+/// whole history. The same marker placed at a stable point in `messages`
+/// buys that middle entry and costs the prefix nothing it was keeping.
+///
+/// Only when the client left room. A client already spending all four gets
+/// the ADR-0006 behaviour unchanged: ours is the one the cap drops.
+fn reallocate_prefix_breakpoint(object: &mut serde_json::Map<String, Value>, max: usize) {
+    if breakpoint_total(object) > max {
+        return;
+    }
+    let Some(index) = object
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|messages| checkpoint_index(messages))
+    else {
+        return;
+    };
+    let Some(control) = object
+        .get_mut("system")
+        .and_then(Value::as_array_mut)
+        .and_then(|blocks| blocks.get_mut(1))
+        .and_then(Value::as_object_mut)
+        .and_then(|block| block.remove("cache_control"))
+    else {
+        return;
+    };
+    if let Some(block) = object
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .and_then(|messages| messages.get_mut(index))
+        .and_then(|message| message.get_mut("content"))
+        .and_then(Value::as_array_mut)
+        .and_then(|content| content.last_mut())
+        .and_then(Value::as_object_mut)
+    {
+        block.insert("cache_control".to_string(), control);
+    }
+}
+
 fn cap_cache_control(object: &mut serde_json::Map<String, Value>, max: usize) {
     fn count(value: Option<&Value>) -> usize {
         value.and_then(Value::as_array).map_or(0, |blocks| {
@@ -345,6 +435,7 @@ pub fn apply_cloaking(
     // may already spend its full budget (e.g. hermes marks 4); the injected prefix
     // would make 5. Keep the last 4 cache breakpoints (the client's, which cache the
     // most content) and drop the earlier ones (our prefix) so the total stays valid.
+    reallocate_prefix_breakpoint(object, 4);
     cap_cache_control(object, 4);
 
     let session = header_value(request_headers, "x-claude-code-session-id").map_or_else(
