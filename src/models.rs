@@ -592,10 +592,34 @@ impl ModelCatalog {
 #[must_use]
 pub fn upstream_model<'a>(model: &'a str, provider: &ProviderId) -> &'a str {
     let prefix = provider.id.as_ref();
-    model
+    let named = model
         .strip_prefix(prefix)
         .and_then(|rest| rest.strip_prefix('/'))
-        .unwrap_or(model)
+        .unwrap_or(model);
+    strip_thinking_level(named)
+}
+
+/// The thinking levels pi appends to a model id as shorthand
+/// (`pi --model sonnet:high`, README). Client vocabulary: no vendor
+/// parses them.
+const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// Drop a trailing `:<level>` so the vendor is asked for a model it has.
+///
+/// An allowlist, not a split on the last colon: the relay serves
+/// `meituan/LongCat-2.0:free`, and ollama-style tags (`qwen:7b`) are the
+/// same shape. Only the seven words pi defines are a level, which is the
+/// same set pi's own `splitKnownThinkingSuffix` recognises.
+fn strip_thinking_level(model: &str) -> &str {
+    let Some((name, tail)) = model.rsplit_once(':') else {
+        return model;
+    };
+    // A bare `:high` has no model in front of it; asking upstream for an
+    // empty name is worse than passing the oddity through.
+    if name.is_empty() || !THINKING_LEVELS.contains(&tail) {
+        return model;
+    }
+    name
 }
 
 /// Route an id no fetched list claims, by name shape. Broad on purpose: a new `gpt-*` or
@@ -1084,6 +1108,57 @@ mod tests {
             llama.metadata.as_ref().and_then(|m| m.context_window),
             Some(131_072)
         );
+    }
+
+    /// AC-1/AC-2/AC-3: a thinking level is client vocabulary, so it is
+    /// removed before the vendor sees it; a colon-word that is not a
+    /// level is part of the name and survives. The relay serves
+    /// `LongCat-2.0:free` today, so a blanket split would break it.
+    #[test]
+    fn upstream_model_strips_a_thinking_level_but_keeps_other_tags() {
+        let anthropic = ProviderId::anthropic();
+        let generic = ProviderId::generic("commandcode");
+        // AC-1: every level pi defines.
+        for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
+            assert_eq!(
+                super::upstream_model(&format!("anthropic/claude-opus-5:{level}"), &anthropic),
+                "claude-opus-5",
+                "level {level} was not stripped"
+            );
+        }
+        // AC-2: not a level, so not a suffix.
+        assert_eq!(
+            super::upstream_model("commandcode/meituan/LongCat-2.0:free", &generic),
+            "meituan/LongCat-2.0:free"
+        );
+        assert_eq!(super::upstream_model("qwen:7b", &generic), "qwen:7b");
+        // AC-3: the rule is not per-provider.
+        assert_eq!(
+            super::upstream_model("codex/gpt-5.5:high", &ProviderId::codex()),
+            "gpt-5.5"
+        );
+        assert_eq!(
+            super::upstream_model("commandcode/some-model:high", &generic),
+            "some-model"
+        );
+    }
+
+    /// AC-5/AC-6: the edges. Only the final segment counts, and a strip
+    /// never empties the name.
+    #[test]
+    fn stripping_a_level_never_leaves_nothing_behind() {
+        let anthropic = ProviderId::anthropic();
+        // AC-5: no colon at all.
+        assert_eq!(
+            super::upstream_model("anthropic/claude-opus-5", &anthropic),
+            "claude-opus-5"
+        );
+        // AC-5: a bare level with no model before it stays as it is,
+        // rather than becoming an empty request.
+        assert_eq!(super::upstream_model(":high", &anthropic), ":high");
+        // AC-6: only the last segment, and only once.
+        assert_eq!(super::upstream_model("a:high/b", &anthropic), "a:high/b");
+        assert_eq!(super::upstream_model("x:high:high", &anthropic), "x:high");
     }
 
     #[test]

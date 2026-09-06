@@ -3025,3 +3025,90 @@ async fn six_concurrent_requests_each_count_exactly_once() {
         );
     }
 }
+
+/// AC-7: usage counters key on the name the vendor was asked for, so a
+/// `:high` request and a plain request to the same model share one row.
+/// Keying on the client's string would split one model's history in two
+/// the moment a harness started appending a thinking level.
+#[tokio::test]
+async fn a_thinking_level_does_not_split_a_models_usage_row() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(
+        tmp.path(),
+        &TokenData {
+            access_token: "anthropic-access".to_string(),
+            refresh_token: "anthropic-refresh".to_string(),
+            email: "anthropic@example.com".to_string(),
+            expires_at: "2030-01-01T00:00:00Z".to_string(),
+            account_uuid: "acct-anthropic".to_string(),
+            provider: ProviderId::anthropic(),
+            id_token: None,
+            last_refresh_at: None,
+            plan_type: None,
+        },
+    )
+    .expect("save token");
+    let upstream = Arc::new(FakeUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    for model in ["claude-sonnet-4-6", "claude-sonnet-4-6:high"] {
+        let (status, _) = json_response(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("authorization", "Bearer sk-test")
+                .header("content-type", "application/json")
+                .header("content-length", "1")
+                .body(Body::from(
+                    json!({"model": model, "messages": [{"role": "user", "content": "hi"}]})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, 200, "{model} did not succeed");
+    }
+
+    // The vendor was asked for the same model both times.
+    let asked: Vec<String> = upstream
+        .calls()
+        .iter()
+        .filter_map(|call| {
+            call.body
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(
+        asked,
+        vec![
+            "claude-sonnet-4-6".to_string(),
+            "claude-sonnet-4-6".to_string()
+        ],
+        "the thinking level reached the vendor"
+    );
+
+    let usage: Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join("anthropic").join("usage.json"))
+            .expect("usage file"),
+    )
+    .expect("usage json");
+    let models = usage
+        .as_object()
+        .expect("accounts")
+        .values()
+        .next()
+        .expect("one account")
+        .get("models")
+        .and_then(Value::as_object)
+        .expect("models");
+    let mut names: Vec<&String> = models.keys().collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["claude-sonnet-4-6"],
+        "the thinking level opened a second usage row: {names:?}"
+    );
+}
