@@ -154,6 +154,56 @@ fn apply_cloaking_injects_billing_prefix_and_metadata() {
 }
 
 #[test]
+fn the_injected_prefix_never_precedes_a_longer_client_ttl() {
+    // Anthropic renders tools, then system, then messages, and rejects a
+    // 1h breakpoint that appears after a 5m one. The injected prefix is
+    // always the first marked block, so a client asking for 1h retention
+    // got a hard 400 on every request:
+    //
+    //   system.2.cache_control.ttl: a ttl='1h' cache_control block must not
+    //   come after a ttl='5m' cache_control block
+    //
+    // Reproduced against the live API before this test existed
+    // (req_011CenGRfvYn2iTHLfYKdRat).
+    let body = json!({
+        "system": [{
+            "type": "text",
+            "text": "sys",
+            "cache_control": {"type": "ephemeral", "ttl": "1h"}
+        }],
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+
+    let cloaked = apply_cloaking(
+        &body,
+        &BTreeMap::new(),
+        &account(ProviderId::anthropic()),
+        &config(),
+    );
+
+    let ttls: Vec<Option<&str>> = cloaked["system"]
+        .as_array()
+        .expect("system")
+        .iter()
+        .filter_map(|block| block.get("cache_control"))
+        .map(|control| control.get("ttl").and_then(Value::as_str))
+        .collect();
+    // Once a 1h breakpoint has been seen, nothing after it may be shorter,
+    // and nothing before it may be a default-5m marker.
+    let mut seen_long = false;
+    for ttl in &ttls {
+        match ttl {
+            Some("1h") => seen_long = true,
+            _ => assert!(!seen_long, "a 5m breakpoint follows a 1h one: {ttls:?}"),
+        }
+    }
+    assert!(
+        ttls.first().is_none_or(|ttl| *ttl == Some("1h")),
+        "the injected prefix is marked 5m ahead of the client's 1h block: {ttls:?}"
+    );
+}
+
+#[test]
 fn apply_cloaking_caps_cache_control_at_four_across_system_tools_messages() {
     // Anthropic sums cache_control across system + tools + messages. A client (e.g.
     // hermes on a follow-up turn) spends the full budget of 4 spread across all three;

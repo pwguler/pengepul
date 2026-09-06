@@ -233,6 +233,33 @@ fn cap_cache_control(object: &mut serde_json::Map<String, Value>, max: usize) {
 }
 
 #[must_use]
+/// Whether the client marked any breakpoint for the 1h cache, anywhere
+/// Anthropic counts them: `tools`, `system`, and each message's content.
+fn requests_long_retention(body: &Value) -> bool {
+    fn marked_long(value: &Value) -> bool {
+        value
+            .get("cache_control")
+            .and_then(|control| control.get("ttl"))
+            .and_then(Value::as_str)
+            == Some("1h")
+    }
+    let blocks = |field: &str| -> Vec<Value> {
+        body.get(field)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    blocks("tools").iter().any(marked_long)
+        || blocks("system").iter().any(marked_long)
+        || blocks("messages").iter().any(|message| {
+            marked_long(message)
+                || message
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|content| content.iter().any(marked_long))
+        })
+}
+
 pub fn apply_cloaking(
     body: &Value,
     request_headers: &BTreeMap<String, String>,
@@ -295,13 +322,20 @@ pub fn apply_cloaking(
             )
         })
     });
-    let prefix = prefix.unwrap_or_else(|| {
+    let mut prefix = prefix.unwrap_or_else(|| {
         json!({
             "type": "text",
             "text": "You are Claude Code, Anthropic's official CLI for Claude.",
             "cache_control": {"type": "ephemeral"}
         })
     });
+    // Anthropic renders tools, then system, then messages, and refuses a 1h
+    // breakpoint that comes after a 5m one. The prefix is always the first
+    // marked block, so a client asking for 1h retention was answered 400 on
+    // every request until the prefix carried the same TTL.
+    if requests_long_retention(body) && prefix.get("cache_control").is_some() {
+        prefix["cache_control"] = json!({"type": "ephemeral", "ttl": "1h"});
+    }
     object.insert(
         "system".to_string(),
         Value::Array([billing, prefix].into_iter().chain(kept).collect()),
