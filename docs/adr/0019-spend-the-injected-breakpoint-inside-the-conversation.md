@@ -60,8 +60,17 @@ true total, because it is the one adding a breakpoint the client cannot see.
   the wire: ADR-0006 already ships it whenever a client is at budget, and ADR-0014
   states cloaking follows Claude Code except where fidelity costs the client.
 - A tail miss now falls back to the checkpoint instead of to `system + tools`. It
-  bounds the cost of a miss; it does not prevent one. The 1.9- and 2.9-minute-gap
-  misses above are still unexplained, and this does not explain them.
+  bounds the cost of a miss; it does not prevent one.
+- **The misses in the table were not the relay's, and not time.** They were traced
+  after this landed: the `pi-goal-list-loop-audit` extension inserts an ephemeral
+  checkpoint message early in the conversation and, in npm `0.38.22`, fills it with
+  live counters (`iteration`, `tokensUsed`, `lastIterationCompletedAt`), so every
+  iteration rewrote the prefix at that point. That is why `cache read` sat at
+  27,901 regardless of gap. Upstream fixed it in `451de16e` by making the checkpoint
+  byte-stable; the fix was unpublished and was installed from a git ref. This ADR's
+  checkpoint would not have prevented those misses either — the rewrite happened
+  *before* any anchor — which is the point of recording the cause here: a floor that
+  never moves with time is a prefix that changes, not a cache that expires.
 - The checkpoint re-anchors once per stride, costing one extra cache write every
   20 messages.
 - Conversations shorter than a stride get no checkpoint: the anchor would land at
