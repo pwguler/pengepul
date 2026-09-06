@@ -36,9 +36,31 @@ pooled subscriptions, so keep it secret and prefer a trusted network or an SSH t
 
 ### OpenAI-compatible endpoints
 
-Point the pool at any service that speaks the OpenAI API. Add a `providers:` entry to
-`~/.pengepul/config.yaml` (one per endpoint), then save its static API key; requests
-address its models with a `<provider>/<model>` prefix:
+Point the pool at any service that speaks the OpenAI API. One command registers the
+endpoint and saves its key; requests address its models with a `<provider>/<model>`
+prefix:
+
+```sh
+pengepul login --provider openrouter \
+  --base-url https://openrouter.ai/api/v1 --key $OPENROUTER_API_KEY
+systemctl --user restart pengepul   # or: pengepul service restart
+```
+
+A provider id becomes a directory name under the auth dir, so it may hold letters,
+digits, `.`, `-` and `_`; `.` and `..` are refused, since a filesystem
+reads them as somewhere else. Providers are read at startup, so the relay needs a restart
+before it will serve a new one. Registration is for new providers only: an id already in
+the file with a different `base-url` is an error naming the URL it kept, so a mistyped
+flag cannot move a live provider's traffic to another host. Repeating the same command
+is safe. Changing an endpoint, or removing one, means editing the file.
+
+Registration rewrites `config.yaml`, so values survive but comments do not, and it holds
+a `config.yaml.lock` beside it for the length of the write. If a registration is killed,
+that lock can outlive it: the next one names the file and stops, and removing the file
+is the whole recovery.
+
+Editing the file by hand works too — one entry per endpoint, then `pengepul login
+--provider <id> --key $KEY`:
 
 ```sh
 # ~/.pengepul/config.yaml
@@ -148,6 +170,7 @@ curl -sS http://127.0.0.1:8317/v1/chat/completions \
 pengepul serve # start the relay (the default with no subcommand)
 pengepul login --provider anthropic # authorize an account in a browser (--provider codex for Codex)
 pengepul login --provider groq --key $KEY # save a static key for a configured provider
+pengepul login --provider groq --base-url $URL --key $KEY # register a new OpenAI-compatible provider and save its key
 pengepul status # health of the running relay
 pengepul accounts # loaded accounts (--reload re-reads from disk)
 pengepul usage # the last 30 days of tokens, as a sparkline

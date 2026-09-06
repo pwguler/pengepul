@@ -150,6 +150,15 @@ fn run(argv: &[&str], home: &Path, runtime: &mut impl CliRuntime) -> RunOutcome 
     run_with_env(argv, home, home, runtime, Style::Plain).expect("cli run")
 }
 
+/// The error a failing command reports. `run` panics on failure, which
+/// is right for the happy path and useless for testing a refusal.
+fn run_err(argv: &[&str], home: &Path, runtime: &mut impl CliRuntime) -> String {
+    match run_with_env(argv, home, home, runtime, Style::Plain) {
+        Ok(outcome) => panic!("expected a refusal, got: {}", outcome.stdout),
+        Err(error) => format!("{error:#}"),
+    }
+}
+
 fn run_style(
     argv: &[&str],
     home: &Path,
@@ -3245,4 +3254,1207 @@ fn a_day_of_failures_is_one_day_recorded_not_zero() {
         .find(|line| line.contains("peak"))
         .expect("peak row");
     assert!(peak.contains(&today), "peak names the recorded day: {peak}");
+}
+
+/// AC-1: `--base-url` mendaftarkan provider baru dan menyimpan keynya
+/// dalam satu perintah, ke file config yang sama dengan yang dibaca.
+#[test]
+fn login_registers_a_new_provider_and_saves_its_key() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  existing:\n    base-url: https://existing.host/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+
+    let outcome = run(
+        &[
+            "login",
+            "--provider",
+            "openrouter",
+            "--base-url",
+            "https://openrouter.ai/api/v1",
+            "--key",
+            "sk-or-v1-test",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    let registered_at = outcome
+        .stdout
+        .find("registered openrouter")
+        .expect("registration was not announced");
+    let saved_at = outcome
+        .stdout
+        .find("saved openrouter account token")
+        .expect("the token was not announced");
+    assert!(
+        registered_at < saved_at,
+        "the registration must precede the token line: {}",
+        outcome.stdout
+    );
+    // AC-1 also promises the credential is saved.
+    assert!(
+        tmp.path().join(".pengepul").join("openrouter").exists(),
+        "no credential was written for the registered provider"
+    );
+    // The config it read is the config it wrote.
+    let written = std::fs::read_to_string(tmp.path().join(".pengepul").join("config.yaml"))
+        .expect("read config");
+    assert!(
+        written.contains("openrouter"),
+        "provider not written: {written}"
+    );
+    assert!(
+        written.contains("https://openrouter.ai/api/v1"),
+        "base-url not written: {written}"
+    );
+    // AC-8: the provider that was already there survives.
+    assert!(
+        written.contains("https://existing.host/v1"),
+        "an existing provider was dropped: {written}"
+    );
+}
+
+/// AC-2: registering without a credential would leave a provider that has
+/// no account. The flag exists to avoid exactly that half-done state.
+#[test]
+fn base_url_without_a_key_registers_nothing() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  existing:\n    base-url: https://existing.host/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+
+    let error = run_err(
+        &[
+            "login",
+            "--provider",
+            "openrouter",
+            "--base-url",
+            "https://openrouter.ai/api/v1",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    // The message must name the registration, not merely mention --key:
+    // the pre-existing "takes a static API key" error also contains
+    // "--key", and would let this test pass with the guard deleted.
+    assert!(
+        error.contains("registers openrouter"),
+        "the error does not name what the flag was doing: {error}"
+    );
+    let written = std::fs::read_to_string(tmp.path().join(".pengepul").join("config.yaml"))
+        .expect("read config");
+    assert!(
+        !written.contains("openrouter"),
+        "a failed registration wrote to the config: {written}"
+    );
+}
+
+/// AC-3: one mistyped flag must not move a live provider's traffic to
+/// another host.
+#[test]
+fn a_different_base_url_for_a_known_provider_is_refused() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  openrouter:\n    base-url: https://openrouter.ai/api/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+
+    let error = run_err(
+        &[
+            "login",
+            "--provider",
+            "openrouter",
+            "--base-url",
+            "https://typo.host/v1",
+            "--key",
+            "sk-test",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    assert!(
+        error.contains("https://openrouter.ai/api/v1"),
+        "the error does not name the URL it kept: {error}"
+    );
+    let written = std::fs::read_to_string(tmp.path().join(".pengepul").join("config.yaml"))
+        .expect("read config");
+    assert!(
+        written.contains("https://openrouter.ai/api/v1"),
+        "the live URL was overwritten: {written}"
+    );
+    assert!(
+        !written.contains("typo.host"),
+        "the rejected URL was written anyway: {written}"
+    );
+}
+
+/// AC-4: the same URL is not a conflict, so repeating a command is safe.
+#[test]
+fn re_registering_the_same_url_is_accepted() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  openrouter:\n    base-url: https://openrouter.ai/api/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+
+    let outcome = run(
+        &[
+            "login",
+            "--provider",
+            "openrouter",
+            // AC-5: the trailing slash is trimmed, so this is the same URL.
+            "--base-url",
+            "https://openrouter.ai/api/v1/",
+            "--key",
+            "sk-test",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    assert!(outcome.stdout.contains("saved openrouter account token"));
+    assert!(
+        outcome.stdout.contains("registered openrouter"),
+        "an accepted re-registration said nothing: {}",
+        outcome.stdout
+    );
+}
+
+/// AC-5: `base_url` is joined as `{base_url}/chat/completions`, so a
+/// trailing slash would make a double slash: a 404 on some hosts, with a
+/// message that names nothing.
+#[test]
+fn a_trailing_slash_is_trimmed_before_it_is_written() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  existing:\n    base-url: https://existing.host/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+
+    run(
+        &[
+            "login",
+            "--provider",
+            "openrouter",
+            "--base-url",
+            "https://openrouter.ai/api/v1/",
+            "--key",
+            "sk-test",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    let written = std::fs::read_to_string(tmp.path().join(".pengepul").join("config.yaml"))
+        .expect("read config");
+    assert!(
+        written.contains("https://openrouter.ai/api/v1\n")
+            || written.contains("https://openrouter.ai/api/v1\""),
+        "the trailing slash survived: {written}"
+    );
+    assert!(
+        !written.contains("api/v1/"),
+        "the trailing slash survived: {written}"
+    );
+}
+
+/// AC-6: a built-in provider's endpoint is fixed, so there is nothing to
+/// register.
+#[test]
+fn a_builtin_provider_refuses_a_base_url() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime::default();
+
+    let error = run_err(
+        &[
+            "login",
+            "--provider",
+            "anthropic",
+            "--base-url",
+            "https://elsewhere.host/v1",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    // Names the flag, not just "OAuth": the pre-existing --key guard says
+    // "OAuth" too, so that substring cannot tell the two guards apart.
+    assert!(
+        error.contains("--base-url"),
+        "the error does not name the flag it refused: {error}"
+    );
+}
+
+/// AC-7: a name the load path rejects cannot enter through this door
+/// either.
+#[test]
+fn registration_applies_the_same_name_rules_as_the_config() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  existing:\n    base-url: https://existing.host/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+
+    let error = run_err(
+        &[
+            "login",
+            "--provider",
+            "some/vendor",
+            "--base-url",
+            "https://host/v1",
+            "--key",
+            "sk-test",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+    // The rule, not a character: the provider and the URL both contain
+    // '/', so that assertion held for any error at all.
+    assert!(
+        error.contains("must not contain"),
+        "the error does not name the rule: {error}"
+    );
+    let written = std::fs::read_to_string(tmp.path().join(".pengepul").join("config.yaml"))
+        .expect("read config");
+    assert!(
+        !written.contains("some/vendor"),
+        "a rejected name was written: {written}"
+    );
+    // The config was the only thing this test used to check. A rejected
+    // id must not leave a credential either: `storage_dir()` returns the
+    // id verbatim, so `some/vendor` writes into `auth_dir/some/`.
+    assert!(
+        !tmp.path().join(".pengepul").join("some").exists(),
+        "a rejected id wrote a credential outside its own pool"
+    );
+}
+
+/// AC-8: the written config loads again, and the fields this command has
+/// no business touching are untouched.
+#[test]
+fn registration_leaves_every_other_field_alone() {
+    let tmp = tempdir().expect("tempdir");
+    let config_dir = tmp.path().join(".pengepul");
+    std::fs::create_dir_all(&config_dir).expect("config dir");
+    // A non-default port, and an api-key distinct from the --key below:
+    // the default port would hold after a total default rewrite, and one
+    // shared string cannot tell "api-keys preserved" from "the credential
+    // leaked into the config".
+    std::fs::write(
+        config_dir.join("config.yaml"),
+        "host: \"127.0.0.1\"\nport: 9999\nauth-dir: ~/.pengepul\napi-keys:\n  - sk-untouched-key\nproviders:\n  existing:\n    base-url: https://existing.host/v1\n",
+    )
+    .expect("write config");
+    let mut runtime = FakeRuntime::default();
+
+    run(
+        &[
+            "login",
+            "--provider",
+            "openrouter",
+            "--base-url",
+            "https://openrouter.ai/api/v1",
+            "--key",
+            "sk-test",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    // It parses, and the reload sees the new provider. `run` panics on a
+    // load failure, and `code` is a constant on the Ok path, so the
+    // assertion has to be about what `config show` actually reports.
+    let outcome = run(&["config", "show"], tmp.path(), &mut runtime);
+    assert!(
+        outcome.stdout.contains("openrouter"),
+        "the reloaded config does not carry the provider: {}",
+        outcome.stdout
+    );
+    let written = std::fs::read_to_string(tmp.path().join(".pengepul").join("config.yaml"))
+        .expect("read config");
+    assert!(
+        written.contains("openrouter"),
+        "the provider was not written at all: {written}"
+    );
+    // Non-default values, so the assertion distinguishes "preserved" from
+    // "rewritten with today's defaults". The port and the section keys
+    // are emitted unconditionally by serde, so asserting those proves
+    // nothing.
+    assert!(
+        written.contains("sk-untouched-key"),
+        "api-keys lost: {written}"
+    );
+    assert!(
+        written.contains("9999"),
+        "a non-default port was lost: {written}"
+    );
+    assert!(
+        written.contains("https://existing.host/v1"),
+        "the other provider was dropped: {written}"
+    );
+}
+
+/// AC-10: without `--base-url`, nothing about `login` changes.
+#[test]
+fn login_without_a_base_url_is_unchanged() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  openrouter:\n    base-url: https://openrouter.ai/api/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+
+    let configured = run(
+        &["login", "--provider", "openrouter", "--key", "sk-test"],
+        tmp.path(),
+        &mut runtime,
+    );
+    assert!(configured.stdout.contains("saved openrouter account token"));
+    assert!(
+        !configured.stdout.contains("registered"),
+        "a plain login announced a registration: {}",
+        configured.stdout
+    );
+
+    // An unconfigured provider without --base-url still names what is
+    // configured.
+    let error = run_err(
+        &["login", "--provider", "nowhere", "--key", "sk-test"],
+        tmp.path(),
+        &mut runtime,
+    );
+    assert!(error.contains("not configured"), "{error}");
+}
+
+/// AC-9: the token is saved before the config is written, so a failure
+/// there leaves no registered provider behind. The reverse order would
+/// leave a provider with no account: the half-done state AC-2 refuses.
+#[test]
+fn a_failed_token_save_registers_nothing() {
+    let tmp = tempdir().expect("tempdir");
+    let config_dir = tmp.path().join(".pengepul");
+    std::fs::create_dir_all(&config_dir).expect("config dir");
+    // auth-dir points at a path that cannot become a directory.
+    let blocked = tmp.path().join("blocked");
+    std::fs::write(&blocked, "not a directory").expect("write blocker");
+    std::fs::write(
+        config_dir.join("config.yaml"),
+        format!(
+            "host: \"127.0.0.1\"\nport: 8317\nauth-dir: {}\napi-keys:\n  - sk-test\nproviders:\n  existing:\n    base-url: https://existing.host/v1\n",
+            blocked.display()
+        ),
+    )
+    .expect("write config");
+    let mut runtime = FakeRuntime::default();
+
+    // `run_err` panics unless the command fails, so the call is the check.
+    run_err(
+        &[
+            "login",
+            "--provider",
+            "openrouter",
+            "--base-url",
+            "https://openrouter.ai/api/v1",
+            "--key",
+            "sk-test",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    let written = std::fs::read_to_string(config_dir.join("config.yaml")).expect("read config");
+    assert!(
+        !written.contains("openrouter"),
+        "the provider was registered despite a failed token save: {written}"
+    );
+}
+
+/// AC-12: the flag documents what it does and what it needs.
+#[test]
+fn login_help_documents_base_url() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime = FakeRuntime::default();
+
+    let outcome = run(&["help", "login"], tmp.path(), &mut runtime);
+
+    // The doc text, not clap's flag list: `--base-url` prints from its
+    // #[arg] attribute even with the doc comment deleted, and `--key` is
+    // a pre-existing flag. Asserting on either proves nothing.
+    assert!(
+        outcome
+            .stdout
+            .contains("register a new OpenAI-compatible provider"),
+        "the flag's purpose is undocumented: {}",
+        outcome.stdout
+    );
+    assert!(
+        outcome.stdout.contains("needs --key"),
+        "help does not say the flag needs a key: {}",
+        outcome.stdout
+    );
+}
+
+/// P1-2 reproduction: a refused registration must not leave a credential
+/// in a live provider's pool.
+#[test]
+fn a_refused_registration_leaves_no_credential_behind() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  openrouter:\n    base-url: https://openrouter.ai/api/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+    let config = tmp.path().join(".pengepul").join("config.yaml");
+    let before = std::fs::read_to_string(&config).expect("read config");
+    let pool = tmp.path().join(".pengepul").join("openrouter");
+
+    let _ = run_err(
+        &[
+            "login",
+            "--provider",
+            "openrouter",
+            "--base-url",
+            "https://typo.host/v1",
+            "--key",
+            "sk-foreign",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    assert!(
+        !pool.exists() || pool_entries(&pool).is_empty(),
+        "a refused registration left a credential in a live provider's pool"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config).expect("read config"),
+        before,
+        "a conflicting URL was written into the config"
+    );
+}
+
+/// AC-11 in rich style: a registration is a row inside the login panel,
+/// not a bare line stacked above it. Every line holds the panel width.
+#[test]
+fn a_rich_registration_is_a_row_in_the_login_panel() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  existing:\n    base-url: https://existing.host/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+
+    let outcome = run_style(
+        &[
+            "login",
+            "--provider",
+            "openrouter",
+            "--base-url",
+            "https://openrouter.ai/api/v1",
+            "--key",
+            "sk-test",
+        ],
+        tmp.path(),
+        &mut runtime,
+        Style::Rich,
+    );
+
+    let visible = strip_ansi(&outcome.stdout);
+    let lines: Vec<&str> = visible.lines().collect();
+    // One panel, not two.
+    assert_eq!(
+        lines.iter().filter(|line| line.starts_with('┌')).count(),
+        1,
+        "a second panel was opened: {visible}"
+    );
+    // The registration is inside it, as a labelled row.
+    let row = lines
+        .iter()
+        .find(|line| line.contains("registered"))
+        .expect("the registration is not in the panel");
+    assert!(
+        row.starts_with('│') && row.ends_with('│'),
+        "the registration is not a panel row: {row}"
+    );
+    assert!(
+        row.contains("openrouter"),
+        "the row does not name the provider: {row}"
+    );
+    // The width invariant every other rich panel holds.
+    for line in &lines {
+        assert_eq!(
+            line.chars().count(),
+            64,
+            "a panel line broke the width: {line}"
+        );
+    }
+}
+
+/// P2-3: with only a legacy workspace config present, `load_config`
+/// migrates it to the home path — so registration must land in the
+/// migrated file, which is the one the next load reads. Correct today
+/// only because the migration ran moments earlier in the same process;
+/// this pins it.
+#[test]
+fn registration_follows_a_migrated_legacy_config() {
+    let tmp = tempdir().expect("tempdir");
+    let cwd = tmp.path().join("workspace");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    std::fs::write(
+        cwd.join("config.yaml"),
+        "host: \"127.0.0.1\"\nport: 8317\nauth-dir: ~/.pengepul\napi-keys:\n  - sk-test\nproviders:\n  existing:\n    base-url: https://existing.host/v1\n",
+    )
+    .expect("write legacy config");
+    let mut runtime = FakeRuntime::default();
+
+    run_with_env(
+        &[
+            "login",
+            "--provider",
+            "openrouter",
+            "--base-url",
+            "https://openrouter.ai/api/v1",
+            "--key",
+            "sk-test",
+        ],
+        tmp.path(),
+        &cwd,
+        &mut runtime,
+        Style::Plain,
+    )
+    .expect("cli run");
+
+    let home_config = std::fs::read_to_string(tmp.path().join(".pengepul").join("config.yaml"))
+        .expect("the migrated config was not written");
+    assert!(
+        home_config.contains("openrouter"),
+        "registration did not follow the migration: {home_config}"
+    );
+    // And the shadowed original is left as it was, not written twice.
+    let legacy = std::fs::read_to_string(cwd.join("config.yaml")).expect("legacy config");
+    assert!(
+        !legacy.contains("openrouter"),
+        "the shadowed legacy config was written too: {legacy}"
+    );
+}
+
+/// P0: an id that names a live provider's directory must not write a
+/// credential into it. `save_token` builds its path from the id verbatim,
+/// so `groq/` lands in `auth_dir/groq` — the live pool — where the next
+/// reload adopts it into rotation and answers 401. The command refusing
+/// afterwards does not undo the file.
+#[test]
+fn a_rejected_id_cannot_write_into_a_live_pool() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  groq:\n    base-url: https://api.groq.com/openai/v1\n",
+    );
+    let pool = tmp.path().join(".pengepul").join("groq");
+    std::fs::create_dir_all(&pool).expect("pool");
+    std::fs::write(pool.join("key-legit.json"), "{}").expect("legit key");
+    let config = tmp.path().join(".pengepul").join("config.yaml");
+    let before_config = std::fs::read_to_string(&config).expect("read config");
+    let mut runtime = FakeRuntime::default();
+
+    let error = run_err(
+        &[
+            "login",
+            "--provider",
+            "groq/",
+            "--base-url",
+            "https://x/v1",
+            "--key",
+            "sk-foreign",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    assert!(
+        error.contains("must not contain"),
+        "the error does not name the rule: {error}"
+    );
+    let files: Vec<_> = std::fs::read_dir(&pool)
+        .expect("read pool")
+        .filter_map(|entry| {
+            entry
+                .ok()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+        })
+        .collect();
+    assert_eq!(
+        files,
+        vec!["key-legit.json".to_string()],
+        "a foreign credential joined a live pool: {files:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config).expect("read config"),
+        before_config,
+        "a rejected id was written into the config"
+    );
+}
+
+/// P0, worse variant: `..` in the id escapes the auth-dir, writing a
+/// plaintext credential where ARCHITECTURE promises none exists
+/// ("on disk at 0600 and never elsewhere").
+#[test]
+fn an_id_cannot_write_a_credential_outside_the_auth_dir() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  groq:\n    base-url: https://api.groq.com/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+
+    let error = run_err(
+        &[
+            "login",
+            "--provider",
+            "../escaped",
+            "--base-url",
+            "https://x/v1",
+            "--key",
+            "sk-foreign",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    assert!(
+        error.contains("must not contain"),
+        "the error does not name the rule: {error}"
+    );
+    assert!(
+        !tmp.path().join("escaped").exists(),
+        "a credential was written outside the auth-dir"
+    );
+}
+
+/// P1: an empty URL is refused before the credential is written, not
+/// after. `register_provider` rejects it, but only once `save_token` has
+/// already run.
+#[test]
+fn an_empty_base_url_is_refused_before_the_credential() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  existing:\n    base-url: https://existing.host/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+    let config = tmp.path().join(".pengepul").join("config.yaml");
+    let before = std::fs::read_to_string(&config).expect("read config");
+
+    let error = run_err(
+        &[
+            "login",
+            "--provider",
+            "openrouter",
+            "--base-url",
+            "   ",
+            "--key",
+            "sk-test",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    assert!(
+        error.contains("missing base-url"),
+        "the error does not name the rule: {error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config).expect("read config"),
+        before,
+        "an empty URL was registered"
+    );
+    assert!(
+        !tmp.path().join(".pengepul").join("openrouter").exists(),
+        "an empty URL still wrote a credential"
+    );
+}
+
+/// The round-2 fix rejected `/` and nothing else, so twelve other ids
+/// still wrote a credential — `..` outside the auth-dir, an empty id into
+/// its root — and registered themselves into the config, where they
+/// loaded on every start. Found by probing the built binary; the suite
+/// was green throughout. This walks the same list through the CLI and
+/// checks the filesystem, not only the error.
+#[test]
+fn no_id_shape_can_write_a_credential_anywhere_unexpected() {
+    for id in [
+        "",
+        " ",
+        ".",
+        "..",
+        "/",
+        "//",
+        "/etc/pengepul",
+        "\\",
+        "..\\..\\x",
+        "groq ",
+        " groq",
+        "groq/../groq",
+        "a\nb",
+        "x\tb",
+    ] {
+        let tmp = tempdir().expect("tempdir");
+        write_config_with_providers(
+            tmp.path(),
+            "  groq:\n    base-url: https://api.groq.com/openai/v1\n",
+        );
+        let pool = tmp.path().join(".pengepul").join("groq");
+        std::fs::create_dir_all(&pool).expect("pool");
+        std::fs::write(pool.join("key-legit.json"), "{}").expect("legit key");
+        let before = tree(tmp.path());
+        let mut runtime = FakeRuntime::default();
+
+        let error = run_err(
+            &[
+                "login",
+                "--provider",
+                id,
+                "--base-url",
+                "https://x/v1",
+                "--key",
+                "sk-probe",
+            ],
+            tmp.path(),
+            &mut runtime,
+        );
+
+        assert!(
+            error.contains("providers:"),
+            "id {id:?} was not refused by the id rule: {error}"
+        );
+        assert_eq!(
+            tree(tmp.path()),
+            before,
+            "id {id:?} wrote something before it was refused"
+        );
+    }
+}
+
+/// The filenames in a pool, sorted.
+fn pool_entries(pool: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(pool) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|entry| {
+            entry
+                .ok()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Every file under `root`, sorted: what the command must not change when
+/// it refuses.
+fn tree(root: &Path) -> Vec<String> {
+    fn walk(dir: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else {
+                out.push(path.to_string_lossy().to_string());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, &mut out);
+    out.sort();
+    out
+}
+
+/// An empty `--key` saved a credential with no secret in it, which then
+/// joined rotation and failed every request handed to it. Pre-existing on
+/// main; fixed here because this branch already owns this function's
+/// guards.
+#[test]
+fn an_empty_key_saves_no_credential() {
+    for key in ["", "   "] {
+        let tmp = tempdir().expect("tempdir");
+        write_config_with_providers(
+            tmp.path(),
+            "  groq:\n    base-url: https://api.groq.com/openai/v1\n",
+        );
+        let mut runtime = FakeRuntime::default();
+
+        let error = run_err(
+            &["login", "--provider", "groq", "--key", key],
+            tmp.path(),
+            &mut runtime,
+        );
+
+        assert!(
+            error.contains("--key is empty"),
+            "an empty key was not named: {error}"
+        );
+        assert!(
+            !tmp.path().join(".pengepul").join("groq").exists(),
+            "an empty key still wrote a credential"
+        );
+    }
+}
+
+/// The token is written before the config so a refusal cannot leave a
+/// registered provider without an account. When the config write itself
+/// fails, the mirror problem appears: a credential in a pool the config
+/// never gained. The command must take it back.
+#[test]
+fn a_failed_config_write_takes_its_credential_back() {
+    let tmp = tempdir().expect("tempdir");
+    let config_path = tmp.path().join("readonly.yaml");
+    let auth_dir = tmp.path().join("auth");
+    std::fs::write(
+        &config_path,
+        format!(
+            "host: \"127.0.0.1\"\nport: 8317\nauth-dir: {}\napi-keys:\n  - sk-test\nproviders:\n  groq:\n    base-url: https://api.groq.com/openai/v1\n",
+            auth_dir.display()
+        ),
+    )
+    .expect("write config");
+    let mut permissions = std::fs::metadata(&config_path)
+        .expect("metadata")
+        .permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&config_path, permissions).expect("chmod");
+    let mut runtime = FakeRuntime::default();
+
+    let error = run_with_env(
+        &[
+            "--config",
+            config_path.to_str().expect("path"),
+            "login",
+            "--provider",
+            "openrouter",
+            "--base-url",
+            "https://openrouter.ai/api/v1",
+            "--key",
+            "sk-orphan",
+        ],
+        tmp.path(),
+        tmp.path(),
+        &mut runtime,
+        Style::Plain,
+    )
+    .expect_err("a failed config write reported success");
+
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("Permission denied") || error.contains("failed to write"),
+        "the failure was not reported: {error}"
+    );
+    assert!(
+        !auth_dir.join("openrouter").exists(),
+        "a credential outlived the registration that failed"
+    );
+}
+
+/// The cleanup must never take more than this command created. The first
+/// version of this test used a *different* URL, which the conflict check
+/// refuses before `save_token` ever runs — so it passed with the whole
+/// cleanup block deleted, policing code it never reached.
+///
+/// The configured URL, so the conflict check passes and the cleanup
+/// genuinely runs; and the same key as the seeded credential, so
+/// `save_token` overwrites that exact file. Rolling it back would destroy
+/// a credential that predates the command.
+#[test]
+fn the_cleanup_never_empties_an_existing_pool() {
+    let tmp = tempdir().expect("tempdir");
+    let config_path = tmp.path().join("readonly.yaml");
+    let auth_dir = tmp.path().join("auth");
+    let pool = auth_dir.join("groq");
+    std::fs::create_dir_all(&pool).expect("pool");
+    std::fs::write(
+        &config_path,
+        format!(
+            "host: \"127.0.0.1\"\nport: 8317\nauth-dir: {}\napi-keys:\n  - sk-test\nproviders:\n  groq:\n    base-url: https://api.groq.com/openai/v1\n",
+            auth_dir.display()
+        ),
+    )
+    .expect("write config");
+    let mut runtime = FakeRuntime::default();
+    // Seed the pool through the CLI, so the file carries the label the
+    // key actually hashes to and the second run overwrites it.
+    run_with_env(
+        &[
+            "--config",
+            config_path.to_str().expect("path"),
+            "login",
+            "--provider",
+            "groq",
+            "--key",
+            "sk-legit",
+        ],
+        tmp.path(),
+        tmp.path(),
+        &mut runtime,
+        Style::Plain,
+    )
+    .expect("seed the pool");
+    let seeded: Vec<_> = std::fs::read_dir(&pool)
+        .expect("read pool")
+        .filter_map(|entry| {
+            entry
+                .ok()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+        })
+        .collect();
+    assert_eq!(seeded.len(), 1, "the pool was not seeded: {seeded:?}");
+    let mut permissions = std::fs::metadata(&config_path)
+        .expect("metadata")
+        .permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&config_path, permissions).expect("chmod");
+
+    // The configured URL and the seeded key: accepted, so save_token
+    // overwrites key-legit.json, and only then does the config write
+    // fail.
+    let _ = run_with_env(
+        &[
+            "--config",
+            config_path.to_str().expect("path"),
+            "login",
+            "--provider",
+            "groq",
+            "--base-url",
+            "https://api.groq.com/openai/v1",
+            "--key",
+            "sk-legit",
+        ],
+        tmp.path(),
+        tmp.path(),
+        &mut runtime,
+        Style::Plain,
+    );
+
+    assert!(
+        pool.exists(),
+        "the cleanup removed a pool that predates the command"
+    );
+    let files: Vec<_> = std::fs::read_dir(&pool)
+        .expect("read pool")
+        .filter_map(|entry| {
+            entry
+                .ok()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+        })
+        .collect();
+    assert_eq!(
+        files, seeded,
+        "the cleanup took a credential it did not create: {files:?}"
+    );
+}
+
+/// A URL whose tail is a space before the slash was stored with that
+/// space intact, while `validate_providers` trims it on load — so the
+/// stored form and the loaded form disagreed and repeating the identical
+/// command refused itself.
+#[test]
+fn a_url_with_a_space_before_its_slash_is_stored_trimmed() {
+    let tmp = tempdir().expect("tempdir");
+    write_config_with_providers(
+        tmp.path(),
+        "  existing:\n    base-url: https://existing.host/v1\n",
+    );
+    let mut runtime = FakeRuntime::default();
+
+    run(
+        &[
+            "login",
+            "--provider",
+            "openrouter",
+            "--base-url",
+            "https://openrouter.ai/api/v1 /",
+            "--key",
+            "sk-test",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    let written = std::fs::read_to_string(tmp.path().join(".pengepul").join("config.yaml"))
+        .expect("read config");
+    assert!(
+        written.contains("base-url: https://openrouter.ai/api/v1\n"),
+        "a trailing space survived into the file: {written}"
+    );
+    // Repeating the BYTE-IDENTICAL command, not the normalised form. The
+    // first version of this test re-ran with `https://openrouter.ai/api/v1`
+    // — the one input that cannot fail — so it passed while the same
+    // command run twice refused itself on the second run.
+    run(
+        &[
+            "login",
+            "--provider",
+            "openrouter",
+            "--base-url",
+            "https://openrouter.ai/api/v1 /",
+            "--key",
+            "sk-test",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+}
+
+/// A pool outlives its config entry whenever a provider is hand-removed,
+/// which is the only removal this tool has. Re-registering it with the
+/// same key, against a config that cannot be written, must not roll back
+/// the credential that was already there.
+///
+/// The earlier version of this guard asked the config whether the
+/// provider was new. That answer disagrees with the filesystem in exactly
+/// this state, so the rollback deleted a credential it had not created
+/// and then removed the emptied pool.
+#[test]
+fn a_pool_that_outlives_its_config_entry_is_not_rolled_back() {
+    let tmp = tempdir().expect("tempdir");
+    let config_path = tmp.path().join("cfg.yaml");
+    let auth_dir = tmp.path().join("auth");
+    let header = format!(
+        "host: \"127.0.0.1\"\nport: 8317\nauth-dir: {}\napi-keys:\n  - sk-test\n",
+        auth_dir.display()
+    );
+    std::fs::write(
+        &config_path,
+        format!("{header}providers:\n  groq:\n    base-url: https://api.groq.com/openai/v1\n"),
+    )
+    .expect("write config");
+    let mut runtime = FakeRuntime::default();
+    run_with_env(
+        &[
+            "--config",
+            config_path.to_str().expect("path"),
+            "login",
+            "--provider",
+            "groq",
+            "--key",
+            "sk-legit",
+        ],
+        tmp.path(),
+        tmp.path(),
+        &mut runtime,
+        Style::Plain,
+    )
+    .expect("seed the pool");
+    let seeded: Vec<_> = std::fs::read_dir(auth_dir.join("groq"))
+        .expect("read pool")
+        .filter_map(|entry| {
+            entry
+                .ok()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+        })
+        .collect();
+    assert_eq!(seeded.len(), 1, "the pool was not seeded: {seeded:?}");
+
+    // The provider is removed by hand; the pool stays, as the spec says.
+    std::fs::write(&config_path, format!("{header}providers: {{}}\n")).expect("rewrite config");
+    let mut permissions = std::fs::metadata(&config_path)
+        .expect("metadata")
+        .permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&config_path, permissions).expect("chmod");
+
+    let _ = run_with_env(
+        &[
+            "--config",
+            config_path.to_str().expect("path"),
+            "login",
+            "--provider",
+            "groq",
+            "--base-url",
+            "https://api.groq.com/openai/v1",
+            "--key",
+            "sk-legit",
+        ],
+        tmp.path(),
+        tmp.path(),
+        &mut runtime,
+        Style::Plain,
+    );
+
+    assert!(
+        auth_dir.join("groq").exists(),
+        "the rollback destroyed a pool it did not create"
+    );
+    let after: Vec<_> = std::fs::read_dir(auth_dir.join("groq"))
+        .expect("read pool")
+        .filter_map(|entry| {
+            entry
+                .ok()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+        })
+        .collect();
+    assert_eq!(
+        after, seeded,
+        "the rollback took a credential it did not create: {after:?}"
+    );
+}
+
+/// The shape, not an instance: a failed credential write must leave the
+/// config exactly as it was, byte for byte.
+///
+/// Four of six review rounds found defects in the credential-first order
+/// and the rollback it needs — deleting a file requires reasoning about
+/// whether this command created it, and that reasoning was wrong in a
+/// different way each time. Config first, credential second, and the
+/// undo is restoring bytes already held rather than deciding what a file
+/// meant.
+#[test]
+fn a_failed_credential_write_leaves_the_config_byte_identical() {
+    let tmp = tempdir().expect("tempdir");
+    let config_path = tmp.path().join(".pengepul").join("config.yaml");
+    std::fs::create_dir_all(config_path.parent().expect("parent")).expect("config dir");
+    // auth-dir points at a path that cannot become a directory, so
+    // `save_token` fails after the config has been written.
+    let blocked = tmp.path().join("blocked");
+    std::fs::write(&blocked, "not a directory").expect("blocker");
+    let original = format!(
+        "host: \"127.0.0.1\"\nport: 8317\nauth-dir: {}\napi-keys:\n  - sk-test\nproviders:\n  existing:\n    base-url: https://existing.host/v1\n",
+        blocked.display()
+    );
+    std::fs::write(&config_path, &original).expect("write config");
+    let mut runtime = FakeRuntime::default();
+
+    run_err(
+        &[
+            "login",
+            "--provider",
+            "openrouter",
+            "--base-url",
+            "https://openrouter.ai/api/v1",
+            "--key",
+            "sk-test",
+        ],
+        tmp.path(),
+        &mut runtime,
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&config_path).expect("read config"),
+        original,
+        "a failed credential write left the provider registered"
+    );
 }

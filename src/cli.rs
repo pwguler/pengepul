@@ -1,10 +1,11 @@
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use serde_json::Value;
 
-use crate::config::{Config, load_config, selected_config_path};
+use crate::config::{Config, load_config, register_provider, selected_config_path};
 pub use crate::render::Style;
 use crate::render::{ActionGlyph, BOLD, DIM, Fact, Output, fact_panel, paint, status_glyph};
 use crate::service::service_status_panel;
@@ -170,6 +171,9 @@ enum Command {
         /// static API key for a configured OpenAI-compatible provider
         #[arg(long)]
         key: Option<String>,
+        /// register a new OpenAI-compatible provider at this URL; needs --key
+        #[arg(long = "base-url")]
+        base_url: Option<String>,
     },
     /// show local server status
     Status {
@@ -333,11 +337,13 @@ pub fn run_with_env(
             command_config,
             provider,
             key,
+            base_url,
         }) => {
             login(
                 root_env.with_override(command_config.as_deref()),
                 &provider,
                 key.as_deref(),
+                base_url.as_deref(),
                 runtime,
                 &mut output,
                 style,
@@ -796,6 +802,7 @@ fn login(
     env: CommandEnv<'_>,
     provider: &str,
     key: Option<&str>,
+    base_url: Option<&str>,
     runtime: &mut impl CliRuntime,
     output: &mut Output,
     style: Style,
@@ -807,11 +814,26 @@ fn login(
         if key.is_some() {
             bail!("{builtin} uses OAuth; --key is for configured providers");
         }
+        // AC-6: a built-in's endpoint is fixed, so there is nothing to
+        // register.
+        if base_url.is_some() {
+            bail!("{builtin} uses OAuth; --base-url is for configured providers");
+        }
         let email = runtime.login(&config, builtin.clone(), key)?;
-        print_login_saved(&builtin.to_string(), &email, output, style);
+        print_login_saved(&builtin.to_string(), &email, false, output, style);
         return Ok(());
     }
-    if !config.providers.contains_key(provider) {
+    // AC-2: registering without a credential leaves a provider that has
+    // no account, which is the half-done state this flag exists to avoid.
+    if base_url.is_some() && key.is_none() {
+        bail!("--base-url registers {provider} and needs --key to be usable");
+    }
+    // Every rule about the id, the URL and a conflicting registration
+    // lives in `register_provider`, which now runs before `save_token`
+    // and refuses without writing. `login` used to carry its own copies
+    // because the credential was written first; two of them drifted, and
+    // that was rounds 5 and 6.
+    if base_url.is_none() && !config.providers.contains_key(provider) {
         bail!(
             "{provider} is not configured; configured providers: {}",
             config
@@ -823,6 +845,13 @@ fn login(
         );
     }
     let key = key.context(format!("{provider} takes a static API key; pass --key"))?;
+    // Pre-existing on main, fixed here because this function's guards are
+    // already this branch's: an empty key saved a credential with no
+    // secret in it, which then joined rotation and failed every request
+    // it was handed.
+    if key.trim().is_empty() {
+        bail!("{provider} takes a static API key; --key is empty");
+    }
     let label = format!("key-{}", &sha256_hex(key)[..8]);
     let provider_id = ProviderId::new(ProviderKind::Generic, provider);
     let token = TokenData {
@@ -836,24 +865,96 @@ fn login(
         last_refresh_at: None,
         plan_type: None,
     };
-    save_token(&config.auth_dir, &token)?;
-    print_login_saved(provider, &label, output, style);
+    // The token first: if the config write then fails, what is left is an
+    // orphan token in the auth-dir, which is harmless because the
+    // provider is still unconfigured. The other order leaves a registered
+    // provider with no account (AC-9).
+    // What the rollback below is allowed to take back: only a file this
+    // command created. The label is `key-<hash of the key>`, so
+    // re-running the same command overwrites the same filename, and
+    // rolling that back would destroy a credential that predates the
+    // command.
+    //
+    // The question is about the filesystem, so it is asked of the
+    // filesystem. An earlier version asked whether the provider was in
+    // the config, which disagrees whenever a pool outlives its config
+    // entry — the normal state after a hand-removal, since removing a
+    // provider is not a verb this tool has.
+    // Config first, credential second.
+    //
+    // The other order needs a rollback: a credential written before a
+    // failed registration has to be taken back, which means deciding
+    // whether this command created that file. Four review rounds found a
+    // different wrong answer to that question — the config disagreeing
+    // with the filesystem, a pool that outlived its entry, a rollback
+    // that deleted what it had only overwritten.
+    //
+    // This way the undo is restoring bytes already in hand. A registered
+    // provider whose credential never arrived is visible in `accounts`,
+    // costs nothing, and is fixed by re-running the command; a credential
+    // in a pool the config never gained is invisible and joins rotation.
+    let mut registered = false;
+    let mut restore: Option<(PathBuf, String)> = None;
+    if let Some(base_url) = base_url {
+        // The path `env.load()` read. With a legacy config that load has
+        // just migrated it to the home path, so this resolves there — the
+        // file the next load will read, not the shadowed original.
+        let path = selected_config_path(env.config_path, Some(env.home), env.cwd);
+        // The bytes `register_provider` read under its own lock, not a
+        // read of our own: reading here would capture the file before a
+        // racing registration and undo theirs along with ours.
+        let before = register_provider(&path, provider, base_url)?;
+        restore = Some((path, before));
+        registered = true;
+    }
+    if let Err(error) = save_token(&config.auth_dir, &token) {
+        if let Some((path, before)) = restore {
+            // Bytes this command read moments ago, under the same lock
+            // `register_provider` took. Nothing is deduced about what a
+            // file means.
+            if let Err(undo) = fs::write(&path, before) {
+                return Err(error.context(format!(
+                    "left {provider} registered in {} and could not undo it: {undo}",
+                    path.display()
+                )));
+            }
+        }
+        return Err(error);
+    }
+    print_login_saved(provider, &label, registered, output, style);
     Ok(())
 }
 
 /// The login outcome: the plain line when piped, a `login: <provider>`
 /// panel when rich.
-fn print_login_saved(provider: &str, label: &str, output: &mut Output, style: Style) {
+/// AC-11: a registration is a fact of the login it arrived with, not an
+/// event of its own. Plain gets its own parseable line; rich gets a row
+/// inside the existing panel, because a bare line above a 64-column box
+/// is neither the panel language nor a second panel (CONTEXT.md, Panel).
+fn print_login_saved(
+    provider: &str,
+    label: &str,
+    registered: bool,
+    output: &mut Output,
+    style: Style,
+) {
     match style {
-        Style::Plain => output.line(&format!("saved {provider} account token for {label}")),
+        Style::Plain => {
+            if registered {
+                output.line(&format!("registered {provider}"));
+            }
+            output.line(&format!("saved {provider} account token for {label}"));
+        }
         Style::Rich => {
-            for line in fact_panel(
-                &format!("login {provider}"),
-                &[
-                    Fact::new("state", &format!("{} saved", status_glyph(ActionGlyph::Ok))),
-                    Fact::new("account", &paint(BOLD, label)),
-                ],
-            ) {
+            let mut facts = vec![Fact::new(
+                "state",
+                &format!("{} saved", status_glyph(ActionGlyph::Ok)),
+            )];
+            if registered {
+                facts.push(Fact::new("registered", &paint(BOLD, provider)));
+            }
+            facts.push(Fact::new("account", &paint(BOLD, label)));
+            for line in fact_panel(&format!("login {provider}"), &facts) {
                 output.line(&line);
             }
         }

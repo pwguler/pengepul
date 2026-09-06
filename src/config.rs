@@ -160,6 +160,77 @@ pub fn selected_config_path(
     config_paths(config_path, home_override, cwd).1
 }
 
+/// Register an OpenAI-compatible provider in the config file `login` read.
+///
+/// Rewrites the file in place, leaving every other field as it was. The
+/// provider must be new: an id already present with a different
+/// `base-url` is an error rather than an overwrite, so one mistyped flag
+/// cannot move a live provider's traffic to another host
+/// (login-registers-a-provider, AC-3). Re-registering the same URL is
+/// accepted, so repeating a command is safe.
+///
+/// # Errors
+///
+/// Returns an error when the config cannot be read, parsed, or written,
+/// when `base_url` is empty, or when `id` is already registered with a
+/// different `base-url`.
+pub fn register_provider(path: &Path, id: &str, base_url: &str) -> Result<String> {
+    // Read-modify-write on one shared file. Two registrations racing each
+    // other each read, insert, and write the whole file back, so the
+    // slower one silently drops the faster one's provider while both
+    // report success and both leave a credential on disk. Verified: eight
+    // concurrent registrations left eight pools and one provider.
+    //
+    // `create_new` is atomic in the OS, so it needs no dependency: the
+    // process that creates the lock owns the file until it removes it.
+    // Appended, not `with_extension`: that replaces, so `--config x.lock`
+    // would lock the operator's own config and then advise deleting it.
+    let lock_path = path.with_file_name(format!(
+        "{}.lock",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    let _lock = FileLock::acquire(&lock_path)?;
+    // A trailing slash would make `{base_url}/chat/completions` a double
+    // slash, which some hosts answer with a 404 that names nothing
+    // (AC-5).
+    let base_url = normalize_base_url(base_url);
+    // Before the file is read. `validate_providers` below would catch an
+    // empty URL with the same message, but only after parsing the config
+    // and inserting the entry: refusing here keeps a bad argument from
+    // touching the operator's file at all.
+    if base_url.is_empty() {
+        bail!("providers: {id} is missing base-url");
+    }
+    let text =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    // Returned so a caller that must undo this restores what the file held
+    // *under this lock*. Reading it outside would capture a racing
+    // writer's absence and erase their registration on undo.
+    let before = text.clone();
+    let mut raw: RawConfig = if text.trim().is_empty() {
+        RawConfig::default()
+    } else {
+        serde_yaml::from_str(&text).with_context(|| format!("invalid config {}", path.display()))?
+    };
+    if let Some(existing) = raw.providers.get(id) {
+        let existing = normalize_base_url(&existing.base_url);
+        if existing != base_url {
+            bail!("{id} already points at {existing}; edit the config to change it");
+        }
+    }
+    raw.providers.insert(
+        id.to_string(),
+        RawConfiguredProvider {
+            base_url: base_url.to_string(),
+        },
+    );
+    // The same validation the load path applies, so a name this file
+    // would reject cannot enter through this door (AC-7).
+    validate_providers(&raw.providers)?;
+    write_config(path, &raw, false)?;
+    Ok(before)
+}
+
 /// Load config from an explicit path, the default home config, or legacy workspace config.
 ///
 /// # Errors
@@ -225,23 +296,129 @@ pub fn load_config(
     })
 }
 
-/// Turn the raw `providers:` section into validated configured providers.
+/// Exclusive ownership of a config file for the length of a
+/// read-modify-write, released on drop however the write ends.
+struct FileLock {
+    path: PathBuf,
+}
+
+impl FileLock {
+    /// Take the lock, waiting briefly for a holder to finish.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the lock is still held after the wait, which
+    /// means another process is registering or one died holding it.
+    fn acquire(path: &Path) -> Result<Self> {
+        // Short and bounded: this guards a file write, not a network call.
+        for _ in 0..50 {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
+                Ok(_) => {
+                    return Ok(Self {
+                        path: path.to_path_buf(),
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(error) => {
+                    return Err(anyhow::Error::new(error)
+                        .context(format!("failed to lock {}", path.display())));
+                }
+            }
+        }
+        bail!(
+            "{} is locked by another pengepul; remove it if no other command is running",
+            path.display()
+        )
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// The stored form of a `base-url`: what two callers must agree on.
 ///
-/// The entry name becomes the provider id a client's model prefix must match, so
-/// it cannot collide with a built-in provider (anthropic, codex, or the claude
-/// spelling the glossary reserves) and cannot contain `/` (the prefix separator).
-/// `base-url` is required; the keys for the endpoint live in the auth-dir, not here.
+/// A trailing slash would make `{base_url}/chat/completions` a double
+/// slash, which some hosts answer with a 404 that names nothing; the
+/// second trim catches a space *before* that slash, which would otherwise
+/// be stored and then trimmed again on load, so the stored and loaded
+/// forms disagree and repeating a command refuses itself.
+///
+/// This exists as a function because it did not: `login` and
+/// `register_provider` each carried their own copy, they drifted by one
+/// call, and the guard that runs first was the one missing it.
+///
+/// One pass over a set, rather than a chain of trims, so the result is a
+/// fixed point: `normalize(normalize(x)) == normalize(x)` for every
+/// input. A chain is not — `.trim().trim_end_matches('/').trim_end()`
+/// leaves the slash in `https://h/v1/ /`, and the stored form then
+/// disagrees with the guard that compares against it.
+#[must_use]
+pub fn normalize_base_url(url: &str) -> &str {
+    url.trim()
+        .trim_end_matches(|c: char| c == '/' || c.is_whitespace())
+}
+
+/// Reject a Provider id the registry cannot hold.
+///
+/// A caller that writes anything keyed by the id — a credential
+/// directory, for instance — must apply this first: `storage_dir()`
+/// returns the id verbatim, so a `/` in it escapes the Account's
+/// directory and, with `..`, the auth-dir entirely.
+///
+/// # Errors
+///
+/// Returns an error when `id` names a built-in Provider or contains `/`.
+pub fn validate_provider_id(id: &str) -> Result<()> {
+    if matches!(id, "anthropic" | "codex" | "claude") {
+        bail!("providers: {id} is a built-in provider name");
+    }
+    // An allowlist, not a denylist. This id becomes a directory name
+    // verbatim (`ProviderId::storage_dir`), and a denylist of separators
+    // let `..`, `\`, an empty id, and whitespace through — each one a
+    // credential written somewhere the operator did not name. Letters,
+    // digits, dot, dash and underscore are what a provider id has ever
+    // needed; `.` and `..` are excluded by name because they are legal
+    // under that rule and mean something else to a filesystem.
+    if id.is_empty() {
+        bail!("providers: an id cannot be empty");
+    }
+    if matches!(id, "." | "..") {
+        bail!("providers: {id} is not a usable name");
+    }
+    if let Some(bad) = id
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')))
+    {
+        let shown = if bad.is_control() {
+            format!("{}", bad.escape_debug())
+        } else {
+            bad.to_string()
+        };
+        bail!("providers: {id} must not contain '{shown}'; use letters, digits, '.', '-' or '_'");
+    }
+    Ok(())
+}
+
+/// Turn the raw `providers:` section into validated configured
+/// providers.
+///
+/// Each id passes `validate_provider_id`, and `base-url` is required; the
+/// keys for the endpoint live in the auth-dir, not here.
 fn validate_providers(
     raw: &BTreeMap<String, RawConfiguredProvider>,
 ) -> Result<BTreeMap<String, ConfiguredProvider>> {
     let mut providers = BTreeMap::new();
     for (id, entry) in raw {
-        if matches!(id.as_str(), "anthropic" | "codex" | "claude") {
-            bail!("providers: {id} is a built-in provider name");
-        }
-        if id.contains('/') {
-            bail!("providers: {id} must not contain '/'");
-        }
+        validate_provider_id(id)?;
         if entry.base_url.trim().is_empty() {
             bail!("providers: {id} is missing base-url");
         }
@@ -314,7 +491,27 @@ fn write_config(path: &Path, raw: &RawConfig, private_parent: bool) -> Result<()
     }
 
     let text = serde_yaml::to_string(raw).context("failed to encode config YAML")?;
-    fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))?;
+    // Temp file plus rename, as `usage.json` is written. `fs::write`
+    // truncates first, so a concurrent reader sees an empty file, decides
+    // `api-keys` is missing, generates a fresh key and writes a whole new
+    // config over everything — verified: eight concurrent registrations
+    // left four, each having silently replaced the file.
+    //
+    // A rename replaces the file rather than writing through it, so a
+    // read-only config would be silently replaced and its mode reset.
+    // Refuse first: an operator who chmods a file means it.
+    if let Ok(existing) = fs::metadata(path)
+        && existing.permissions().readonly()
+    {
+        bail!("failed to write {}: Permission denied", path.display());
+    }
+    let temp = path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    fs::write(&temp, text).with_context(|| format!("failed to write {}", temp.display()))?;
+    fs::rename(&temp, path)
+        .with_context(|| format!("failed to move {} into place", temp.display()))?;
     set_mode(path, 0o600)
 }
 
@@ -333,4 +530,351 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
 #[cfg(not(unix))]
 fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod id_tests {
+    use super::validate_provider_id;
+
+    /// The id becomes a directory name verbatim, so the rule is an
+    /// allowlist. A denylist of `/` let every one of these through, each
+    /// writing a credential somewhere the operator did not name — found
+    /// by probing the built binary, not by the suite.
+    #[test]
+    fn no_id_can_escape_its_own_directory() {
+        for id in [
+            "",
+            " ",
+            ".",
+            "..",
+            "/",
+            "//",
+            "/etc/pengepul",
+            "\\",
+            "..\\..\\x",
+            "groq ",
+            " groq",
+            "groq/../groq",
+            "a\nb",
+            "x\tb",
+            "a\0b",
+            "üñïçø∂é",
+        ] {
+            assert!(
+                validate_provider_id(id).is_err(),
+                "an id that cannot be a directory name was accepted: {id:?}"
+            );
+        }
+    }
+
+    /// And the ids an operator actually types still work.
+    #[test]
+    fn ordinary_ids_are_accepted() {
+        for id in [
+            "openrouter",
+            "groq",
+            "open-router",
+            "open_router",
+            "openrouter2",
+            "open.router",
+            "GROQ",
+        ] {
+            validate_provider_id(id).unwrap_or_else(|error| {
+                panic!("a usable id was refused: {id:?}: {error:#}");
+            });
+        }
+    }
+
+    /// A built-in is refused by name, not by shape.
+    #[test]
+    fn built_in_names_stay_refused() {
+        for id in ["anthropic", "codex", "claude"] {
+            assert!(validate_provider_id(id).is_err(), "{id} was accepted");
+        }
+    }
+}
+
+#[cfg(test)]
+mod register_tests {
+    use super::register_provider;
+    use std::fs;
+
+    /// The conflict rule lives here as well as in `login`, and `login`
+    /// short-circuits it on every integration path — so without this
+    /// test, deleting the check below breaks nothing. It is the backstop
+    /// for the window between a caller's read and this write.
+    #[test]
+    fn a_known_id_with_a_different_url_is_refused_here_too() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yaml");
+        fs::write(
+            &path,
+            "host: \"127.0.0.1\"\nport: 8317\napi-keys:\n  - sk-test\nproviders:\n  groq:\n    base-url: https://api.groq.com/openai/v1\n",
+        )
+        .expect("write config");
+
+        let error = register_provider(&path, "groq", "https://elsewhere.host/v1")
+            .expect_err("a conflicting URL was accepted");
+
+        assert!(
+            format!("{error:#}").contains("https://api.groq.com/openai/v1"),
+            "the error does not name the URL it kept: {error:#}"
+        );
+        let after = fs::read_to_string(&path).expect("read config");
+        assert!(
+            after.contains("https://api.groq.com/openai/v1") && !after.contains("elsewhere.host"),
+            "the live URL was overwritten: {after}"
+        );
+    }
+
+    /// Read-modify-write on one shared file loses everything but the last
+    /// writer: eight concurrent registrations left eight credentials on
+    /// disk and one provider in the config, every command reporting
+    /// success. Threads here rather than processes, which is the same
+    /// race through the same lock.
+    #[test]
+    fn concurrent_registrations_do_not_lose_each_other() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yaml");
+        fs::write(
+            &path,
+            "host: \"127.0.0.1\"\nport: 8317\napi-keys:\n  - sk-test\nproviders:\n  base:\n    base-url: https://base/v1\n",
+        )
+        .expect("write config");
+
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let path = path.clone();
+                scope.spawn(move || {
+                    register_provider(&path, &format!("p{index}"), &format!("https://h{index}/v1"))
+                        .expect("register");
+                });
+            }
+        });
+
+        let after = fs::read_to_string(&path).expect("read config");
+        for index in 0..8 {
+            assert!(
+                after.contains(&format!("p{index}:")),
+                "p{index} was lost to a concurrent registration: {after}"
+            );
+        }
+        assert!(after.contains("base:"), "the original provider was lost");
+        assert!(
+            !dir.path().join("config.yaml.lock").exists(),
+            "the lock outlived the registration"
+        );
+    }
+
+    /// `with_extension` replaces rather than appends, so a config named
+    /// `x.lock` derived a lock path identical to itself: the tool locked
+    /// the operator's own config and then advised deleting it.
+    #[test]
+    fn a_config_named_lock_is_not_its_own_lock_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("x.lock");
+        fs::write(
+            &path,
+            "host: \"127.0.0.1\"\nport: 8317\napi-keys:\n  - sk-test\nproviders: {}\n",
+        )
+        .expect("write config");
+
+        register_provider(&path, "groq", "https://api.groq.com/openai/v1").expect("register");
+
+        let after = fs::read_to_string(&path).expect("the config was consumed as a lock");
+        assert!(
+            after.contains("groq:"),
+            "the provider was not written: {after}"
+        );
+        assert!(
+            !dir.path().join("x.lock.lock").exists(),
+            "the lock outlived the registration"
+        );
+    }
+
+    /// An empty URL is refused before the config is read, not after it is
+    /// parsed and the entry inserted. `validate_providers` catches it
+    /// too, with the same message — so the message cannot tell the two
+    /// apart, and only the untouched file can.
+    #[test]
+    fn an_empty_url_is_refused_without_reading_the_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yaml");
+        // Not valid YAML: reaching the parser at all is a failure, and it
+        // would report `invalid config` rather than the missing URL.
+        fs::write(&path, "{not yaml at all").expect("write config");
+
+        let error = register_provider(&path, "groq", "   ").expect_err("an empty URL was accepted");
+
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("missing base-url"),
+            "the config was read before the URL was checked: {error}"
+        );
+    }
+
+    /// `fs::write` truncates before it writes, so a concurrent reader saw
+    /// an empty file, concluded `api-keys` was missing, generated a fresh
+    /// key and wrote a whole new config over everything. Eight concurrent
+    /// registrations left four, each silently replacing the file — and
+    /// the lock could not prevent it, because `load_config` runs before
+    /// the lock is taken.
+    #[test]
+    fn a_reader_never_sees_a_half_written_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yaml");
+        let original =
+            "host: \"127.0.0.1\"\nport: 8317\napi-keys:\n  - sk-original\nproviders: {}\n";
+        fs::write(&path, original).expect("write config");
+
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let writer_path = path.clone();
+                scope.spawn(move || {
+                    register_provider(
+                        &writer_path,
+                        &format!("p{index}"),
+                        &format!("https://h{index}/v1"),
+                    )
+                    .expect("register");
+                });
+                // A reader racing every writer: it must never observe a
+                // file that parses as empty.
+                let reader_path = path.clone();
+                scope.spawn(move || {
+                    for _ in 0..20 {
+                        if let Ok(text) = fs::read_to_string(&reader_path) {
+                            assert!(
+                                text.contains("api-keys"),
+                                "a reader saw a half-written config: {text:?}"
+                            );
+                        }
+                    }
+                });
+            }
+        });
+
+        let after = fs::read_to_string(&path).expect("read config");
+        assert!(
+            after.contains("sk-original"),
+            "the original api-key was replaced: {after}"
+        );
+        for index in 0..8 {
+            assert!(after.contains(&format!("p{index}:")), "p{index} was lost");
+        }
+    }
+
+    /// The same URL is not a conflict, so a caller repeating itself is
+    /// safe.
+    #[test]
+    fn the_same_url_is_accepted_here_too() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yaml");
+        fs::write(
+            &path,
+            "host: \"127.0.0.1\"\nport: 8317\napi-keys:\n  - sk-test\nproviders:\n  groq:\n    base-url: https://api.groq.com/openai/v1\n",
+        )
+        .expect("write config");
+
+        register_provider(&path, "groq", "https://api.groq.com/openai/v1/").expect("same URL");
+
+        let after = fs::read_to_string(&path).expect("read config");
+        assert!(after.contains("https://api.groq.com/openai/v1"), "{after}");
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::register_provider;
+    use std::fs;
+
+    fn config(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("config.yaml");
+        fs::write(
+            &path,
+            "host: \"127.0.0.1\"\nport: 8317\napi-keys:\n  - sk-test\nproviders: {}\n",
+        )
+        .expect("write config");
+        path
+    }
+
+    /// A killed registration cannot run `Drop`, so its lock outlives it.
+    /// README promises the next registration names the file and that
+    /// removing it is the whole recovery — the one failure an operator
+    /// actually meets, and nothing pinned it.
+    #[test]
+    fn a_stale_lock_names_itself_and_removing_it_is_the_recovery() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = config(dir.path());
+        let lock = dir.path().join("config.yaml.lock");
+        fs::write(&lock, "").expect("stale lock");
+
+        let error = register_provider(&path, "groq", "https://api.groq.com/openai/v1")
+            .expect_err("a held lock was ignored");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("config.yaml.lock"),
+            "the error does not name the file to remove: {error}"
+        );
+
+        fs::remove_file(&lock).expect("remove lock");
+        register_provider(&path, "groq", "https://api.groq.com/openai/v1")
+            .expect("removing the lock did not restore service");
+    }
+
+    /// And the lock is released by finishing, not only by the operator
+    /// deleting it: without this, a `Drop` that does nothing looks
+    /// exactly like a `Drop` that works until the second registration.
+    #[test]
+    fn a_finished_registration_releases_its_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = config(dir.path());
+
+        register_provider(&path, "groq", "https://api.groq.com/openai/v1").expect("first");
+        assert!(
+            !dir.path().join("config.yaml.lock").exists(),
+            "the lock outlived the registration that took it"
+        );
+        // The proof that matters: a second registration can still take it.
+        register_provider(&path, "other", "https://other.host/v1")
+            .expect("the lock was never released");
+    }
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::normalize_base_url;
+
+    /// A stored form must be a fixed point, or the guard that compares
+    /// against it disagrees with the writer that produced it. The first
+    /// version chained three trims and was not one.
+    #[test]
+    fn normalizing_twice_changes_nothing() {
+        for url in [
+            "https://h/v1",
+            "https://h/v1/",
+            "https://h/v1 /",
+            "https://h/v1/ /",
+            "  https://h/v1//  ",
+            "https://h/v1/ / / ",
+            "/",
+            "///",
+            "   ",
+            "",
+        ] {
+            let once = normalize_base_url(url);
+            let twice = normalize_base_url(once);
+            assert_eq!(once, twice, "not a fixed point: {url:?} -> {once:?}");
+        }
+    }
+
+    /// And it still does the job it was extracted for.
+    #[test]
+    fn it_strips_what_the_upstream_join_would_double() {
+        assert_eq!(normalize_base_url("https://h/v1/"), "https://h/v1");
+        assert_eq!(normalize_base_url("https://h/v1 /"), "https://h/v1");
+        assert_eq!(normalize_base_url("  https://h/v1  "), "https://h/v1");
+        assert_eq!(normalize_base_url("/"), "");
+        assert_eq!(normalize_base_url("   "), "");
+    }
 }
