@@ -272,8 +272,10 @@ pub async fn refresh_grok_tokens(refresh_token: String) -> Result<TokenData> {
         }
         bail!("grok token refresh failed ({status}): {body}");
     }
-    let mut token =
-        grok_token(&serde_json::from_str(&body).context("Grok refresh response is not JSON")?)?;
+    let mut token = grok_token(
+        &serde_json::from_str(&body).context("Grok refresh response is not JSON")?,
+        false,
+    )?;
     // auth.x.ai may rotate the refresh token on use; when it does not send one
     // back, the grant it just honored stays valid and is kept.
     if token.refresh_token.is_empty() {
@@ -295,7 +297,10 @@ async fn exchange_grok_grant(pairs: &[(&str, &str)]) -> Result<TokenData> {
     if !status.is_success() {
         bail!("grok token exchange failed ({status}): {body}");
     }
-    grok_token(&serde_json::from_str(&body).context("Grok token response is not JSON")?)
+    grok_token(
+        &serde_json::from_str(&body).context("Grok token response is not JSON")?,
+        true,
+    )
 }
 
 fn grok_refresh_request(refresh_token: &str) -> reqwest::RequestBuilder {
@@ -314,9 +319,31 @@ fn grok_redirect_uri() -> String {
     format!("http://localhost:{GROK_CALLBACK_PORT}{GROK_CALLBACK_PATH}")
 }
 
-fn grok_token(data: &Value) -> Result<TokenData> {
-    let id_token = required_string(data, "id_token")?;
-    let claims = decode_jwt_payload(&id_token)?;
+/// Derive a `TokenData` from a token-endpoint response. The code exchange
+/// mints an `id_token` carrying the account identity, so `login` requires
+/// it. The refresh grant does not return one, so with `require_id_token`
+/// false the identity fields stay empty and the account manager keeps the
+/// stored identity (empty email/uuid and a `None` plan read as "unchanged").
+fn grok_token(data: &Value, require_id_token: bool) -> Result<TokenData> {
+    let id_token = data
+        .get("id_token")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .map(ToOwned::to_owned);
+    if require_id_token && id_token.is_none() {
+        bail!("token response is missing id_token");
+    }
+    let claims = match &id_token {
+        Some(token) => decode_jwt_payload(token)?,
+        None => Value::Null,
+    };
+    let claim_string = |field: &str| {
+        claims
+            .get(field)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
     Ok(TokenData {
         access_token: required_string(data, "access_token")?,
         refresh_token: data
@@ -324,11 +351,15 @@ fn grok_token(data: &Value) -> Result<TokenData> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
-        email: claims
-            .get("email")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string(),
+        email: if require_id_token {
+            claims
+                .get("email")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string()
+        } else {
+            claim_string("email")
+        },
         expires_at: expires_in_iso(
             data.get("expires_in").and_then(Value::as_u64),
             GROK_TOKEN_TTL_SECONDS,
@@ -337,10 +368,10 @@ fn grok_token(data: &Value) -> Result<TokenData> {
             .get("principal_id")
             .or_else(|| claims.get("sub"))
             .and_then(Value::as_str)
-            .unwrap_or("")
+            .unwrap_or_default()
             .to_string(),
         provider: ProviderId::grok(),
-        id_token: Some(id_token),
+        id_token,
         last_refresh_at: None,
         plan_type: claims.get("tier").map(|tier| format!("tier-{tier}")),
     })
@@ -534,12 +565,15 @@ mod tests {
             "principal_id": "42284626-f3a1-47bd-9717-b7afd95d86d9",
             "tier": 3,
         }));
-        let token = grok_token(&serde_json::json!({
-            "access_token": "at-jwt",
-            "refresh_token": "refresh-1",
-            "id_token": id_token,
-            "expires_in": 21_600,
-        }))
+        let token = grok_token(
+            &serde_json::json!({
+                "access_token": "at-jwt",
+                "refresh_token": "refresh-1",
+                "id_token": id_token,
+                "expires_in": 21_600,
+            }),
+            true,
+        )
         .expect("grok token derives");
         assert_eq!(token.provider, ProviderId::grok());
         assert_eq!(token.email, "operator@example.com");
@@ -555,13 +589,46 @@ mod tests {
             "sub": "sub-only-id",
             "email": "operator@example.com",
         }));
-        let token = grok_token(&serde_json::json!({
-            "access_token": "at",
-            "refresh_token": "r",
-            "id_token": id_token,
-        }))
+        let token = grok_token(
+            &serde_json::json!({
+                "access_token": "at",
+                "refresh_token": "r",
+                "id_token": id_token,
+            }),
+            true,
+        )
         .expect("grok token derives");
         assert_eq!(token.account_uuid, "sub-only-id");
         assert_eq!(token.plan_type, None);
+    }
+
+    #[test]
+    fn grok_refresh_without_id_token_keeps_identity_empty() {
+        // The refresh grant's real shape (observed live against auth.x.ai):
+        // access and refresh tokens, no id_token. Empty identity fields tell
+        // the account manager to keep what it has on file.
+        let token = grok_token(
+            &serde_json::json!({
+                "access_token": "new-at",
+                "expires_in": 21_600,
+            }),
+            false,
+        )
+        .expect("refresh token derives");
+        assert_eq!(token.access_token, "new-at");
+        assert_eq!(token.email, "");
+        assert_eq!(token.account_uuid, "");
+        assert_eq!(token.plan_type, None);
+    }
+
+    #[test]
+    fn grok_exchange_without_id_token_is_refused() {
+        assert!(
+            grok_token(
+                &serde_json::json!({"access_token": "at", "refresh_token": "r"}),
+                true,
+            )
+            .is_err()
+        );
     }
 }

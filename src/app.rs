@@ -784,7 +784,13 @@ async fn model_catalog_refresh_loop(state: AppState) {
 }
 
 async fn refresh_model_catalog(state: &AppState) {
-    for kind in [ProviderKind::Anthropic, ProviderKind::Codex] {
+    for kind in [
+        ProviderKind::Anthropic,
+        ProviderKind::Codex,
+        // Grok's list is static, but it enters the catalog through the same
+        // fetch so /v1/models and routing see it like any provider's.
+        ProviderKind::Grok,
+    ] {
         let Some(account) = catalog_account(state, kind).await else {
             continue;
         };
