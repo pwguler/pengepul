@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use crate::types::{PkceCodes, ProviderId, RefreshTokenExhaustedError, TokenData};
+use crate::upstream::GROK_CLIENT_VERSION;
 use crate::utils::{decode_jwt_payload, expires_in_iso};
 
 pub const ANTHROPIC_AUTH_URL: &str = "https://claude.ai/oauth/authorize";
@@ -21,6 +22,17 @@ pub const CODEX_SCOPE: &str =
 pub const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 pub const ANTHROPIC_TOKEN_URL: &str = "https://api.anthropic.com/v1/oauth/token";
 pub const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+
+pub const GROK_ISSUER: &str = "https://auth.x.ai";
+pub const GROK_AUTH_URL: &str = "https://auth.x.ai/oauth2/authorize";
+pub const GROK_TOKEN_URL: &str = "https://auth.x.ai/oauth2/token";
+pub const GROK_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
+pub const GROK_CALLBACK_PORT: u16 = 14550;
+pub const GROK_CALLBACK_PATH: &str = "/callback";
+pub const GROK_SCOPE: &str = "openid profile email offline_access grok-cli:access";
+pub const GROK_REFERRER: &str = "grok-build";
+/// Grok access tokens live 6 h (21600 s by the minted JWT's `exp - iat`).
+pub const GROK_TOKEN_TTL_SECONDS: u64 = 21_600;
 
 #[must_use]
 pub fn detect_exhausted_reason(body: &str) -> Option<&'static str> {
@@ -67,6 +79,25 @@ pub fn generate_codex_auth_url(state: &str, pkce: &PkceCodes) -> String {
         .append_pair("originator", CODEX_ORIGINATOR)
         .finish();
     format!("{CODEX_AUTH_URL}?{query}")
+}
+
+/// Build the Grok OAuth authorize URL. Unlike the other providers this flow
+/// also carries a `nonce` (validated against the id_token by the OIDC
+/// machinery) and a `referrer` attributing the login to grok build.
+#[must_use]
+pub fn generate_grok_auth_url(state: &str, pkce: &PkceCodes, nonce: &str) -> String {
+    let query = Serializer::new(String::new())
+        .append_pair("response_type", "code")
+        .append_pair("client_id", GROK_CLIENT_ID)
+        .append_pair("redirect_uri", &grok_redirect_uri())
+        .append_pair("scope", GROK_SCOPE)
+        .append_pair("code_challenge", &pkce.code_challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", state)
+        .append_pair("nonce", nonce)
+        .append_pair("referrer", GROK_REFERRER)
+        .finish();
+    format!("{GROK_AUTH_URL}?{query}")
 }
 
 /// Exchange an Anthropic OAuth authorization code for a stored token.
@@ -201,6 +232,121 @@ pub async fn refresh_codex_tokens(refresh_token: String) -> Result<TokenData> {
     codex_token(&serde_json::from_str(&body).context("Codex refresh response is not JSON")?)
 }
 
+/// Exchange a Grok OAuth authorization code for a stored token.
+///
+/// # Errors
+///
+/// Returns an error when OAuth state does not match, the token endpoint fails, or the response
+/// body does not contain the expected token fields.
+pub async fn exchange_grok_code(
+    code: &str,
+    returned_state: &str,
+    expected_state: &str,
+    pkce: &PkceCodes,
+) -> Result<TokenData> {
+    ensure_state(returned_state, expected_state)?;
+    exchange_grok_grant(&[
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", grok_redirect_uri().as_str()),
+        ("client_id", GROK_CLIENT_ID),
+        ("code_verifier", pkce.code_verifier.as_str()),
+    ])
+    .await
+}
+
+/// Refresh a Grok OAuth token.
+///
+/// # Errors
+///
+/// Returns an error when the token endpoint fails or the response body is invalid.
+pub async fn refresh_grok_tokens(refresh_token: String) -> Result<TokenData> {
+    let response = grok_refresh_request(&refresh_token).send().await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        if let Some(reason) = detect_exhausted_reason(&body) {
+            return Err(
+                RefreshTokenExhaustedError::new(reason, Some(status.as_u16()), Some(body)).into(),
+            );
+        }
+        bail!("grok token refresh failed ({status}): {body}");
+    }
+    let mut token = grok_token(
+        &serde_json::from_str(&body).context("Grok refresh response is not JSON")?,
+    )?;
+    // auth.x.ai may rotate the refresh token on use; when it does not send one
+    // back, the grant it just honored stays valid and is kept.
+    if token.refresh_token.is_empty() {
+        token.refresh_token = refresh_token;
+    }
+    Ok(token)
+}
+
+async fn exchange_grok_grant(pairs: &[(&str, &str)]) -> Result<TokenData> {
+    let response = reqwest::Client::new()
+        .post(GROK_TOKEN_URL)
+        .header("x-grok-client-version", GROK_CLIENT_VERSION)
+        .form(pairs)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        bail!("grok token exchange failed ({status}): {body}");
+    }
+    grok_token(&serde_json::from_str(&body).context("Grok token response is not JSON")?)
+}
+
+fn grok_refresh_request(refresh_token: &str) -> reqwest::RequestBuilder {
+    reqwest::Client::new()
+        .post(GROK_TOKEN_URL)
+        .header("x-grok-client-version", GROK_CLIENT_VERSION)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", GROK_CLIENT_ID),
+            ("refresh_token", refresh_token),
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+}
+
+fn grok_redirect_uri() -> String {
+    format!("http://localhost:{GROK_CALLBACK_PORT}{GROK_CALLBACK_PATH}")
+}
+
+fn grok_token(data: &Value) -> Result<TokenData> {
+    let id_token = required_string(data, "id_token")?;
+    let claims = decode_jwt_payload(&id_token)?;
+    Ok(TokenData {
+        access_token: required_string(data, "access_token")?,
+        refresh_token: data
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        email: claims
+            .get("email")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        expires_at: expires_in_iso(
+            data.get("expires_in").and_then(Value::as_u64),
+            GROK_TOKEN_TTL_SECONDS,
+        ),
+        account_uuid: claims
+            .get("principal_id")
+            .or_else(|| claims.get("sub"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        provider: ProviderId::grok(),
+        id_token: Some(id_token),
+        last_refresh_at: None,
+        plan_type: claims.get("tier").map(|tier| format!("tier-{tier}")),
+    })
+}
+
 fn ensure_state(returned_state: &str, expected_state: &str) -> Result<()> {
     if returned_state != expected_state {
         bail!("OAuth state mismatch");
@@ -317,5 +463,99 @@ mod tests {
         let body = body_string(&req);
         assert!(body.contains("\"grant_type\":\"refresh_token\""), "{body}");
         assert!(body.contains("\"refresh_token\":\"refresh-xyz\""), "{body}");
+    }
+
+    fn fake_id_token(claims: &serde_json::Value) -> String {
+        use base64::Engine as _;
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        format!(
+            "{}.{}.sig",
+            encode(br#"{"alg":"ES256","typ":"at+jwt"}"#),
+            encode(serde_json::to_vec(claims).expect("claims serialize").as_slice())
+        )
+    }
+
+    #[test]
+    fn grok_auth_url_carries_pkce_state_nonce_and_referrer() {
+        let pkce = PkceCodes {
+            code_verifier: "v".repeat(43),
+            code_challenge: "c".to_string(),
+        };
+        let url = generate_grok_auth_url("state-1", &pkce, "nonce-1");
+        assert!(url.starts_with(GROK_AUTH_URL), "{url}");
+        for piece in [
+            "response_type=code",
+            &format!("client_id={GROK_CLIENT_ID}"),
+            &format!("redirect_uri=http%3A%2F%2Flocalhost%3A{GROK_CALLBACK_PORT}%2Fcallback"),
+            &format!("scope={}", urlencode(GROK_SCOPE)),
+            "code_challenge=c",
+            "code_challenge_method=S256",
+            "state=state-1",
+            "nonce=nonce-1",
+            "referrer=grok-build",
+        ] {
+            assert!(url.contains(piece), "{piece} missing from {url}");
+        }
+    }
+
+    fn urlencode(value: &str) -> String {
+        url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("", value)
+            .finish()
+            .trim_start_matches('=')
+            .to_string()
+    }
+
+    #[test]
+    fn grok_refresh_uses_form_encoded_request() {
+        let req = grok_refresh_request("refresh-xyz")
+            .build()
+            .expect("grok refresh request builds");
+        assert_eq!(req.url().as_str(), GROK_TOKEN_URL);
+        assert_eq!(content_type(&req), "application/x-www-form-urlencoded");
+        let body = body_string(&req);
+        assert!(body.contains("grant_type=refresh_token"), "{body}");
+        assert!(body.contains("refresh_token=refresh-xyz"), "{body}");
+        assert!(body.contains(&format!("client_id={GROK_CLIENT_ID}")), "{body}");
+    }
+
+    #[test]
+    fn grok_token_derivation_reads_id_token_claims() {
+        let id_token = fake_id_token(&serde_json::json!({
+            "iss": "https://auth.x.ai",
+            "sub": "42284626-f3a1-47bd-9717-b7afd95d86d9",
+            "email": "operator@example.com",
+            "principal_id": "42284626-f3a1-47bd-9717-b7afd95d86d9",
+            "tier": 3,
+        }));
+        let token = grok_token(&serde_json::json!({
+            "access_token": "at-jwt",
+            "refresh_token": "refresh-1",
+            "id_token": id_token,
+            "expires_in": 21_600,
+        }))
+        .expect("grok token derives");
+        assert_eq!(token.provider, ProviderId::grok());
+        assert_eq!(token.email, "operator@example.com");
+        assert_eq!(token.account_uuid, "42284626-f3a1-47bd-9717-b7afd95d86d9");
+        assert_eq!(token.plan_type.as_deref(), Some("tier-3"));
+        assert_eq!(token.refresh_token, "refresh-1");
+        assert_eq!(token.access_token, "at-jwt");
+    }
+
+    #[test]
+    fn grok_token_falls_back_to_sub_when_principal_id_is_absent() {
+        let id_token = fake_id_token(&serde_json::json!({
+            "sub": "sub-only-id",
+            "email": "operator@example.com",
+        }));
+        let token = grok_token(&serde_json::json!({
+            "access_token": "at",
+            "refresh_token": "r",
+            "id_token": id_token,
+        }))
+        .expect("grok token derives");
+        assert_eq!(token.account_uuid, "sub-only-id");
+        assert_eq!(token.plan_type, None);
     }
 }

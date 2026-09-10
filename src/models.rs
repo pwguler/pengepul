@@ -366,6 +366,14 @@ fn gpt_and_vendor_family_entries(
             "xai/grok-4.5",
             meta(TEXT_IMAGE, Some(500_000), None, 2.0, 6.0, 0.30, None),
         ),
+        (
+            "grok-4.6",
+            meta(TEXT_IMAGE, Some(500_000), None, 2.0, 6.0, 0.50, None),
+        ),
+        (
+            "grok-4.5",
+            meta(TEXT_IMAGE, Some(500_000), None, 2.0, 6.0, 0.30, None),
+        ),
         ("google/gemini-3", capability(None, None)),
         (
             "gpt-5.6",
@@ -548,6 +556,7 @@ impl ModelCatalog {
             match prefix {
                 "anthropic" => return Some(ProviderId::anthropic()),
                 "codex" => return Some(ProviderId::codex()),
+                "grok" => return Some(ProviderId::grok()),
                 other if providers.contains_key(other) => {
                     return Some(ProviderId::generic(other));
                 }
@@ -634,7 +643,24 @@ fn heuristic_provider(model: &str) -> Option<ProviderKind> {
         || lower
             .strip_prefix('o')
             .is_some_and(|rest| rest.chars().next().is_some_and(|c| c.is_ascii_digit()));
-    codex.then_some(ProviderKind::Codex)
+    if codex {
+        return Some(ProviderKind::Codex);
+    }
+    lower.starts_with("grok-").then_some(ProviderKind::Grok)
+}
+
+/// The grok catalog is static: grok build serves two models (its
+/// `default_models.json`), so there is no upstream fetch to fail. The ids and
+/// the 500k context come from grok build's own model list
+/// (docs/research/grok-build-provider.md).
+#[must_use]
+pub fn grok_static_models() -> FetchedModels {
+    let ids = vec!["grok-4.6".to_string(), "grok-4.5".to_string()];
+    let metadata = ids
+        .iter()
+        .filter_map(|id| curated_metadata(id).map(|meta| (id.clone(), meta)))
+        .collect();
+    FetchedModels::with_metadata(ids, metadata)
 }
 
 /// Models from an Anthropic `/v1/models` body (`{"data": [{"id": ...}]}`). The upstream

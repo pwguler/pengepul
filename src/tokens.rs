@@ -184,6 +184,7 @@ fn token_to_storage(token: &TokenData) -> StoredToken {
         token_type: Some(match token.provider.kind {
             ProviderKind::Anthropic => "claude".to_string(),
             ProviderKind::Codex => "codex".to_string(),
+            ProviderKind::Grok => "grok".to_string(),
             ProviderKind::Generic => "generic".to_string(),
         }),
         expired: token.expires_at.clone(),

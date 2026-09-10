@@ -18,6 +18,19 @@ pub const CODEX_MODELS_PATH: &str = "/codex/models";
 pub const CODEX_DEFAULT_ORIGINATOR: &str = "codex_cli_rs";
 pub const CODEX_DEFAULT_CLI_VERSION: &str = "0.125.0";
 
+/// Grok build's relay. The session token minted by the auth.x.ai OAuth flow is
+/// a bearer here, with the routing and version headers below.
+pub const GROK_CHAT_BASE_URL: &str = "https://cli-chat-proxy.grok.com";
+/// Routes the proxy's nginx auth subrequest to the OAuth path. Without it the
+/// bearer is not resolved against a session at all.
+pub const GROK_TOKEN_AUTH_HEADER: &str = "X-XAI-Token-Auth";
+pub const GROK_TOKEN_AUTH_VALUE: &str = "xai-grok-cli";
+/// The pinned CLI identity the relay presents. The proxy enforces a floor and
+/// names a new minimum with HTTP 426; the relay reads that body and adopts the
+/// version for the process lifetime (`learn_grok_client_version`), so the pin
+/// is only the starting point.
+pub const GROK_CLIENT_VERSION: &str = "0.1.202";
+
 const FINGERPRINT_SALT: &str = "59cf53e54c78";
 
 // Anthropic's billing classifier reads this exact sentence (injected by openclaw's
@@ -697,6 +710,73 @@ pub fn generic_chat_headers(account: &AvailableAccount) -> BTreeMap<String, Stri
     ])
 }
 
+/// Headers for grok build's relay: the session token as bearer, the header
+/// that routes the auth subrequest, and the CLI version the proxy gates on.
+#[must_use]
+pub fn grok_chat_headers(account: &AvailableAccount) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("Content-Type".to_string(), "application/json".to_string()),
+        (
+            "Authorization".to_string(),
+            format!("Bearer {}", account.token.access_token),
+        ),
+        (
+            GROK_TOKEN_AUTH_HEADER.to_string(),
+            GROK_TOKEN_AUTH_VALUE.to_string(),
+        ),
+        (
+            "x-grok-client-version".to_string(),
+            grok_client_version(),
+        ),
+    ])
+}
+
+/// The CLI version to present right now: the learned minimum once a 426 has
+/// taught this process one, else the pinned default.
+#[must_use]
+pub fn grok_client_version() -> String {
+    learned_grok_client_version().unwrap_or_else(|| GROK_CLIENT_VERSION.to_string())
+}
+
+fn learned_grok_client_version() -> Option<String> {
+    GROK_LEARNED_VERSION
+        .get()
+        .and_then(|state| state.lock().ok().and_then(|guard| guard.clone()))
+}
+
+static GROK_LEARNED_VERSION: std::sync::OnceLock<Mutex<Option<String>>> = std::sync::OnceLock::new();
+
+/// Adopt the minimum version a 426 body names. Returns the version when it is
+/// new information (the caller may retry once with it); `None` when the body
+/// names nothing or the relay already presents that version.
+pub fn learn_grok_client_version(response_body: &str) -> Option<String> {
+    let minimum = parse_grok_minimum_version(response_body)?;
+    let mut guard = GROK_LEARNED_VERSION
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()?;
+    if guard.as_deref() == Some(minimum.as_str()) {
+        return None;
+    }
+    *guard = Some(minimum.clone());
+    Some(minimum)
+}
+
+/// The minimum in grok build's own upgrade nudge:
+/// `"... Please update to version 0.1.202 or later ..."`. A version is a
+/// dotted number; anything else in that slot is not one.
+fn parse_grok_minimum_version(response_body: &str) -> Option<String> {
+    const MARKER: &str = "to version ";
+    let rest = response_body.split_once(MARKER)?.1;
+    let token: &str = rest.split([' ', '`', '"']).next()?;
+    let token = token.trim_end_matches(['.', ',', ';']);
+    let dotted = token.contains('.');
+    let numeric = token
+        .split('.')
+        .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()));
+    (dotted && numeric).then(|| token.to_string())
+}
+
 /// The configured endpoint's base URL, trimmed of a trailing slash so the
 /// path join is deterministic.
 #[must_use]
@@ -705,4 +785,53 @@ pub fn generic_base_url(config: &Config, provider_id: &str) -> Option<String> {
         .providers
         .get(provider_id)
         .map(|provider| provider.base_url.trim_end_matches('/').to_string())
+}
+
+#[cfg(test)]
+mod grok_version_tests {
+    use super::{GROK_CLIENT_VERSION, grok_client_version, learn_grok_client_version};
+
+    /// The proxy's real 426 body, verbatim from a live probe (2026-09-10).
+    const REAL_426_BODY: &str = "{\"error\":\"Your Grok CLI version (none) is outdated. Please update to version 0.1.202 or later via `grok update` or the installation documentation.\"}";
+
+    #[test]
+    fn parse_reads_the_minimum_from_the_real_426_body() {
+        assert_eq!(
+            super::parse_grok_minimum_version(REAL_426_BODY),
+            Some("0.1.202".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_rejects_bodies_without_a_dotted_version() {
+        assert_eq!(super::parse_grok_minimum_version("{}"), None);
+        assert_eq!(
+            super::parse_grok_minimum_version(
+                "update to version soon or later via `grok update`"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn without_a_426_the_pinned_version_is_presented_then_a_426_teaches() {
+        // One test owns the process-global learned version: parallel tests
+        // would race on it.
+        assert_eq!(grok_client_version(), GROK_CLIENT_VERSION);
+        assert_eq!(
+            learn_grok_client_version(REAL_426_BODY),
+            Some("0.1.202".to_string())
+        );
+        assert_eq!(grok_client_version(), "0.1.202");
+        // Same floor again: nothing new, so no second retry would be owed.
+        assert_eq!(learn_grok_client_version(REAL_426_BODY), None);
+        // A higher floor still teaches.
+        assert_eq!(
+            learn_grok_client_version(
+                "Please update to version 0.1.203 or later via `grok update`."
+            ),
+            Some("0.1.203".to_string())
+        );
+        assert_eq!(grok_client_version(), "0.1.203");
+    }
 }

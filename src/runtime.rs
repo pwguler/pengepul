@@ -10,8 +10,9 @@ use crate::app::create_app;
 use crate::cli::{CliRuntime, LaunchPlan, ModelChoice, ServiceInstallRequest};
 use crate::config::{Config, DebugMode};
 use crate::oauth::{
-    ANTHROPIC_REDIRECT_URI, CODEX_CALLBACK_PATH, CODEX_CALLBACK_PORT, exchange_anthropic_code,
-    exchange_codex_code, generate_anthropic_auth_url, generate_codex_auth_url,
+    ANTHROPIC_REDIRECT_URI, CODEX_CALLBACK_PATH, CODEX_CALLBACK_PORT, GROK_CALLBACK_PATH,
+    GROK_CALLBACK_PORT, exchange_anthropic_code, exchange_codex_code, exchange_grok_code,
+    generate_anthropic_auth_url, generate_codex_auth_url, generate_grok_auth_url,
 };
 use crate::render::Style;
 use crate::service::{ServiceOptions, run_command};
@@ -215,7 +216,8 @@ impl CliRuntime for RealRuntime {
     ) -> Result<String> {
         let state = random_urlsafe(32);
         let pkce = generate_pkce_codes();
-        let auth_url = auth_url(&provider, &state, &pkce);
+        let nonce = random_urlsafe(32);
+        let auth_url = auth_url(&provider, &state, &pkce, &nonce);
         println!("\nOpen this URL to authorize {provider}:\n\n{auth_url}\n");
         open_browser(&auth_url);
         let (port, path) = callback_endpoint(&provider)?;
@@ -227,6 +229,9 @@ impl CliRuntime for RealRuntime {
                 }
                 ProviderKind::Codex => {
                     exchange_codex_code(&callback.code, &callback.state, &state, &pkce).await
+                }
+                ProviderKind::Grok => {
+                    exchange_grok_code(&callback.code, &callback.state, &state, &pkce).await
                 }
                 ProviderKind::Generic => {
                     unreachable!("cli::login saves static keys; the OAuth flow is never entered")
@@ -331,10 +336,11 @@ struct CallbackResult {
     state: String,
 }
 
-fn auth_url(provider: &ProviderId, state: &str, pkce: &PkceCodes) -> String {
+fn auth_url(provider: &ProviderId, state: &str, pkce: &PkceCodes, nonce: &str) -> String {
     match provider.kind {
         ProviderKind::Anthropic => generate_anthropic_auth_url(state, pkce),
         ProviderKind::Codex => generate_codex_auth_url(state, pkce),
+        ProviderKind::Grok => generate_grok_auth_url(state, pkce, nonce),
         ProviderKind::Generic => {
             unreachable!("static-key providers never build an OAuth authorize URL")
         }
@@ -349,6 +355,7 @@ fn callback_endpoint(provider: &ProviderId) -> Result<(u16, &'static str)> {
             Ok((port, "/callback"))
         }
         ProviderKind::Codex => Ok((CODEX_CALLBACK_PORT, CODEX_CALLBACK_PATH)),
+        ProviderKind::Grok => Ok((GROK_CALLBACK_PORT, GROK_CALLBACK_PATH)),
         ProviderKind::Generic => {
             unreachable!("static-key providers never serve an OAuth callback")
         }

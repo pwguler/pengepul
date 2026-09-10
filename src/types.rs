@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 pub enum ProviderKind {
     Anthropic,
     Codex,
+    /// A grok.com subscription account, authorized through grok build's own
+    /// OAuth and relayed to the cli-chat-proxy. "xai" stays free as the
+    /// configured-endpoint id for the keyed console API.
+    Grok,
     /// A configured OpenAI-compatible endpoint. The id names the `providers:`
     /// config entry ("groq", ...); the kind is what makes it generic.
     Generic,
@@ -20,6 +24,7 @@ impl ProviderKind {
         match self {
             Self::Anthropic => "anthropic",
             Self::Codex => "codex",
+            Self::Grok => "grok",
             Self::Generic => "generic",
         }
     }
@@ -38,6 +43,7 @@ impl FromStr for ProviderKind {
         match value {
             "anthropic" | "claude" => Ok(Self::Anthropic),
             "codex" => Ok(Self::Codex),
+            "grok" => Ok(Self::Grok),
             other => Err(format!("unknown provider kind: {other}")),
         }
     }
@@ -68,6 +74,11 @@ impl ProviderId {
         Self::new(ProviderKind::Codex, "codex")
     }
 
+    #[must_use]
+    pub fn grok() -> Self {
+        Self::new(ProviderKind::Grok, "grok")
+    }
+
     /// A configured OpenAI-compatible endpoint, named by its `providers:` entry.
     #[must_use]
     pub fn generic(id: impl Into<Arc<str>>) -> Self {
@@ -81,6 +92,7 @@ impl ProviderId {
         match kind {
             ProviderKind::Anthropic => Self::anthropic(),
             ProviderKind::Codex => Self::codex(),
+            ProviderKind::Grok => Self::grok(),
             ProviderKind::Generic => {
                 unreachable!("a generic provider needs its config entry name")
             }
@@ -213,6 +225,7 @@ mod tests {
         assert_eq!(ProviderId::anthropic().kind, ProviderKind::Anthropic);
         assert_eq!(&*ProviderId::anthropic().id, "anthropic");
         assert_eq!(&*ProviderId::codex().id, "codex");
+        assert_eq!(&*ProviderId::grok().id, "grok");
     }
 
     #[test]
@@ -226,6 +239,7 @@ mod tests {
     fn provider_kind_canonical_ids_match_serde_repr() {
         assert_eq!(ProviderKind::Anthropic.canonical_id(), "anthropic");
         assert_eq!(ProviderKind::Codex.canonical_id(), "codex");
+        assert_eq!(ProviderKind::Grok.canonical_id(), "grok");
     }
 
     #[test]
@@ -239,6 +253,10 @@ mod tests {
             Ok(ProviderKind::Anthropic)
         );
         assert_eq!("codex".parse::<ProviderKind>(), Ok(ProviderKind::Codex));
+        assert_eq!("grok".parse::<ProviderKind>(), Ok(ProviderKind::Grok));
+        // "xai" is the generic configured-endpoint id for the console API, not
+        // the OAuth provider.
+        assert!("xai".parse::<ProviderKind>().is_err());
         assert!("nope".parse::<ProviderKind>().is_err());
     }
 

@@ -24,9 +24,10 @@ use crate::cloaking_versions::{CliVersions, codex_release, effective, npm_latest
 use crate::config::Config;
 use crate::masquerade::{masquerade_request, restore_tool_use_names};
 use crate::models::{
-    FetchedModels, ModelCatalog, parse_anthropic, parse_codex, parse_openai, upstream_model,
+    FetchedModels, ModelCatalog, grok_static_models, parse_anthropic, parse_codex, parse_openai,
+    upstream_model,
 };
-use crate::oauth::{refresh_anthropic_tokens, refresh_codex_tokens};
+use crate::oauth::{refresh_anthropic_tokens, refresh_codex_tokens, refresh_grok_tokens};
 use crate::streaming::{
     AnthropicStreamState, ChatStreamState, ResponsesStreamState, anthropic_sse_to_chat,
     anthropic_sse_to_responses, chat_sse_to_anthropic, drain_complete_sse_events,
@@ -42,8 +43,9 @@ use crate::translate::{
 use crate::types::{AvailableAccount, ProviderId, ProviderKind, UsageData};
 use crate::upstream::{
     ANTHROPIC_BASE_URL, CODEX_BASE_URL, CODEX_DEFAULT_CLI_VERSION, CODEX_MODELS_PATH,
-    CODEX_RESPONSES_PATH, anthropic_headers, apply_cloaking, codex_headers, generic_base_url,
-    generic_chat_headers, normalize_codex_responses_body,
+    CODEX_RESPONSES_PATH, GROK_CHAT_BASE_URL, anthropic_headers, apply_cloaking, codex_headers,
+    generic_base_url, generic_chat_headers, grok_chat_headers, learn_grok_client_version,
+    normalize_codex_responses_body,
 };
 use crate::utils::now_iso;
 use crate::utils::sha256_hex;
@@ -89,6 +91,20 @@ pub trait UpstreamClient: Send + Sync {
     /// chat completion.
     fn generic_chat(&self, request: UpstreamRequest) -> UpstreamFuture;
     fn generic_chat_stream(&self, request: UpstreamRequest) -> UpstreamSseFuture;
+
+    /// Grok build's Chat Completions relay, over a pooled subscription
+    /// session. Default: unavailable, so harnesses that never serve grok
+    /// (test upstreams, alternate clients) need no stub — a request that
+    /// reaches one is answered with an error, not silence.
+    fn grok_chat(&self, request: UpstreamRequest) -> UpstreamFuture {
+        let _ = request;
+        Box::pin(async { anyhow::bail!("no grok upstream") })
+    }
+
+    fn grok_chat_stream(&self, request: UpstreamRequest) -> UpstreamSseFuture {
+        let _ = request;
+        Box::pin(async { anyhow::bail!("no grok upstream") })
+    }
     fn fetch_models(
         &self,
         kind: ProviderKind,
@@ -119,6 +135,7 @@ struct AppState {
 struct AccountManagers {
     anthropic: tokio::sync::Mutex<AccountManager>,
     codex: tokio::sync::Mutex<AccountManager>,
+    grok: tokio::sync::Mutex<AccountManager>,
     generic: BTreeMap<String, tokio::sync::Mutex<AccountManager>>,
 }
 
@@ -448,6 +465,36 @@ impl UpstreamClient for HttpUpstreamClient {
         })
     }
 
+    fn grok_chat(&self, request: UpstreamRequest) -> UpstreamFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            let stream = request
+                .body
+                .get("stream")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let timeout_ms = if stream {
+                request.config.timeouts.stream_messages_ms
+            } else {
+                request.config.timeouts.messages_ms
+            };
+            send_grok_json(client, &request.account, request.body, timeout_ms).await
+        })
+    }
+
+    fn grok_chat_stream(&self, request: UpstreamRequest) -> UpstreamSseFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            send_grok_stream(
+                client,
+                &request.account,
+                request.body,
+                request.config.timeouts.stream_messages_ms,
+            )
+            .await
+        })
+    }
+
     fn fetch_models(
         &self,
         kind: ProviderKind,
@@ -496,6 +543,9 @@ impl UpstreamClient for HttpUpstreamClient {
                     let body = send_get(client, url, headers, timeout).await?;
                     Ok(parse_codex(&body))
                 }
+                // Grok's catalog is static — two models, known up front — so
+                // the fetch is local and cannot fail.
+                ProviderKind::Grok => Ok(grok_static_models()),
             }
         })
     }
@@ -582,8 +632,19 @@ fn build_account_managers(config: &Config) -> AccountManagers {
             seconds: 8 * 24 * 60 * 60,
         },
     );
+    // Grok access tokens live 6 h; the lead refreshes an hour before expiry.
+    let mut grok = AccountManager::new(
+        config.auth_dir.clone(),
+        ProviderId::grok(),
+        |refresh_token| Box::pin(refresh_grok_tokens(refresh_token)),
+        RefreshPolicy {
+            kind: RefreshPolicyKind::ExpiresLead,
+            seconds: 60 * 60,
+        },
+    );
     let _ = anthropic.load();
     let _ = codex.load();
+    let _ = grok.load();
     // One manager per configured provider; static keys never refresh, so the
     // callback exists only to satisfy the type and must never be called.
     let mut generic = BTreeMap::new();
@@ -603,12 +664,14 @@ fn build_account_managers(config: &Config) -> AccountManagers {
     tracing::info!(
         anthropic = anthropic.account_count(),
         codex = codex.account_count(),
+        grok = grok.account_count(),
         generic = generic.len(),
         "loaded provider accounts"
     );
     AccountManagers {
         anthropic: tokio::sync::Mutex::new(anthropic),
         codex: tokio::sync::Mutex::new(codex),
+        grok: tokio::sync::Mutex::new(grok),
         generic,
     }
 }
@@ -788,6 +851,12 @@ async fn catalog_account(state: &AppState, kind: ProviderKind) -> Option<Availab
             let _ = manager.refresh_if_due(&email).await;
             manager.account(&email)
         }
+        ProviderKind::Grok => {
+            let mut manager = state.account_managers.grok.lock().await;
+            let email = manager.next_account()?.token.email;
+            let _ = manager.refresh_if_due(&email).await;
+            manager.account(&email)
+        }
         ProviderKind::Generic => None,
     }
 }
@@ -810,6 +879,7 @@ async fn admin_accounts(State(state): State<AppState>, headers: HeaderMap) -> Re
 
     let anthropic = state.account_managers.anthropic.lock().await;
     let codex = state.account_managers.codex.lock().await;
+    let grok = state.account_managers.grok.lock().await;
     let mut providers = serde_json::Map::from_iter([
         (
             ProviderId::anthropic().to_string(),
@@ -825,9 +895,17 @@ async fn admin_accounts(State(state): State<AppState>, headers: HeaderMap) -> Re
                 "account_count": codex.account_count()
             }),
         ),
+        (
+            ProviderId::grok().to_string(),
+            json!({
+                "accounts": grok.snapshots(),
+                "account_count": grok.account_count()
+            }),
+        ),
     ]);
     drop(anthropic);
     drop(codex);
+    drop(grok);
     for (id, manager) in &state.account_managers.generic {
         let manager = manager.lock().await;
         providers.insert(
@@ -1136,6 +1214,39 @@ async fn route_provider_request(
                 )
                 .await
             }
+            ProviderKind::Grok => {
+                // Chat and Messages translate onto the relay's chat dialect.
+                // Responses waits on a request-side Responses→Chat converter.
+                if matches!(route, RequestRoute::Chat | RequestRoute::Messages) {
+                    route_grok_request(
+                        state,
+                        headers,
+                        body,
+                        route,
+                        &model,
+                        &account,
+                        client_wants_stream,
+                    )
+                    .await
+                } else {
+                    // A Refusal is an outcome: it counts its own request
+                    // (ADR-0015). Returning without recording one would
+                    // lose the request entirely, not merely unbalance the
+                    // counters. It earns no cooldown: a dialect the
+                    // provider cannot serve is not the account's fault.
+                    record_provider_refusal(state, &provider, &account).await;
+                    return AppError::provider(
+                        StatusCode::NOT_IMPLEMENTED,
+                        format!(
+                            "the {} dialect is not supported for the {provider} provider",
+                            route_name(route)
+                        ),
+                        "unsupported_endpoint_for_provider",
+                        provider,
+                    )
+                    .into_response();
+                }
+            }
             ProviderKind::Anthropic => {
                 route_anthropic_request(
                     state,
@@ -1179,6 +1290,7 @@ async fn provider_account_count(state: &AppState, provider: ProviderId) -> usize
             .await
             .account_count(),
         ProviderKind::Codex => state.account_managers.codex.lock().await.account_count(),
+        ProviderKind::Grok => state.account_managers.grok.lock().await.account_count(),
         ProviderKind::Generic => {
             let Some(manager) = state.account_managers.generic.get(provider.id.as_ref()) else {
                 return 0;
@@ -1318,6 +1430,75 @@ async fn route_generic_chat_request(
     match state
         .upstream
         .generic_chat(UpstreamRequest {
+            body: upstream_body,
+            request_headers: headers_to_map(headers),
+            account: account.clone(),
+            config: cloaked_config(state),
+        })
+        .await
+    {
+        Ok(response) => {
+            record_json_result(state, account.provider.clone(), account, &response, model).await;
+            json_upstream_response(response, &account.provider, route, model, &BTreeMap::new())
+        }
+        Err(error) => {
+            upstream_failure_response(state, account.provider.clone(), account, &error).await
+        }
+    }
+}
+
+async fn route_grok_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &Value,
+    route: RequestRoute,
+    model: &str,
+    account: &AvailableAccount,
+    client_wants_stream: bool,
+) -> Response {
+    // Chat Completions is the dialect grok build's relay speaks; every
+    // inbound dialect translates onto it, like the generic path.
+    let mut upstream_body = upstream_request_body(ProviderKind::Grok, route, body, model);
+    if let Some(object) = upstream_body.as_object_mut() {
+        object.insert("stream".to_string(), Value::Bool(client_wants_stream));
+    }
+    if client_wants_stream {
+        return match state
+            .upstream
+            .grok_chat_stream(UpstreamRequest {
+                body: upstream_body,
+                request_headers: headers_to_map(headers),
+                account: account.clone(),
+                config: cloaked_config(state),
+            })
+            .await
+        {
+            Ok(response) => {
+                let accounting = stream_accounting(
+                    state,
+                    account.provider.clone(),
+                    account,
+                    response.status,
+                    model,
+                )
+                .await;
+                sse_upstream_response(
+                    response,
+                    account.provider.clone(),
+                    route,
+                    model,
+                    accounting,
+                    Arc::new(BTreeMap::new()),
+                )
+            }
+            Err(error) => {
+                upstream_failure_response(state, account.provider.clone(), account, &error).await
+            }
+        };
+    }
+    match state
+        .upstream
+        .grok_chat(UpstreamRequest {
             body: upstream_body,
             request_headers: headers_to_map(headers),
             account: account.clone(),
@@ -1683,6 +1864,7 @@ async fn next_provider_account(
     let mut manager = match provider.kind {
         ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
         ProviderKind::Codex => state.account_managers.codex.lock().await,
+        ProviderKind::Grok => state.account_managers.grok.lock().await,
         ProviderKind::Generic => {
             let Some(manager) = state.account_managers.generic.get(provider.id.as_ref()) else {
                 return Err(AppError::provider(
@@ -1749,6 +1931,7 @@ async fn record_provider_success(
     let mut manager = match provider.kind {
         ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
         ProviderKind::Codex => state.account_managers.codex.lock().await,
+        ProviderKind::Grok => state.account_managers.grok.lock().await,
         ProviderKind::Generic => {
             let Some(manager) = state.account_managers.generic.get(provider.id.as_ref()) else {
                 return;
@@ -1769,6 +1952,7 @@ async fn record_provider_refusal(
     let mut manager = match provider.kind {
         ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
         ProviderKind::Codex => state.account_managers.codex.lock().await,
+        ProviderKind::Grok => state.account_managers.grok.lock().await,
         ProviderKind::Generic => {
             let Some(manager) = state.account_managers.generic.get(provider.id.as_ref()) else {
                 return;
@@ -1791,6 +1975,7 @@ async fn record_billing_cooldown(
     let mut manager = match provider.kind {
         ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
         ProviderKind::Codex => state.account_managers.codex.lock().await,
+        ProviderKind::Grok => state.account_managers.grok.lock().await,
         ProviderKind::Generic => {
             let Some(manager) = state.account_managers.generic.get(provider.id.as_ref()) else {
                 return;
@@ -1833,6 +2018,7 @@ async fn record_provider_failure_kind(
     let mut manager = match provider.kind {
         ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
         ProviderKind::Codex => state.account_managers.codex.lock().await,
+        ProviderKind::Grok => state.account_managers.grok.lock().await,
         ProviderKind::Generic => {
             let Some(manager) = state.account_managers.generic.get(provider.id.as_ref()) else {
                 return;
@@ -2191,6 +2377,9 @@ fn update_stream_usage(
     match provider.kind {
         ProviderKind::Anthropic => update_anthropic_stream_usage(event, &data, usage, completed),
         ProviderKind::Codex => update_codex_stream_usage(event, &data, usage, completed),
+        // Grok streams Chat Completions chunks, so its usage rides the same
+        // late-chunk shape a generic endpoint uses.
+        ProviderKind::Grok => update_generic_stream_usage(&data, usage),
         // A generic endpoint streams Chat Completions chunks; servers that
         // opt into usage carry it on a late chunk (often the last before
         // [DONE]) in the same shape as the non-streamed body.
@@ -2412,16 +2601,22 @@ fn transform_sse_event(
             |data| responses_sse_to_anthropic(event, &data, anthropic_state),
         ),
         // A generic endpoint answers in Chat Completions, so a Chat client
-        // reads its stream unchanged.
-        (ProviderKind::Generic, RequestRoute::Chat) => parsed.map_or_else(
+        // reads its stream unchanged. Grok streams the same dialect (its
+        // reasoning_content deltas ride along untouched, per the spec).
+        (ProviderKind::Grok, RequestRoute::Chat)
+        | (ProviderKind::Generic, RequestRoute::Chat) => parsed.map_or_else(
             |_| Vec::new(),
             |data| vec![sse(&data, passthrough_event(event))],
         ),
-        (ProviderKind::Generic, RequestRoute::Messages) => parsed.map_or_else(
+        (ProviderKind::Grok, RequestRoute::Messages)
+        | (ProviderKind::Generic, RequestRoute::Messages) => parsed.map_or_else(
             |_| Vec::new(),
             |data| chat_sse_to_anthropic(&data, anthropic_state),
         ),
-        (ProviderKind::Generic, _) => parsed.map_or_else(
+        // (Grok, Responses) never reaches here: routing refuses it before an
+        // account is chosen.
+        (ProviderKind::Grok, RequestRoute::Responses)
+        | (ProviderKind::Generic, _) => parsed.map_or_else(
             |_| Vec::new(),
             |data| vec![sse(&data, passthrough_event(event))],
         ),
@@ -2480,13 +2675,16 @@ impl Translation {
             (ProviderKind::Anthropic, RequestRoute::Responses) => Self::ResponsesToAnthropic,
             (ProviderKind::Codex, RequestRoute::Chat) => Self::ChatToResponses,
             (ProviderKind::Codex, RequestRoute::Messages) => Self::AnthropicToResponses,
+            (ProviderKind::Grok, RequestRoute::Messages) => Self::AnthropicToChat,
             (ProviderKind::Generic, RequestRoute::Messages) => Self::AnthropicToChat,
-            // The three pairs where the client already speaks the
-            // upstream's dialect, and (Generic, Responses), which routing
-            // refuses before an account is chosen — the arm is here so the
-            // match is total, not because it is reachable.
+            // The pairs where the client already speaks the upstream's
+            // dialect, and the refused ones — (Generic, Responses) and
+            // (Grok, Responses), which routing answers 501 before an account
+            // is chosen. The arms are here so the match is total, not
+            // because they are reachable.
             (ProviderKind::Anthropic, RequestRoute::Messages)
             | (ProviderKind::Codex, RequestRoute::Responses)
+            | (ProviderKind::Grok, RequestRoute::Chat | RequestRoute::Responses)
             | (ProviderKind::Generic, RequestRoute::Chat | RequestRoute::Responses) => Self::Native,
         }
     }
@@ -2647,6 +2845,61 @@ async fn send_stream(
     Ok(UpstreamSseResponse {
         status,
         body: Box::pin(response.bytes_stream().map_err(anyhow::Error::from)),
+    })
+}
+
+/// Send one grok relay call, retrying once when the proxy's version gate
+/// answers 426 with a floor the relay has not adopted yet. The gate is
+/// checked before any generation, so the retry is free of duplicate work;
+/// once the version is learned it stays adopted for the process lifetime,
+/// so the retry happens at most once per floor bump.
+async fn send_grok_json(
+    client: reqwest::Client,
+    account: &AvailableAccount,
+    body: Value,
+    timeout_ms: u64,
+) -> anyhow::Result<UpstreamJsonResponse> {
+    let url = format!("{GROK_CHAT_BASE_URL}/chat/completions");
+    let first = send_json(client.clone(), url.clone(), grok_chat_headers(account), body.clone(), timeout_ms).await?;
+    if first.status.as_u16() == 426
+        && learn_grok_client_version(&first.body.to_string()).is_some()
+    {
+        return send_json(client, url, grok_chat_headers(account), body, timeout_ms).await;
+    }
+    Ok(first)
+}
+
+/// The stream twin of [`send_grok_json`]. A 426 error body is a short JSON
+/// document, not an event stream, so it is read whole: learned floors retry,
+/// unlearnable ones surface as a one-event stream carrying the error.
+async fn send_grok_stream(
+    client: reqwest::Client,
+    account: &AvailableAccount,
+    body: Value,
+    timeout_ms: u64,
+) -> anyhow::Result<UpstreamSseResponse> {
+    let url = format!("{GROK_CHAT_BASE_URL}/chat/completions");
+    let first = send_stream(
+        client.clone(),
+        url.clone(),
+        grok_chat_headers(account),
+        body.clone(),
+        timeout_ms,
+    )
+    .await?;
+    if first.status.as_u16() != 426 {
+        return Ok(first);
+    }
+    let bytes = first.body.try_collect::<Vec<Bytes>>().await?.concat();
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    if learn_grok_client_version(&text).is_some() {
+        return send_stream(client, url, grok_chat_headers(account), body, timeout_ms).await;
+    }
+    Ok(UpstreamSseResponse {
+        status: first.status,
+        body: Box::pin(futures_util::stream::once(async move {
+            Ok::<Bytes, anyhow::Error>(Bytes::from(bytes))
+        })),
     })
 }
 
@@ -3106,6 +3359,7 @@ mod tests {
             account_managers: Arc::new(AccountManagers {
                 anthropic: tokio::sync::Mutex::new(manager(tmp, ProviderId::anthropic())),
                 codex: tokio::sync::Mutex::new(manager(tmp, ProviderId::codex())),
+                grok: tokio::sync::Mutex::new(manager(tmp, ProviderId::grok())),
                 generic: std::collections::BTreeMap::new(),
             }),
             rate_limit_buckets: Arc::new(Mutex::new(std::collections::BTreeMap::<
