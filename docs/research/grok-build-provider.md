@@ -130,10 +130,12 @@ Flow mechanics (`crates/codegen/xai-grok-login/src/oidc/login.rs`,
   overridable per request; `build_authorize_url` also takes optional
   `principal_type`/`principal_id` for team logins — not needed for personal
   accounts).
-- Scopes requested (`default_oauth2_scopes`): `openid profile email
-  offline_access grok-cli:access`. The server grants more: the live token's
-  scope also includes `api:access conversations:read conversations:write
-  workspaces:read workspaces:write`.
+- Scopes requested (`default_oauth2_scopes`, ten of them): `openid profile
+  email offline_access grok-cli:access api:access conversations:read
+  conversations:write workspaces:read workspaces:write`. The grant is exactly
+  what was asked for — a token that omits `api:access` from the request is
+  refused by the relay with `OAuth2 token missing required scope: api:access`
+  (observed live), so the full set is load-bearing, not decorative.
 - Token exchange: form-encoded
   `grant_type=authorization_code&code=...&redirect_uri=...&client_id=...&
   code_verifier=...` (no client secret), plus the

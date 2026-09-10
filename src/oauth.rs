@@ -29,7 +29,12 @@ pub const GROK_TOKEN_URL: &str = "https://auth.x.ai/oauth2/token";
 pub const GROK_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 pub const GROK_CALLBACK_PORT: u16 = 14550;
 pub const GROK_CALLBACK_PATH: &str = "/callback";
-pub const GROK_SCOPE: &str = "openid profile email offline_access grok-cli:access";
+/// The scope set grok build's own `OAuth2` client requests
+/// (`default_oauth2_scopes`). `grok-cli:access` declares the token for proxy
+/// use; `api:access` is what the relay checks before serving a request, and
+/// it is granted only to a token that asked for it.
+pub const GROK_SCOPE: &str = "openid profile email offline_access grok-cli:access \
+     api:access conversations:read conversations:write workspaces:read workspaces:write";
 pub const GROK_REFERRER: &str = "grok-build";
 /// Grok access tokens live 6 h (21600 s by the minted JWT's `exp - iat`).
 pub const GROK_TOKEN_TTL_SECONDS: u64 = 21_600;

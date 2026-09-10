@@ -29,7 +29,9 @@ inbound dialect. Protocol facts and sources live in
 - AC-1: `pengepul login --provider grok` runs the auth.x.ai authorization-code
   flow with PKCE (`https://auth.x.ai`, client id
   `b1a00492-073a-47ea-816f-4c329264a828`, scopes `openid profile email
-  offline_access grok-cli:access`, `referrer=grok-build`), opens the browser,
+  offline_access grok-cli:access api:access conversations:read
+  conversations:write workspaces:read workspaces:write`,
+  `referrer=grok-build`), opens the browser,
   binds a fixed loopback callback (`http://127.0.0.1:14550/callback` — the
   registered host is `127.0.0.1`, not `localhost`), and stores an account
   labeled with the login's email. When the browser cannot reach that callback
