@@ -225,11 +225,16 @@ impl CliRuntime for RealRuntime {
         let callback = if provider.kind == ProviderKind::Grok {
             // auth.x.ai hands the code to the user by hand when the redirect
             // cannot reach this host (headless box, browser on another
-            // machine). Take either path, whichever arrives first.
-            println!(
-                "If the browser cannot reach this host, auth.x.ai shows a code instead.\n\
-                 Paste that code — or the full callback URL — here and press Enter.\n"
-            );
+            // machine). Take either path, whichever arrives first. The
+            // paste prompt is only honest when stdin can actually deliver
+            // one — a non-tty stdin is the headless case, where the
+            // browser-side link has to do the work.
+            if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                println!(
+                    "If the browser cannot reach this host, auth.x.ai shows a code instead.\n\
+                     Paste that code — or the full callback URL — here and press Enter.\n"
+                );
+            }
             wait_for_callback_or_paste(port, path, Duration::from_mins(5))?
         } else {
             wait_for_callback(port, path, Duration::from_mins(5))?
@@ -413,8 +418,22 @@ fn wait_for_callback_or_paste(
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut line = String::new();
-        if std::io::stdin().read_line(&mut line).is_ok() {
-            let _ = sender.send(line);
+        loop {
+            line.clear();
+            match std::io::stdin().read_line(&mut line) {
+                // EOF: stdin was never a terminal (or closed), so no paste
+                // can arrive — stop reading and let the callback wait run
+                // out. A read error is the same story.
+                Ok(0) | Err(_) => break,
+                Ok(_) => match classify_paste_line(&line) {
+                    PasteLine::Paste(paste) => {
+                        let _ = sender.send(paste);
+                        break;
+                    }
+                    // A bare Enter is not a credential; keep reading.
+                    PasteLine::Ignore => {}
+                },
+            }
         }
     });
     let listener = std::net::TcpListener::bind(("127.0.0.1", port))
@@ -429,8 +448,8 @@ fn wait_for_callback_or_paste(
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(error).context("failed to accept OAuth callback"),
         }
-        if let Ok(line) = receiver.try_recv() {
-            let (code, state) = parse_grok_paste(&line)?;
+        if let Ok(paste) = receiver.try_recv() {
+            let (code, state) = parse_grok_paste(&paste)?;
             return Ok(CallbackResult {
                 code,
                 state: state.unwrap_or_default(),
@@ -440,6 +459,23 @@ fn wait_for_callback_or_paste(
         std::thread::sleep(Duration::from_millis(100));
     }
     bail!("OAuth callback timeout")
+}
+
+/// What one line read from stdin means for the paste fallback: a bare Enter
+/// is not a credential, so it leaves the login waiting for the browser
+/// callback. EOF never reaches here — the reader stops on `Ok(0)`.
+#[derive(Debug, PartialEq, Eq)]
+enum PasteLine {
+    Paste(String),
+    Ignore,
+}
+
+fn classify_paste_line(line: &str) -> PasteLine {
+    if line.trim().is_empty() {
+        PasteLine::Ignore
+    } else {
+        PasteLine::Paste(line.to_string())
+    }
 }
 
 fn handle_callback_stream(
@@ -975,5 +1011,31 @@ mod tests {
             .filter(|n| n.starts_with('.'))
             .collect();
         assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+    }
+}
+
+#[cfg(test)]
+mod paste_line_tests {
+    use super::{PasteLine, classify_paste_line};
+
+    #[test]
+    fn an_empty_read_is_not_a_paste() {
+        // The live bug: stdin at EOF (or a bare Enter) was taken as a paste
+        // and failed the login instantly with "nothing was pasted" instead
+        // of leaving the callback wait running.
+        assert_eq!(classify_paste_line(""), PasteLine::Ignore);
+        assert_eq!(classify_paste_line("\n"), PasteLine::Ignore);
+        assert_eq!(classify_paste_line("   \t\n"), PasteLine::Ignore);
+    }
+
+    #[test]
+    fn a_non_empty_line_is_a_paste() {
+        let code = "Z5HJkCGO3wsKaBmHPw2AfZjOto6_ToL7ug\n";
+        assert_eq!(
+            classify_paste_line(code),
+            PasteLine::Paste(code.to_string())
+        );
+        let url = "http://127.0.0.1:14550/callback?code=abc&state=xyz\n";
+        assert_eq!(classify_paste_line(url), PasteLine::Paste(url.to_string()));
     }
 }

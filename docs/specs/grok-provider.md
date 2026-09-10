@@ -30,10 +30,14 @@ inbound dialect. Protocol facts and sources live in
   flow with PKCE (`https://auth.x.ai`, client id
   `b1a00492-073a-47ea-816f-4c329264a828`, scopes `openid profile email
   offline_access grok-cli:access`, `referrer=grok-build`), opens the browser,
-  binds a fixed localhost callback distinct from the other providers', and
-  stores an account labeled with the login's email. Logging in again pools a
-  second account; `--key` and `--base-url` are refused for it, like the other
-  built-ins.
+  binds a fixed loopback callback (`http://127.0.0.1:14550/callback` — the
+  registered host is `127.0.0.1`, not `localhost`), and stores an account
+  labeled with the login's email. When the browser cannot reach that callback
+  (headless host, forwarded browser), auth.x.ai's consent page hands over the
+  code instead, and the login accepts it pasted as the code or as the full
+  callback URL — whichever of the two arrives first wins. Logging in again
+  pools a second account; `--key` and `--base-url` are refused for it, like
+  the other built-ins.
 - AC-2: `GET /v1/models` advertises `grok/grok-4.6` and `grok/grok-4.5` (500k
   context). Requests may address them bare (`grok-4.6`) or prefixed
   (`grok/grok-4.6`); both route to the grok pool, and `xai/…` still routes to
