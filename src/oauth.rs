@@ -316,7 +316,13 @@ fn grok_refresh_request(refresh_token: &str) -> reqwest::RequestBuilder {
 }
 
 fn grok_redirect_uri() -> String {
-    format!("http://localhost:{GROK_CALLBACK_PORT}{GROK_CALLBACK_PATH}")
+    // auth.x.ai's registered URI is the CLI's loopback form: host
+    // `127.0.0.1`, port-agnostic (RFC 8252 — the CLI itself binds a random
+    // port). `localhost` is not registered; the server rejects the whole
+    // authorize request with "redirect_uri does not match any registered
+    // URI". The fixed port keeps the token exchange's redirect_uri identical
+    // to the authorize one.
+    format!("http://127.0.0.1:{GROK_CALLBACK_PORT}{GROK_CALLBACK_PATH}")
 }
 
 /// Derive a `TokenData` from a token-endpoint response. The code exchange
@@ -520,7 +526,7 @@ mod tests {
         for piece in [
             "response_type=code",
             &format!("client_id={GROK_CLIENT_ID}"),
-            &format!("redirect_uri=http%3A%2F%2Flocalhost%3A{GROK_CALLBACK_PORT}%2Fcallback"),
+            &format!("redirect_uri=http%3A%2F%2F127.0.0.1%3A{GROK_CALLBACK_PORT}%2Fcallback"),
             &format!("scope={}", urlencode(GROK_SCOPE)),
             "code_challenge=c",
             "code_challenge_method=S256",
