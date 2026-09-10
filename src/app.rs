@@ -2879,6 +2879,12 @@ async fn send_stream(
     })
 }
 
+/// The grok relay's chat endpoint. `/v1` rides on the base constant because
+/// the proxy serves nothing without it: dropping it answers an nginx 404.
+fn grok_chat_url() -> String {
+    format!("{GROK_CHAT_BASE_URL}/chat/completions")
+}
+
 /// Send one grok relay call, retrying once when the proxy's version gate
 /// answers 426 with a floor the relay has not adopted yet. The gate is
 /// checked before any generation, so the retry is free of duplicate work;
@@ -2890,7 +2896,7 @@ async fn send_grok_json(
     body: Value,
     timeout_ms: u64,
 ) -> anyhow::Result<UpstreamJsonResponse> {
-    let url = format!("{GROK_CHAT_BASE_URL}/chat/completions");
+    let url = grok_chat_url();
     let first = send_json(
         client.clone(),
         url.clone(),
@@ -2915,7 +2921,7 @@ async fn send_grok_stream(
     body: Value,
     timeout_ms: u64,
 ) -> anyhow::Result<UpstreamSseResponse> {
-    let url = format!("{GROK_CHAT_BASE_URL}/chat/completions");
+    let url = grok_chat_url();
     let first = send_stream(
         client.clone(),
         url.clone(),

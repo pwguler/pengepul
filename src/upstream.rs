@@ -19,8 +19,10 @@ pub const CODEX_DEFAULT_ORIGINATOR: &str = "codex_cli_rs";
 pub const CODEX_DEFAULT_CLI_VERSION: &str = "0.125.0";
 
 /// Grok build's relay. The session token minted by the auth.x.ai OAuth flow is
-/// a bearer here, with the routing and version headers below.
-pub const GROK_CHAT_BASE_URL: &str = "https://cli-chat-proxy.grok.com";
+/// a bearer here, with the routing and version headers below. The `/v1` is
+/// part of the base: the CLI's own `PROD_CLI_CHAT_PROXY_BASE_URL` is
+/// `https://cli-chat-proxy.grok.com/v1`, and the chat path is appended to it.
+pub const GROK_CHAT_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
 /// Routes the proxy's nginx auth subrequest to the OAuth path. Without it the
 /// bearer is not resolved against a session at all.
 pub const GROK_TOKEN_AUTH_HEADER: &str = "X-XAI-Token-Auth";
@@ -791,6 +793,16 @@ mod grok_version_tests {
 
     /// The proxy's real 426 body, verbatim from a live probe (2026-09-10).
     const REAL_426_BODY: &str = "{\"error\":\"Your Grok CLI version (none) is outdated. Please update to version 0.1.202 or later via `grok update` or the installation documentation.\"}";
+
+    #[test]
+    fn the_chat_url_keeps_the_v1_segment() {
+        // Observed live: without /v1 the proxy answers nginx 404, and the
+        // relay reports the upstream error to the client.
+        assert_eq!(
+            super::GROK_CHAT_BASE_URL,
+            "https://cli-chat-proxy.grok.com/v1"
+        );
+    }
 
     #[test]
     fn parse_reads_the_minimum_from_the_real_426_body() {
