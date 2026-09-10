@@ -12,7 +12,8 @@ use crate::config::{Config, DebugMode};
 use crate::oauth::{
     ANTHROPIC_REDIRECT_URI, CODEX_CALLBACK_PATH, CODEX_CALLBACK_PORT, GROK_CALLBACK_PATH,
     GROK_CALLBACK_PORT, exchange_anthropic_code, exchange_codex_code, exchange_grok_code,
-    generate_anthropic_auth_url, generate_codex_auth_url, generate_grok_auth_url,
+    exchange_grok_pasted_code, generate_anthropic_auth_url, generate_codex_auth_url,
+    generate_grok_auth_url, parse_grok_paste,
 };
 use crate::render::Style;
 use crate::service::{ServiceOptions, run_command};
@@ -221,7 +222,18 @@ impl CliRuntime for RealRuntime {
         println!("\nOpen this URL to authorize {provider}:\n\n{auth_url}\n");
         open_browser(&auth_url);
         let (port, path) = callback_endpoint(&provider)?;
-        let callback = wait_for_callback(port, path, Duration::from_mins(5))?;
+        let callback = if provider.kind == ProviderKind::Grok {
+            // auth.x.ai hands the code to the user by hand when the redirect
+            // cannot reach this host (headless box, browser on another
+            // machine). Take either path, whichever arrives first.
+            println!(
+                "If the browser cannot reach this host, auth.x.ai shows a code instead.\n\
+                 Paste that code — or the full callback URL — here and press Enter.\n"
+            );
+            wait_for_callback_or_paste(port, path, Duration::from_mins(5))?
+        } else {
+            wait_for_callback(port, path, Duration::from_mins(5))?
+        };
         let token = self.runtime.block_on(async {
             match provider.kind {
                 ProviderKind::Anthropic => {
@@ -231,7 +243,11 @@ impl CliRuntime for RealRuntime {
                     exchange_codex_code(&callback.code, &callback.state, &state, &pkce).await
                 }
                 ProviderKind::Grok => {
-                    exchange_grok_code(&callback.code, &callback.state, &state, &pkce).await
+                    if callback.pasted {
+                        exchange_grok_pasted_code(&callback.code, &pkce).await
+                    } else {
+                        exchange_grok_code(&callback.code, &callback.state, &state, &pkce).await
+                    }
                 }
                 ProviderKind::Generic => {
                     unreachable!("cli::login saves static keys; the OAuth flow is never entered")
@@ -334,6 +350,10 @@ fn home_dir() -> Result<PathBuf> {
 struct CallbackResult {
     code: String,
     state: String,
+    /// True when the credential arrived as a pasted code rather than through
+    /// the loopback callback: auth.x.ai's manual-carry fallback. A pasted
+    /// code carries no state to verify (the PKCE verifier still binds it).
+    pasted: bool,
 }
 
 fn auth_url(provider: &ProviderId, state: &str, pkce: &PkceCodes, nonce: &str) -> String {
@@ -381,6 +401,47 @@ fn wait_for_callback(port: u16, callback_path: &str, timeout: Duration) -> Resul
     bail!("OAuth callback timeout")
 }
 
+/// The callback and the pasted code race to finish the login: whichever
+/// arrives first wins. The reader thread blocks on stdin for the life of the
+/// process; login has already returned by the time the process exits, so an
+/// abandoned reader is harmless.
+fn wait_for_callback_or_paste(
+    port: u16,
+    callback_path: &str,
+    timeout: Duration,
+) -> Result<CallbackResult> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_ok() {
+            let _ = sender.send(line);
+        }
+    });
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port))
+        .with_context(|| format!("failed to listen on 127.0.0.1:{port}"))?;
+    listener
+        .set_nonblocking(true)
+        .context("failed to make callback listener nonblocking")?;
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match listener.accept() {
+            Ok((mut stream, _)) => return handle_callback_stream(&mut stream, callback_path),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error).context("failed to accept OAuth callback"),
+        }
+        if let Ok(line) = receiver.try_recv() {
+            let (code, state) = parse_grok_paste(&line)?;
+            return Ok(CallbackResult {
+                code,
+                state: state.unwrap_or_default(),
+                pasted: true,
+            });
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    bail!("OAuth callback timeout")
+}
+
 fn handle_callback_stream(
     stream: &mut std::net::TcpStream,
     callback_path: &str,
@@ -421,7 +482,11 @@ fn handle_callback_stream(
         "text/html",
         b"<!doctype html><html><body><h1>Login successful</h1><p>You can close this tab and return to the terminal.</p></body></html>",
     )?;
-    Ok(CallbackResult { code, state })
+    Ok(CallbackResult {
+        code,
+        state,
+        pasted: false,
+    })
 }
 
 fn query_value(url: &url::Url, name: &str) -> Option<String> {

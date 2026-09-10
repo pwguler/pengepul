@@ -383,6 +383,56 @@ fn grok_token(data: &Value, require_id_token: bool) -> Result<TokenData> {
     })
 }
 
+/// The paste fallback auth.x.ai offers when a redirect cannot reach the
+/// machine running the login (headless hosts, forwarded browsers): the
+/// consent page displays the code for the user to carry over by hand, which
+/// is what "Copy the code below into Grok Build" is. Accepts the full
+/// callback URL (state verified on exchange) or the bare code.
+///
+/// # Errors
+///
+/// Returns an error when the paste is blank, is a URL without a `code`, or
+/// is not a parseable URL.
+pub fn parse_grok_paste(input: &str) -> Result<(String, Option<String>)> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        bail!("nothing was pasted");
+    }
+    if trimmed.contains("://") {
+        let parsed = url::Url::parse(trimmed).context("pasted callback is not a URL")?;
+        let code = parsed
+            .query_pairs()
+            .find(|(key, _)| key == "code")
+            .map(|(_, value)| value.into_owned())
+            .context("pasted callback carries no code")?;
+        let state = parsed
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .map(|(_, value)| value.into_owned());
+        return Ok((code, state));
+    }
+    Ok((trimmed.to_string(), None))
+}
+
+/// Exchange a pasted code. The paste carries no state to verify, so the
+/// check is skipped: the code is still bound to this login's PKCE verifier,
+/// which only this process holds.
+///
+/// # Errors
+///
+/// Returns an error when the token endpoint fails or its response body does
+/// not contain the expected token fields.
+pub async fn exchange_grok_pasted_code(code: &str, pkce: &PkceCodes) -> Result<TokenData> {
+    exchange_grok_grant(&[
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", grok_redirect_uri().as_str()),
+        ("client_id", GROK_CLIENT_ID),
+        ("code_verifier", pkce.code_verifier.as_str()),
+    ])
+    .await
+}
+
 fn ensure_state(returned_state: &str, expected_state: &str) -> Result<()> {
     if returned_state != expected_state {
         bail!("OAuth state mismatch");
@@ -606,6 +656,31 @@ mod tests {
         .expect("grok token derives");
         assert_eq!(token.account_uuid, "sub-only-id");
         assert_eq!(token.plan_type, None);
+    }
+
+    #[test]
+    fn a_pasted_callback_url_yields_code_and_state() {
+        let (code, state) =
+            parse_grok_paste("http://127.0.0.1:14550/callback?code=abc123&state=xyz789")
+                .expect("URL paste parses");
+        assert_eq!(code, "abc123");
+        assert_eq!(state.as_deref(), Some("xyz789"));
+    }
+
+    #[test]
+    fn a_pasted_bare_code_yields_no_state() {
+        // auth.x.ai's manual fallback shows a bare code, not a URL; there is
+        // nothing to verify against, and the PKCE verifier is what binds it.
+        let pasted = "Z5HJkCGO3wsKaBmHPw2AfZjOto6_ToL7ug-LjjILd9oeUck5B2NWE7oSqgf7QkAhJ_oYt_ryEzrU-SRiNJt_NA";
+        let (code, state) = parse_grok_paste(&format!("  {pasted}\n")).expect("bare code parses");
+        assert_eq!(code, pasted);
+        assert_eq!(state, None);
+    }
+
+    #[test]
+    fn a_pasted_url_without_a_code_is_refused() {
+        assert!(parse_grok_paste("http://127.0.0.1:14550/callback?state=xyz").is_err());
+        assert!(parse_grok_paste("   ").is_err());
     }
 
     #[test]
