@@ -198,6 +198,7 @@ fn token_to_storage(token: &TokenData) -> StoredToken {
 fn storage_to_token(stored: StoredToken, dir_id: &str) -> TokenData {
     let provider = match stored.token_type.as_deref() {
         Some("codex") => ProviderId::codex(),
+        Some("grok") => ProviderId::grok(),
         // The id lives in the directory name, not the file: a configured
         // provider's token_type is "generic" and its `providers:` entry name
         // is the subdirectory under auth-dir.

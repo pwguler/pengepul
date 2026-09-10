@@ -44,9 +44,11 @@ inbound dialect. Protocol facts and sources live in
   reported. `reasoning_effort` in the client body reaches the upstream.
 - AC-4: An Anthropic-messages or OpenAI-responses request naming a grok model
   is translated to the chat dialect upstream and answered in the inbound
-  dialect, by the existing translation matrix. Grok's `reasoning_content` is
-  dropped in that translation — it passes through only on the Chat
-  Completions dialect (AC-3), never as a thinking block on the others.
+  dialect, by the existing translation matrix — the same one a configured
+  OpenAI-compatible endpoint rides. Grok's `reasoning_content` maps into that
+  matrix like any chat upstream's: it becomes a thinking block on the
+  Messages dialect (nothing is invented when it is absent), and only the
+  Chat Completions dialect sees the field itself (AC-3).
 - AC-5: Every upstream request carries `Authorization: Bearer <session
   token>`, `X-XAI-Token-Auth: xai-grok-cli`, and `x-grok-client-version`
   (default `0.1.202`), against `https://cli-chat-proxy.grok.com/v1`.

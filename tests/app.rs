@@ -3280,3 +3280,314 @@ async fn a_thinking_level_does_not_split_a_models_usage_row() {
         "the thinking level opened a second usage row: {names:?}"
     );
 }
+
+struct GrokUpstream {
+    calls: Mutex<Vec<UpstreamRequest>>,
+}
+
+impl GrokUpstream {
+    fn new() -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+}
+
+impl UpstreamClient for GrokUpstream {
+    fn generic_chat(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("generic chat not used in grok tests")
+    }
+
+    fn generic_chat_stream(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        unreachable!("generic stream not used in grok tests")
+    }
+
+    fn anthropic_messages(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("anthropic not used in grok tests")
+    }
+
+    fn anthropic_messages_stream(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        unreachable!("anthropic stream not used in grok tests")
+    }
+
+    fn anthropic_count_tokens(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("count_tokens not used in grok tests")
+    }
+
+    fn codex_responses(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("codex not used in grok tests")
+    }
+
+    fn codex_responses_stream(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        unreachable!("codex stream not used in grok tests")
+    }
+
+    fn fetch_models(
+        &self,
+        kind: ProviderKind,
+        _account: AvailableAccount,
+        _config: Arc<Config>,
+    ) -> ModelsFuture {
+        assert_eq!(kind, ProviderKind::Grok);
+        Box::pin(async { Ok(FetchedModels::new(vec![])) })
+    }
+
+    fn grok_chat(
+        &self,
+        request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        self.calls.lock().expect("calls lock").push(request);
+        Box::pin(async {
+            Ok(UpstreamJsonResponse {
+                status: axum::http::StatusCode::OK,
+                body: GrokUpstream::default_json_body(),
+            })
+        })
+    }
+
+    fn grok_chat_stream(
+        &self,
+        request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        self.calls.lock().expect("calls lock").push(request);
+        Box::pin(async {
+            Ok(UpstreamSseResponse {
+                status: axum::http::StatusCode::OK,
+                body: Box::pin(futures_util::stream::iter([
+                    Ok(Bytes::from_static(
+                        b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"thin\"}}]}\n\n",
+                    )),
+                    Ok(Bytes::from_static(
+                        b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"pong\"}}]}\n\n",
+                    )),
+                    Ok(Bytes::from_static(
+                        b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":211,\"completion_tokens\":1,\"total_tokens\":371}}\n\n",
+                    )),
+                    Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+                ])),
+            })
+        })
+    }
+}
+
+impl GrokUpstream {
+    fn default_json_body() -> Value {
+        json!({
+            "id": "chatcmpl_grok",
+            "object": "chat.completion",
+            "created": 1_789_015_110u64,
+            "model": "grok-4.6-build",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "pong",
+                    "reasoning_content": "the user asked for pong"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 211, "completion_tokens": 1, "total_tokens": 371}
+        })
+    }
+}
+
+fn save_grok_account(dir: &std::path::Path) {
+    save_token(
+        dir,
+        &TokenData {
+            access_token: "grok-session-token".to_string(),
+            refresh_token: "grok-refresh".to_string(),
+            email: "grok@example.com".to_string(),
+            expires_at: "2030-01-01T00:00:00Z".to_string(),
+            account_uuid: "principal-1".to_string(),
+            provider: ProviderId::grok(),
+            id_token: None,
+            last_refresh_at: None,
+            plan_type: Some("tier-3".to_string()),
+        },
+    )
+    .expect("save grok token");
+}
+
+#[tokio::test]
+async fn grok_pool_serves_chat_completions_and_passes_reasoning_through() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_grok_account(tmp.path());
+    let upstream = Arc::new(GrokUpstream::new());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, body) = json_response(
+        app,
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .body(Body::from(
+                json!({
+                    "model": "grok-4.6",
+                    "messages": [{"role": "user", "content": "reply exactly: pong"}],
+                    "reasoning_effort": "low"
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    // The upstream's reply leaves untouched: content, reasoning_content and all.
+    assert_eq!(body["choices"][0]["message"]["content"], "pong");
+    assert_eq!(
+        body["choices"][0]["message"]["reasoning_content"],
+        "the user asked for pong"
+    );
+    assert_eq!(body["usage"]["prompt_tokens"], 211);
+
+    let calls = upstream.calls.lock().expect("calls lock");
+    let request = calls.first().expect("one grok upstream call");
+    assert_eq!(request.body["model"], "grok-4.6");
+    assert_eq!(request.body["stream"], false);
+    assert_eq!(request.body["reasoning_effort"], "low");
+    assert_eq!(
+        request.body["messages"][0]["content"],
+        "reply exactly: pong"
+    );
+    assert_eq!(request.account.token.access_token, "grok-session-token");
+}
+
+#[tokio::test]
+async fn grok_messages_route_translates_onto_chat_and_back() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_grok_account(tmp.path());
+    let upstream = Arc::new(GrokUpstream::new());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, body) = json_response(
+        app,
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .body(Body::from(
+                json!({
+                    "model": "grok/grok-4.6",
+                    "max_tokens": 64,
+                    "system": "You are terse.",
+                    "messages": [{"role": "user", "content": "reply exactly: pong"}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    // The reply left in the dialect the client asked in.
+    assert_eq!(body["type"], "message");
+    assert_eq!(body["content"][0]["type"], "thinking");
+    assert_eq!(body["content"][0]["thinking"], "the user asked for pong");
+    assert_eq!(body["content"][1]["type"], "text");
+    assert_eq!(body["content"][1]["text"], "pong");
+
+    let calls = upstream.calls.lock().expect("calls lock");
+    let request = calls.first().expect("one grok upstream call");
+    // The request left in the chat dialect, with the prefix stripped.
+    assert_eq!(request.body["model"], "grok-4.6");
+    assert_eq!(request.body["max_tokens"], 64);
+    assert_eq!(request.body["messages"][0]["role"], "system");
+    assert_eq!(request.body["messages"][0]["content"], "You are terse.");
+    assert_eq!(request.body["messages"][1]["role"], "user");
+}
+
+#[tokio::test]
+async fn grok_chat_stream_passes_chunks_through_with_reasoning_deltas() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_grok_account(tmp.path());
+    let upstream = Arc::new(GrokUpstream::new());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, _, body) = raw_response(
+        app,
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .body(Body::from(
+                json!({
+                    "model": "grok-4.6",
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "reply exactly: pong"}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert!(body.contains("\"reasoning_content\":\"thin\""), "{body}");
+    assert!(body.contains("\"content\":\"pong\""), "{body}");
+    assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+}
+
+#[tokio::test]
+async fn grok_responses_route_is_refused_without_reaching_an_account() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_grok_account(tmp.path());
+    let upstream = Arc::new(GrokUpstream::new());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, body) = json_response(
+        app,
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .body(Body::from(
+                json!({
+                    "model": "grok-4.6",
+                    "input": "reply exactly: pong"
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, 501);
+    assert_eq!(body["error"]["type"], "unsupported_endpoint_for_provider");
+    assert!(
+        upstream.calls.lock().expect("calls lock").is_empty(),
+        "a refusal must not spend an account turn"
+    );
+}
