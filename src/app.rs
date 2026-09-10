@@ -30,15 +30,15 @@ use crate::models::{
 use crate::oauth::{refresh_anthropic_tokens, refresh_codex_tokens, refresh_grok_tokens};
 use crate::streaming::{
     AnthropicStreamState, ChatStreamState, ResponsesStreamState, anthropic_sse_to_chat,
-    anthropic_sse_to_responses, chat_sse_to_anthropic, drain_complete_sse_events,
-    finish_chat_stream, finish_sse_events, responses_sse_to_anthropic, responses_sse_to_chat,
-    responses_sse_to_payload, sse,
+    anthropic_sse_to_responses, chat_sse_to_anthropic, chat_sse_to_responses,
+    drain_complete_sse_events, finish_chat_stream, finish_sse_events, responses_sse_to_anthropic,
+    responses_sse_to_chat, responses_sse_to_payload, sse,
 };
 use crate::translate::{
     anthropic_to_chat_request, anthropic_to_openai, anthropic_to_responses,
-    anthropic_to_responses_request, chat_to_anthropic_message, chat_to_responses_request,
-    openai_to_anthropic, responses_to_anthropic, responses_to_anthropic_message,
-    responses_to_chat_completion,
+    anthropic_to_responses_request, chat_to_anthropic_message, chat_to_responses_message,
+    chat_to_responses_request, openai_to_anthropic, responses_to_anthropic,
+    responses_to_anthropic_message, responses_to_chat_completion, responses_to_chat_request,
 };
 use crate::types::{AvailableAccount, ProviderId, ProviderKind, UsageData};
 use crate::upstream::{
@@ -1127,29 +1127,56 @@ fn parse_request(state: &AppState, headers: &HeaderMap, body: &[u8]) -> Result<V
         .map_err(|_| AppError::simple(StatusCode::BAD_REQUEST, "invalid JSON body"))
 }
 
+/// The parts of a client request routing needs: the provider its model
+/// resolves to, the id the upstream is asked for, and whether the client
+/// wants a stream.
+struct ResolvedRequest {
+    provider: ProviderId,
+    model: String,
+    client_wants_stream: bool,
+}
+
+/// Resolve a client body to a routed request, or the error to return.
+fn resolve_route_request(state: &AppState, body: &Value) -> Result<ResolvedRequest, AppError> {
+    let Some(model_id) = required_model(body) else {
+        return Err(AppError::simple(
+            StatusCode::BAD_REQUEST,
+            "model is required",
+        ));
+    };
+    let provider = state
+        .catalog
+        .read()
+        .expect("catalog lock poisoned")
+        .resolve_id(model_id, &state.config.providers)
+        .ok_or_else(|| {
+            AppError::simple(
+                StatusCode::BAD_REQUEST,
+                format!("unknown model: {model_id}"),
+            )
+        })?;
+    Ok(ResolvedRequest {
+        model: upstream_model(model_id, &provider).to_string(),
+        client_wants_stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
+        provider,
+    })
+}
+
 async fn route_provider_request(
     state: &AppState,
     headers: &HeaderMap,
     body: &Value,
     route: RequestRoute,
 ) -> Response {
-    let Some(model_id) = required_model(body) else {
-        return AppError::simple(StatusCode::BAD_REQUEST, "model is required").into_response();
+    let request = match resolve_route_request(state, body) {
+        Ok(request) => request,
+        Err(error) => return error.into_response(),
     };
-    let Some(provider) = state
-        .catalog
-        .read()
-        .expect("catalog lock poisoned")
-        .resolve_id(model_id, &state.config.providers)
-    else {
-        return AppError::simple(
-            StatusCode::BAD_REQUEST,
-            format!("unknown model: {model_id}"),
-        )
-        .into_response();
-    };
-    let model = upstream_model(model_id, &provider).to_string();
-    let client_wants_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let ResolvedRequest {
+        provider,
+        model,
+        client_wants_stream,
+    } = request;
     let attempts = provider_account_count(state, provider.clone()).await.max(1);
     // One request, one conversation: computed before the attempt loop, not
     // inside it, because the body does not change between attempts.
@@ -1184,22 +1211,7 @@ async fn route_provider_request(
                     )
                     .await
                 } else {
-                    // A Refusal is an outcome: it counts its own request
-                    // (ADR-0015). Returning without recording one would
-                    // lose the request entirely, not merely unbalance the
-                    // counters. It earns no cooldown: a dialect the
-                    // provider cannot serve is not the account's fault.
-                    record_provider_refusal(state, &provider, &account).await;
-                    return AppError::provider(
-                        StatusCode::NOT_IMPLEMENTED,
-                        format!(
-                            "the {} dialect is not supported for the {provider} provider",
-                            route_name(route)
-                        ),
-                        "unsupported_endpoint_for_provider",
-                        provider,
-                    )
-                    .into_response();
+                    return route_refusal(state, &provider, &account, route).await;
                 }
             }
             ProviderKind::Codex => {
@@ -1215,37 +1227,19 @@ async fn route_provider_request(
                 .await
             }
             ProviderKind::Grok => {
-                // Chat and Messages translate onto the relay's chat dialect.
-                // Responses waits on a request-side Responses→Chat converter.
-                if matches!(route, RequestRoute::Chat | RequestRoute::Messages) {
-                    route_grok_request(
-                        state,
-                        headers,
-                        body,
-                        route,
-                        &model,
-                        &account,
-                        client_wants_stream,
-                    )
-                    .await
-                } else {
-                    // A Refusal is an outcome: it counts its own request
-                    // (ADR-0015). Returning without recording one would
-                    // lose the request entirely, not merely unbalance the
-                    // counters. It earns no cooldown: a dialect the
-                    // provider cannot serve is not the account's fault.
-                    record_provider_refusal(state, &provider, &account).await;
-                    return AppError::provider(
-                        StatusCode::NOT_IMPLEMENTED,
-                        format!(
-                            "the {} dialect is not supported for the {provider} provider",
-                            route_name(route)
-                        ),
-                        "unsupported_endpoint_for_provider",
-                        provider,
-                    )
-                    .into_response();
-                }
+                // Every inbound dialect translates onto the relay's chat
+                // dialect, so nothing is refused here. A future route must
+                // decide: Translation::between forces the choice.
+                route_grok_request(
+                    state,
+                    headers,
+                    body,
+                    route,
+                    &model,
+                    &account,
+                    client_wants_stream,
+                )
+                .await
             }
             ProviderKind::Anthropic => {
                 route_anthropic_request(
@@ -1279,6 +1273,29 @@ async fn route_provider_request(
         )
         .into_response()
     })
+}
+
+/// A dialect the provider cannot serve. A Refusal is an outcome: it counts
+/// its own request (ADR-0015). Returning without recording one would lose
+/// the request entirely, not merely unbalance the counters. It earns no
+/// cooldown: a dialect the provider cannot serve is not the account's fault.
+async fn route_refusal(
+    state: &AppState,
+    provider: &ProviderId,
+    account: &AvailableAccount,
+    route: RequestRoute,
+) -> Response {
+    record_provider_refusal(state, provider, account).await;
+    AppError::provider(
+        StatusCode::NOT_IMPLEMENTED,
+        format!(
+            "the {} dialect is not supported for the {provider} provider",
+            route_name(route)
+        ),
+        "unsupported_endpoint_for_provider",
+        provider.clone(),
+    )
+    .into_response()
 }
 
 async fn provider_account_count(state: &AppState, provider: ProviderId) -> usize {
@@ -2377,13 +2394,10 @@ fn update_stream_usage(
     match provider.kind {
         ProviderKind::Anthropic => update_anthropic_stream_usage(event, &data, usage, completed),
         ProviderKind::Codex => update_codex_stream_usage(event, &data, usage, completed),
-        // Grok streams Chat Completions chunks, so its usage rides the same
-        // late-chunk shape a generic endpoint uses.
-        ProviderKind::Grok => update_generic_stream_usage(&data, usage),
-        // A generic endpoint streams Chat Completions chunks; servers that
-        // opt into usage carry it on a late chunk (often the last before
-        // [DONE]) in the same shape as the non-streamed body.
-        ProviderKind::Generic => update_generic_stream_usage(&data, usage),
+        // Grok rides the generic path: it streams Chat Completions chunks,
+        // and servers that opt into usage carry it on a late chunk (often
+        // the last before [DONE]) in the same shape as the streamed body.
+        ProviderKind::Grok | ProviderKind::Generic => update_generic_stream_usage(&data, usage),
     }
 }
 
@@ -2562,6 +2576,10 @@ fn transform_sse_event(
             | (ProviderKind::Codex, RequestRoute::Responses) => {
                 vec!["data: [DONE]\n\n".to_string()]
             }
+            // A Responses client's stream already closed with
+            // response.completed (the finish_reason chunk); the chat
+            // terminator itself is not part of its dialect.
+            (ProviderKind::Grok, RequestRoute::Responses) => Vec::new(),
             // Chat Completions clients — generic upstreams included — end
             // their stream with [DONE]; dropping it hangs parsers that wait
             // for the terminator.
@@ -2600,23 +2618,24 @@ fn transform_sse_event(
             |_| Vec::new(),
             |data| responses_sse_to_anthropic(event, &data, anthropic_state),
         ),
+        (ProviderKind::Grok, RequestRoute::Responses) => parsed.map_or_else(
+            |_| Vec::new(),
+            |data| chat_sse_to_responses(&data, responses_state, model),
+        ),
         // A generic endpoint answers in Chat Completions, so a Chat client
         // reads its stream unchanged. Grok streams the same dialect (its
         // reasoning_content deltas ride along untouched, per the spec).
-        (ProviderKind::Grok, RequestRoute::Chat)
-        | (ProviderKind::Generic, RequestRoute::Chat) => parsed.map_or_else(
+        // Grok streams the same dialect a generic endpoint does; its
+        // reasoning_content deltas ride along untouched (AC-3).
+        (ProviderKind::Grok | ProviderKind::Generic, RequestRoute::Chat) => parsed.map_or_else(
             |_| Vec::new(),
             |data| vec![sse(&data, passthrough_event(event))],
         ),
-        (ProviderKind::Grok, RequestRoute::Messages)
-        | (ProviderKind::Generic, RequestRoute::Messages) => parsed.map_or_else(
+        (ProviderKind::Grok | ProviderKind::Generic, RequestRoute::Messages) => parsed.map_or_else(
             |_| Vec::new(),
             |data| chat_sse_to_anthropic(&data, anthropic_state),
         ),
-        // (Grok, Responses) never reaches here: routing refuses it before an
-        // account is chosen.
-        (ProviderKind::Grok, RequestRoute::Responses)
-        | (ProviderKind::Generic, _) => parsed.map_or_else(
+        (ProviderKind::Generic, _) => parsed.map_or_else(
             |_| Vec::new(),
             |data| vec![sse(&data, passthrough_event(event))],
         ),
@@ -2664,6 +2683,7 @@ enum Translation {
     AnthropicToChat,
     AnthropicToResponses,
     ChatToResponses,
+    ResponsesToChat,
 }
 
 impl Translation {
@@ -2675,16 +2695,19 @@ impl Translation {
             (ProviderKind::Anthropic, RequestRoute::Responses) => Self::ResponsesToAnthropic,
             (ProviderKind::Codex, RequestRoute::Chat) => Self::ChatToResponses,
             (ProviderKind::Codex, RequestRoute::Messages) => Self::AnthropicToResponses,
-            (ProviderKind::Grok, RequestRoute::Messages) => Self::AnthropicToChat,
-            (ProviderKind::Generic, RequestRoute::Messages) => Self::AnthropicToChat,
+            // Grok rides the generic chat translation for Messages and adds
+            // a Responses converter of its own.
+            (ProviderKind::Grok | ProviderKind::Generic, RequestRoute::Messages) => {
+                Self::AnthropicToChat
+            }
+            (ProviderKind::Grok, RequestRoute::Responses) => Self::ResponsesToChat,
             // The pairs where the client already speaks the upstream's
-            // dialect, and the refused ones — (Generic, Responses) and
-            // (Grok, Responses), which routing answers 501 before an account
-            // is chosen. The arms are here so the match is total, not
-            // because they are reachable.
+            // dialect, plus (Generic, Responses), which routing answers 501
+            // before an account is chosen. The arms are here so the match is
+            // total, not because each is reachable.
             (ProviderKind::Anthropic, RequestRoute::Messages)
             | (ProviderKind::Codex, RequestRoute::Responses)
-            | (ProviderKind::Grok, RequestRoute::Chat | RequestRoute::Responses)
+            | (ProviderKind::Grok, RequestRoute::Chat)
             | (ProviderKind::Generic, RequestRoute::Chat | RequestRoute::Responses) => Self::Native,
         }
     }
@@ -2698,6 +2721,7 @@ impl Translation {
             Self::AnthropicToChat => anthropic_to_chat_request(body),
             Self::AnthropicToResponses => anthropic_to_responses_request(body),
             Self::ChatToResponses => chat_to_responses_request(body),
+            Self::ResponsesToChat => responses_to_chat_request(body),
         }
     }
 
@@ -2713,6 +2737,7 @@ impl Translation {
             Self::AnthropicToChat => chat_to_anthropic_message(&body, model),
             Self::AnthropicToResponses => responses_to_anthropic_message(&body, model),
             Self::ChatToResponses => responses_to_chat_completion(&body, model),
+            Self::ResponsesToChat => chat_to_responses_message(&body, model),
         }
     }
 
@@ -2860,9 +2885,15 @@ async fn send_grok_json(
     timeout_ms: u64,
 ) -> anyhow::Result<UpstreamJsonResponse> {
     let url = format!("{GROK_CHAT_BASE_URL}/chat/completions");
-    let first = send_json(client.clone(), url.clone(), grok_chat_headers(account), body.clone(), timeout_ms).await?;
-    if first.status.as_u16() == 426
-        && learn_grok_client_version(&first.body.to_string()).is_some()
+    let first = send_json(
+        client.clone(),
+        url.clone(),
+        grok_chat_headers(account),
+        body.clone(),
+        timeout_ms,
+    )
+    .await?;
+    if first.status.as_u16() == 426 && learn_grok_client_version(&first.body.to_string()).is_some()
     {
         return send_json(client, url, grok_chat_headers(account), body, timeout_ms).await;
     }

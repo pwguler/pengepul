@@ -724,10 +724,7 @@ pub fn grok_chat_headers(account: &AvailableAccount) -> BTreeMap<String, String>
             GROK_TOKEN_AUTH_HEADER.to_string(),
             GROK_TOKEN_AUTH_VALUE.to_string(),
         ),
-        (
-            "x-grok-client-version".to_string(),
-            grok_client_version(),
-        ),
+        ("x-grok-client-version".to_string(), grok_client_version()),
     ])
 }
 
@@ -744,7 +741,8 @@ fn learned_grok_client_version() -> Option<String> {
         .and_then(|state| state.lock().ok().and_then(|guard| guard.clone()))
 }
 
-static GROK_LEARNED_VERSION: std::sync::OnceLock<Mutex<Option<String>>> = std::sync::OnceLock::new();
+static GROK_LEARNED_VERSION: std::sync::OnceLock<Mutex<Option<String>>> =
+    std::sync::OnceLock::new();
 
 /// Adopt the minimum version a 426 body names. Returns the version when it is
 /// new information (the caller may retry once with it); `None` when the body
@@ -806,9 +804,7 @@ mod grok_version_tests {
     fn parse_rejects_bodies_without_a_dotted_version() {
         assert_eq!(super::parse_grok_minimum_version("{}"), None);
         assert_eq!(
-            super::parse_grok_minimum_version(
-                "update to version soon or later via `grok update`"
-            ),
+            super::parse_grok_minimum_version("update to version soon or later via `grok update`"),
             None
         );
     }

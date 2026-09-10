@@ -1237,70 +1237,70 @@ mod tests {
     }
 }
 
-    #[test]
-    fn grok_models_route_bare_prefixed_and_by_shape() {
-        let mut catalog = ModelCatalog::default();
-        catalog.set_direct(ProviderKind::Grok, grok_static_models());
-        let providers = BTreeMap::from([(
-            "xai".to_string(),
-            crate::config::ConfiguredProvider {
-                base_url: "https://api.x.ai/v1".to_string(),
-            },
-        )]);
+#[test]
+fn grok_models_route_bare_prefixed_and_by_shape() {
+    let mut catalog = ModelCatalog::default();
+    catalog.set_direct(ProviderKind::Grok, grok_static_models());
+    let providers = BTreeMap::from([(
+        "xai".to_string(),
+        crate::config::ConfiguredProvider {
+            base_url: "https://api.x.ai/v1".to_string(),
+        },
+    )]);
 
-        // bare ids come from the static list
-        assert_eq!(
-            catalog.resolve_id("grok-4.6", &providers),
-            Some(ProviderId::grok())
-        );
-        // the provider's own prefix routes the same pool
-        assert_eq!(
-            catalog.resolve_id("grok/grok-4.6", &providers),
-            Some(ProviderId::grok())
-        );
-        // unknown grok families still route by name shape
-        assert_eq!(
-            catalog.resolve_id("grok-9", &providers),
-            Some(ProviderId::for_kind(ProviderKind::Grok))
-        );
-        // and `xai/` stays claimed by the configured console endpoint
-        assert_eq!(
-            catalog.resolve_id("xai/grok-4.6", &providers),
-            Some(ProviderId::generic("xai"))
-        );
+    // bare ids come from the static list
+    assert_eq!(
+        catalog.resolve_id("grok-4.6", &providers),
+        Some(ProviderId::grok())
+    );
+    // the provider's own prefix routes the same pool
+    assert_eq!(
+        catalog.resolve_id("grok/grok-4.6", &providers),
+        Some(ProviderId::grok())
+    );
+    // unknown grok families still route by name shape
+    assert_eq!(
+        catalog.resolve_id("grok-9", &providers),
+        Some(ProviderId::for_kind(ProviderKind::Grok))
+    );
+    // and `xai/` stays claimed by the configured console endpoint
+    assert_eq!(
+        catalog.resolve_id("xai/grok-4.6", &providers),
+        Some(ProviderId::generic("xai"))
+    );
+}
+
+#[test]
+fn grok_static_models_carry_context_metadata_and_advertise_prefixed() {
+    let static_models = grok_static_models();
+    assert_eq!(
+        static_models.ids,
+        vec!["grok-4.6".to_string(), "grok-4.5".to_string()]
+    );
+    for id in &static_models.ids {
+        let metadata = static_models.metadata.get(id).expect("curated metadata");
+        assert_eq!(metadata.context_window, Some(500_000), "{id}");
     }
 
-    #[test]
-    fn grok_static_models_carry_context_metadata_and_advertise_prefixed() {
-        let static_models = grok_static_models();
-        assert_eq!(
-            static_models.ids,
-            vec!["grok-4.6".to_string(), "grok-4.5".to_string()]
-        );
-        for id in &static_models.ids {
-            let metadata = static_models.metadata.get(id).expect("curated metadata");
-            assert_eq!(metadata.context_window, Some(500_000), "{id}");
-        }
-
-        let mut catalog = ModelCatalog::default();
-        catalog.set_direct(ProviderKind::Grok, static_models);
-        let mut advertised: Vec<(String, Option<u64>)> = catalog
-            .advertised()
-            .into_iter()
-            .filter(|model| model.provider.kind == ProviderKind::Grok)
-            .map(|model| {
-                (
-                    model.id,
-                    model.metadata.and_then(|meta| meta.context_window),
-                )
-            })
-            .collect();
-        advertised.sort();
-        assert_eq!(
-            advertised,
-            vec![
-                ("grok/grok-4.5".to_string(), Some(500_000)),
-                ("grok/grok-4.6".to_string(), Some(500_000)),
-            ]
-        );
-    }
+    let mut catalog = ModelCatalog::default();
+    catalog.set_direct(ProviderKind::Grok, static_models);
+    let mut advertised: Vec<(String, Option<u64>)> = catalog
+        .advertised()
+        .into_iter()
+        .filter(|model| model.provider.kind == ProviderKind::Grok)
+        .map(|model| {
+            (
+                model.id,
+                model.metadata.and_then(|meta| meta.context_window),
+            )
+        })
+        .collect();
+    advertised.sort();
+    assert_eq!(
+        advertised,
+        vec![
+            ("grok/grok-4.5".to_string(), Some(500_000)),
+            ("grok/grok-4.6".to_string(), Some(500_000)),
+        ]
+    );
+}

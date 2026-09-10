@@ -82,7 +82,7 @@ pub fn generate_codex_auth_url(state: &str, pkce: &PkceCodes) -> String {
 }
 
 /// Build the Grok OAuth authorize URL. Unlike the other providers this flow
-/// also carries a `nonce` (validated against the id_token by the OIDC
+/// also carries a `nonce` (validated against the `id_token` by the OIDC
 /// machinery) and a `referrer` attributing the login to grok build.
 #[must_use]
 pub fn generate_grok_auth_url(state: &str, pkce: &PkceCodes, nonce: &str) -> String {
@@ -272,9 +272,8 @@ pub async fn refresh_grok_tokens(refresh_token: String) -> Result<TokenData> {
         }
         bail!("grok token refresh failed ({status}): {body}");
     }
-    let mut token = grok_token(
-        &serde_json::from_str(&body).context("Grok refresh response is not JSON")?,
-    )?;
+    let mut token =
+        grok_token(&serde_json::from_str(&body).context("Grok refresh response is not JSON")?)?;
     // auth.x.ai may rotate the refresh token on use; when it does not send one
     // back, the grant it just honored stays valid and is kept.
     if token.refresh_token.is_empty() {
@@ -471,7 +470,11 @@ mod tests {
         format!(
             "{}.{}.sig",
             encode(br#"{"alg":"ES256","typ":"at+jwt"}"#),
-            encode(serde_json::to_vec(claims).expect("claims serialize").as_slice())
+            encode(
+                serde_json::to_vec(claims)
+                    .expect("claims serialize")
+                    .as_slice()
+            )
         )
     }
 
@@ -516,7 +519,10 @@ mod tests {
         let body = body_string(&req);
         assert!(body.contains("grant_type=refresh_token"), "{body}");
         assert!(body.contains("refresh_token=refresh-xyz"), "{body}");
-        assert!(body.contains(&format!("client_id={GROK_CLIENT_ID}")), "{body}");
+        assert!(
+            body.contains(&format!("client_id={GROK_CLIENT_ID}")),
+            "{body}"
+        );
     }
 
     #[test]

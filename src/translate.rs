@@ -542,6 +542,210 @@ pub fn responses_to_chat_completion(payload: &Value, model: &str) -> Value {
     })
 }
 
+/// An `OpenAI` Responses request → `OpenAI` Chat Completions request: what
+/// grok build's relay has to be handed for a harness that speaks Responses
+/// to reach it. The inverse of the response side, `chat_to_responses_message`
+/// — input items become messages, `instructions` becomes a system message,
+/// `reasoning.effort` becomes `reasoning_effort`, and the function tools
+/// unwrap into the chat dialect's nested shape.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn responses_to_chat_request(body: &Value) -> Value {
+    let mut messages = Vec::new();
+    if let Some(instructions) =
+        text_or_empty(body.get("instructions")).filter(|text| !text.is_empty())
+    {
+        messages.push(json!({"role": "system", "content": instructions}));
+    }
+    let input = body.get("input").unwrap_or(&Value::Null);
+    let items: Vec<&Value> = match input {
+        Value::Array(items) => items.iter().collect(),
+        // A bare string is the shorthand for one user message.
+        Value::String(text) => {
+            messages.push(json!({"role": "user", "content": text}));
+            Vec::new()
+        }
+        _ => Vec::new(),
+    };
+    for item in items {
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call") => {
+                messages.push(json!({
+                    "role": "assistant",
+                    "content": Value::Null,
+                    "tool_calls": [{
+                        "id": item.get("call_id").cloned().unwrap_or(Value::Null),
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name").cloned().unwrap_or(Value::Null),
+                            "arguments": item.get("arguments").cloned().unwrap_or_else(|| json!("{}"))
+                        }
+                    }]
+                }));
+            }
+            Some("function_call_output") => {
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": item.get("call_id").cloned().unwrap_or(Value::Null),
+                    "content": item.get("output").cloned().unwrap_or_else(|| json!(""))
+                }));
+            }
+            // Reasoning items are the model's own history; a chat request has
+            // no place for them and nothing is lost by dropping them.
+            Some("reasoning") => {}
+            Some("message") => {
+                let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+                let text = item
+                    .get("content")
+                    .map(text_from_content)
+                    .unwrap_or_default();
+                if !text.is_empty() || role != "assistant" {
+                    messages.push(json!({"role": role, "content": text}));
+                }
+            }
+            _ => {
+                // A plain `{role, content}` item, or nothing recognizable.
+                if let Some(role) = item.get("role").and_then(Value::as_str) {
+                    let text = item
+                        .get("content")
+                        .map(text_from_content)
+                        .unwrap_or_default();
+                    messages.push(json!({"role": role, "content": text}));
+                }
+            }
+        }
+    }
+
+    let mut out = Map::new();
+    insert_if_some(&mut out, "model", body.get("model").cloned());
+    copy_if_present(body, &mut out, "stream");
+    copy_if_present(body, &mut out, "temperature");
+    copy_if_present(body, &mut out, "top_p");
+    if let Some(tokens) = body.get("max_output_tokens") {
+        out.insert("max_tokens".to_string(), tokens.clone());
+    }
+    if let Some(effort) = body
+        .get("reasoning")
+        .and_then(|reasoning| reasoning.get("effort"))
+    {
+        out.insert("reasoning_effort".to_string(), effort.clone());
+    }
+    if !messages.is_empty() {
+        out.insert("messages".to_string(), Value::Array(messages));
+    }
+    let mut tools = Vec::new();
+    for tool in value_array(body.get("tools")) {
+        if tool.get("type").and_then(Value::as_str) != Some("function") {
+            // Server-side tools (web_search, ...) have no chat-dialect form;
+            // the request stays honest about what it can run.
+            continue;
+        }
+        tools.push(json!({
+            "type": "function",
+            "function": {
+                "name": tool.get("name").cloned().unwrap_or(Value::Null),
+                "description": tool.get("description").cloned().unwrap_or_else(|| json!("")),
+                "parameters": tool.get("parameters").cloned().unwrap_or_else(|| json!({"type": "object"}))
+            }
+        }));
+    }
+    if !tools.is_empty() {
+        out.insert("tools".to_string(), Value::Array(tools));
+    }
+    if let Some(choice) = body.get("tool_choice") {
+        out.insert(
+            "tool_choice".to_string(),
+            chat_tool_choice_from_responses(choice),
+        );
+    }
+    copy_if_present(body, &mut out, "parallel_tool_calls");
+    Value::Object(out)
+}
+
+fn text_or_empty(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(text) => Some(text.clone()),
+        other => Some(text_from_content(other)),
+    }
+}
+
+fn chat_tool_choice_from_responses(choice: &Value) -> Value {
+    if choice.get("type").and_then(Value::as_str) == Some("function") {
+        return json!({
+            "type": "function",
+            "function": {"name": choice.get("name").cloned().unwrap_or(Value::Null)}
+        });
+    }
+    choice.clone()
+}
+
+/// A chat completion reply as the Responses reply the client asked in: the
+/// inverse of [`responses_to_chat_completion`]. Reasoning content becomes a
+/// `reasoning` item, tool calls become `function_call` items, and the chat
+/// usage map re-keys into the Responses one.
+#[must_use]
+pub fn chat_to_responses_message(payload: &Value, model: &str) -> Value {
+    let choice = payload
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .cloned()
+        .unwrap_or(Value::Null);
+    let message = choice.get("message").unwrap_or(&Value::Null);
+    let mut output = Vec::new();
+    if let Some(reasoning) = message
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
+        output.push(json!({
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": reasoning}]
+        }));
+    }
+    for call in value_array(message.get("tool_calls")) {
+        let function = call.get("function").unwrap_or(&Value::Null);
+        output.push(json!({
+            "type": "function_call",
+            "call_id": call.get("id").cloned().unwrap_or(Value::Null),
+            "name": function.get("name").cloned().unwrap_or(Value::Null),
+            "arguments": function.get("arguments").cloned().unwrap_or_else(|| json!("{}"))
+        }));
+    }
+    let text = text_from_content(message.get("content").unwrap_or(&Value::Null));
+    if !text.is_empty() {
+        output.push(json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text, "annotations": []}]
+        }));
+    }
+
+    let usage = payload.get("usage").unwrap_or(&Value::Null);
+    let input_tokens = int_field(usage, "prompt_tokens");
+    let output_tokens = int_field(usage, "completion_tokens");
+    let status = if choice.get("finish_reason").and_then(Value::as_str) == Some("length") {
+        "incomplete"
+    } else {
+        "completed"
+    };
+    json!({
+        "id": format!("resp_{}", uuid::Uuid::new_v4().simple()),
+        "object": "response",
+        "created_at": chrono::Utc::now().timestamp(),
+        "status": status,
+        "model": model,
+        "output": output,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "input_tokens_details": usage.get("prompt_tokens_details").cloned().unwrap_or_else(|| json!({"cached_tokens": 0})),
+            "output_tokens_details": usage.get("completion_tokens_details").cloned().unwrap_or_else(|| json!({"reasoning_tokens": 0}))
+        }
+    })
+}
+
 #[must_use]
 pub fn responses_to_anthropic_message(payload: &Value, model: &str) -> Value {
     let mut content = Vec::new();
@@ -1483,4 +1687,120 @@ fn int_field(value: &Value, key: &str) -> i64 {
 
 fn is_empty(value: &Value) -> bool {
     matches!(value, Value::Null) || value.as_str().is_some_and(str::is_empty)
+}
+
+#[cfg(test)]
+mod grok_responses_tests {
+    use super::{chat_to_responses_message, responses_to_chat_request};
+    use serde_json::json;
+
+    #[test]
+    fn responses_request_maps_instructions_input_and_reasoning_onto_chat() {
+        let request = responses_to_chat_request(&json!({
+            "model": "grok-4.6",
+            "instructions": "You are terse.",
+            "max_output_tokens": 64,
+            "reasoning": {"effort": "low"},
+            "stream": true,
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "function_call", "call_id": "call-1", "name": "read", "arguments": "{\"path\":\"a\"}"},
+                {"type": "function_call_output", "call_id": "call-1", "output": "contents"},
+                {"type": "reasoning", "summary": []}
+            ],
+            "tools": [{"type": "function", "name": "read", "description": "read a file", "parameters": {"type": "object"}}]
+        }));
+        assert_eq!(request["model"], "grok-4.6");
+        assert_eq!(request["stream"], true);
+        assert_eq!(request["max_tokens"], 64);
+        assert_eq!(request["reasoning_effort"], "low");
+        let messages = request["messages"].as_array().expect("messages");
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "You are terse.");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "hi");
+        // the tool call replays as an assistant tool_calls entry, the output
+        // as a tool message keyed by the same call id
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["tool_calls"][0]["id"], "call-1");
+        assert_eq!(messages[2]["tool_calls"][0]["function"]["name"], "read");
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["tool_call_id"], "call-1");
+        assert_eq!(messages[3]["content"], "contents");
+        assert_eq!(messages.len(), 4, "reasoning items are dropped");
+        // the responses function tool unwraps into the chat dialect's shape
+        assert_eq!(request["tools"][0]["type"], "function");
+        assert_eq!(request["tools"][0]["function"]["name"], "read");
+    }
+
+    #[test]
+    fn responses_request_accepts_a_bare_string_input() {
+        let request = responses_to_chat_request(&json!({
+            "model": "grok-4.6",
+            "input": "reply exactly: pong"
+        }));
+        let messages = request["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "reply exactly: pong");
+    }
+
+    #[test]
+    fn chat_reply_becomes_a_responses_object_with_reasoning_and_tool_items() {
+        let reply = chat_to_responses_message(
+            &json!({
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "done",
+                        "reasoning_content": "figured it out",
+                        "tool_calls": [{"id": "call-9", "type": "function", "function": {"name": "read", "arguments": "{\"path\":\"a\"}"}}]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                    "prompt_tokens_details": {"cached_tokens": 2},
+                    "completion_tokens_details": {"reasoning_tokens": 3}
+                }
+            }),
+            "grok-4.6-build",
+        );
+        assert_eq!(reply["object"], "response");
+        assert_eq!(reply["status"], "completed");
+        assert_eq!(reply["model"], "grok-4.6-build");
+        assert_eq!(reply["output"][0]["type"], "reasoning");
+        assert_eq!(reply["output"][0]["summary"][0]["text"], "figured it out");
+        assert_eq!(reply["output"][1]["type"], "function_call");
+        assert_eq!(reply["output"][1]["call_id"], "call-9");
+        assert_eq!(reply["output"][1]["name"], "read");
+        assert_eq!(reply["output"][2]["type"], "message");
+        assert_eq!(reply["output"][2]["content"][0]["text"], "done");
+        assert_eq!(reply["usage"]["input_tokens"], 10);
+        assert_eq!(reply["usage"]["output_tokens"], 5);
+        assert_eq!(reply["usage"]["input_tokens_details"]["cached_tokens"], 2);
+        assert_eq!(
+            reply["usage"]["output_tokens_details"]["reasoning_tokens"],
+            3
+        );
+    }
+
+    #[test]
+    fn a_length_truncated_chat_reply_is_incomplete_on_the_responses_dialect() {
+        let reply = chat_to_responses_message(
+            &json!({
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "partial"},
+                    "finish_reason": "length"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            }),
+            "grok-4.6",
+        );
+        assert_eq!(reply["status"], "incomplete");
+    }
 }

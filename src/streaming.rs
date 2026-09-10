@@ -37,6 +37,26 @@ pub struct ResponsesStreamState {
     block_output_indexes: BTreeMap<i64, i64>,
     tool_calls: BTreeMap<i64, FunctionCall>,
     usage: UsageData,
+    /// Chat-upstream bookkeeping (`chat_sse_to_responses`): whether
+    /// `response.created` has gone out, which output item is open, and the
+    /// text each item has accumulated. The Anthropic path keys off explicit
+    /// block events instead, so it leaves these untouched.
+    created: bool,
+    open_item: Option<ResponsesOpenItem>,
+    message_text: String,
+    reasoning_text: String,
+    message_output_index: Option<i64>,
+    reasoning_output_index: Option<i64>,
+    tool_output_indexes: BTreeMap<i64, i64>,
+}
+
+/// The output item a translated chat stream currently has open. A chat
+/// stream interleaves reasoning, text and tool calls in one `choices` delta,
+/// so the Responses items they become have to be opened and closed here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponsesOpenItem {
+    Message,
+    Reasoning,
 }
 
 impl ResponsesStreamState {
@@ -48,6 +68,13 @@ impl ResponsesStreamState {
             block_output_indexes: BTreeMap::new(),
             tool_calls: BTreeMap::new(),
             usage: UsageData::default(),
+            created: false,
+            open_item: None,
+            message_text: String::new(),
+            reasoning_text: String::new(),
+            message_output_index: None,
+            reasoning_output_index: None,
+            tool_output_indexes: BTreeMap::new(),
         }
     }
 }
@@ -853,6 +880,281 @@ fn flush_chat_tool_calls(state: &mut AnthropicStreamState) -> Vec<String> {
 /// `index` the chunks carry, because their id and name arrive on the chunk
 /// that opens the call and the arguments trickle in after it.
 #[must_use]
+/// A chat-upstream stream (grok build's relay, a configured endpoint) as the
+/// event stream a Responses client reads. Chat signals its end with a
+/// `finish_reason` chunk — that is where the items close and
+/// `response.completed` leaves; the `[DONE]` terminator is not forwarded to
+/// a Responses client.
+#[allow(clippy::too_many_lines)]
+pub fn chat_sse_to_responses(
+    data: &Value,
+    state: &mut ResponsesStreamState,
+    model: &str,
+) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let choice = data
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .cloned()
+        .unwrap_or(Value::Null);
+    let delta = choice.get("delta").unwrap_or(&Value::Null);
+    let finish_reason = choice
+        .get("finish_reason")
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.is_empty());
+    // Chunks carrying usage (usually the finish chunk) feed the completed
+    // event's numbers; chunks without usage must not clobber what earlier
+    // ones recorded.
+    if let Some(usage) = data.get("usage").filter(|usage| !usage.is_null()) {
+        update_chat_usage(&mut state.usage, usage);
+    }
+
+    if !state.created {
+        state.created = true;
+        chunks.push(sse(
+            &json!({
+                "type": "response.created",
+                "response": {
+                    "id": state.id,
+                    "object": "response",
+                    "created_at": chrono::Utc::now().timestamp(),
+                    "status": "in_progress",
+                    "model": model
+                }
+            }),
+            Some("response.created"),
+        ));
+    }
+
+    if let Some(reasoning) = delta_text(delta, "reasoning_content") {
+        if state.open_item != Some(ResponsesOpenItem::Reasoning) {
+            close_open_item(state, &mut chunks);
+            let output_index = state.next_output_index;
+            state.next_output_index += 1;
+            state.reasoning_output_index = Some(output_index);
+            state.reasoning_text.clear();
+            state.open_item = Some(ResponsesOpenItem::Reasoning);
+            chunks.push(sse(
+                &json!({
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": {"type": "reasoning", "summary": []}
+                }),
+                Some("response.output_item.added"),
+            ));
+        }
+        state.reasoning_text.push_str(reasoning);
+        chunks.push(sse(
+            &json!({
+                "type": "response.reasoning_text.delta",
+                "output_index": state.reasoning_output_index,
+                "delta": reasoning
+            }),
+            Some("response.reasoning_text.delta"),
+        ));
+    }
+
+    if let Some(text) = delta_text(delta, "content") {
+        if state.open_item != Some(ResponsesOpenItem::Message) {
+            close_open_item(state, &mut chunks);
+            let output_index = state.next_output_index;
+            state.next_output_index += 1;
+            state.message_output_index = Some(output_index);
+            state.message_text.clear();
+            state.open_item = Some(ResponsesOpenItem::Message);
+            chunks.push(sse(
+                &json!({
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": {"type": "message", "role": "assistant", "content": []}
+                }),
+                Some("response.output_item.added"),
+            ));
+            chunks.push(sse(
+                &json!({
+                    "type": "response.content_part.added",
+                    "item_id": state.id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": ""}
+                }),
+                Some("response.content_part.added"),
+            ));
+        }
+        state.message_text.push_str(text);
+        chunks.push(sse(
+            &json!({
+                "type": "response.output_text.delta",
+                "output_index": state.message_output_index,
+                "content_index": 0,
+                "delta": text
+            }),
+            Some("response.output_text.delta"),
+        ));
+    }
+
+    let tool_calls = delta.get("tool_calls").and_then(Value::as_array);
+    for call in tool_calls.into_iter().flatten() {
+        let chat_index = int_field(call, "index");
+        let function = call.get("function").unwrap_or(&Value::Null);
+        let is_new = !state.tool_calls.contains_key(&chat_index);
+        if is_new {
+            state.tool_calls.insert(
+                chat_index,
+                FunctionCall {
+                    id: call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool")
+                        .to_string(),
+                    name: function
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    arguments: String::new(),
+                },
+            );
+            close_open_item(state, &mut chunks);
+            let output_index = state.next_output_index;
+            state.next_output_index += 1;
+            state.tool_output_indexes.insert(chat_index, output_index);
+            let item = response_function_item(&state.tool_calls[&chat_index]);
+            chunks.push(sse(
+                &json!({
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": item
+                }),
+                Some("response.output_item.added"),
+            ));
+        }
+        let partial = function
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !partial.is_empty() {
+            if let Some(entry) = state.tool_calls.get_mut(&chat_index) {
+                entry.arguments.push_str(partial);
+            }
+            let output_index = state.tool_output_indexes[&chat_index];
+            let item = response_function_item(&state.tool_calls[&chat_index]);
+            chunks.push(sse(
+                &json!({
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": item["id"],
+                    "output_index": output_index,
+                    "delta": partial
+                }),
+                Some("response.function_call_arguments.delta"),
+            ));
+        }
+    }
+
+    if let Some(reason) = finish_reason {
+        close_open_item(state, &mut chunks);
+        // Tool-call items close with their final form; the arguments came in
+        // pieces, so the done events carry the whole call.
+        let done: Vec<(i64, i64)> = state
+            .tool_output_indexes
+            .iter()
+            .map(|(chat_index, output_index)| (*chat_index, *output_index))
+            .collect();
+        for (chat_index, output_index) in done {
+            if let Some(call) = state.tool_calls.get(&chat_index) {
+                let item = response_function_item(call);
+                chunks.push(sse(
+                    &json!({
+                        "type": "response.function_call_arguments.done",
+                        "output_index": output_index,
+                        "item": item
+                    }),
+                    Some("response.function_call_arguments.done"),
+                ));
+                chunks.push(sse(
+                    &json!({
+                        "type": "response.output_item.done",
+                        "output_index": output_index,
+                        "item": item
+                    }),
+                    Some("response.output_item.done"),
+                ));
+            }
+        }
+        let status = if reason == "length" {
+            "incomplete"
+        } else {
+            "completed"
+        };
+        chunks.push(sse(
+            &json!({
+                "type": "response.completed",
+                "response": {
+                    "id": state.id,
+                    "object": "response",
+                    "created_at": chrono::Utc::now().timestamp(),
+                    "status": status,
+                    "model": model,
+                    "usage": responses_usage(&state.usage)
+                }
+            }),
+            Some("response.completed"),
+        ));
+    }
+    chunks
+}
+
+/// Close the item a translated chat stream has open, emitting the done
+/// events its dialect owes: the accumulated text goes out with the item.
+fn close_open_item(state: &mut ResponsesStreamState, chunks: &mut Vec<String>) {
+    match state.open_item {
+        Some(ResponsesOpenItem::Message) => {
+            let output_index = state.message_output_index.unwrap_or(0);
+            chunks.push(sse(
+                &json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": state.message_text, "annotations": []}]
+                    }
+                }),
+                Some("response.output_item.done"),
+            ));
+            state.message_text.clear();
+        }
+        Some(ResponsesOpenItem::Reasoning) => {
+            let output_index = state.reasoning_output_index.unwrap_or(0);
+            chunks.push(sse(
+                &json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": {
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": state.reasoning_text}]
+                    }
+                }),
+                Some("response.output_item.done"),
+            ));
+            state.reasoning_text.clear();
+        }
+        None => {}
+    }
+    state.open_item = None;
+}
+
+/// A chat delta's text field, when it carries a non-empty one. Both the
+/// reasoning and the plain content live under their own names on the same
+/// delta object.
+fn delta_text<'a>(delta: &'a Value, field: &str) -> Option<&'a str> {
+    delta
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+}
+
 pub fn chat_sse_to_anthropic(data: &Value, state: &mut AnthropicStreamState) -> Vec<String> {
     let empty = Vec::new();
     let mut chunks = Vec::new();
@@ -1482,6 +1784,32 @@ fn update_anthropic_usage(usage: &mut UsageData, payload: &Value) {
         .and_then(Value::as_i64)
     {
         usage.cache_read_input_tokens = cache_read_input_tokens;
+    }
+}
+
+/// A chat usage map (`prompt_tokens` / `completion_tokens` with the two
+/// detail objects) into the relay's usage record. Missing fields keep what
+/// earlier chunks recorded.
+fn update_chat_usage(usage: &mut UsageData, payload: &Value) {
+    if let Some(input_tokens) = payload.get("prompt_tokens").and_then(Value::as_i64) {
+        usage.input_tokens = input_tokens;
+    }
+    if let Some(output_tokens) = payload.get("completion_tokens").and_then(Value::as_i64) {
+        usage.output_tokens = output_tokens;
+    }
+    if let Some(cache_read_input_tokens) = payload
+        .get("prompt_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_i64)
+    {
+        usage.cache_read_input_tokens = cache_read_input_tokens;
+    }
+    if let Some(reasoning_output_tokens) = payload
+        .get("completion_tokens_details")
+        .and_then(|details| details.get("reasoning_tokens"))
+        .and_then(Value::as_i64)
+    {
+        usage.reasoning_output_tokens = reasoning_output_tokens;
     }
 }
 

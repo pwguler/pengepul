@@ -3291,7 +3291,6 @@ impl GrokUpstream {
             calls: Mutex::new(Vec::new()),
         }
     }
-
 }
 
 impl UpstreamClient for GrokUpstream {
@@ -3559,7 +3558,7 @@ async fn grok_chat_stream_passes_chunks_through_with_reasoning_deltas() {
 }
 
 #[tokio::test]
-async fn grok_responses_route_is_refused_without_reaching_an_account() {
+async fn grok_responses_route_translates_onto_chat_and_back() {
     let tmp = tempfile::tempdir().expect("tempdir");
     save_grok_account(tmp.path());
     let upstream = Arc::new(GrokUpstream::new());
@@ -3575,7 +3574,67 @@ async fn grok_responses_route_is_refused_without_reaching_an_account() {
             .header("content-length", "1")
             .body(Body::from(
                 json!({
+                    "model": "grok/grok-4.6",
+                    "instructions": "You are terse.",
+                    "max_output_tokens": 64,
+                    "reasoning": {"effort": "low"},
+                    "input": [
+                        {"role": "user", "content": [{"type": "input_text", "text": "reply exactly: pong"}]}
+                    ]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    // The reply left as a Responses object: reasoning item, then the message.
+    assert_eq!(body["object"], "response");
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["output"][0]["type"], "reasoning");
+    assert_eq!(
+        body["output"][0]["summary"][0]["text"],
+        "the user asked for pong"
+    );
+    assert_eq!(body["output"][1]["type"], "message");
+    assert_eq!(body["output"][1]["content"][0]["type"], "output_text");
+    assert_eq!(body["output"][1]["content"][0]["text"], "pong");
+    assert_eq!(body["usage"]["input_tokens"], 211);
+    assert_eq!(body["usage"]["output_tokens"], 1);
+
+    let calls = upstream.calls.lock().expect("calls lock");
+    let request = calls.first().expect("one grok upstream call");
+    // The request left in the chat dialect.
+    assert_eq!(request.body["model"], "grok-4.6");
+    assert_eq!(request.body["max_tokens"], 64);
+    assert_eq!(request.body["reasoning_effort"], "low");
+    let messages = request.body["messages"].as_array().expect("messages");
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[0]["content"], "You are terse.");
+    assert_eq!(messages[1]["role"], "user");
+    assert_eq!(messages[1]["content"], "reply exactly: pong");
+}
+
+#[tokio::test]
+async fn grok_responses_stream_translates_chat_chunks_into_response_events() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_grok_account(tmp.path());
+    let upstream = Arc::new(GrokUpstream::new());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, _, body) = raw_response(
+        app,
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .body(Body::from(
+                json!({
                     "model": "grok-4.6",
+                    "stream": true,
                     "input": "reply exactly: pong"
                 })
                 .to_string(),
@@ -3584,10 +3643,23 @@ async fn grok_responses_route_is_refused_without_reaching_an_account() {
     )
     .await;
 
-    assert_eq!(status, 501);
-    assert_eq!(body["error"]["type"], "unsupported_endpoint_for_provider");
+    assert_eq!(status, 200);
+    assert!(body.contains("\"type\":\"response.created\""), "{body}");
     assert!(
-        upstream.calls.lock().expect("calls lock").is_empty(),
-        "a refusal must not spend an account turn"
+        body.contains("\"type\":\"response.reasoning_text.delta\""),
+        "{body}"
     );
+    assert!(body.contains("\"delta\":\"thin\""), "{body}");
+    assert!(
+        body.contains("\"type\":\"response.output_text.delta\""),
+        "{body}"
+    );
+    assert!(body.contains("\"delta\":\"pong\""), "{body}");
+    // Items close as they switch; the reasoning item's summary carries its text.
+    assert!(body.contains("\"text\":\"thin\""), "{body}");
+    assert!(body.contains("\"type\":\"response.completed\""), "{body}");
+    assert!(body.contains("\"status\":\"completed\""), "{body}");
+    assert!(body.contains("\"input_tokens\":211"), "{body}");
+    // The Responses dialect ends at response.completed; no chat [DONE] leaks.
+    assert!(!body.contains("[DONE]"), "{body}");
 }
