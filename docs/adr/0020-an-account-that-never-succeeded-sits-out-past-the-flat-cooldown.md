@@ -1,4 +1,4 @@
-# 20. A credential that never succeeded sits out past the flat cooldown
+# 20. An account that never succeeded sits out past the flat cooldown
 
 Status: Accepted (amends the Reauth and Cooldown entries in CONTEXT.md)
 
@@ -28,13 +28,15 @@ Six draws an hour, forever, each spending an upstream round trip for a reply tha
 cannot change.
 
 Two details made this worse than a slow leak. `AccountManager` had **two** billing
-paths: `record_failure(email, "billing", ..)` and a separate
-`record_billing_cooldown(email, ..)` that the failover loop calls when a 200 body
-reports exhausted credits. The second assigned `cooldown_until = now + 600s`
-unconditionally — no multiplier, no ceiling, and no "a cooldown only ever grows"
-guard, so it could also collapse a 24-hour reauth lockout back to ten minutes. It is
-the path that fired for this key, so a rule applied only to `record_failure` would
-have fixed nothing.
+paths: `record_failure(email, "billing", ..)`, which nothing on the wire reaches any
+more (production 400/402 goes the refusal route and applies the cooldown through
+`record_billing_cooldown`), and `record_billing_cooldown(email, ..)` that the failover
+loop calls when a 400 or 402 body reports exhausted credits. The second assigned
+`cooldown_until = now + 600s` unconditionally — no multiplier, no ceiling, and no "a
+cooldown only ever grows" guard, so it could also collapse a 24-hour reauth cooldown
+back to ten minutes, and it stamped its own reason over that cooldown's. It is the path
+that fired for this key, so a rule applied only to `record_failure` would have fixed
+nothing.
 
 Under ADR-0017's original affinity key the cost was larger than the round trip. The
 failure re-pinned the single affinity entry every conversation on that model shared,
@@ -105,39 +107,79 @@ asserting anything about *why* an account is failing.
 ## Consequences
 
 - **A never-succeeded account stops being a recurring expense.** Steady state, a
-  depleted key is retried hourly instead of every ten minutes — a sixth of the
-  wasted requests — so the pool keeps probing for a credential that might be topped
-  up upstream without paying for it sixty times a day.
+  depleted key is retried hourly instead of every ten minutes — 24 probes a day
+  instead of 144 — so a key that gets topped up upstream is picked back up within the
+  hour rather than within ten minutes, without paying for the other 120 attempts.
 - **The ceiling survives a restart; the streak does not.** `total_successes` is
   restored from persisted usage, so an account with no success to its name is still
   recognised as such after `pengepul serve` restarts. `failure_count` is not
   persisted, so the streak restarts at zero and the account is drawn four times
-  (billing) before it climbs back to the hour ceiling. That ramp is bounded; making
-  it durable would mean a disk write on every failure, which is not worth four
-  retries per restart.
+  (billing) before it climbs back to the hour ceiling. That ramp is bounded and
+  accepted on its merits, not on a cost that does not exist: the write already
+  happens on every outcome — `record_failure` and `record_billing_cooldown` both end
+  in `persist_usage`, which rewrites the whole file — so persisting the streak would
+  add a field, not a write. It is left out because four extra probes per restart is
+  cheap, and because a restart is a clean slate for an account the operator may
+  have just fixed.
+- **The rule reads persisted history, so losing `usage.json` demotes every account.**
+  `total_successes` comes from `~/.pengepul/<provider>/usage.json` and from live
+  successes; nothing else. If that file is lost — an operator tidying up, a fresh host,
+  a bad restore — every account sits at `total_successes == 0`, so a proven account
+  becomes indistinguishable from a dead one and its ceiling moves from ten minutes to
+  an hour. Measured: the same account with `usage.json` intact caps at `600s` after
+  four billing failures; with the file removed, the same four failures give `3600s`.
+  The rule is a policy decision resting on a reporting file, and the honest statement
+  of its reach is that a relay whose history is gone will be slow to retry proven keys
+  for as long as the histories stay gone.
+- **What is protected is the load path, and only that.** `load_usage` maps an absent,
+  truncated, malformed or non-object file to an empty map — a permissive contract the
+  usage-persistence spec fixes for counters (its AC-5), and one this change does not
+  overturn. What it does overturn is the write-back that followed: `AccountManager::load`
+  now refuses to rewrite a file it could not read, and warns, so a startup that serves
+  no traffic cannot destroy recoverable history and lock in the demotion. Two limits
+  are worth stating plainly. A *served request* still rewrites that file, so recovery
+  depends on the relay staying idle until the file is restored. And an entry dropped
+  for an account whose token file was unreadable is still dropped from the next write,
+  so repairing a token file after a bad read can leave that one account with no history.
+  Both are pinned by tests (`an_unreadable_usage_file_is_not_overwritten_with_zeros_at_load`,
+  `a_missing_usage_file_is_written_normally_not_treated_as_unreadable`). A rule that
+  survives any of this would need a marker written once on first success into the token
+  file itself, which is a change to what pengepul treats as durable and deserves its
+  own decision rather than a rider on this one.
 - **An account is delayed, never excluded — but a pool with no success to its name
-  can be dark for an hour.** `account_for` still selects any account whose cooldown
-  has expired, so a pool of one recovers by being selected again, and nothing here is
-  a permanent lockout; ADR-0017's rule that affinity never outranks availability is
-  untouched. The honest limit is narrower than "availability cannot be lost": in a
-  pool where *every* account has failed its way to the hour ceiling, the relay serves
-  nothing until one expires. Nothing clears that hour except time, a successful
-  request, a changed token file, or a restart — `reload` resets a cooldown only for
-  an account whose credential changed, so topping up credits upstream without
-  re-login does not bring the account back early, and `failure_count` is not
-  persisted, so restarting the relay is what returns it to the base cooldown. A pool
-  in that state was already serving nothing, so this delays a recovery rather than
-  causing an outage; it is still the sharpest edge of this change.
+  can be dark for an hour, and that is a real slowdown.** `account_for` still selects
+  any account whose cooldown has expired, so a pool of one recovers by being selected
+  again, and nothing here is a permanent exclusion; ADR-0017's rule that affinity never
+  outranks availability is untouched. The honest limit is narrower than "availability
+  cannot be lost": in a pool where *every* account has failed its way to the hour
+  ceiling, the relay serves nothing until one expires. Nothing clears that hour except
+  time, a successful request, a completed Refresh, a changed token file, or a restart —
+  `reload` resets a cooldown only for an account whose credential changed, so topping
+  up credits upstream without re-login does not bring the account back early.
+  (A restart does not merely shorten the hour: `cooldown_until` is not persisted, so it
+  clears the cooldown outright — pinned by `usage_counters_survive_a_manager_rebuild`,
+  which asserts the account is `available` after a rebuild. That is the operator's
+  fastest remedy, and it is why the ceiling is survivable at all.)
+  The cost this replaces is worth naming rather than waving away: the previous server
+  re-probed a never-succeeded pool every 600 s (billing) or 300 s (transient), so a
+  condition fixed upstream was picked up within ten minutes; it can now take an hour.
+  The pool was already refusing requests in both cases, so nothing that used to work
+  stops working — but recovery is up to 6× slower for billing and 12× for transient
+  failures, which is the price of not hammering a credential with nothing to lose.
 - **A fresh account's first errors are still retried fast.** The change moves the
   ceiling, not the base, so the 1s/2s/4s opening that
   `failure_cooldown_doubles_from_one_second` pins is unchanged.
 - **One success undoes all of it.** `record_success` resets `failure_count`, so a
   credential that was merely unlucky returns to the ordinary regime on its next
   successful request, and to full service immediately.
-- **`record_billing_cooldown` no longer shortens a longer cooldown.** A billing
-  rejection arriving after a 24-hour reauth lockout now leaves the lockout in place.
-  This is a bug fix, not a design choice: it is the invariant `record_failure`
-  already documented and its sibling was missing.
+- **`record_billing_cooldown` no longer shortens a longer cooldown, and no longer
+  mislabels one.** A billing rejection arriving after a 24-hour reauth cooldown now
+  leaves that cooldown in place, and leaves the reason the operator reads —
+  `refresh token …; re-run login` — intact rather than overwriting it with exhausted
+  credits. Both are bug fixes, not design choices: the first is the invariant
+  `record_failure` already documented and its sibling was missing, and the second is
+  that same rule applied to the two fields `record_failure` keeps inside its guard,
+  pinned by `a_billing_rejection_does_not_shorten_a_longer_cooldown`.
 - **The operator still has to fix the credential.** This bounds the waste; it does
   not top up a balance or replace a key. `pengepul accounts` remains the place to
   see a zero-success row, and `systemctl --user restart pengepul` is the quickest

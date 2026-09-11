@@ -349,7 +349,26 @@ impl ModelUsage {
 }
 
 /// Path of a provider's usage file: `~/.pengepul/<provider>/usage.json`.
-fn usage_path(auth_dir: &Path, provider: &ProviderId) -> PathBuf {
+/// Whether a provider's usage file is present but does not parse as a JSON object.
+///
+/// Used only to decide whether the load path may rewrite that file. `total_successes`
+/// is a policy input now (`AccountState::failure_cooldown`, ADR-0020), so a file that
+/// exists and cannot be read must not be replaced with zeros by a startup that never
+/// served a request — the counters would regenerate, a cooldown ceiling earned by the
+/// loss would not.
+///
+/// An absent file is not unreadable: there is no history to preserve, and the next
+/// write creates one.
+#[must_use]
+pub(crate) fn usage_file_unreadable(auth_dir: &Path, provider: &ProviderId) -> bool {
+    let path = usage_path(auth_dir, provider);
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return false;
+    };
+    !serde_json::from_str::<Value>(&raw).is_ok_and(|value| value.is_object())
+}
+
+pub(crate) fn usage_path(auth_dir: &Path, provider: &ProviderId) -> PathBuf {
     auth_dir.join(provider.storage_dir()).join("usage.json")
 }
 
@@ -378,7 +397,29 @@ pub(crate) fn load_usage(
 
 fn parse_persisted_usage(entry: &Value) -> Option<PersistedUsage> {
     let object = entry.as_object()?;
-    let field = |key: &str| object.get(key).and_then(Value::as_i64).unwrap_or(0);
+    // A counter that is not a JSON integer is still a counter. Reading `7122.0` or
+    // `"7122"` as 0 would silently demote a proven account to a never-succeeded one, and
+    // `total_successes` decides a cooldown ceiling now (ADR-0020), so this parse is as
+    // forgiving as the zero-on-corruption contract it sits behind.
+    let field = |key: &str| -> i64 {
+        let Some(value) = object.get(key) else {
+            return 0;
+        };
+        if let Some(int) = value.as_i64() {
+            return int;
+        }
+        if let Some(float) = value.as_f64() {
+            // `7122.0` is a valid counter, so render the truncated value and parse it
+            // back. Deliberately not a cast: this keeps the conversion total (a NaN or a
+            // value past i64 simply fails to parse and falls back to 0) and keeps the
+            // crate's `-D warnings` gates clean without an allow.
+            return format!("{:.0}", float.trunc()).parse::<i64>().unwrap_or(0);
+        }
+        value
+            .as_str()
+            .and_then(|text| text.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+    };
     Some(PersistedUsage {
         requests: field("total_requests"),
         successes: field("total_successes"),

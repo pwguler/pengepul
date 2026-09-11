@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use crate::tokens::{
     DayUsage, ModelUsage, PersistedUsage, RETENTION_DAYS, load_all_tokens, load_usage, save_token,
-    save_usage, trim_days,
+    save_usage, trim_days, usage_file_unreadable, usage_path,
 };
 use crate::types::{
     AvailableAccount, ProviderId, ProviderKind, RefreshTokenExhaustedError, TokenData, UsageData,
@@ -315,6 +315,22 @@ impl AccountManager {
         for token in load_all_tokens(&self.auth_dir, Some(&self.provider))? {
             self.upsert_loaded_token(token);
         }
+        // `total_successes` is a policy input, not only a counter: it decides whether an
+        // account earns the never-succeeded cooldown ceiling (ADR-0020). So a usage file
+        // that exists and yielded nothing is not merely missing observability — writing the
+        // repair back would overwrite recoverable history with zeros and reclassify every
+        // proven account as one that has never succeeded. Leave the file alone and say so:
+        // counters regenerate, an hour-long cooldown earned by a lost file does not undo
+        // itself.
+        if !self.accounts.is_empty() && usage_file_unreadable(&self.auth_dir, &self.provider) {
+            tracing::warn!(
+                path = %usage_path(&self.auth_dir, &self.provider).display(),
+                provider = %self.provider,
+                "usage file is unreadable; leaving it in place rather than overwriting it with \
+                 zeros, which would reclassify these accounts as never-succeeded"
+            );
+            return Ok(());
+        }
         // Write the repair back now. An account that serves nothing after
         // a restart would otherwise leave a stale file behind a correct
         // panel, and the two would disagree until its next request.
@@ -482,9 +498,7 @@ impl AccountManager {
             return;
         };
         state.failure_count += 1;
-        state.last_failure_kind = Some("billing".to_string());
         state.last_failure_at = Some(now_iso());
-        state.last_error = Some(format!("billing: {detail}"));
         // An account with successes behind it gets the flat billing cooldown it
         // always has. One that has never succeeded escalates instead: it is not
         // going to clear mid-session either, and a flat ten minutes forever is the
@@ -493,9 +507,15 @@ impl AccountManager {
         let multiplier = 2_f64.powi(i32::try_from(state.failure_count - 1).unwrap_or(0));
         let cooldown = unix_now() + (base * multiplier).min(maximum);
         // Same rule as `record_failure`: a cooldown only ever grows, so a billing
-        // rejection cannot collapse a 24-hour reauth lockout back to minutes.
+        // rejection cannot collapse a 24-hour reauth lockout back to minutes — and the
+        // recorded reason belongs inside that guard for the same reason its sibling keeps
+        // it there. Writing "billing" outside would leave an account parked on the reauth
+        // lockout with `lastError` claiming exhausted credits, hiding the one field
+        // CONTEXT.md tells the operator to read for a Reauth.
         if cooldown > state.cooldown_until {
             state.cooldown_until = cooldown;
+            state.last_failure_kind = Some("billing".to_string());
+            state.last_error = Some(format!("billing: {detail}"));
         }
         self.persist_usage();
     }

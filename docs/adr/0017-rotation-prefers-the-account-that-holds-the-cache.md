@@ -52,6 +52,9 @@ groups what actually shares a cache and still spreads unrelated work.
 - **Two identical requests no longer alternate accounts.** They share a prefix, so
   they share an account. `messages_route_rotates_available_anthropic_accounts` now
   sends two different system prompts to assert the pool is still spread across.
+  (The Context table counts the `commandcode` pool at two keys and this amendment at
+  three: a third key was added between the two measurements. The request figures are
+  reconciled in ADR-0020; the account count is simply a later snapshot.)
 - **Availability still outranks cache locality.** A pinned account on Cooldown is
   passed over at the next selection, not waited for.
 - **Failover re-pins, and that is what heals a bad pin.** Its loop re-enters
@@ -66,6 +69,16 @@ groups what actually shares a cache and still spreads unrelated work.
 - The map is bounded (1024 conversations, cleared wholesale when full) and is not
   persisted. A restart re-learns the mapping on the next turn, at the cost of one
   cold read — the same price a restart already pays for Cooldown.
+- **The 1024 bound now binds.** It did not before: with a key of
+  `{system, tools, model}` a whole project shared one entry, so a busy relay filled a
+  handful. One entry per conversation is the point of this change, and it means the
+  bound is now reachable by a relay serving enough distinct conversations at once,
+  and that hitting it drops the whole map at once rather than evicting the oldest
+  entry. A relay at that scale re-pins every live conversation to Rotation for one
+  turn and then re-learns; the cost is one round of cold reads, not lost work. Left
+  as-is deliberately: 1024 concurrent conversations is far above what this relay
+  serves, and the constraint on this change was to keep the bound rather than grow it.
+  A least-recently-used eviction would be the fix if that ever stops being true.
 - Widening the fallback to the Messages dialect costs each live Claude session one
   cold read, once. A Claude conversation is not therefore split across accounts
   afterwards, which is the failure this amendment exists to stop.
@@ -87,7 +100,7 @@ Completions dialect. It read only two session headers, which pi did not send for
 an `openai` affinity format at the time of this measurement — its client emitted
 `session_id`, `x-client-request-id` and `x-session-affinity` instead, none of
 which this relay reads. (The sibling provider has since pinned `x-session-id`;
-see the amendment below for what that does and does not change.) Otherwise the key
+the amendment below states what that does and does not change.) Otherwise the key
 hashed `system`, `tools` and `model` — but a Chat Completions body has no
 top-level `system`, so the key collapsed to the model and tool list. Every
 conversation on that model shared one affinity entry, so one account's Cooldown or
@@ -98,7 +111,7 @@ The key now resolves in this order:
 
 1. `x-claude-code-session-id`, then `x-session-id`;
 2. `body.prompt_cache_key`, the standard `OpenAI` field for exactly this and the
-   only affinity signal an OpenAI-dialect client can send;
+   only affinity signal an OpenAI-dialect client can put *inside its body*;
 3. a hash of the cacheable prefix: `system`, `tools` and `model`, plus a fixed
    window over the opening of the message list — the first two messages, each cut
    to 4 KiB (`messages` for Chat and Messages, `instructions` then `input` for
@@ -126,11 +139,33 @@ turn after it. Two messages is the smallest window that can satisfy both
 requirements on a first turn, and **no window can satisfy both on a single-message
 first turn**: with only message 0 in hand, "this conversation grows" and "this is a
 different conversation" are the same observation. A conversation that opens with one
-message settles on its second turn; one that opens with two or more — every pi
-request, which always carries a developer or system message — never moves. The
+message in the window settles on its second turn; one whose window already holds two
+messages — every pi *Chat* request, which always carries a developer or system message
+as its first entry — never moves. pi's Messages dialect is the one case that does move
+on its second turn: there the system prompt is a top-level `system` field rather than a
+message, so a first turn carries a single entry in the window. That costs one cold read
+per Claude session at turn 1 → 2, and nothing after it. The
 earlier draft of this ADR justified the instability as "nothing shorter than the
 minimum cacheable unit has a prefix worth preserving"; that claim was unverifiable
 from inside this repository and is withdrawn in favour of the argument above.
+
+Two conversations that agree for the whole window and diverge after it still share a
+key, and that is the residual this window cannot remove: it bounds how much of a
+conversation is read, so two conversations on one model and tool set whose first two
+messages are byte-identical are one affinity entry. The consequence is the one this
+change is about, at reduced scope — one of them failing over moves both, because
+their shared entry is re-pinned. Probed rather than assumed: two bodies differing
+only at message 3 return the same key. No window can avoid this without reading the
+whole list, which is what a byte-budget design was trying to prevent; a harness that
+opens its turn with a unique first user message (pi does) never hits it.
+
+The header path had the same class of bug and was missed. `header_str` returned any
+value, including an empty one, so a client sending `x-session-id:` with nothing after
+it gave every one of its conversations the key `""` and one failover moved all of
+them. Blank is now treated as absent, per candidate — an empty
+`x-claude-code-session-id` falls through to a real `x-session-id` rather than masking
+it — which also matches the body field, which already rejected an empty
+`prompt_cache_key`.
 
 The Messages dialect needed rule 3 as much as Chat did, which is not obvious from
 its body: it has a real top-level `system`, so the old key was not empty — it just
@@ -159,9 +194,10 @@ explicit approval once the measurement above showed the constraint was protectin
 collapse rather than a working key. The cost is one cold read per live Claude
 conversation, once.
 
-Every selection logs the resolved key, the chosen account and whether the affinity
-entry was honored or fell through to Rotation, so a re-billed prefix can be tied
-to the account switch that caused it. The `honored`/`rotation` value that line prints
+Every selection that reaches an account logs the resolved key, the chosen account and
+whether the affinity entry was honored or fell through to Rotation — a selection that
+finds no account at all, or whose token refresh fails, returns before that line — so a
+re-billed prefix can be tied to the account switch that caused it. The `honored`/`rotation` value that line prints
 is unit-tested through `AccountResult`; the log format itself was verified by
 running the relay with `RUST_LOG=pengepul=debug` and reading its output, and is not
 covered by an automated test.
@@ -175,13 +211,18 @@ idle after the first:
 | turn | prompt | cached | re-billed | hit |
 |---|---|---|---|---|
 | 1 | 7394 | 0 | 7394 | 0% |
-| 2 | 7404 | 7168 | 226 | 96% |
+| 2 | 7404 | 7168 | 236 | 96% |
 | 3 | 7414 | 7168 | 246 | 96% |
 | 4 | 7424 | 7168 | 256 | 96% |
 
 The four-second gap that used to collapse the prefix from 17,920 to 1,920 now costs
-nothing: every turn after the first re-bills only its own increment. Re-billed is
-flat at ~240 tokens per turn instead of the whole prefix.
+nothing: every turn after the first re-bills only its own increment, stepping by the
+prompt's own +10 per turn. One caveat about what this run proves. The body carried a
+`prompt_cache_key` *and* the provider pins `x-session-id`, so rule 1 supplied the key
+and this table demonstrates a stable affinity, not which rule supplied it. The
+fallback of rule 3 — the only signal that carries Messages traffic, and the basis for
+the approach below — has no live evidence here; it is covered by the unit tests and
+by the per-account-cache integration test named at the end of this section.
 
 The account-switch case is covered by
 `one_chat_conversation_failing_over_does_not_re_bill_another`, which runs against an

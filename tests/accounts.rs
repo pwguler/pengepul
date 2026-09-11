@@ -301,7 +301,7 @@ async fn a_depleted_key_that_never_succeeded_escalates_past_the_flat_billing_coo
 async fn a_billing_rejection_does_not_shorten_a_longer_cooldown() {
     // The guard `record_billing_cooldown` was missing. It used to assign
     // `cooldown_until = now + 600s` unconditionally, so a billing rejection arriving
-    // behind a 24-hour reauth lockout collapsed it to ten minutes and re-selected the
+    // behind a 24-hour reauth cooldown collapsed it to ten minutes and re-selected the
     // account into a failure loop. `record_failure` has always documented "a cooldown
     // only ever grows"; this is the same rule applied to its sibling.
     let tmp = tempdir().expect("tempdir");
@@ -326,14 +326,28 @@ async fn a_billing_rejection_does_not_shorten_a_longer_cooldown() {
     let locked = remaining(&mut manager);
     assert!(
         locked > 3_600.0,
-        "the reauth lockout should be ~24h, got {locked}s"
+        "the reauth cooldown should be ~24h, got {locked}s"
     );
 
     manager.record_billing_cooldown("locked@example.com", "insufficient credits");
     let after_billing = remaining(&mut manager);
     assert!(
         after_billing > 3_600.0,
-        "a billing rejection collapsed a 24h reauth lockout to {after_billing}s"
+        "a billing rejection collapsed a 24h reauth cooldown to {after_billing}s"
+    );
+    // And it must not rewrite the reason for a cooldown it did not apply. The billing
+    // cooldown was rejected by the guard, so the operator must still be told to re-run
+    // login: that field is the tell CONTEXT.md names for a Reauth, and a sibling test
+    // (`a_reauth_lockout_is_not_clobbered_by_the_paired_failure`) pins the same rule.
+    let snap = manager.snapshots().remove(0);
+    let error = snap["lastError"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("re-run login"),
+        "a rejected billing cooldown overwrote the reauth reason: {error:?}"
+    );
+    assert_eq!(
+        snap["failureCount"], 2,
+        "the rejection still counts against the account"
     );
 }
 
@@ -372,6 +386,108 @@ async fn the_selection_says_whether_affinity_was_honored_or_fell_through() {
     manager.record_failure(&chosen, "upstream", Some("503"));
     let fallen_through = manager.account_for("conversation-a");
     assert_eq!(fallen_through.affinity.as_str(), "rotation");
+}
+
+#[tokio::test]
+async fn an_unreadable_usage_file_is_not_overwritten_with_zeros_at_load() {
+    // `total_successes` decides a cooldown ceiling now (ADR-0020), so it is a policy
+    // input, not only a counter. The permissive-zero load contract (usage-persistence
+    // AC-5) is still right for counters, but the *write-back* that follows it would
+    // turn a file nobody could read into a permanent "these accounts never succeeded"
+    // — the counters regenerate, an hour-long cooldown earned that way does not undo
+    // itself. So the load path leaves an unreadable file alone and says so.
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let provider_dir = tmp.path().join("commandcode");
+    fs::create_dir_all(&provider_dir).expect("provider dir");
+    let usage = provider_dir.join("usage.json");
+    fs::write(&usage, "{not json").expect("write junk");
+
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load survives corruption");
+    // Still permissive: the manager is usable and its counters are zero.
+    assert_eq!(manager.snapshots()[0]["totalRequests"], 0);
+    // But the unreadable file is untouched, so a later recovery is possible.
+    assert_eq!(
+        fs::read_to_string(&usage).expect("read"),
+        "{not json",
+        "load overwrote an unreadable usage file with zeros"
+    );
+
+    // Traffic still replaces it, which is the documented permissive contract; this test
+    // pins only the load path, and says so rather than implying the file is safe.
+    manager.record_success("k@example.com", None, "deepseek-v4.1-flash");
+    assert_eq!(
+        persisted(&usage)["k@example.com"]["total_requests"],
+        1,
+        "a served request still writes valid usage"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_usage_file_is_written_normally_not_treated_as_unreadable() {
+    // The guard must not fire for a provider that simply has no history yet, or a first
+    // run would never create the file.
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let usage = tmp.path().join("commandcode").join("usage.json");
+    assert!(!usage.exists());
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    assert!(usage.exists(), "a fresh provider must get its usage file");
+}
+
+#[tokio::test]
+async fn counters_written_as_floats_or_strings_still_count() {
+    // Reading `7122.0` or `"7122"` as 0 would demote a proven account to a
+    // never-succeeded one and hand it the hour ceiling, so the parse tolerates the
+    // shapes a JSON writer might produce.
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    let provider_dir = tmp.path().join("commandcode");
+    fs::create_dir_all(&provider_dir).expect("provider dir");
+    fs::write(
+        provider_dir.join("usage.json"),
+        json!({
+            "k@example.com": {
+                "total_requests": 7122.0,
+                "total_successes": "7100",
+                "total_failures": 22
+            }
+        })
+        .to_string(),
+    )
+    .expect("write usage");
+
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    let snapshot = manager.snapshots().remove(0);
+    assert_eq!(
+        snapshot["totalSuccesses"], 7100,
+        "a string counter was read as 0"
+    );
+    assert_eq!(
+        snapshot["totalRequests"], 7122,
+        "a float counter was read as 0"
+    );
+    assert_eq!(snapshot["totalFailures"], 22);
+
+    // And the consequence that matters: this account keeps the ordinary ceiling.
+    manager.record_billing_cooldown("k@example.com", "insufficient credits");
+    manager.record_billing_cooldown("k@example.com", "insufficient credits");
+    manager.record_billing_cooldown("k@example.com", "insufficient credits");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs_f64();
+    let remaining = manager.snapshots().remove(0)["cooldownUntil"]
+        .as_f64()
+        .expect("cooldownUntil")
+        - now;
+    assert!(
+        (600.0 - 0.5..=600.0).contains(&remaining),
+        "a proven account whose counters were floats earned the hour ceiling: {remaining}s"
+    );
 }
 
 fn static_token(email: &str) -> TokenData {

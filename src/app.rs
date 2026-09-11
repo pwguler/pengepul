@@ -1892,6 +1892,13 @@ const AFFINITY_MESSAGE_BYTES: usize = 4 * 1024;
 /// whole, as they always have been, so a pathological tool list is still hashed in
 /// full — a pre-existing cost, bounded in practice by the tools a harness sends.
 fn conversation_key(headers: &HeaderMap, body: &Value, route: RequestRoute) -> String {
+    // `header_str` treats a blank value as absent. It did not always: a client sending
+    // `x-session-id:` with nothing after it collapsed every one of its conversations
+    // onto the single key `""`, so one failover moved all of them — the same
+    // blast-radius bug this key exists to fix. (`apply_cloaking` in src/upstream.rs reads
+    // the same header for the cloaked session id and still accepts a blank one; that is
+    // pre-existing, upstream-facing, and out of this change's scope.)
+    // The body field below rejects a blank string for the same reason.
     if let Some(session) = header_str(headers, "x-claude-code-session-id")
         .or_else(|| header_str(headers, "x-session-id"))
     {
@@ -1900,7 +1907,7 @@ fn conversation_key(headers: &HeaderMap, body: &Value, route: RequestRoute) -> S
     if let Some(key) = body
         .get("prompt_cache_key")
         .and_then(Value::as_str)
-        .filter(|key| !key.is_empty())
+        .filter(|key| !key.trim().is_empty())
     {
         return key.to_string();
     }
@@ -1933,10 +1940,11 @@ fn conversation_key(headers: &HeaderMap, body: &Value, route: RequestRoute) -> S
 /// Two messages is the smallest window that can satisfy both requirements on a first
 /// turn, and no window can satisfy both on a single-message first turn: with only
 /// message 0 in hand, "this conversation grows" and "this is a different
-/// conversation" are the same observation. A conversation that opens with one
-/// message therefore settles on its second turn, and one that opens with two or more
-/// (every pi request, which always carries a developer or system message) never
-/// moves.
+/// conversation" are the same observation. A conversation that opens with one message
+/// therefore settles on its second turn, and one whose window already holds two never
+/// moves — every pi Chat request, which puts its developer or system message first.
+/// pi's Messages dialect is the exception that does move once: there the system prompt
+/// is a top-level `system` field, not a message, so a first turn fills only one slot.
 fn cacheable_opening(body: &Value, route: RequestRoute) -> String {
     let mut out = String::new();
     match route {
@@ -1945,7 +1953,17 @@ fn cacheable_opening(body: &Value, route: RequestRoute) -> String {
         }
         RequestRoute::Responses => {
             push_opening(&mut out, body.get("instructions"));
-            push_opening(&mut out, body.get("input"));
+            // `input` or `messages`, in that order, because that is the order the route
+            // itself resolves them: the handler accepts either field and Translation reads
+            // `input` with `messages` as the fallback (see `responses_to_anthropic`). Reading
+            // only `input` left a `messages`-shaped Responses body with an empty window, so
+            // it collapsed onto the model and tool hash — the very bug this key exists to
+            // fix, still live on a third route.
+            let turns = body
+                .get("input")
+                .filter(|value| !value.is_null())
+                .or_else(|| body.get("messages"));
+            push_opening(&mut out, turns);
         }
     }
     out
@@ -1981,8 +1999,16 @@ fn push_prefix(buffer: &mut String, text: &str, limit: usize) {
     buffer.push_str(&text[..end]);
 }
 
+/// The value of `name`, when the request carries one and it is not blank.
+///
+/// Blank is treated as absent, which is what lets `conversation_key` fall through from
+/// an empty `x-claude-code-session-id` to a real `x-session-id` rather than letting the
+/// empty one mask it.
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers.get(name).and_then(|value| value.to_str().ok())
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
 }
 
 async fn next_provider_account(
@@ -3734,6 +3760,79 @@ mod tests {
         );
         assert_eq!(usage.output_tokens, 72);
         assert_eq!(usage.reasoning_output_tokens, 58);
+    }
+
+    #[test]
+    fn a_blank_session_header_is_not_a_name() {
+        // Found by adversarial review after this change had already landed. A client that
+        // sends the header with nothing after it collapsed every one of its conversations
+        // onto the key `""`, so one failover moved all of them at once — the same
+        // blast-radius bug the whole change exists to fix, on the only path that had not
+        // been checked. The body's `prompt_cache_key` already rejected empty.
+        let left = chat_turn(&["left opening"], None);
+        let right = chat_turn(&["right opening"], None);
+        for blank in ["", "   "] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-session-id", blank.parse().expect("header value"));
+            let left_key = key_for(&headers, &left);
+            let right_key = key_for(&headers, &right);
+            assert!(
+                left_key.starts_with("prefix:"),
+                "a blank x-session-id ({blank:?}) was used as an affinity key: {left_key:?}"
+            );
+            assert_ne!(
+                left_key, right_key,
+                "two conversations sending a blank x-session-id ({blank:?}) shared one key"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_high_priority_header_does_not_mask_a_real_lower_priority_one() {
+        // The blank check is per candidate, not after the fallback. Filtering the result
+        // of `or_else` would have thrown away a perfectly good `x-session-id` because a
+        // higher-priority header happened to be present with an empty value.
+        let body = chat_turn(&["one"], None);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-claude-code-session-id",
+            "".parse().expect("header value"),
+        );
+        headers.insert("x-session-id", "sess-real".parse().expect("header value"));
+        assert_eq!(key_for(&headers, &body), "sess-real");
+    }
+
+    #[test]
+    fn a_responses_body_that_carries_messages_is_not_a_blank_window() {
+        // The handler accepts either field (`input` or `messages`) and Translation reads
+        // `input` with `messages` as the fallback, so a Messages-shaped body is served on
+        // /v1/responses. Reading only `input` here left its window empty, which collapsed
+        // every such conversation onto hash({system,tools,model}) — the exact bug this key
+        // exists to remove, still live on a third route.
+        let left = json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "left opening"}],
+        });
+        let right = json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "right opening"}],
+        });
+        assert_ne!(
+            conversation_key(&HeaderMap::new(), &left, RequestRoute::Responses),
+            conversation_key(&HeaderMap::new(), &right, RequestRoute::Responses),
+            "two Responses conversations carrying `messages` shared one key"
+        );
+
+        // `input` still wins when both are present, matching `responses_to_anthropic`.
+        let with_input = json!({
+            "model": "claude-sonnet-4-6",
+            "input": [{"role": "user", "content": "right opening"}],
+            "messages": [{"role": "user", "content": "ignored"}],
+        });
+        assert_eq!(
+            conversation_key(&HeaderMap::new(), &with_input, RequestRoute::Responses),
+            conversation_key(&HeaderMap::new(), &right, RequestRoute::Responses)
+        );
     }
 
     #[test]
