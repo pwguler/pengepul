@@ -3663,3 +3663,76 @@ async fn grok_responses_stream_translates_chat_chunks_into_response_events() {
     // The Responses dialect ends at response.completed; no chat [DONE] leaks.
     assert!(!body.contains("[DONE]"), "{body}");
 }
+
+#[tokio::test]
+async fn admin_reload_picks_up_a_relogged_grok_token_without_a_restart() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_grok_account(tmp.path());
+    let upstream = Arc::new(GrokUpstream::new());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    // A fresh `pengepul login --provider grok` replaces the credential on disk
+    // while the relay is running (the token it mints carries scopes the old
+    // one lacked).
+    let relogged = TokenData {
+        access_token: "grok-relogged-token".to_string(),
+        refresh_token: "grok-refresh-2".to_string(),
+        email: "grok@example.com".to_string(),
+        expires_at: "2030-01-01T00:00:00Z".to_string(),
+        account_uuid: "principal-1".to_string(),
+        provider: ProviderId::grok(),
+        id_token: None,
+        last_refresh_at: None,
+        plan_type: Some("tier-3".to_string()),
+    };
+    save_token(tmp.path(), &relogged).expect("save relogged token");
+
+    let (status, reloaded) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/admin/reload")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    // The regression: grok was absent from the reload list, so this reported
+    // the account as changed nowhere and the relay kept the stale credential.
+    assert_eq!(
+        reloaded["reloaded"]["grok"]["updated"],
+        json!(["grok@example.com"])
+    );
+
+    // And the very next request spends the reloaded token, not the old one.
+    let (status, _) = json_response(
+        app,
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .body(Body::from(
+                json!({
+                    "model": "grok-4.6",
+                    "messages": [{"role": "user", "content": "reply exactly: pong"}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let calls = upstream.calls.lock().expect("calls lock");
+    assert_eq!(
+        calls
+            .last()
+            .expect("one grok call")
+            .account
+            .token
+            .access_token,
+        "grok-relogged-token"
+    );
+}

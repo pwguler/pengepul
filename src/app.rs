@@ -931,42 +931,46 @@ async fn admin_reload(State(state): State<AppState>, headers: HeaderMap) -> Resp
         return error.into_response();
     }
 
+    // Every pool is reloaded here, built-ins included. A hand-written list of
+    // providers is what let grok's fresh login be silently ignored: the token
+    // file was replaced, reload reported nothing, and the relay kept serving
+    // the stale credential until a restart.
     let anthropic = state.account_managers.anthropic.lock().await.reload();
     let codex = state.account_managers.codex.lock().await.reload();
-    let mut generic = BTreeMap::new();
-    let mut generic_failed = None;
+    let grok = state.account_managers.grok.lock().await.reload();
+    let mut reloaded = serde_json::Map::new();
+    for (provider, result) in [
+        (ProviderId::anthropic(), anthropic),
+        (ProviderId::codex(), codex),
+        (ProviderId::grok(), grok),
+    ] {
+        match result {
+            Ok(value) => {
+                reloaded.insert(provider.to_string(), value);
+            }
+            Err(error) => {
+                return AppError::simple(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to reload accounts: {error}"),
+                )
+                .into_response();
+            }
+        }
+    }
     for (id, manager) in &state.account_managers.generic {
         match manager.lock().await.reload() {
             Ok(result) => {
-                generic.insert(id.clone(), result);
+                reloaded.insert(id.clone(), result);
             }
-            Err(error) => generic_failed = Some(error),
+            Err(error) => {
+                return AppError::simple(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to reload accounts: {error}"),
+                )
+                .into_response();
+            }
         }
     }
-    if let Some(error) = generic_failed {
-        return AppError::simple(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to reload accounts: {error}"),
-        )
-        .into_response();
-    }
-    let reloaded = match (anthropic, codex) {
-        (Ok(anthropic), Ok(codex)) => {
-            let mut map = serde_json::Map::from_iter([
-                (ProviderId::anthropic().to_string(), anthropic),
-                (ProviderId::codex().to_string(), codex),
-            ]);
-            map.extend(generic);
-            map
-        }
-        (Err(error), _) | (_, Err(error)) => {
-            return AppError::simple(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to reload accounts: {error}"),
-            )
-            .into_response();
-        }
-    };
 
     // Reloading accounts can add a provider that now has credentials to fetch models with.
     let refresh_state = state.clone();
