@@ -164,6 +164,216 @@ async fn failure_cooldown_doubles_from_one_second() {
     }
 }
 
+#[tokio::test]
+async fn a_credential_that_never_succeeded_is_parked_past_the_transient_error_ceiling() {
+    // Five minutes is the ceiling for an account whose error is assumed
+    // transient. An account with no success to its name is a different bet: a
+    // static key the upstream rejects never recovers on its own, and retrying
+    // it every five minutes forever is waste, not availability. Only the
+    // ceiling moves -- the 1s, 2s, 4s opening is unchanged, which
+    // `failure_cooldown_doubles_from_one_second` pins, and the first success
+    // resets the streak and returns the account to Rotation.
+    let tmp = tempdir().expect("tempdir");
+    let codex_dir = tmp.path().join("codex");
+    fs::create_dir_all(&codex_dir).expect("codex dir");
+    fs::write(
+        codex_dir.join("key.json"),
+        json!({
+            "access_token": "sk-codex",
+            "refresh_token": "",
+            "email": "codex-abc12345",
+            "type": "codex",
+            "expired": "9999-12-31T23:59:59Z",
+            "account_uuid": ""
+        })
+        .to_string(),
+    )
+    .expect("write codex token");
+    let mut manager = AccountManager::new(
+        tmp.path().to_path_buf(),
+        "codex".parse().unwrap(),
+        |_refresh_token| Box::pin(async { anyhow::bail!("unused refresh") }),
+        RefreshPolicy::default(),
+    );
+    manager.load().expect("load accounts");
+
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs_f64()
+    };
+    let remaining = |manager: &mut AccountManager| {
+        manager.snapshots().remove(0)["cooldownUntil"]
+            .as_f64()
+            .expect("cooldownUntil")
+            - now()
+    };
+
+    // 2^12 seconds is past the transient ceiling, so the never-succeeded cap is
+    // what the cooldown settles against.
+    for _ in 0..13 {
+        manager.record_failure("codex-abc12345", "upstream", Some("400"));
+    }
+    let parked = remaining(&mut manager);
+    assert!(
+        (3_600.0 - 0.5..=3_600.0).contains(&parked),
+        "a never-succeeded credential should sit out an hour, got {parked}s"
+    );
+
+    // One success proves the credential works, so the account goes back to
+    // being treated as good and the five-minute ceiling applies again.
+    manager.record_success("codex-abc12345", None, "gpt-5.6");
+    for _ in 0..13 {
+        manager.record_failure("codex-abc12345", "upstream", Some("400"));
+    }
+    let transient = remaining(&mut manager);
+    assert!(
+        (300.0 - 0.5..=300.0).contains(&transient),
+        "a credential with a success behind it should cap at five minutes, got {transient}s"
+    );
+}
+
+#[tokio::test]
+async fn a_depleted_key_that_never_succeeded_escalates_past_the_flat_billing_cooldown() {
+    // The path this pins is `record_billing_cooldown`, not `record_failure`: it is
+    // what the failover loop calls when a 200 body reports exhausted credits, and
+    // unlike its sibling it used to assign a flat ten minutes forever. Measured on
+    // the live pool, `key-d792179a` drew 91 requests, served none, and produced
+    // exactly that cycle -- 600s at failure_count=1, then 600s again, indefinitely.
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("broke@example.com")).expect("save token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs_f64()
+    };
+    let remaining = |manager: &mut AccountManager| {
+        manager.snapshots().remove(0)["cooldownUntil"]
+            .as_f64()
+            .expect("cooldownUntil")
+            - now()
+    };
+
+    // First rejection: the billing base, ten minutes, as before.
+    manager.record_billing_cooldown("broke@example.com", "insufficient credits");
+    let first = remaining(&mut manager);
+    assert!(
+        (600.0 - 0.5..=600.0).contains(&first),
+        "the first billing rejection should still sit out ten minutes, got {first}s"
+    );
+
+    // A second and third double it, past the flat billing cooldown and up to the
+    // never-succeeded ceiling. A credential with no success to its name is not
+    // going to clear mid-session, so it should not be probed six times an hour.
+    manager.record_billing_cooldown("broke@example.com", "insufficient credits");
+    let second = remaining(&mut manager);
+    assert!(
+        (1_200.0 - 0.5..=1_200.0).contains(&second),
+        "a repeat billing rejection should double the cooldown, got {second}s"
+    );
+    manager.record_billing_cooldown("broke@example.com", "insufficient credits");
+    manager.record_billing_cooldown("broke@example.com", "insufficient credits");
+    let capped = remaining(&mut manager);
+    assert!(
+        (3_600.0 - 0.5..=3_600.0).contains(&capped),
+        "a never-succeeded key should cap at an hour, got {capped}s"
+    );
+
+    // And an account that has served something keeps the flat billing cooldown,
+    // unchanged: being out of credits is not evidence about the credential.
+    manager.record_success("broke@example.com", None, "deepseek-v4.1-flash");
+    manager.record_billing_cooldown("broke@example.com", "insufficient credits");
+    manager.record_billing_cooldown("broke@example.com", "insufficient credits");
+    manager.record_billing_cooldown("broke@example.com", "insufficient credits");
+    let proven = remaining(&mut manager);
+    assert!(
+        (600.0 - 0.5..=600.0).contains(&proven),
+        "an account with a success behind it keeps the flat billing cooldown, got {proven}s"
+    );
+}
+
+#[tokio::test]
+async fn a_billing_rejection_does_not_shorten_a_longer_cooldown() {
+    // The guard `record_billing_cooldown` was missing. It used to assign
+    // `cooldown_until = now + 600s` unconditionally, so a billing rejection arriving
+    // behind a 24-hour reauth lockout collapsed it to ten minutes and re-selected the
+    // account into a failure loop. `record_failure` has always documented "a cooldown
+    // only ever grows"; this is the same rule applied to its sibling.
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("locked@example.com")).expect("save token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs_f64()
+    };
+    let remaining = |manager: &mut AccountManager| {
+        manager.snapshots().remove(0)["cooldownUntil"]
+            .as_f64()
+            .expect("cooldownUntil")
+            - now()
+    };
+
+    manager.record_refresh_exhausted("locked@example.com", "invalid_grant");
+    let locked = remaining(&mut manager);
+    assert!(
+        locked > 3_600.0,
+        "the reauth lockout should be ~24h, got {locked}s"
+    );
+
+    manager.record_billing_cooldown("locked@example.com", "insufficient credits");
+    let after_billing = remaining(&mut manager);
+    assert!(
+        after_billing > 3_600.0,
+        "a billing rejection collapsed a 24h reauth lockout to {after_billing}s"
+    );
+}
+
+#[tokio::test]
+async fn the_selection_says_whether_affinity_was_honored_or_fell_through() {
+    // This value is what the account-selection debug line prints, and without a test
+    // on it a regression that always logged `honored` -- or logged the wrong one when
+    // an account cooled -- would be invisible to `cargo test`. The log format itself is
+    // hand-verified; the decision it reports is not.
+    let tmp = tempdir().expect("tempdir");
+    for email in ["alice@example.com", "bob@example.com"] {
+        save_token(tmp.path(), &static_token(email)).expect("save token");
+    }
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("reload");
+
+    // First sight of a conversation: Rotation chose, because nothing was recorded yet.
+    let first = manager.account_for("conversation-a");
+    let chosen = first
+        .account
+        .as_ref()
+        .expect("an account")
+        .token
+        .email
+        .clone();
+    assert_eq!(first.affinity.as_str(), "rotation");
+
+    // Second turn, same conversation, account healthy: the preference was honored.
+    assert_eq!(
+        manager.account_for("conversation-a").affinity.as_str(),
+        "honored"
+    );
+
+    // Account cooled: the preference exists but could not be honored, and saying
+    // `honored` here is exactly the lie that would hide a cache-moving failure.
+    manager.record_failure(&chosen, "upstream", Some("503"));
+    let fallen_through = manager.account_for("conversation-a");
+    assert_eq!(fallen_through.affinity.as_str(), "rotation");
+}
+
 fn static_token(email: &str) -> TokenData {
     TokenData {
         access_token: format!("access-{email}"),

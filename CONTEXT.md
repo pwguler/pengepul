@@ -39,7 +39,7 @@ Replacement of an account's expiring access token using its refresh token, done 
 _Avoid_: renew, re-auth
 
 **Reauth**:
-The state an account enters when its refresh token is itself rejected, where nothing but a human re-running `pengepul login` restores it. Static-key accounts never enter Reauth — they have no refresh token — a rejected key only cools down and comes back to fail again until the operator replaces it.
+The state an account enters when its refresh token is itself rejected, where nothing but a human re-running `pengepul login` restores it. Static-key accounts never enter Reauth — they have no refresh token — a rejected or depleted key cools down and keeps being retried, on a much longer cycle once it has never once succeeded, until the operator fixes the credential (ADR-0020).
 _Avoid_: refresh exhausted, invalid_grant, dead token
 
 **Cooldown**:
@@ -96,7 +96,7 @@ _Avoid_: billing classifier, detector, filter
 - One **Provider** has zero or more **Accounts**; one **Account** belongs to exactly one **Provider**.
 - Within one **Provider** an **Account** is keyed by exactly one email (anthropic/codex) or by a label derived from the key (static-key providers), and keys are unique.
 - One **Account** holds exactly one credential: an access-token/refresh-token pair for anthropic and codex, or one static API key for a configured OpenAI-compatible **Provider**.
-- One **Account** has at most one **Cooldown** in effect, with one duration policy for ordinary failures and a longer one for **Reauth**.
+- One **Account** has at most one **Cooldown** in effect, with one duration policy for ordinary failures, a longer one for **Reauth**, and a longer ceiling still for an account that has never once succeeded (ADR-0020).
 - One model id resolves to exactly one **Provider**.
 - One client request is served by one **Account** at a time, and **Failover** only moves it between **Accounts** of the same **Provider**.
 - **Cloaking** applies to requests bound for the anthropic and codex **Upstreams**; configured OpenAI-compatible endpoints are never cloaked. The **Local API key** applies to requests arriving from a client.
@@ -128,7 +128,7 @@ _Avoid_: billing classifier, detector, filter
 - "claude" appears as an alias for anthropic in stored credentials. Resolved: **anthropic** is the only spelling an operator uses or types.
 - "account", "credential" and "token" all name the same file under the auth directory across the README, the CLI and the source. Resolved: **Account** is the domain noun — the identity, its credential, and its record. Credential is the secret inside an account. Token is a wire artifact and never means the account.
 - Accounts are keyed by email. Resolved: read the field as the account key, not as an address.
-- "backoff", "lockout" and "unavailable" appear across the README, the CLI and the admin output for one mechanism. Resolved: there is one **Cooldown** with two duration policies. Say "failure cooldown" and "reauth cooldown" when the durations must be distinguished.
+- "backoff", "lockout" and "unavailable" appear across the README, the CLI and the admin output for one mechanism. Resolved: there is one **Cooldown** with three duration policies — an ordinary failure cooldown, a longer **Reauth** cooldown, and a longer ceiling still for an account that has never once succeeded (ADR-0020). Say "failure cooldown", "reauth cooldown" and "never-succeeded cooldown" when the durations must be distinguished.
 - "API key" covers two unrelated secrets: the keys clients present to pengepul, and the credentials pengepul presents upstream. Resolved: **Local API key** is what clients present; the upstream credential is what pengepul presents upstream. They point in opposite directions on the wire.
 - "cloaking" and "masquerade" are used interchangeably. Resolved: **Cloaking** is the domain term.
 - "refresh" names both the secret an account holds and the act of replacing its expiring access token. Resolved: **Refresh** is the act. The secret is the refresh token.

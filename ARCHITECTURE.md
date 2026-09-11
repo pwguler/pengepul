@@ -157,6 +157,12 @@ in files.
   opening of the message list (the first two messages, 4 KiB each). A fixed
   window, not a growing slice, so appends keep the key. It is bounded and not
   persisted: a restart re-learns it at the cost of one cold read.
+- **A credential that has never once succeeded sits out past the flat cooldown.**
+  Ordinary failures cool an account for 1s, 2s, 4s, … capped at five minutes, and a
+  billing rejection sits out a flat ten; an account with no success to its name caps
+  at an hour instead, so a depleted key stops spending a round trip every ten
+  minutes. It is delayed, never excluded, and its first success restores the
+  ordinary regime (ADR-0020).
 - **Every route authenticates before it parses a body.** `/health` is the only
   unauthenticated route.
 - **One Account holds exactly one credential**, on disk at `0600` and never

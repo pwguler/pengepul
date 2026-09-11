@@ -30,6 +30,19 @@ const FAILURE_BACKOFF: (f64, f64) = (1.0, 5.0 * 60.0);
 /// way a transient error does, so the account sits out far longer before being retried.
 const BILLING_COOLDOWN_SECONDS: f64 = 10.0 * 60.0;
 
+/// The cooldown ceiling for a credential that has never once succeeded.
+///
+/// [`FAILURE_BACKOFF`]'s five-minute ceiling assumes the account is good and the
+/// error was transient, which is the wrong assumption for an account with no
+/// success to its name: a static key the upstream rejects will never recover on
+/// its own, and retrying it every five minutes forever is pure waste (one such key
+/// drew 91 requests and served none). Raising only the *ceiling* and keeping the
+/// 1s, 2s, 4s opening means a fresh account's first blips are still retried fast,
+/// an upstream outage that hits every account cannot park the whole pool (the
+/// cooldown still has to be earned by a long streak), and the first success resets
+/// `failure_count` and puts the account straight back into Rotation.
+const NEVER_SUCCEEDED_COOLDOWN_SECONDS: f64 = 60.0 * 60.0;
+
 const REAUTH_COOLDOWN_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 
 /// How many conversations keep an account preference before the whole map
@@ -122,6 +135,27 @@ struct AccountState {
 }
 
 impl AccountState {
+    /// The (base, maximum) cooldown this account's next failure earns.
+    ///
+    /// A billing failure sits out longer than a transient one because it does not
+    /// clear mid-session, and an account with no success to its name sits out longer
+    /// still — see ADR-0020 for why the ceiling, and not the base, is what moves.
+    fn failure_cooldown(&self, kind: &str) -> (f64, f64) {
+        let billing = kind == "billing";
+        if self.total_successes == 0 {
+            let base = if billing {
+                BILLING_COOLDOWN_SECONDS
+            } else {
+                FAILURE_BACKOFF.0
+            };
+            (base, NEVER_SUCCEEDED_COOLDOWN_SECONDS)
+        } else if billing {
+            (BILLING_COOLDOWN_SECONDS, BILLING_COOLDOWN_SECONDS)
+        } else {
+            FAILURE_BACKOFF
+        }
+    }
+
     fn new(token: TokenData) -> Self {
         let last_refresh_at = token.last_refresh_at.clone();
         Self {
@@ -451,7 +485,18 @@ impl AccountManager {
         state.last_failure_kind = Some("billing".to_string());
         state.last_failure_at = Some(now_iso());
         state.last_error = Some(format!("billing: {detail}"));
-        state.cooldown_until = unix_now() + BILLING_COOLDOWN_SECONDS;
+        // An account with successes behind it gets the flat billing cooldown it
+        // always has. One that has never succeeded escalates instead: it is not
+        // going to clear mid-session either, and a flat ten minutes forever is the
+        // cycle that let a depleted key be drawn six times an hour indefinitely.
+        let (base, maximum) = state.failure_cooldown("billing");
+        let multiplier = 2_f64.powi(i32::try_from(state.failure_count - 1).unwrap_or(0));
+        let cooldown = unix_now() + (base * multiplier).min(maximum);
+        // Same rule as `record_failure`: a cooldown only ever grows, so a billing
+        // rejection cannot collapse a 24-hour reauth lockout back to minutes.
+        if cooldown > state.cooldown_until {
+            state.cooldown_until = cooldown;
+        }
         self.persist_usage();
     }
 
@@ -462,11 +507,7 @@ impl AccountManager {
         state.failure_count += 1;
         let _ = state.settle(false);
         state.last_failure_at = Some(now_iso());
-        let (base, maximum) = if kind == "billing" {
-            (BILLING_COOLDOWN_SECONDS, BILLING_COOLDOWN_SECONDS)
-        } else {
-            FAILURE_BACKOFF
-        };
+        let (base, maximum) = state.failure_cooldown(kind);
         let multiplier = 2_f64.powi(i32::try_from(state.failure_count - 1).unwrap_or(0));
         let cooldown = unix_now() + (base * multiplier).min(maximum);
         // A cooldown only ever grows. A reauth lockout is 24 hours; a
