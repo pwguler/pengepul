@@ -254,11 +254,13 @@ timeouts:
 debug: off # off | errors | verbose
 ```
 
-Requests round-robin across accounts with no session affinity, failing over once per
-account on upstream 401, 403, 429, 500 and 502-599. Failover never crosses providers: a
-request stays on the endpoint or subscription family it named. A failed account backs
-off up to 5 minutes; a dead refresh token locks it out for 24 hours until a fresh
-`pengepul login`.
+Requests round-robin across accounts, preferring the account that already holds a
+conversation's cached prefix and never waiting for it — a cooling account is passed
+over rather than stalled for (ADR-0017). Failover re-enters rotation, so a request
+fails over once per account on upstream 401, 403, 429, 500 and 502-599. Failover
+never crosses providers: a request stays on the endpoint or subscription family it
+named. A failed account backs off up to 5 minutes; a dead refresh token locks it out
+for 24 hours until a fresh `pengepul login`.
 
 `pengepul status` shows one block: where the relay is, one summary line per pool, and
 the relay-wide totals — requests served and tokens in/out/cache. `pengepul accounts`

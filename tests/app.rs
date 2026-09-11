@@ -3736,3 +3736,320 @@ async fn admin_reload_picks_up_a_relogged_grok_token_without_a_restart() {
         "grok-relogged-token"
     );
 }
+
+/// An upstream whose prompt cache lives per Account, the way every real one's does.
+///
+/// A prefix warmed on one Account reads cold on another, and the split is reported in
+/// `prompt_tokens_details.cached_tokens` exactly as the real dialects report it. A test
+/// can therefore assert what a turn actually re-billed, rather than asserting which
+/// affinity key was computed and trusting that caching follows from it.
+#[derive(Default)]
+struct PerAccountCacheUpstream {
+    /// Accounts whose every request is rejected with 401.
+    failing: Mutex<HashSet<String>>,
+    /// `(account, prefix)` pairs this upstream has already cached.
+    warmed: Mutex<HashSet<(String, String)>>,
+    /// One entry per *served* request: account, prompt tokens, cached tokens. A
+    /// rejected attempt is not recorded — it served nothing.
+    served: Mutex<Vec<(String, u64, u64)>>,
+}
+
+/// Every prompt is this long. The number is arbitrary; only its split into cached and
+/// re-billed carries meaning, and any real prefix is far above the minimum cacheable
+/// unit at every upstream.
+const PROMPT_TOKENS: u64 = 4_096;
+
+impl PerAccountCacheUpstream {
+    /// The cacheable prefix of a request: its first message, which is the stable
+    /// opening both OpenAI-shaped dialects put at the front.
+    fn prefix_of(body: &Value) -> String {
+        body.get("messages")
+            .and_then(|messages| messages.get(0))
+            .and_then(|first| first.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn served(&self) -> Vec<(String, u64, u64)> {
+        self.served.lock().expect("served lock").clone()
+    }
+}
+
+impl UpstreamClient for PerAccountCacheUpstream {
+    fn generic_chat(
+        &self,
+        request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        let email = request.account.token.email.clone();
+        let prefix = Self::prefix_of(&request.body);
+
+        if self.failing.lock().expect("failing lock").contains(&email) {
+            return Box::pin(async move {
+                Ok(UpstreamJsonResponse {
+                    status: axum::http::StatusCode::UNAUTHORIZED,
+                    body: json!({"error": {
+                        "message": "invalid api key",
+                        "type": "authentication_error"
+                    }}),
+                })
+            });
+        }
+
+        // Warm or cold: has *this* Account ever seen *this* prefix?
+        let warm = !self
+            .warmed
+            .lock()
+            .expect("warmed lock")
+            .insert((email.clone(), prefix));
+        let cached_tokens = if warm { PROMPT_TOKENS } else { 0 };
+        self.served
+            .lock()
+            .expect("served lock")
+            .push((email, PROMPT_TOKENS, cached_tokens));
+
+        Box::pin(async move {
+            Ok(UpstreamJsonResponse {
+                status: axum::http::StatusCode::OK,
+                body: json!({
+                    "id": "chatcmpl_peraccountcache",
+                    "object": "chat.completion",
+                    "model": "gpt-5.6-sol",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": PROMPT_TOKENS,
+                        "completion_tokens": 1,
+                        "total_tokens": PROMPT_TOKENS + 1,
+                        "prompt_tokens_details": {"cached_tokens": cached_tokens}
+                    }
+                }),
+            })
+        })
+    }
+
+    fn generic_chat_stream(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        unreachable!("stream not used in the affinity cache test")
+    }
+    fn anthropic_messages(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("anthropic not used in the affinity cache test")
+    }
+    fn anthropic_messages_stream(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        unreachable!("anthropic stream not used in the affinity cache test")
+    }
+    fn anthropic_count_tokens(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("count_tokens not used in the affinity cache test")
+    }
+    fn codex_responses(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("codex not used in the affinity cache test")
+    }
+    fn codex_responses_stream(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        unreachable!("codex stream not used in the affinity cache test")
+    }
+    fn fetch_models(
+        &self,
+        _kind: ProviderKind,
+        _account: AvailableAccount,
+        _config: Arc<Config>,
+    ) -> ModelsFuture {
+        Box::pin(async { Ok(FetchedModels::new(Vec::new())) })
+    }
+}
+
+/// One conversation's identity as the relay sees it: the `prompt_cache_key` it carries
+/// (if any), and the opening of its message list.
+type ChatConversation = (Option<&'static str>, &'static str);
+
+/// Which signal tells the relay that two Chat Completions conversations are two
+/// conversations. Both must work on their own, and the `BodyKey` half is not
+/// hypothetical: measured through the provider's production model configs
+/// (`pi-pengepul-provider`, `test/affinity-wire.test.ts`), pi emits
+/// `prompt_cache_key` on this dialect when cache retention resolves to long, which is
+/// how the operator's own environment is configured (`PI_CACHE_RETENTION=long`). The
+/// `DerivedPrefix` half is what covers every client that sends nothing.
+#[derive(Clone, Copy)]
+enum ChatIdentity {
+    /// Distinct `prompt_cache_key`, byte-identical openings.
+    BodyKey,
+    /// No `prompt_cache_key`, distinct openings.
+    DerivedPrefix,
+}
+
+impl ChatIdentity {
+    fn label(self) -> &'static str {
+        match self {
+            Self::BodyKey => "prompt_cache_key",
+            Self::DerivedPrefix => "derived prefix",
+        }
+    }
+
+    /// The identity of each conversation. Exactly one of the two fields varies between
+    /// them, so the variant proves which signal was load-bearing.
+    fn pair(self) -> (ChatConversation, ChatConversation) {
+        match self {
+            Self::BodyKey => (
+                (Some("sess-alpha"), "one shared opening"),
+                (Some("sess-bravo"), "one shared opening"),
+            ),
+            Self::DerivedPrefix => ((None, "alpha opening"), (None, "bravo opening")),
+        }
+    }
+}
+
+/// One turn of a Chat Completions conversation: an opening, then the turn.
+///
+/// `model` and `tools` are identical in every body off this helper. That is the point:
+/// those, plus a `system` field a Chat body does not have, are all the pre-fix affinity
+/// key read, so two conversations built this way were one key to it.
+fn chat_turn_request(
+    cache_key: Option<&str>,
+    opening: &str,
+    turn: &str,
+) -> axum::http::Request<Body> {
+    let mut body = json!({
+        "model": "commandcode/gpt-5.6-sol",
+        "tools": [{"type": "function", "function": {"name": "read_file"}}],
+        "messages": [
+            {"role": "developer", "content": opening},
+            {"role": "user", "content": turn}
+        ]
+    });
+    if let Some(key) = cache_key {
+        body["prompt_cache_key"] = json!(key);
+    }
+    axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("authorization", "Bearer sk-test")
+        .header("content-type", "application/json")
+        .header("content-length", "1024")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// Warm two conversations, fail one conversation's account, and check what the *other*
+/// conversation's next turn cost.
+///
+/// The regression this measures: for a Chat Completions body there is no top-level
+/// `system`, so the pre-fix key reduced to `{tools, model}` — which every conversation
+/// on that model shares. `account_for` then held ONE affinity entry for all of them, so
+/// a failure on the account holding it re-pinned all of them at once, and each re-read
+/// its prefix cold on an account that had never seen it. Measured on the live relay
+/// before the fix: one deepseek conversation split 656/96 across two accounts, and a
+/// turn arriving four seconds after the previous one re-billed 17,429 tokens. A
+/// four-second gap is not a TTL expiry; it is a different account.
+async fn assert_failover_does_not_re_bill_a_sibling(signal: ChatIdentity) {
+    let label = signal.label();
+    let ((alpha_key, alpha_open), (bravo_key, bravo_open)) = signal.pair();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_key_token("commandcode", "key-90445c90"))
+        .expect("save first key");
+    save_token(tmp.path(), &static_key_token("commandcode", "key-d792179a"))
+        .expect("save second key");
+    let upstream = Arc::new(PerAccountCacheUpstream::default());
+    let app = create_app_with_upstream(
+        config_with_static_provider("commandcode", tmp.path().to_path_buf()),
+        upstream.clone(),
+    );
+
+    for (key, opening) in [(alpha_key, alpha_open), (bravo_key, bravo_open)] {
+        let (status, _) =
+            json_response(app.clone(), chat_turn_request(key, opening, "turn one")).await;
+        assert_eq!(status, 200, "[{label}] a first turn should succeed");
+    }
+
+    let first = upstream.served();
+    assert_eq!(
+        first.len(),
+        2,
+        "[{label}] two conversations, two served requests"
+    );
+    let alpha_account = first[0].0.clone();
+    let bravo_account = first[1].0.clone();
+    assert_eq!(first[0].2, 0, "[{label}] nothing is cached yet");
+    assert_eq!(first[1].2, 0, "[{label}] nothing is cached yet");
+
+    // Alpha's account starts rejecting. Its next turn must move; bravo's must not.
+    upstream
+        .failing
+        .lock()
+        .expect("failing lock")
+        .insert(alpha_account.clone());
+
+    let (status, _) = json_response(
+        app.clone(),
+        chat_turn_request(alpha_key, alpha_open, "turn two"),
+    )
+    .await;
+    assert_eq!(status, 200, "[{label}] alpha should fail over, not fail");
+    let (status, _) = json_response(
+        app.clone(),
+        chat_turn_request(bravo_key, bravo_open, "turn two"),
+    )
+    .await;
+    assert_eq!(status, 200, "[{label}] bravo should be unaffected");
+
+    let after = upstream.served();
+    assert_eq!(
+        after.len(),
+        4,
+        "[{label}] a rejected attempt serves nothing, so it is not recorded: {after:?}"
+    );
+    let (alpha_account_two, _, alpha_cached) = after[2].clone();
+    let (bravo_account_two, _, bravo_cached) = after[3].clone();
+
+    // The symptom, asserted directly.
+    assert_eq!(
+        bravo_cached, PROMPT_TOKENS,
+        "[{label}] bravo re-billed its prefix ({bravo_cached} cached of {PROMPT_TOKENS}) \
+         because another conversation failed over"
+    );
+    assert_eq!(
+        bravo_account_two, bravo_account,
+        "[{label}] bravo was moved off its account by alpha's failure"
+    );
+
+    // The failover was real, so the assertions above are not vacuous. `alpha_cached`
+    // is deliberately not asserted: this upstream is content-addressed like a real
+    // prefix cache, so when the two conversations share an opening the destination
+    // account already holds it and alpha legitimately re-reads nothing.
+    assert_ne!(
+        alpha_account_two, alpha_account,
+        "[{label}] alpha did not actually move, so this test proves nothing"
+    );
+    let _ = alpha_cached;
+
+    // And the mechanism: two conversations on one model and tool set are no longer one
+    // key, so they spread instead of stacking on whichever account won first.
+    assert_ne!(
+        alpha_account, bravo_account,
+        "[{label}] two conversations on one model and tool set were collapsed onto one account"
+    );
+}
+
+#[tokio::test]
+async fn one_chat_conversation_failing_over_does_not_re_bill_another() {
+    assert_failover_does_not_re_bill_a_sibling(ChatIdentity::BodyKey).await;
+    assert_failover_does_not_re_bill_a_sibling(ChatIdentity::DerivedPrefix).await;
+}

@@ -551,7 +551,7 @@ impl UpstreamClient for HttpUpstreamClient {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestRoute {
     Chat,
     Responses,
@@ -1087,13 +1087,16 @@ async fn count_tokens(State(state): State<AppState>, headers: HeaderMap, body: B
         )
         .into_response();
     }
-    let account =
-        match next_provider_account(&state, provider.clone(), &conversation_key(&headers, &body))
-            .await
-        {
-            Ok(account) => account,
-            Err(error) => return error.into_response(),
-        };
+    let account = match next_provider_account(
+        &state,
+        provider.clone(),
+        &conversation_key(&headers, &body, RequestRoute::Messages),
+    )
+    .await
+    {
+        Ok(account) => account,
+        Err(error) => return error.into_response(),
+    };
     let body = body_with_model(&body, &model);
     match state
         .upstream
@@ -1190,7 +1193,7 @@ async fn route_provider_request(
     let attempts = provider_account_count(state, provider.clone()).await.max(1);
     // One request, one conversation: computed before the attempt loop, not
     // inside it, because the body does not change between attempts.
-    let conversation = conversation_key(headers, body);
+    let conversation = conversation_key(headers, body, route);
     let mut last_response = None;
 
     for _ in 0..attempts {
@@ -1856,27 +1859,126 @@ fn enforce_body_limit(state: &AppState, headers: &HeaderMap) -> Result<(), AppEr
     Ok(())
 }
 
+/// How much of a conversation's opening the fallback key reads: the first
+/// [`AFFINITY_OPENING_MESSAGES`] messages, at most [`AFFINITY_MESSAGE_BYTES`] of each.
+///
+/// Both bounds are load-bearing, and the per-message one is what makes the window
+/// useful at all. pi opens with a developer message far larger than any sane budget,
+/// so one aggregate bound fills up inside that shared message and never reaches the
+/// first user turn — the one thing that separates two conversations in a project.
+/// Every conversation on that model then hashes to the same key, which is the
+/// collapse this exists to fix. Budgeting per message leaves room for the turn after
+/// the shared opening.
+const AFFINITY_OPENING_MESSAGES: usize = 2;
+const AFFINITY_MESSAGE_BYTES: usize = 4 * 1024;
+
 /// The conversation a request belongs to, for cache affinity.
 ///
-/// A harness that names its session is believed. Otherwise the key is a
-/// hash of the cacheable prefix itself — the system blocks and the tool
-/// list, which turns of one conversation repeat byte for byte and which is
-/// exactly what the upstream cache is keyed on. Deriving it from the
-/// client's credential instead would make every request from one key one
-/// conversation, which does not preserve a cache so much as switch
-/// Rotation off.
-fn conversation_key(headers: &HeaderMap, body: &Value) -> String {
+/// The signals are tried in the order of how directly each names a
+/// conversation. A harness that names its session is believed. Then
+/// `prompt_cache_key`, the standard `OpenAI` field for exactly this and the
+/// only affinity signal a Chat Completions client can send: its body has no
+/// top-level `system`, so without it the fallback below could only ever see
+/// a model and tool list, which every conversation on that model shares.
+///
+/// The fallback is a hash of the cacheable prefix: the system blocks and the
+/// tool list, which turns of one conversation repeat byte for byte, plus the
+/// opening of the message list, which is what separates two conversations on
+/// one model and tool set. Deriving the key from the client's credential
+/// instead would make every request from one key one conversation, which
+/// does not preserve a cache so much as switch Rotation off.
+///
+/// Only the message window is byte-bounded. `system` and `tools` are serialized
+/// whole, as they always have been, so a pathological tool list is still hashed in
+/// full — a pre-existing cost, bounded in practice by the tools a harness sends.
+fn conversation_key(headers: &HeaderMap, body: &Value, route: RequestRoute) -> String {
     if let Some(session) = header_str(headers, "x-claude-code-session-id")
         .or_else(|| header_str(headers, "x-session-id"))
     {
         return session.to_string();
     }
-    let prefix = json!({
+    if let Some(key) = body
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .filter(|key| !key.is_empty())
+    {
+        return key.to_string();
+    }
+    let mut prefix = json!({
         "system": body.get("system"),
         "tools": body.get("tools"),
         "model": body.get("model"),
-    });
-    format!("prefix:{}", sha256_hex(&prefix.to_string()))
+    })
+    .to_string();
+    // Every dialect contributes its opening. Messages has no
+    // `prompt_cache_key` on pi's wire and pi-ai hardcodes `x-session-affinity`
+    // there, so without this it falls back to hashing only `system`, `tools`
+    // and `model` — which every conversation in one project shares, the same
+    // collapse that made Chat Completions re-bill (ADR-0017).
+    prefix.push_str(&cacheable_opening(body, route));
+    format!("prefix:{}", sha256_hex(&prefix))
+}
+
+/// The opening of a request's cacheable content, canonicalized: the first
+/// [`AFFINITY_OPENING_MESSAGES`] messages, each cut to [`AFFINITY_MESSAGE_BYTES`], and
+/// for Responses the `instructions` that dialect keeps its system prompt in.
+///
+/// The window is a fixed *count* of leading messages, not a growing slice of the
+/// list, and that is the whole design. Appends land at the end, so a window over a
+/// fixed prefix keeps the same key turn after turn, while two conversations that
+/// differ anywhere inside the window never collide. A window that instead read the
+/// list up to a byte budget re-keyed a conversation on every turn until it outgrew
+/// the budget, and once it had outgrown it the hash covered only the shared opening.
+///
+/// Two messages is the smallest window that can satisfy both requirements on a first
+/// turn, and no window can satisfy both on a single-message first turn: with only
+/// message 0 in hand, "this conversation grows" and "this is a different
+/// conversation" are the same observation. A conversation that opens with one
+/// message therefore settles on its second turn, and one that opens with two or more
+/// (every pi request, which always carries a developer or system message) never
+/// moves.
+fn cacheable_opening(body: &Value, route: RequestRoute) -> String {
+    let mut out = String::new();
+    match route {
+        RequestRoute::Chat | RequestRoute::Messages => {
+            push_opening(&mut out, body.get("messages"));
+        }
+        RequestRoute::Responses => {
+            push_opening(&mut out, body.get("instructions"));
+            push_opening(&mut out, body.get("input"));
+        }
+    }
+    out
+}
+
+/// The first [`AFFINITY_OPENING_MESSAGES`] entries of one message field, each cut to
+/// [`AFFINITY_MESSAGE_BYTES`].
+fn push_opening(out: &mut String, value: Option<&Value>) {
+    for item in message_items(value).take(AFFINITY_OPENING_MESSAGES) {
+        push_prefix(out, &item.to_string(), AFFINITY_MESSAGE_BYTES);
+        out.push('\n');
+    }
+}
+
+/// The entries of a message field, whether the dialect carries them as an
+/// array or (Responses) as one bare string.
+fn message_items(value: Option<&Value>) -> impl Iterator<Item = &Value> {
+    value.into_iter().flat_map(|value| match value {
+        Value::Array(items) => items.iter(),
+        single => std::slice::from_ref(single).iter(),
+    })
+}
+
+/// Append at most `limit` bytes of `text`, never splitting a UTF-8 character.
+///
+/// The budget is per call, not per buffer: a shared 15 KB system prompt must not be
+/// able to spend the whole window and crowd out the turn after it.
+fn push_prefix(buffer: &mut String, text: &str, limit: usize) {
+    let mut end = text.len().min(limit);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    buffer.push_str(&text[..end]);
 }
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -1945,6 +2047,17 @@ async fn next_provider_account(
             ));
         }
     }
+    // One line per selection, and the only one that says which account a
+    // conversation landed on and why. `debug: off` keeps it out of the
+    // default log; `RUST_LOG=pengepul=debug` turns it on for exactly this
+    // question.
+    tracing::debug!(
+        provider = %provider,
+        conversation = %conversation,
+        account = %email,
+        affinity = result.affinity.as_str(),
+        "account selected"
+    );
     Ok(manager.account(&email).unwrap_or(account))
 }
 
@@ -3049,8 +3162,9 @@ mod tests {
     use super::{
         AccountManagers, AppState, BodyLimit, ModelsFuture, RateLimitBucket, RequestRoute,
         StdRwLock, UpstreamClient, UpstreamFuture, UpstreamJsonResponse, UpstreamRequest,
-        UpstreamSseFuture, build_upstream_request, decode_upstream_body, forward_refusal_event,
-        is_decoded_upstream_error, refresh_model_catalog, route_provider_request,
+        UpstreamSseFuture, build_upstream_request, conversation_key, decode_upstream_body,
+        forward_refusal_event, is_decoded_upstream_error, refresh_model_catalog,
+        route_provider_request,
     };
     use crate::accounts::{AccountManager, RefreshPolicy};
     use crate::config::{CloakingConfig, Config, DebugMode, TimeoutConfig};
@@ -3637,5 +3751,266 @@ mod tests {
         ));
         assert!(super::should_retry_upstream_status(StatusCode::BAD_GATEWAY));
         assert!(!super::should_retry_upstream_status(StatusCode::OK));
+    }
+
+    /// A Chat Completions conversation, as pi sends one: model and tools held
+    /// constant, messages growing by append.
+    fn chat_turn(turns: &[&str], cache_key: Option<&str>) -> Value {
+        let messages = turns
+            .iter()
+            .enumerate()
+            .map(|(index, text)| {
+                let role = if index % 2 == 0 { "user" } else { "assistant" };
+                json!({"role": role, "content": text})
+            })
+            .collect::<Vec<_>>();
+        let mut body = json!({
+            "model": "deepseek-v4.1-flash",
+            "messages": messages,
+            "tools": [{"type": "function", "function": {"name": "read_file"}}],
+        });
+        if let Some(key) = cache_key {
+            body["prompt_cache_key"] = json!(key);
+        }
+        body
+    }
+
+    fn key_for(headers: &HeaderMap, body: &Value) -> String {
+        conversation_key(headers, body, RequestRoute::Chat)
+    }
+
+    /// A Chat Completions body with explicit roles: `(role, content)` pairs, then a
+    /// final user turn. pi's shape is a large `developer` message first, so roles
+    /// matter here and cannot be inferred from position.
+    fn chat_body(opening: &[(&str, &str)], turn: &str) -> Value {
+        let mut messages: Vec<Value> = opening
+            .iter()
+            .map(|(role, content)| json!({"role": role, "content": content}))
+            .collect();
+        messages.push(json!({"role": "user", "content": turn}));
+        json!({
+            "model": "deepseek-v4.1-flash",
+            "messages": messages,
+            "tools": [{"type": "function", "function": {"name": "read_file"}}],
+        })
+    }
+
+    #[test]
+    fn prompt_cache_key_names_the_same_conversation_as_a_session_header() {
+        // An OpenAI-dialect client can send no session header at all; pi sends
+        // the session id as prompt_cache_key. The two spellings of one session
+        // must land on one affinity key, or a client that switches between them
+        // rotates accounts mid-conversation.
+        let body = chat_turn(&["one"], Some("sess-1"));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", "sess-1".parse().expect("header value"));
+        assert_eq!(key_for(&headers, &body), "sess-1");
+        assert_eq!(key_for(&HeaderMap::new(), &body), "sess-1");
+
+        // And a body that names its cache key keeps that name whatever the message
+        // list does, so a client-driven identity is stable as the conversation grows.
+        let grown = chat_turn(&["one", "two", "three"], Some("sess-1"));
+        assert_eq!(key_for(&HeaderMap::new(), &grown), "sess-1");
+    }
+
+    #[test]
+    fn a_named_session_outranks_prompt_cache_key() {
+        let body = chat_turn(&["one"], Some("from-body"));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", "from-header".parse().expect("header value"));
+        assert_eq!(key_for(&headers, &body), "from-header");
+
+        headers.insert(
+            "x-claude-code-session-id",
+            "from-claude-code".parse().expect("header value"),
+        );
+        assert_eq!(key_for(&headers, &body), "from-claude-code");
+    }
+
+    #[test]
+    fn an_empty_prompt_cache_key_falls_through_to_the_prefix() {
+        // pi emits `prompt_cache_key: ""` when a session names no id. Believing
+        // it would put every such session on one affinity key, so an empty value
+        // is not a name.
+        let body = chat_turn(&["one"], Some(""));
+        assert!(key_for(&HeaderMap::new(), &body).starts_with("prefix:"));
+    }
+
+    #[test]
+    fn one_conversation_keeps_its_key_as_messages_are_appended() {
+        // pi's real shape, and the case an aggregate byte window gets wrong: a
+        // developer message plus a first user turn, well under any byte bound, then
+        // the conversation grows. A window that reads the growing tail re-keys the
+        // conversation on every single turn, and a re-keyed conversation is handed
+        // to whatever Rotation picks -- the bug this whole change exists to fix.
+        let opening = chat_body(
+            &[
+                ("developer", "a short stable opening"),
+                ("user", "the first turn"),
+            ],
+            "the second turn",
+        );
+        let mut grown = opening.clone();
+        grown["messages"]
+            .as_array_mut()
+            .expect("messages")
+            .push(json!({"role": "assistant", "content": "an answer"}));
+        grown["messages"]
+            .as_array_mut()
+            .expect("messages")
+            .push(json!({"role": "user", "content": "a third turn"}));
+        assert_eq!(
+            key_for(&HeaderMap::new(), &opening),
+            key_for(&HeaderMap::new(), &grown),
+            "a short conversation re-keyed itself as it grew"
+        );
+    }
+
+    #[test]
+    fn conversations_sharing_a_large_system_prompt_do_not_share_a_key() {
+        // The same collapse from the other side, and the one an aggregate byte bound
+        // creates: pi sends a developer message far larger than any sane bound, so a
+        // window that fills up inside it never reaches the first user turn -- the one
+        // thing that separates two conversations in a project. Every conversation on
+        // that model then hashes to the same key.
+        let shared = "s".repeat(15 * 1024);
+        let left = chat_body(
+            &[("developer", &shared), ("user", "left opening")],
+            "left turn",
+        );
+        let right = chat_body(
+            &[("developer", &shared), ("user", "right opening")],
+            "right turn",
+        );
+        assert_ne!(
+            key_for(&HeaderMap::new(), &left),
+            key_for(&HeaderMap::new(), &right),
+            "two conversations sharing a large developer message collapsed onto one key"
+        );
+    }
+
+    #[test]
+    fn conversations_sharing_a_model_and_tools_do_not_share_a_key() {
+        // The old fallback hashed only {system, tools, model}, which is exactly what
+        // two conversations on one model have in common. This asserts only the derived
+        // key: `prompt_cache_key` is a separate signal with its own test, so a break in
+        // either one names the one that broke.
+        let left = chat_turn(&["left opening"], None);
+        let right = chat_turn(&["right opening"], None);
+        assert_ne!(
+            key_for(&HeaderMap::new(), &left),
+            key_for(&HeaderMap::new(), &right)
+        );
+    }
+
+    #[test]
+    fn the_responses_dialect_reads_its_instructions_and_input() {
+        // Responses keeps its system prompt in `instructions` and its turns in
+        // `input`; both belong in the opening, or two conversations that share
+        // one and differ in the other collide on the same account.
+        let left = json!({
+            "model": "gpt-5.6",
+            "instructions": "stable",
+            "input": [{"role": "user", "content": "left opening"}],
+        });
+        let right = json!({
+            "model": "gpt-5.6",
+            "instructions": "stable",
+            "input": [{"role": "user", "content": "right opening"}],
+        });
+        assert_ne!(
+            conversation_key(&HeaderMap::new(), &left, RequestRoute::Responses),
+            conversation_key(&HeaderMap::new(), &right, RequestRoute::Responses)
+        );
+        let reworded = json!({
+            "model": "gpt-5.6",
+            "instructions": "different",
+            "input": [{"role": "user", "content": "left opening"}],
+        });
+        assert_ne!(
+            conversation_key(&HeaderMap::new(), &left, RequestRoute::Responses),
+            conversation_key(&HeaderMap::new(), &reworded, RequestRoute::Responses)
+        );
+    }
+
+    #[test]
+    fn the_messages_fallback_key_is_pinned_to_its_derivation() {
+        // This literal is sha256 over the concatenation of
+        //   {"model":…,"system":…,"tools":…}   (serde_json's default
+        //   BTreeMap key order, which is what the fallback has always hashed)
+        // and the canonicalized opening: the first two `messages`, each cut to 4 KiB,
+        // newline-separated. A literal rather than a recomputation, so re-deriving the
+        // same wrong expression in the test cannot pass -- that is the trap this test
+        // exists to avoid, and a canonicalization change here costs every live Claude
+        // session one cold read.
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "system": [{"type": "text", "text": "stable opening"}],
+            "tools": [],
+            "messages": [
+                {"role": "user", "content": "the first turn"},
+                {"role": "assistant", "content": "an answer"},
+                {"role": "user", "content": "the second turn"},
+            ],
+        });
+        assert_eq!(
+            conversation_key(&HeaderMap::new(), &body, RequestRoute::Messages),
+            "prefix:b119ec2db3cacdf6b621b3a3f4367814d1a9b710379f248d2bce62d889203ce6"
+        );
+    }
+
+    #[test]
+    fn the_messages_dialect_separates_conversations_sharing_a_system_prompt() {
+        // pi's Messages wire names no session: no `prompt_cache_key` in the body
+        // and no header this relay reads (`test/affinity-wire.test.ts` measures
+        // it). So the fallback is the only thing that can tell two Claude
+        // conversations in one project apart, and hashing `system`+`tools`
+        // alone makes them one entry -- the Chat Completions collapse, one
+        // dialect over.
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "system": [{"type": "text", "text": "stable opening"}],
+            "tools": [],
+            "messages": [{"role": "user", "content": "left opening"}],
+        });
+        let other = json!({
+            "model": "claude-sonnet-4-6",
+            "system": [{"type": "text", "text": "stable opening"}],
+            "tools": [],
+            "messages": [{"role": "user", "content": "right opening"}],
+        });
+        assert_ne!(
+            conversation_key(&HeaderMap::new(), &body, RequestRoute::Messages),
+            conversation_key(&HeaderMap::new(), &other, RequestRoute::Messages)
+        );
+
+        // And appends keep the key, the same way the other dialects do. The opening
+        // is two messages, the shape pi sends: a conversation that starts with a
+        // single message settles on its second turn instead, because with one message
+        // in hand "this grows" and "this is a different conversation" are the same
+        // observation.
+        let long = json!({
+            "model": "claude-sonnet-4-6",
+            "system": [{"type": "text", "text": "stable opening"}],
+            "tools": [],
+            "messages": [
+                {"role": "user", "content": "the first turn"},
+                {"role": "assistant", "content": "an answer"},
+                {"role": "user", "content": "the second turn"},
+            ],
+        });
+        let mut grown = long.clone();
+        grown["messages"]
+            .as_array_mut()
+            .expect("messages")
+            .push(json!({"role": "assistant", "content": "another answer"}));
+        grown["messages"]
+            .as_array_mut()
+            .expect("messages")
+            .push(json!({"role": "user", "content": "a third turn"}));
+        assert_eq!(
+            conversation_key(&HeaderMap::new(), &long, RequestRoute::Messages),
+            conversation_key(&HeaderMap::new(), &grown, RequestRoute::Messages)
+        );
     }
 }

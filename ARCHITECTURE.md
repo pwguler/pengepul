@@ -151,8 +151,11 @@ in files.
   Each upstream keeps its own prompt cache, so a conversation stays on the
   Account that served it last while that Account is off Cooldown, and takes
   the next one the moment it is not (ADR-0017). The preference is keyed by
-  the session a harness names, or by a hash of the cacheable prefix —
-  `system`, `tools`, `model` — when it names none. It is bounded and not
+  the session a harness names — a session header, or the `prompt_cache_key`
+  its body carries — or, when it names none, by a hash of the cacheable
+  prefix: the system blocks, `tools` and `model`, plus a fixed window over the
+  opening of the message list (the first two messages, 4 KiB each). A fixed
+  window, not a growing slice, so appends keep the key. It is bounded and not
   persisted: a restart re-learns it at the cost of one cold read.
 - **Every route authenticates before it parses a body.** `/health` is the only
   unauthenticated route.

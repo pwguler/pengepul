@@ -19,9 +19,11 @@ pub type RefreshFuture = Pin<Box<dyn Future<Output = Result<TokenData>> + Send>>
 
 pub type RefreshFn = Box<dyn Fn(String) -> RefreshFuture + Send + Sync>;
 
-/// Every failure kind backs off the same: 1s, 2s, 4s, 8s, … per consecutive failure, capped
-/// at 5 minutes, reset on the next success. Short first retries keep a single static key (or a
-/// lone account) from being locked out by one transient error.
+/// Every failure kind cools down the same way at the base: 1s, 2s, 4s, 8s, … per
+/// consecutive failure, capped at 5 minutes and reset on the next success. Short first
+/// retries keep a single static key (or a lone account) from being locked out by one
+/// transient error. The *ceiling* is what varies — billing, reauth, and a credential
+/// that has never succeeded each sit out longer; see [`AccountState::failure_cooldown`].
 const FAILURE_BACKOFF: (f64, f64) = (1.0, 5.0 * 60.0);
 
 /// Billing failures (an account out of credits or quota) do not recover mid-session the
@@ -50,11 +52,34 @@ pub struct RefreshPolicy {
     pub seconds: i64,
 }
 
+/// Where a selection's account came from. Logged at the selection site so a
+/// cache miss can be correlated with the account switch that caused it: a
+/// conversation re-reads its prefix cold every time its recorded account
+/// stops being selectable, and nothing else in the logs says so (ADR-0017).
+#[derive(Debug, Clone, Copy)]
+pub enum AffinityOutcome {
+    /// The conversation's recorded account was still selectable and was reused.
+    Honored,
+    /// No record, or the recorded account was on Cooldown: Rotation chose.
+    Rotation,
+}
+
+impl AffinityOutcome {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Honored => "honored",
+            Self::Rotation => "rotation",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AccountResult {
     pub account: Option<AvailableAccount>,
     pub failure_kind: Option<String>,
     pub retry_after_seconds: Option<f64>,
+    pub affinity: AffinityOutcome,
 }
 
 impl Default for RefreshPolicy {
@@ -558,6 +583,7 @@ impl AccountManager {
                 account: Some(account),
                 failure_kind: None,
                 retry_after_seconds: None,
+                affinity: AffinityOutcome::Honored,
             };
         }
         let result = self.next_account_result();
@@ -581,6 +607,7 @@ impl AccountManager {
                 account: None,
                 failure_kind: None,
                 retry_after_seconds: None,
+                affinity: AffinityOutcome::Rotation,
             };
         }
         let now = unix_now();
@@ -595,6 +622,7 @@ impl AccountManager {
                     account: Some(self.available_account(state)),
                     failure_kind: None,
                     retry_after_seconds: None,
+                    affinity: AffinityOutcome::Rotation,
                 };
             }
         }
@@ -611,6 +639,7 @@ impl AccountManager {
             account: None,
             failure_kind: best.and_then(|state| state.last_failure_kind.clone()),
             retry_after_seconds: best.map(|state| (state.cooldown_until - now).max(0.0)),
+            affinity: AffinityOutcome::Rotation,
         }
     }
 
