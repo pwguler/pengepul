@@ -28,22 +28,26 @@ impl Style {
     }
 }
 
-/// One decimal at K/M scale, integers under 1,000. Integer math throughout,
-/// so the rendered value is exact and truncation-free.
+/// One decimal at the K/M/B/T scale, integers under 1,000. Integer math
+/// throughout, so the rendered value is exact and truncation-free. The
+/// table runs largest-first: the first scale the value clears wins.
 pub(crate) fn format_count(value: i64) -> String {
+    const SCALES: [(u64, char); 4] = [
+        (1_000_000_000_000, 'T'),
+        (1_000_000_000, 'B'),
+        (1_000_000, 'M'),
+        (1_000, 'K'),
+    ];
     let magnitude = value.unsigned_abs();
     let sign = if value < 0 { "-" } else { "" };
-    if magnitude >= 1_000_000 {
-        let whole = magnitude / 1_000_000;
-        let tenths = (magnitude % 1_000_000) / 100_000;
-        format!("{sign}{whole}.{tenths}M")
-    } else if magnitude >= 1_000 {
-        let whole = magnitude / 1_000;
-        let tenths = (magnitude % 1_000) / 100;
-        format!("{sign}{whole}.{tenths}K")
-    } else {
-        format!("{sign}{magnitude}")
+    for (scale, suffix) in SCALES {
+        if magnitude >= scale {
+            let whole = magnitude / scale;
+            let tenths = (magnitude % scale) / (scale / 10);
+            return format!("{sign}{whole}.{tenths}{suffix}");
+        }
     }
+    format!("{sign}{magnitude}")
 }
 
 /// Comma-grouped form for request counts, which stay exact on the rollup line.
@@ -369,6 +373,15 @@ mod tests {
         assert_eq!(format_count(812_300), "812.3K");
         assert_eq!(format_count(1_000_000), "1.0M");
         assert_eq!(format_count(45_200_000), "45.2M");
+        assert_eq!(format_count(999_999_999), "999.9M");
+        assert_eq!(format_count(1_000_000_000), "1.0B");
+        assert_eq!(format_count(1_500_000_000), "1.5B");
+        assert_eq!(format_count(45_200_000_000), "45.2B");
+        assert_eq!(format_count(999_999_999_999), "999.9B");
+        assert_eq!(format_count(1_000_000_000_000), "1.0T");
+        assert_eq!(format_count(1_500_000_000_000), "1.5T");
+        assert_eq!(format_count(-2_500_000_000), "-2.5B");
+        assert_eq!(format_count(-2_500_000_000_000), "-2.5T");
         assert_eq!(format_count(-1), "-1");
     }
 
