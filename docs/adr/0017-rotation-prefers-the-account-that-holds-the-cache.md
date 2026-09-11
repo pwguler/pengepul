@@ -149,15 +149,19 @@ earlier draft of this ADR justified the instability as "nothing shorter than the
 minimum cacheable unit has a prefix worth preserving"; that claim was unverifiable
 from inside this repository and is withdrawn in favour of the argument above.
 
-Two conversations that agree for the whole window and diverge after it still share a
+Two conversations that agree across the whole window and diverge after it still share a
 key, and that is the residual this window cannot remove: it bounds how much of a
 conversation is read, so two conversations on one model and tool set whose first two
-messages are byte-identical are one affinity entry. The consequence is the one this
-change is about, at reduced scope — one of them failing over moves both, because
-their shared entry is re-pinned. Probed rather than assumed: two bodies differing
-only at message 3 return the same key. No window can avoid this without reading the
-whole list, which is what a byte-budget design was trying to prevent; a harness that
-opens its turn with a unique first user message (pi does) never hits it.
+messages **agree within their first 4 KiB each** are one affinity entry. Both
+qualifiers matter and the second is easy to miss — the window truncates each message,
+so it is not byte-identity of the messages that groups them but byte-identity of their
+retained prefixes. The consequence is the one this change is about, at reduced scope —
+one of them failing over moves both, because their shared entry is re-pinned. Probed
+rather than assumed: two bodies differing only at message 3 return the same key, and so
+do two bodies identical in the first 4 KiB of each window message and different after
+it. No window can avoid this without reading the whole list, which is what a
+byte-budget design was trying to prevent; a harness that opens its turn with a unique
+first user message (pi does) never hits it.
 
 The header path had the same class of bug and was missed. `header_str` returned any
 value, including an empty one, so a client sending `x-session-id:` with nothing after

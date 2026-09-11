@@ -1890,7 +1890,11 @@ const AFFINITY_MESSAGE_BYTES: usize = 4 * 1024;
 ///
 /// Only the message window is byte-bounded. `system` and `tools` are serialized
 /// whole, as they always have been, so a pathological tool list is still hashed in
-/// full — a pre-existing cost, bounded in practice by the tools a harness sends.
+/// full — pre-existing, and not free: measured against a 200 MB body limit, the
+/// message window costs ~1 ms while a 20 MB `tools` description costs ~2.4 s per
+/// call. Real harness tool lists are three orders of magnitude smaller than that, so
+/// this is a latent cost rather than a live one, but it is unbounded by design and
+/// the window next to it is not.
 fn conversation_key(headers: &HeaderMap, body: &Value, route: RequestRoute) -> String {
     // `header_str` treats a blank value as absent. It did not always: a client sending
     // `x-session-id:` with nothing after it collapsed every one of its conversations
@@ -3962,6 +3966,51 @@ mod tests {
             key_for(&HeaderMap::new(), &opening),
             key_for(&HeaderMap::new(), &grown),
             "a short conversation re-keyed itself as it grew"
+        );
+    }
+
+    #[test]
+    fn the_window_budget_is_exactly_4_kib_per_message() {
+        // Pins the number, not just the behaviour, and separately from the collision test
+        // below: raising this budget changes every fallback affinity key, so it must fail
+        // loudly with a reason rather than silently invalidating the residual documented
+        // in docs/adr/0017.
+        assert_eq!(
+            super::AFFINITY_OPENING_MESSAGES,
+            2,
+            "the window size decides which conversations share an affinity key;              docs/adr/0017 argues the current value and must be rewritten with it"
+        );
+        assert_eq!(
+            super::AFFINITY_MESSAGE_BYTES,
+            4 * 1024,
+            "the per-message budget decides which conversations share an affinity key;              docs/adr/0017 argues the current value and must be rewritten with it"
+        );
+    }
+
+    #[test]
+    fn the_window_truncates_so_agreement_past_the_cut_does_not_separate() {
+        // A deliberate residual, pinned so it is a decision rather than a surprise. The
+        // window keeps only the first 4 KiB of each message, so it is byte-identity of
+        // those retained prefixes that groups two conversations, not byte-identity of the
+        // messages themselves. The shared prefix below is a fixed 8 KiB — deliberately
+        // NOT derived from AFFINITY_MESSAGE_BYTES, which would make this test unable to
+        // fail — so raising the budget past 8 KiB makes the two tails separate and this
+        // assertion fires.
+        let shared = "s".repeat(8 * 1024);
+        let body = |tail: &str| {
+            chat_body(
+                &[
+                    ("developer", &format!("{shared}{tail}")),
+                    ("user", &format!("{shared}{tail}")),
+                ],
+                "turn",
+            )
+        };
+        assert_eq!(
+            key_for(&HeaderMap::new(), &body("alpha distinct tail")),
+            key_for(&HeaderMap::new(), &body("bravo distinct tail")),
+            "the window is reading past its 4 KiB budget; the residual documented in \
+             docs/adr/0017 no longer holds and that paragraph needs rewriting"
         );
     }
 

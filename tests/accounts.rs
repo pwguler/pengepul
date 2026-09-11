@@ -237,7 +237,8 @@ async fn a_credential_that_never_succeeded_is_parked_past_the_transient_error_ce
 #[tokio::test]
 async fn a_depleted_key_that_never_succeeded_escalates_past_the_flat_billing_cooldown() {
     // The path this pins is `record_billing_cooldown`, not `record_failure`: it is
-    // what the failover loop calls when a 200 body reports exhausted credits, and
+    // what the failover loop calls when a 400 or 402 body reports exhausted credits
+    // (never a 200 — see `record_billing_scoped_failure` in src/app.rs), and
     // unlike its sibling it used to assign a flat ten minutes forever. Measured on
     // the live pool, `key-d792179a` drew 91 requests, served none, and produced
     // exactly that cycle -- 600s at failure_count=1, then 600s again, indefinitely.
