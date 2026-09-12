@@ -221,7 +221,7 @@ before.
 - **A reauth cooldown collapsed to two seconds.** `record_refresh_exhausted`
   sets a 24-hour cooldown, and the caller then recorded a failure for the
   same attempt — a call I added in round 2 for an outcome that was
-  already recorded. The 2-second backoff overwrote the cooldown and the
+  already recorded. The 2-second failure cooldown overwrote the reauth one and the
   operator's "re-run login" message, re-selecting a dead account into a
   failure loop. The redundant call is gone, and a cooldown now only ever
   grows.

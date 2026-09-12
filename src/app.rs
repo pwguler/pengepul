@@ -174,7 +174,7 @@ impl Drop for StreamAccounting {
         let account = self.account.clone();
         // A Refusal, not a failure: the account was serving a 2xx stream
         // when the client hung up. Cooling it down would walk a healthy
-        // account up the backoff every time a harness cancels a
+        // account up the failure cooldown every time a harness cancels a
         // generation (CONTEXT.md, Refusal).
         tokio::spawn(async move {
             record_provider_refusal(&state, &provider, &account).await;
@@ -2186,9 +2186,9 @@ async fn record_provider_failure(
 ) {
     // 400/402 by themselves say nothing about account health — a malformed request is
     // the client's fault, and a drained balance is recorded by the failover path with
-    // the billing kind instead. Recording both would double-count the backoff. The
-    // request still happened, though: count it as a refusal so it reaches an outcome
-    // without touching the account's health.
+    // the billing kind instead. Recording both would count the failure twice, widening
+    // one request's cooldown. The request still happened, though: count it as a refusal
+    // so it reaches an outcome without touching the account's health.
     if status == StatusCode::BAD_REQUEST || status == StatusCode::PAYMENT_REQUIRED {
         // The request reached an outcome here. If the body turns out to be
         // billing-scoped, the failover path adds the cooldown without

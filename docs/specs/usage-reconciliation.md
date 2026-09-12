@@ -112,7 +112,7 @@ settling, because it no longer books anything to another day.
 - AC-9: A Refusal counts a failed request and never touches account
   health: no cooldown, no failure streak, no effect on Rotation.
 - AC-10: A cooldown only ever widens. A 24-hour reauth cooldown survives a
-  paired failure carrying a 2-second backoff.
+  paired failure carrying a 2-second cooldown.
 - AC-11: No test hardcodes a calendar date. Dates come from the clock, so
   no test can go red on a fixed future day.
 - AC-12: `ARCHITECTURE.md` states the counting rule, and no comment,

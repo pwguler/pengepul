@@ -42,7 +42,7 @@ three.
 - AC-8: The README contains no em dash character.
 - AC-9: A compact reference still covers routes with both auth-header forms, model
   aliases and the default model, the settable config keys (framed as settable, not a
-  verbatim generated file), pool rotation/backoff/failover, token refresh, service, and
+  verbatim generated file), pool rotation/cooldown/failover, token refresh, service, and
   logging.
 - AC-10: `README.md` is between 150 and 200 lines.
 - AC-11: No banned house-style words (per global CLAUDE.md); file is well-formed
