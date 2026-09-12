@@ -124,22 +124,10 @@ pub(crate) struct PoolTotals {
     output: i64,
     cache_read: i64,
     cache_write: i64,
-    /// The 1h-retention share of `cache_write`. Named separately because it
-    /// bills at 2x base input against 1.25x for 5m (ADR-0018): folded into
-    /// one figure, a cache write's price cannot be read back.
-    cache_write_1h: i64,
     reasoning: i64,
 }
 
 impl PoolTotals {
-    /// The pool's carried load, through the one function that defines it.
-    /// `account_tokens` reads the same four fields off an account; both
-    /// call `carried_tokens`, so a change to what "carried" means moves
-    /// every view at once rather than one of them silently.
-    fn tokens(&self) -> i64 {
-        carried_tokens(self.input, self.output, self.cache_read, self.cache_write)
-    }
-
     fn add(&mut self, account: &Value) {
         self.requests += i64_field(account, "totalRequests");
         self.successes += i64_field(account, "totalSuccesses");
@@ -148,7 +136,6 @@ impl PoolTotals {
         self.output += i64_field(account, "totalOutputTokens");
         self.cache_read += i64_field(account, "totalCacheReadInputTokens");
         self.cache_write += i64_field(account, "totalCacheCreationInputTokens");
-        self.cache_write_1h += i64_field(account, "totalCacheCreation1hInputTokens");
         self.reasoning += i64_field(account, "totalReasoningOutputTokens");
     }
 }
@@ -587,81 +574,38 @@ pub(crate) fn print_relay_total_rich(
             format_exact(pool.failures)
         ),
     ));
-    facts.push(Fact::new(
-        "tokens",
-        &format!(
-            "in {}  out {}  cache {}",
-            paint(BOLD, &format_count(pool.input)),
-            paint(BOLD, &format_count(pool.output)),
-            cache_with_share(pool.cache_read, pool.input + pool.cache_write),
-        ),
-    ));
-    if let Some(fact) = long_write_fact(pool) {
-        facts.push(fact);
-    }
-    if pool.reasoning != 0 {
-        facts.push(reasoning_fact(pool.reasoning, pool.output, BOLD));
-    }
-    facts.push(Fact::new(
-        "total",
-        &paint(BOLD, &format_count(totals.totals.tokens())),
+    facts.extend(token_block_facts(
+        pool.input,
+        pool.output,
+        pool.cache_read,
+        pool.cache_write,
+        pool.reasoning,
+        BOLD,
     ));
     for line in fact_panel(&relay_header_rich(&totals), &facts) {
         output.line(&line);
     }
 }
 
-/// ` 1h write 7.2K`, or nothing at all when no pool asked for long
-/// retention. Silent by default on purpose: a relay serving only 5m
-/// traffic reads exactly as it did before the split existed, and the line
-/// appears the moment the 2x write starts being paid for (ADR-0018).
-/// The same figure as a suffix on the plain rollup's token line.
-///
-/// The two differ on purpose. Plain output is a byte-stable contract scripts read, and a line
-/// of its own would be a new line in it; the panel has no such contract and gained the row so
-/// the cache share fits there.
-fn long_write_suffix(pool: &PoolTotals) -> String {
-    if pool.cache_write_1h == 0 {
-        return String::new();
-    }
-    format!("  1h write {}", format_count(pool.cache_write_1h))
-}
-
-/// The 1h share of the cache write as its own row, when a pool made one.
-///
-/// It used to be a suffix on the tokens row, which left that row one label-width short of the
-/// cache share's parentheses. The share is the more useful of the two — the 1h premium is a
-/// pricing detail (ADR-0018) while the hit rate is the point of the row — and a row of its own
-/// is only paid for when the figure is real.
-fn long_write_fact(pool: &PoolTotals) -> Option<Fact> {
-    (pool.cache_write_1h != 0)
-        .then(|| Fact::new("1h write", &paint(BOLD, &format_count(pool.cache_write_1h))))
-}
-
 /// The relay-wide rollup, plain: requests, tokens, reasoning when non-zero,
 /// and the carried-load total.
 fn aggregate_lines(totals: &RelayTotals) -> Vec<String> {
     let pool = &totals.totals;
-    let mut lines = vec![
+    vec![
         format!(
             "requests {}  ({} ok, {} failed)",
             format_exact(pool.requests),
             format_exact(pool.successes),
             format_exact(pool.failures)
         ),
-        format!(
-            "tokens in {}  out {}  cache {}{}",
-            format_count(pool.input),
-            format_count(pool.output),
-            format_count(pool.cache_read + pool.cache_write),
-            long_write_suffix(pool)
+        token_line(
+            pool.input,
+            pool.output,
+            pool.cache_read,
+            pool.cache_write,
+            pool.reasoning,
         ),
-    ];
-    if pool.reasoning != 0 {
-        lines.push(format!("reasoning {}", format_count(pool.reasoning)));
-    }
-    lines.push(format!("total {}", format_count(totals.totals.tokens())));
-    lines
+    ]
 }
 
 /// One colored account row: email, glyph + state, ok count, share bar.
@@ -883,9 +827,10 @@ pub(crate) fn account_tokens(account: &Value) -> i64 {
 
 /// What "carried load" means, in one place: input, output and both cache
 /// directions. Reasoning is excluded — it is already inside output. Every
-/// total the CLI prints resolves through here, so `status`, the pool
-/// footers, the share bars and `usage`'s all-time row cannot disagree
-/// about what they are summing (AC-11).
+/// figure derived from it resolves through here — the share bars, the model
+/// headlines and `usage`'s all-time row — so they cannot disagree about what
+/// they are summing (AC-11). No panel prints it as a row: it is `input +
+/// output`, two rows the token block carries (ADR-0024).
 pub(crate) fn carried_tokens(input: i64, output: i64, cache_read: i64, cache_write: i64) -> i64 {
     input + output + cache_read + cache_write
 }
@@ -1075,36 +1020,34 @@ mod tests {
     use super::cooldown_label;
     use crate::render::strip_ansi;
     #[test]
-    fn the_rollup_names_the_long_cache_write_only_when_a_pool_made_one() {
-        // A 1h write bills at 2x base input against 1.25x for 5m (ADR-0018).
-        // Folded into one `cache` figure that price is unreadable, so the
-        // long share gets named — and only when a pool actually wrote one,
-        // which leaves a 5m-only relay's output exactly as it was.
-        let payload = |long: i64| {
-            json!({"providers": {"anthropic": {
-                "account_count": 1,
-                "accounts": [{
-                    "email": "k@example.com",
-                    "totalRequests": 2,
-                    "totalSuccesses": 2,
-                    "totalInputTokens": 100,
-                    "totalCacheCreationInputTokens": 10416,
-                    "totalCacheCreation1hInputTokens": long,
-                    "totalCacheReadInputTokens": 0
-                }]
-            }}})
-        };
+    fn the_relay_block_prints_no_cache_write() {
+        // A 1h write bills at 2x base input against 1.25x for 5m (ADR-0018), and the CLI
+        // does not print it: the figure stays in the admin payload, where a reader who wants
+        // what the write cost can still find it (ADR-0024).
+        let payload = json!({"providers": {"anthropic": {
+            "account_count": 1,
+            "accounts": [{
+                "email": "k@example.com",
+                "totalRequests": 2,
+                "totalSuccesses": 2,
+                "totalInputTokens": 100,
+                "totalCacheCreationInputTokens": 10416,
+                "totalCacheCreation1hInputTokens": 7216,
+                "totalCacheReadInputTokens": 0
+            }]
+        }}});
 
-        let long = super::aggregate_lines(&super::RelayTotals::from_payload(&payload(7216)));
+        let lines = super::aggregate_lines(&super::RelayTotals::from_payload(&payload));
+        for line in &lines {
+            assert!(!line.contains("1h write"), "{lines:?}");
+            assert!(!line.contains("7216"), "{lines:?}");
+            assert!(!line.contains("7.2K"), "{lines:?}");
+        }
+        // The write is still inside the prompt the block prints: 100 uncached + 10,416
+        // written is 10.5K, and that is the only figure the CLI gives it.
         assert!(
-            long.iter().any(|line| line.contains("1h write 7.2K")),
-            "the long-retention share is not named: {long:?}"
-        );
-
-        let short = super::aggregate_lines(&super::RelayTotals::from_payload(&payload(0)));
-        assert!(
-            short.iter().all(|line| !line.contains("1h write")),
-            "a 5m-only pool grew a 1h line: {short:?}"
+            lines.iter().any(|line| line.contains("input 10.5K")),
+            "{lines:?}"
         );
     }
 

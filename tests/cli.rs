@@ -435,70 +435,78 @@ fn soon(seconds: f64) -> f64 {
         + seconds
 }
 
+/// The pool `status_rolls_up_pool_health_and_token_totals_per_provider`
+/// reads: three accounts, one of them on cooldown, a pool with no token
+/// history, and an empty pool.
+fn cooldown_and_empty_pools() -> Value {
+    json!({
+        "providers": {
+            "anthropic": {
+                "account_count": 3,
+                "accounts": [
+                    account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "failureCount": 0,
+                        "totalRequests": 640,
+                        "totalSuccesses": 638,
+                        "totalFailures": 2,
+                        "totalInputTokens": 22_100_000,
+                        "totalOutputTokens": 401_200,
+                        "totalCacheCreationInputTokens": 6_000_000,
+                        "totalCacheCreation1hInputTokens": 7_216_000,
+                        "totalCacheReadInputTokens": 155_000_000,
+                        "totalReasoningOutputTokens": 64_000,
+                        "planType": "max"
+                    })),
+                    account(json!({
+                        "email": "b@x.com",
+                        "available": true,
+                        "failureCount": 4,
+                        "totalRequests": 564,
+                        "totalSuccesses": 560,
+                        "totalFailures": 4,
+                        "totalInputTokens": 23_100_000,
+                        "totalOutputTokens": 411_100,
+                        "totalCacheCreationInputTokens": 6_400_000,
+                        "totalCacheReadInputTokens": 156_700_000,
+                        "totalReasoningOutputTokens": 32_000,
+                        "planType": "pro"
+                    })),
+                    account(json!({
+                        "email": "c@x.com",
+                        "available": false,
+                        "cooldownUntil": soon(252.9),
+                        "failureCount": 9,
+                        "planType": "pro"
+                    }))
+                ]
+            },
+            "groq": {
+                "account_count": 1,
+                "accounts": [
+                    account(json!({
+                        "email": "g@x.com",
+                        "available": true,
+                        "failureCount": 0,
+                        "planType": null
+                    }))
+                ]
+            },
+            "deepseek": {
+                "account_count": 0,
+                "accounts": []
+            }
+        }
+    })
+}
+
 #[test]
 fn status_rolls_up_pool_health_and_token_totals_per_provider() {
     let tmp = tempdir().expect("tempdir");
     write_config(tmp.path(), "0.0.0.0", 8318);
     let mut runtime = FakeRuntime {
-        accounts_payload: Some(json!({
-            "providers": {
-                "anthropic": {
-                    "account_count": 3,
-                    "accounts": [
-                        account(json!({
-                            "email": "a@x.com",
-                            "available": true,
-                            "failureCount": 0,
-                            "totalRequests": 640,
-                            "totalSuccesses": 638,
-                            "totalFailures": 2,
-                            "totalInputTokens": 22_100_000,
-                            "totalOutputTokens": 401_200,
-                            "totalCacheCreationInputTokens": 6_000_000,
-                            "totalCacheReadInputTokens": 155_000_000,
-                            "totalReasoningOutputTokens": 64_000,
-                            "planType": "max"
-                        })),
-                        account(json!({
-                            "email": "b@x.com",
-                            "available": true,
-                            "failureCount": 4,
-                            "totalRequests": 564,
-                            "totalSuccesses": 560,
-                            "totalFailures": 4,
-                            "totalInputTokens": 23_100_000,
-                            "totalOutputTokens": 411_100,
-                            "totalCacheCreationInputTokens": 6_400_000,
-                            "totalCacheReadInputTokens": 156_700_000,
-                            "totalReasoningOutputTokens": 32_000,
-                            "planType": "pro"
-                        })),
-                        account(json!({
-                            "email": "c@x.com",
-                            "available": false,
-                            "cooldownUntil": soon(252.9),
-                            "failureCount": 9,
-                            "planType": "pro"
-                        }))
-                    ]
-                },
-                "groq": {
-                    "account_count": 1,
-                    "accounts": [
-                        account(json!({
-                            "email": "g@x.com",
-                            "available": true,
-                            "failureCount": 0,
-                            "planType": null
-                        }))
-                    ]
-                },
-                "deepseek": {
-                    "account_count": 0,
-                    "accounts": []
-                }
-            }
-        })),
+        accounts_payload: Some(cooldown_and_empty_pools()),
         ..FakeRuntime::default()
     };
 
@@ -521,12 +529,29 @@ fn status_rolls_up_pool_health_and_token_totals_per_provider() {
             .stdout
             .contains("requests 1,204  (1,198 ok, 6 failed)")
     );
+    // AC-7: the relay's token block as one line, in the panel's words and
+    // order. 45.2M uncached + 12.4M written + 311.7M read is a 369.3M
+    // prompt, 84% of it served from cache; 96.0K of the 812.3K generated
+    // were reasoning.
     assert!(
-        outcome
-            .stdout
-            .contains("tokens in 45.2M  out 812.3K  cache 324.1M")
+        outcome.stdout.contains(
+            "input 369.3M cached 311.7M (84%) uncached 57.6M output 812.3K reasoning 96.0K (12%)\n"
+        ),
+        "{}",
+        outcome.stdout
     );
-    assert!(outcome.stdout.contains("reasoning 96.0K"));
+    // AC-5: a pool that wrote 7.2M at the 1h retention prints no figure for
+    // it, and AC-6: the relay's carried load is on its pool lines, not a
+    // `total` row.
+    assert!(!outcome.stdout.contains("1h write"), "{}", outcome.stdout);
+    assert!(
+        !outcome
+            .stdout
+            .lines()
+            .any(|line| line.starts_with("total ")),
+        "{}",
+        outcome.stdout
+    );
     // AC-4: an empty pool is hidden entirely.
     assert!(!outcome.stdout.contains("deepseek"));
     // AC-1: no per-account row survives in status.
@@ -607,6 +632,19 @@ fn status_renders_panels_on_a_tty() {
     assert!(pool_row.contains("183.5M"), "token cell: {pool_row}");
     // AC-4: the empty pool is omitted from lines and from the header count.
     assert!(!visible.contains("deepseek"));
+    // AC-1: the relay's own token block, on the same rows as a pool's would
+    // be. a@x.com's 22.1M uncached + 6.0M written + 155.0M read is a 183.1M
+    // prompt, 85% of it served from cache.
+    assert_eq!(fact_values(&visible, "input"), ["183.1M"]);
+    assert_eq!(fact_values(&visible, "cached"), ["155.0M (85%)"]);
+    assert_eq!(fact_values(&visible, "uncached"), ["28.1M"]);
+    assert_eq!(fact_values(&visible, "output"), ["401.2K"]);
+    assert_eq!(fact_values(&visible, "reasoning"), ["64.0K (16%)"]);
+    // AC-5: the account wrote 7.2M at the 1h retention, and no command prints
+    // it. AC-6: the relay's carried load is not a `total` row either.
+    assert!(!visible.contains("1h write"), "{visible}");
+    assert!(!visible.contains("│ total"), "{visible}");
+    assert!(!visible.contains("│ tokens"), "{visible}");
     // AC-2: every line is exactly the 64-column box width. `<= 64` would
     // hold for any renderer at all, since panel_row clips to 64.
     for line in visible.lines() {
@@ -1217,12 +1255,26 @@ fn status_ends_with_relay_total_block_in_plain() {
             .starts_with("relay total: 2 pools, 2 accounts\n")
     );
     assert!(outcome.stdout.contains("requests 650  (0 ok, 0 failed)\n"));
-    assert!(outcome.stdout.contains("total 175\n"));
+    // ADR-0024: the relay's block is one line, in the panel's words — a 50
+    // prompt (33 + 7 + 10 uncached, 7 of it served from cache) with 125
+    // generated. Carried load is `input + output`, 175.
+    assert!(
+        outcome
+            .stdout
+            .contains("input 50 cached 7 (14%) uncached 43 output 125\n"),
+        "{}",
+        outcome.stdout
+    );
     // AC-3: one line per pool.
     assert!(outcome.stdout.contains("anthropic"));
     assert!(outcome.stdout.contains("commandcode"));
-    // The aggregate is last: nothing after `total`.
-    assert!(outcome.stdout.trim_end().ends_with("total 175"));
+    // The block is last: nothing after the token line.
+    assert!(
+        outcome
+            .stdout
+            .trim_end()
+            .ends_with("input 50 cached 7 (14%) uncached 43 output 125")
+    );
 }
 
 #[test]
@@ -1267,8 +1319,13 @@ fn status_relay_total_block_in_rich_has_64_wide_rule() {
     assert_eq!(bottom, lines.len() - 1, "panel closes the output");
     assert!(visible.contains("│ requests"));
     assert!(visible.contains("640"));
-    assert!(visible.contains("│ total"));
+    // AC-1: the block's rows, and AC-6: no relay-wide `total` row — the
+    // relay's load is `input + output`, 33 + 120.
+    assert!(visible.contains("│ input"));
+    assert!(visible.contains("│ uncached"));
+    assert!(visible.contains("│ output"));
     assert!(visible.contains("153"));
+    assert!(!visible.contains("│ total"));
 }
 
 #[test]
@@ -1302,7 +1359,23 @@ fn status_relay_total_covers_empty_pools_and_zero_relay() {
     // the header counts only shown pools.
     assert!(outcome.stdout.contains("relay total: 1 pool, 1 account\n"));
     assert!(outcome.stdout.contains("requests 0  (0 ok, 0 failed)\n"));
-    assert!(outcome.stdout.contains("total 0\n"));
+    // AC-6: the block prints at a zero relay too, and the relay's carried load
+    // is left to be `input + output` rather than repeated as a `total` row.
+    assert!(
+        outcome
+            .stdout
+            .contains("input 0 cached 0 uncached 0 output 0\n"),
+        "{}",
+        outcome.stdout
+    );
+    assert!(
+        !outcome
+            .stdout
+            .lines()
+            .any(|line| line.starts_with("total ")),
+        "{}",
+        outcome.stdout
+    );
     assert!(!outcome.stdout.contains("codex"));
     assert!(!outcome.stdout.contains("commandcode"));
 }
@@ -2187,8 +2260,20 @@ fn status_prints_the_block_for_a_relay_with_no_pools() {
             .starts_with("relay total: 0 pools, 0 accounts")
     );
     assert!(outcome.stdout.contains("requests 0  (0 ok, 0 failed)"));
-    assert!(outcome.stdout.contains("tokens in 0  out 0  cache 0"));
-    assert!(outcome.stdout.contains("total 0"));
+    assert!(
+        outcome
+            .stdout
+            .contains("input 0 cached 0 uncached 0 output 0")
+    );
+    // AC-6: no `total` row, so nothing follows the token line.
+    assert!(
+        !outcome
+            .stdout
+            .lines()
+            .any(|line| line.starts_with("total ")),
+        "{}",
+        outcome.stdout
+    );
 }
 
 /// usage-by-model AC-8: one name column per panel, not per account — the
@@ -2358,7 +2443,9 @@ fn status_rows_are_labelled_facts_in_one_column() {
     };
 
     // AC-3: the facts status reports, each on a labelled row.
-    for label in ["config", "url", "server", "requests", "tokens", "total"] {
+    for label in [
+        "config", "url", "server", "requests", "input", "cached", "uncached", "output",
+    ] {
         assert!(
             visible.contains(&format!("│ {label}")),
             "missing labelled row {label:?}:\n{visible}"
@@ -2368,7 +2455,7 @@ fn status_rows_are_labelled_facts_in_one_column() {
     assert!(visible.contains("│ anthropic"));
     assert!(visible.contains("│ commandcode"));
     // AC-9: every value starts in the same column.
-    let columns: Vec<usize> = ["config", "url", "server", "anthropic", "requests", "total"]
+    let columns: Vec<usize> = ["config", "url", "server", "anthropic", "requests", "input"]
         .into_iter()
         .map(value_column)
         .collect();
@@ -3153,12 +3240,11 @@ fn usage_says_how_much_history_it_actually_has() {
     }
 }
 
-/// usage-trend: the numbers reconcile across verbs. `usage` shows the
-/// all-time figure beside its window, and that figure is the one `status`
-/// prints — computed from the same payload by the same sum, so the two
-/// cannot drift and a reader can see the window is a subset.
+/// ADR-0024 removed `status`'s relay-wide `total` row, so the two verbs no longer print the same
+/// figure as a fact. They still agree where both print it: `status`'s pool row carries the whole
+/// relay's load, and `usage` calls the same sum `all time`.
 #[test]
-fn usage_all_time_equals_the_status_total() {
+fn usage_all_time_equals_the_status_pool_row() {
     let tmp = tempdir().expect("tempdir");
     write_config(tmp.path(), "127.0.0.1", 8317);
     let payload = json!({
@@ -3195,15 +3281,14 @@ fn usage_all_time_equals_the_status_total() {
     let usage = strip_ansi(&run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich).stdout);
     let status = strip_ansi(&run_style(&["status"], tmp.path(), &mut runtime, Style::Rich).stdout);
 
-    // Exact figures, not humanized ones: two different numbers that both
-    // render "292.6M" would pass a substring check.
-    let status_total = status
+    let load = status
         .lines()
-        .find(|line| line.contains("│ total"))
-        .expect("status total row")
+        .find(|line| line.contains("│ anthropic"))
+        .expect("status pool row")
+        .trim_end_matches(['│', ' '])
         .split_whitespace()
-        .nth(2)
-        .expect("status total value")
+        .next_back()
+        .expect("pool row load")
         .to_string();
     // The same figure, labelled `all time`, inside `usage`.
     let all_time = usage
@@ -3211,8 +3296,8 @@ fn usage_all_time_equals_the_status_total() {
         .find(|line| line.contains("all time"))
         .expect("usage all-time row");
     assert!(
-        all_time.contains(&status_total),
-        "usage all-time {all_time:?} must carry status total {status_total:?}"
+        all_time.contains(&load),
+        "usage all-time {all_time:?} must carry the pool row's load {load:?}"
     );
     // And the window is visibly a subset, not a competing total.
     assert!(usage.contains("window"), "{usage}");
@@ -3354,12 +3439,12 @@ fn a_day_of_failures_counts_as_history_in_both_styles() {
     );
 }
 
-/// usage-trend AC-11: `all time` and `status`'s `total` are the same
-/// number, asserted on exact figures rather than humanized ones. Small
-/// values keep `format_count` exact, so a wrong sum cannot hide behind a
-/// rounded suffix.
+/// usage-trend AC-11: the all-time figure is the carried load the counters imply, asserted on an
+/// exact figure rather than a humanized one — small values keep `format_count` exact, so a wrong
+/// sum cannot hide behind a rounded suffix. ADR-0024 removed the `status` row it used to be
+/// compared against, so the payload is the other side of the comparison now.
 #[test]
-fn usage_all_time_matches_status_exactly_not_just_when_rounded() {
+fn usage_all_time_is_the_payload_carried_load_exactly() {
     let tmp = tempdir().expect("tempdir");
     write_config(tmp.path(), "127.0.0.1", 8317);
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -3398,19 +3483,18 @@ fn usage_all_time_matches_status_exactly_not_just_when_rounded() {
     };
 
     let usage = strip_ansi(&run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich).stdout);
-    let status = strip_ansi(&run_style(&["status"], tmp.path(), &mut runtime, Style::Rich).stdout);
 
-    // 111 + 222 + 333 + 44 = 710, printed exactly at this size.
+    // 111 + 222 + 333 + 44 = 710, printed exactly at this size: a prompt-only
+    // sum would be 488, and a rounded one would carry a scale suffix.
     let all_time = usage
         .lines()
         .find(|line| line.contains("all time"))
         .expect("all time row");
     assert!(all_time.contains("710"), "all time: {all_time}");
-    let total = status
-        .lines()
-        .find(|line| line.contains("│ total"))
-        .expect("status total");
-    assert!(total.contains("710"), "status total: {total}");
+    assert!(
+        !all_time.contains('K') && !all_time.contains('M'),
+        "all time: {all_time}"
+    );
     // And the window is its own, smaller figure: 10 + 20 + 30 = 60.
     let window = usage
         .lines()
