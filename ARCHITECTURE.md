@@ -108,7 +108,9 @@ in files.
   pure argument handling.
 - **`Style`** — decided once from the TTY and environment in `main.rs` and
   handed down; no renderer reads the environment, so tests drive either mode
-  hermetically and piped output stays byte-stable for scripts.
+  hermetically. Piped output speaks its own grammar — one line per subject,
+  never a panel — and it is not a contract: a renamed counter reaches it too
+  (ADR-0024).
 - **Classifier-rewrite tables** — per-harness knowledge is a table entry, not an
   edit to the request path: openclaw's sections and tripping text, and the pi /
   opencode fingerprint rewrites.
@@ -210,11 +212,14 @@ in files.
   remainder: a gap can now only come from restoring a pre-migration file,
   and it is silent by the operator's choice.
 - **One word, one scope.** Two verbs never print the same label for different
-  spans: `status` totals all time, `usage` names its `window` and its
-  `all time` separately, and the all-time figure both print comes from one
-  sum over one payload, so they cannot drift. A row reports a fact the panel
-  does not already carry — it never restates another row or narrates another
-  verb.
+  spans: `status` shows the relay's pools, `usage` names its `window` and its
+  `all time` separately, and neither claims the other's span. A row reports a
+  fact the panel does not already carry — it never restates another row or
+  narrates another verb — and no panel prints the relay's carried load as a
+  row, because it is `input + output`, which the token block carries. A
+  labelled total above its own breakdown is not a restatement: `input` is
+  `cached + uncached` on purpose, so the block reads as a whole without the
+  operator adding anything up (ADR-0024).
 - **Every rich panel speaks one grammar.** Header is `<subject>` or
   `<subject> ─ <qualifier>`, never a colon, and a qualifier must add a
   fact the rows do not carry. Fact rows are `<label>  <value>` with the
@@ -222,9 +227,11 @@ in files.
   only. The exception is deliberate: `accounts` also carries *list* rows
   (account and model tables) with their own fitted columns, and is the
   one panel built by hand rather than by `fact_panel`, because it needs a
-  mid-panel separator between its list and its rollup. Plain output is a
-  separate contract: it stays byte-stable for scripts and does not follow
-  the panel language.
+  mid-panel separator between its list and its rollup. A fact may open an
+  indented breakdown beneath it, one level per scope: the token block does,
+  under the account, that account's models, and the pool's own rollup. Plain
+  output does not follow the panel language — it prints the same vocabulary,
+  one line per subject (ADR-0024).
 - **Cloaking follows Claude Code except where fidelity breaks the client.**
   The beta set is audited against the current CLI binary, but
   `redact-thinking` is never sent (it empties thinking text pengepul's clients
