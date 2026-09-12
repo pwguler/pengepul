@@ -239,42 +239,37 @@ impl ModelRow {
         )
     }
 
-    /// `in 300  out 400  cache 8.5K` — plus reasoning when non-zero.
+    /// `in 300  out 400 (34% of out)  cache 8.5K (97%)` — the counts, each share beside the
+    /// figure it qualifies.
+    ///
+    /// The reasoning share is spelled `of out` and not `reasoning` because that word is what
+    /// overflows the longest realistic row: three six-character counts with two labelled
+    /// percentages are 63 columns against the 60 available, and `pad` answers an over-long row
+    /// with an ellipsis. Beside `out`, `(34% of out)` reads without a label of its own.
+    ///
+    /// A share is left out when it has no base to be a share of, and when the two counters
+    /// disagree — reasoning above output — because a percentage there would dress up two
+    /// numbers that cannot both be right.
     fn detail(&self) -> String {
         let mut detail = format!(
-            "in {}  out {}  cache {}",
+            "in {}  out {}",
             format_count(self.input),
-            format_count(self.output),
-            format_count(self.cache)
+            format_count(self.output)
         );
-        if self.reasoning != 0 {
-            write!(detail, "  reasoning {}", format_count(self.reasoning))
-                .expect("write to String cannot fail");
-        }
-        detail
-    }
-    /// `100% cached  ·  33% of out was reasoning` — what the counts above imply, on a line
-    /// of its own because three counts and two shares do not fit one 60-column row.
-    ///
-    /// Either half is dropped when it has no count and no denominator, so a model that only
-    /// ever served uncached prompts says nothing here rather than `0% cached`. A reasoning
-    /// count above the output count is dropped too — the same rule [`reasoning_fact`] states,
-    /// for the same reason: a percentage would dress up two counters that cannot both be
-    /// right. The counts sit on the line above, where the disagreement is plain to see.
-    fn shares(&self) -> String {
-        let mut parts = Vec::new();
-        if self.cache > 0
-            && let Some(percent) = share(self.cache, self.input.saturating_add(self.cache))
-        {
-            parts.push(format!("{percent}% cached"));
-        }
         if self.reasoning > 0
             && self.reasoning <= self.output
             && let Some(percent) = share(self.reasoning, self.output)
         {
-            parts.push(format!("{percent}% of out was reasoning"));
+            write!(detail, " ({percent}% of out)").expect("write to String cannot fail");
         }
-        parts.join("  ·  ")
+        write!(detail, "  cache {}", format_count(self.cache))
+            .expect("write to String cannot fail");
+        if self.cache > 0
+            && let Some(percent) = share(self.cache, self.input.saturating_add(self.cache))
+        {
+            write!(detail, " ({percent}%)").expect("write to String cannot fail");
+        }
+        detail
     }
 }
 
@@ -389,10 +384,6 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64) {
             for row in model_rows(account) {
                 output.line(&panel_row(&format!("  {}", row.headline(width))));
                 output.line(&panel_row(&paint(DIM, &format!("    {}", row.detail()))));
-                let shares = row.shares();
-                if !shares.is_empty() {
-                    output.line(&panel_row(&paint(DIM, &format!("    {shares}"))));
-                }
             }
         }
 
