@@ -246,13 +246,20 @@ api-keys:
 providers:
   groq:
     base-url: https://api.groq.com/openai/v1
-body-limit: 200mb # checked against Content-Length; empty means unlimited
+body-limit: 200mb # largest request body the relay will read; empty means unlimited
 timeouts:
   messages-ms: 120000
   stream-messages-ms: 600000
   count-tokens-ms: 30000
 debug: off # off | errors | verbose
 ```
+
+`body-limit` is enforced while the body is read, so it is the number that actually bounds
+a request; it is also checked against the declared `Content-Length`. A value that does
+not parse stops the relay at startup rather than being answered per request. Leaving it
+empty means no ceiling at all — and a body is buffered before the API key is checked, so
+set it unless the relay is unreachable by anything you would not trust with your memory
+(ADR-0022).
 
 Requests round-robin across accounts, preferring the account that already holds a
 conversation's cached prefix and never waiting for it — a cooling account is passed

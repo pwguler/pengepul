@@ -12,7 +12,9 @@ use pengepul::app::{
     UpstreamRequest, UpstreamSseFuture, UpstreamSseResponse, create_app, create_app_with_upstream,
 };
 use pengepul::cloaking_versions::CliVersions;
-use pengepul::config::{CloakingConfig, Config, DebugMode, TimeoutConfig};
+use pengepul::config::{
+    BodyLimit, CloakingConfig, Config, DEFAULT_BODY_LIMIT_BYTES, DebugMode, TimeoutConfig,
+};
 use pengepul::models::{FetchedModels, ModelMetadata, ModelPricing};
 use pengepul::tokens::save_token;
 use pengepul::types::{AvailableAccount, ProviderId, ProviderKind, TokenData};
@@ -260,7 +262,7 @@ fn config(auth_dir: PathBuf) -> Config {
         port: 8317,
         auth_dir,
         api_keys: HashSet::from(["sk-test".to_string()]),
-        body_limit: "200mb".to_string(),
+        body_limit: BodyLimit::Limited(DEFAULT_BODY_LIMIT_BYTES),
         cloaking: CloakingConfig {
             cli_version: "2.1.88".to_string(),
             entrypoint: "cli".to_string(),
@@ -611,7 +613,7 @@ async fn leftover_opencode_credentials_are_ignored_and_untouched() {
 async fn app_enforces_configured_body_limit_and_invalid_json() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut cfg = config(tmp.path().to_path_buf());
-    cfg.body_limit = "10b".to_string();
+    cfg.body_limit = BodyLimit::Limited(10);
     let app = create_app(cfg);
 
     let (status, body) = json_response(
@@ -644,7 +646,7 @@ async fn app_enforces_configured_body_limit_and_invalid_json() {
     assert_eq!(body["error"]["message"], "missing content-length");
 
     let mut cfg = config(tmp.path().to_path_buf());
-    cfg.body_limit = "200mb".to_string();
+    cfg.body_limit = BodyLimit::Limited(DEFAULT_BODY_LIMIT_BYTES);
     let app = create_app(cfg);
     let (status, body) = json_response(
         app,
@@ -662,6 +664,106 @@ async fn app_enforces_configured_body_limit_and_invalid_json() {
     .await;
     assert_eq!(status, 400);
     assert_eq!(body["error"]["message"], "invalid JSON body");
+}
+
+/// A JSON body of exactly `size` bytes, valid, with `messages` empty so the relay's own
+/// validation answers if the bytes are ever read. `messages: []` is what keeps these probes
+/// off the upstream.
+fn padded_body(size: usize) -> Vec<u8> {
+    let mut body = String::from(r#"{"model":"m","messages":[]}"#);
+    assert!(size >= body.len(), "{size} is too small to be this body");
+    body.push_str(&" ".repeat(size - body.len()));
+    body.into_bytes()
+}
+
+/// POST one of those bodies to `uri`, declaring its true length, and return the raw text.
+/// Raw rather than JSON because the extractor's rejection is plain text, and asking for JSON
+/// there panics before any assertion runs — which is how the first version of this test
+/// failed for the wrong reason.
+async fn post_padded(app: axum::Router, uri: &str, size: usize) -> (u16, String) {
+    let body = padded_body(size);
+    let (status, _, text) = raw_response(
+        app,
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", body.len().to_string())
+            .body(Body::from(body))
+            .unwrap(),
+    )
+    .await;
+    (status, text)
+}
+
+/// The regression this pins: `body-limit` never reached axum's body buffering, so the
+/// extractor applied its own 2 MiB default to a body the operator had explicitly allowed,
+/// before any handler ran.
+#[tokio::test]
+async fn a_body_above_the_extractor_default_still_reaches_the_handler() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut cfg = config(tmp.path().to_path_buf());
+    cfg.body_limit = BodyLimit::Limited(DEFAULT_BODY_LIMIT_BYTES);
+    let app = create_app(cfg);
+
+    // Past axum's 2 MiB default. The relay's own validation answering is the proof the bytes
+    // were read: a limit inside the extractor would have produced its own 413 first.
+    let (status, body) = post_padded(app, "/v1/chat/completions", 3 * 1024 * 1024).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.contains("messages is required"),
+        "the extractor answered instead of the handler: {body}"
+    );
+}
+
+/// The half the test above cannot see, and the more important one.
+///
+/// A bare `413` says nothing about *which* limit produced it, so a fix that took
+/// `max(configured, 2 MiB)` — or one that limited only the first `/v1` nest — would leave
+/// the reported bug alive and every test above still green. This pins the boundary itself,
+/// on a limit nowhere near any default, and on both mounts a client can arrive through.
+/// `README.md` documents `http://host:port/v1` as the base URL, which is how an Anthropic
+/// SDK reaches `/v1/v1/messages`: the second nest is not a curiosity.
+#[tokio::test]
+async fn the_extractor_enforces_the_configured_limit_on_every_mount() {
+    const LIMIT: usize = 1024;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut cfg = config(tmp.path().to_path_buf());
+    cfg.body_limit = BodyLimit::Limited(LIMIT as u64);
+    let app = create_app(cfg);
+
+    // Every nested POST route, on both mounts. Four of the eight was enough to catch the
+    // mutations above, but not enough to pin what AC-3 claims: splitting the router so that
+    // `/responses` and `/messages/count_tokens` lose the layer left all 470 tests green.
+    for uri in [
+        "/v1/chat/completions",
+        "/v1/messages",
+        "/v1/responses",
+        "/v1/messages/count_tokens",
+        "/v1/v1/chat/completions",
+        "/v1/v1/messages",
+        "/v1/v1/responses",
+        "/v1/v1/messages/count_tokens",
+    ] {
+        // At the limit the bytes are read and the relay's own validation answers, which is a
+        // 400 for this body. Pinned exactly rather than as "not 413": a 401 or a 404 would
+        // satisfy the weaker form while saying nothing about the limit.
+        let (at, body) = post_padded(app.clone(), uri, LIMIT).await;
+        assert_eq!(
+            at, 400,
+            "{uri} did not read a body of exactly the configured limit: {body}"
+        );
+
+        // One byte more is turned away by the extractor, so the handler's message must not
+        // appear: if it does, the configured number was not what bound the read.
+        let (over, body) = post_padded(app.clone(), uri, LIMIT + 1).await;
+        assert_eq!(over, 413, "{uri} at limit + 1: {body}");
+        assert!(
+            !body.contains("request body too large"),
+            "{uri} was bound by the handler, not by the configured limit: {body}"
+        );
+    }
 }
 
 #[tokio::test]

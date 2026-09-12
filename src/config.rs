@@ -32,12 +32,72 @@ pub struct Config {
     pub port: u16,
     pub auth_dir: PathBuf,
     pub api_keys: HashSet<String>,
-    pub body_limit: String,
+    pub body_limit: BodyLimit,
     pub cloaking: CloakingConfig,
     pub timeouts: TimeoutConfig,
     pub stats_enabled: bool,
     pub debug: DebugMode,
     pub providers: BTreeMap<String, ConfiguredProvider>,
+}
+
+/// The largest request body the relay will read, resolved once at config load.
+///
+/// There is no `Invalid` arm: an unparseable `body-limit` is refused by `load_config`
+/// rather than carried into the request path, because a running relay has no sane answer
+/// for "the operator's limit did not parse".
+///
+/// Both the body-reading layer and the relay's own check are given this value, so the two
+/// cannot be given *different* limits. They are not interchangeable, though, and the
+/// difference is what the layer was added for: the extractor reads the body first, so an
+/// honest oversized request is answered there, under axum's message rather than the relay's.
+/// That leaves the handler's check running only on requests already read — and over HTTP a
+/// declared length above the limit cannot reach it, because the extractor answers when the
+/// bytes arrive or the read fails first. It is a fallback, not the answer a client sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyLimit {
+    Unlimited,
+    Limited(u64),
+}
+
+/// The `body-limit` an omitted setting falls back to. An *empty* value is not this: it
+/// parses to [`BodyLimit::Unlimited`], which is what the README documents.
+pub const DEFAULT_BODY_LIMIT_BYTES: u64 = 200 * 1024 * 1024;
+
+/// Parse a `body-limit` value: a byte count with an optional `b`/`kb`/`mb`/`gb` suffix, a
+/// bare number meaning bytes, or empty meaning unlimited.
+///
+/// This is an error rather than a silent fallback on purpose. The setting exists to choose
+/// one number, and the failure mode of guessing is that the operator's `200mb` quietly
+/// becomes the layer's own default while every panel still reports the configured value.
+///
+/// # Errors
+///
+/// Returns an error when the value is not a byte count, or when its suffix would overflow
+/// a `u64`.
+pub fn parse_body_limit(value: &str) -> Result<BodyLimit> {
+    let raw = value.trim().to_ascii_lowercase();
+    if raw.is_empty() {
+        return Ok(BodyLimit::Unlimited);
+    }
+    let (number, multiplier) = match [
+        ("gb", 1024_u64 * 1024 * 1024),
+        ("mb", 1024_u64 * 1024),
+        ("kb", 1024_u64),
+        ("b", 1_u64),
+    ]
+    .into_iter()
+    .find_map(|(suffix, multiplier)| raw.strip_suffix(suffix).map(|n| (n, multiplier)))
+    {
+        Some((number, multiplier)) => (number.trim(), multiplier),
+        // No suffix: a bare number is bytes, which is what `10b` already means.
+        None => (raw.as_str(), 1),
+    };
+    let bytes = number
+        .parse::<u64>()
+        .ok()
+        .and_then(|parsed| parsed.checked_mul(multiplier))
+        .ok_or_else(|| anyhow::anyhow!("not a byte count"))?;
+    Ok(BodyLimit::Limited(bytes))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,7 +339,8 @@ pub fn load_config(
         port: raw.port,
         auth_dir: resolve_auth_dir(&raw.auth_dir, &home),
         api_keys: raw.api_keys.into_iter().collect(),
-        body_limit: raw.body_limit,
+        body_limit: parse_body_limit(&raw.body_limit)
+            .with_context(|| format!("body-limit: {:?}", raw.body_limit))?,
         cloaking: CloakingConfig {
             cli_version: raw.cloaking.cli_version,
             entrypoint: raw.cloaking.entrypoint,
@@ -876,5 +937,90 @@ mod normalize_tests {
         assert_eq!(normalize_base_url("  https://h/v1  "), "https://h/v1");
         assert_eq!(normalize_base_url("/"), "");
         assert_eq!(normalize_base_url("   "), "");
+    }
+}
+
+#[cfg(test)]
+mod body_limit_tests {
+    use super::{BodyLimit, DEFAULT_BODY_LIMIT_BYTES, RawConfig, parse_body_limit};
+
+    #[test]
+    fn suffixes_and_bare_numbers_mean_the_same_thing() {
+        assert_eq!(
+            parse_body_limit("10b").expect("bytes"),
+            BodyLimit::Limited(10)
+        );
+        assert_eq!(
+            parse_body_limit("10").expect("a bare number is bytes"),
+            BodyLimit::Limited(10)
+        );
+        assert_eq!(
+            parse_body_limit("2kb").expect("kb"),
+            BodyLimit::Limited(2 * 1024)
+        );
+        assert_eq!(
+            parse_body_limit("3mb").expect("mb"),
+            BodyLimit::Limited(3 * 1024 * 1024)
+        );
+        assert_eq!(
+            parse_body_limit("1gb").expect("gb"),
+            BodyLimit::Limited(1024 * 1024 * 1024)
+        );
+        // The suffixes differ by a letter, so case and padding must not matter.
+        assert_eq!(
+            parse_body_limit("  200MB  ").expect("case and space"),
+            BodyLimit::Limited(200 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn an_empty_setting_means_unlimited() {
+        assert_eq!(parse_body_limit("").expect("empty"), BodyLimit::Unlimited);
+        assert_eq!(
+            parse_body_limit("   ").expect("blank"),
+            BodyLimit::Unlimited
+        );
+    }
+
+    #[test]
+    fn an_unparseable_setting_is_an_error_not_a_default() {
+        // The whole point: a typo must not quietly become some other limit. If this ever
+        // returns `Ok`, the operator's setting is being replaced without being told.
+        for bad in ["abc", "10xb", "mb", "1.5mb", "-1", "é"] {
+            assert!(
+                parse_body_limit(bad).is_err(),
+                "{bad:?} must not parse to a limit"
+            );
+        }
+    }
+
+    #[test]
+    fn a_space_before_the_suffix_is_tolerated() {
+        // Pre-existing leniency, kept so this change is not also a behaviour change: the
+        // parser trims between the number and its suffix. Pinned so that tightening it is
+        // a decision rather than an accident.
+        assert_eq!(
+            parse_body_limit("10 mb").expect("space before suffix"),
+            BodyLimit::Limited(10 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn an_overflowing_setting_is_an_error_not_a_wrapped_limit() {
+        // u64::MAX bytes cannot be multiplied by 1024 without wrapping, and a wrapped
+        // limit is smaller than the operator asked for.
+        assert!(parse_body_limit("18446744073709551615gb").is_err());
+        assert!(parse_body_limit("99999999999999999999999").is_err());
+    }
+
+    #[test]
+    fn the_default_setting_and_the_default_constant_agree() {
+        // Two spellings of one number: the string written into a fresh config, and the
+        // constant the tests and the docs reason about. Nothing else ties them together,
+        // so changing one without the other is caught here.
+        assert_eq!(
+            parse_body_limit(&RawConfig::default().body_limit).expect("the default must parse"),
+            BodyLimit::Limited(DEFAULT_BODY_LIMIT_BYTES)
+        );
     }
 }

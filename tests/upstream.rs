@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
-use pengepul::config::{CloakingConfig, Config, DebugMode, TimeoutConfig};
+use pengepul::config::{
+    BodyLimit, CloakingConfig, Config, DEFAULT_BODY_LIMIT_BYTES, DebugMode, TimeoutConfig,
+};
 use pengepul::types::{AvailableAccount, ProviderId, ProviderKind, TokenData};
 use pengepul::upstream::{
     anthropic_headers, apply_cloaking, build_beta_header, codex_headers,
@@ -21,7 +23,7 @@ fn config() -> Config {
         port: 8317,
         auth_dir: PathBuf::from("/tmp/pengepul-test"),
         api_keys: HashSet::from(["sk-test".to_string()]),
-        body_limit: "200mb".to_string(),
+        body_limit: BodyLimit::Limited(DEFAULT_BODY_LIMIT_BYTES),
         cloaking: CloakingConfig {
             cli_version: "2.1.88".to_string(),
             entrypoint: "cli".to_string(),

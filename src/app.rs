@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use async_stream::try_stream;
 use axum::body::{Body, Bytes};
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -21,7 +21,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::accounts::{AccountManager, RefreshPolicy, RefreshPolicyKind};
 use crate::cloaking_versions::{CliVersions, codex_release, effective, npm_latest};
-use crate::config::Config;
+use crate::config::{BodyLimit, Config};
 use crate::masquerade::{masquerade_request, restore_tool_use_names};
 use crate::models::{
     FetchedModels, ModelCatalog, grok_static_models, parse_anthropic, parse_codex, parse_openai,
@@ -180,13 +180,6 @@ impl Drop for StreamAccounting {
             record_provider_refusal(&state, &provider, &account).await;
         });
     }
-}
-
-#[derive(Debug, Clone)]
-enum BodyLimit {
-    Unlimited,
-    Limited(u64),
-    Invalid,
 }
 
 #[derive(Debug, Clone)]
@@ -566,7 +559,7 @@ pub fn create_app_with_upstream(config: Config, upstream: Arc<dyn UpstreamClient
     if let Err(error) = crate::tokens::migrate_legacy_layout(&config.auth_dir) {
         tracing::warn!(?error, "legacy token layout migration failed");
     }
-    let body_limit = parse_body_limit(&config.body_limit);
+    let body_limit = config.body_limit;
     let account_managers = build_account_managers(&config);
     let config = Arc::new(config);
     let cloaking = Arc::new(StdRwLock::new(Cloaking::new(
@@ -608,6 +601,11 @@ pub fn create_app_with_upstream(config: Config, upstream: Arc<dyn UpstreamClient
         .nest("/v1", api.clone())
         .nest("/v1/v1", api)
         .with_state(state)
+        // Next to CORS because it is the other cross-cutting request concern, and it has to
+        // sit here rather than in a handler: the extractor reads the body first, so a limit
+        // applied any later is applied after the memory has been spent (see
+        // `extractor_body_limit`).
+        .layer(extractor_body_limit(body_limit))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -1827,16 +1825,34 @@ fn extract_api_key(headers: &HeaderMap) -> Option<String> {
         })
 }
 
+/// Put the configured limit where axum actually reads the body.
+///
+/// The extractor buffers a request before any handler runs, and it does so under its own
+/// default — 2 MiB — which the relay's own check cannot see, because that check runs inside
+/// the handler, after the bytes are already in memory. Left unset, a configured `200mb`
+/// therefore rejected every body past 2 MiB inside the extractor, with axum's message
+/// instead of the relay's.
+///
+/// Both layers are handed the same number, so neither can apply a limit other than the one
+/// the operator configured. Which of them *answers* is decided by ordering rather than by
+/// the value: the extractor reads first, so an honest oversized request is refused there,
+/// and `enforce_body_limit` sees only what was already read.
+fn extractor_body_limit(limit: BodyLimit) -> DefaultBodyLimit {
+    match limit {
+        // Saturating rather than truncating. A limit above `usize::MAX` is unreachable on the
+        // 64-bit targets this ships for; on a 32-bit one it is absurd anyway (4 GiB), and
+        // saturating to `usize::MAX` is the most permissive value that target can express,
+        // where truncating could wrap to 0 and turn a typo into "no bodies at all".
+        BodyLimit::Limited(max) => {
+            DefaultBodyLimit::max(usize::try_from(max).unwrap_or(usize::MAX))
+        }
+        BodyLimit::Unlimited => DefaultBodyLimit::disable(),
+    }
+}
+
 fn enforce_body_limit(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
     let BodyLimit::Limited(limit) = state.body_limit else {
-        return match state.body_limit {
-            BodyLimit::Invalid => Err(AppError::simple(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "invalid body-limit",
-            )),
-            BodyLimit::Unlimited => Ok(()),
-            BodyLimit::Limited(_) => unreachable!(),
-        };
+        return Ok(());
     };
 
     let Some(content_length) = headers.get(CONTENT_LENGTH) else {
@@ -3157,33 +3173,6 @@ fn required_model(body: &Value) -> Option<&str> {
         .filter(|model| !model.is_empty())
 }
 
-fn parse_body_limit(value: &str) -> BodyLimit {
-    let raw = value.trim().to_ascii_lowercase();
-    if raw.is_empty() {
-        return BodyLimit::Unlimited;
-    }
-    for (suffix, multiplier) in [
-        ("gb", 1024_u64 * 1024 * 1024),
-        ("mb", 1024_u64 * 1024),
-        ("kb", 1024_u64),
-        ("b", 1_u64),
-    ] {
-        if let Some(number) = raw.strip_suffix(suffix) {
-            return parse_limit_number(number.trim(), multiplier);
-        }
-    }
-    parse_limit_number(&raw, 1)
-}
-
-fn parse_limit_number(number: &str, multiplier: u64) -> BodyLimit {
-    let Ok(value) = number.parse::<u64>() else {
-        return BodyLimit::Invalid;
-    };
-    value
-        .checked_mul(multiplier)
-        .map_or(BodyLimit::Invalid, BodyLimit::Limited)
-}
-
 #[cfg(test)]
 mod tests {
     use std::future::Future;
@@ -3684,7 +3673,7 @@ mod tests {
             port: 8317,
             auth_dir,
             api_keys: std::collections::HashSet::new(),
-            body_limit: String::new(),
+            body_limit: BodyLimit::Unlimited,
             cloaking: CloakingConfig {
                 cli_version: "2.1.88".to_string(),
                 entrypoint: "cli".to_string(),

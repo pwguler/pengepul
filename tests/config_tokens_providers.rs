@@ -2,7 +2,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
-use pengepul::config::{load_config, selected_config_path};
+use pengepul::config::{BodyLimit, load_config, selected_config_path};
 use pengepul::oauth::{
     CODEX_CALLBACK_PATH, CODEX_CALLBACK_PORT, CODEX_CLIENT_ID, detect_exhausted_reason,
     generate_anthropic_auth_url, generate_codex_auth_url,
@@ -175,6 +175,43 @@ providers:
         error.to_string().contains("base-url"),
         "error names the missing field: {error}"
     );
+}
+
+#[test]
+fn an_unparseable_body_limit_is_refused_at_load() {
+    // The alternative was a per-request 500, which reports the same mistake once per
+    // request on a relay that is otherwise serving traffic. Refusing at load means the
+    // operator sees it before anything is served — and it is why `BodyLimit` needs no
+    // `Invalid` arm: the request path cannot be handed a limit that did not parse.
+    let (_tmp, home, config_path) = write_config_with(
+        r"api-keys:
+  - sk-local
+body-limit: 20omb
+",
+    );
+
+    let error = load_config(Some(&config_path), Some(&home), &home).expect_err("rejected");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("body-limit") && message.contains("20omb"),
+        "the refusal names the setting and the value it could not read: {message}"
+    );
+}
+
+#[test]
+fn body_limit_loads_as_the_number_it_spells() {
+    for (written, expected) in [
+        ("2kb", BodyLimit::Limited(2 * 1024)),
+        ("200mb", BodyLimit::Limited(200 * 1024 * 1024)),
+        // Empty is unlimited, which is the half the README documents and the constant's
+        // doc comment used to get wrong.
+        ("\"\"", BodyLimit::Unlimited),
+    ] {
+        let (_tmp, home, config_path) =
+            write_config_with(&format!("api-keys:\n  - sk-local\nbody-limit: {written}\n"));
+        let config = load_config(Some(&config_path), Some(&home), &home).expect("load");
+        assert_eq!(config.body_limit, expected, "body-limit: {written}");
+    }
 }
 
 #[test]
