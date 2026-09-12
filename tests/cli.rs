@@ -395,6 +395,38 @@ fn strip_ansi(text: &str) -> String {
     out
 }
 
+/// The value cells of every panel row labelled `label`, in panel order. The
+/// label column is padded, so a label only counts when a space follows it and
+/// no longer label shares the prefix.
+fn fact_values(visible: &str, label: &str) -> Vec<String> {
+    visible
+        .lines()
+        .filter_map(|line| {
+            let body = line.strip_prefix('│')?.trim();
+            let rest = body.strip_prefix(label)?;
+            if !rest.starts_with(' ') {
+                return None;
+            }
+            Some(rest.trim().trim_end_matches('│').trim().to_string())
+        })
+        .collect()
+}
+
+/// The panel rows `start..start + len` as `<label> <value>`: the box borders
+/// dropped and the label column's padding collapsed, so an assertion reads the
+/// fact rather than the layout.
+fn block(lines: &[&str], start: usize, len: usize) -> Vec<String> {
+    lines[start..start + len]
+        .iter()
+        .map(|line| {
+            line.split_whitespace()
+                .filter(|token| *token != "│")
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect()
+}
+
 /// An absolute instant `seconds` from now, for `cooldownUntil` fixtures.
 fn soon(seconds: f64) -> f64 {
     std::time::SystemTime::now()
@@ -636,29 +668,142 @@ fn accounts_renders_panels_with_detail_lines_on_a_tty() {
     assert!(visible.contains('└'));
     assert!(visible.contains("● available"));
     assert!(visible.contains("● unresponsive"));
-    // Per-account token facts beneath each row (AC-6); reasoning gets its
-    // own row because five fields cannot fit the fixed width. Both now
-    // carry labels, like every other fact row (consistent-panels AC-2).
-    assert!(visible.contains("in 22.1M  out 401.2K  cache 161.0M"));
-    assert!(visible.contains("│ tokens"));
-    assert!(visible.contains("│ reasoning"));
-    assert!(visible.contains("64.0K"));
-    // The reasoning row says which total it is a share of, because reasoning is a
-    // breakdown of `out` and not a term beside it (ADR-0023): 64.0K of 401.2K is 16%.
-    assert!(
-        visible.contains("64.0K (16%)"),
-        "the reasoning row lost its share: {visible}"
+    // AC-1: the block under each account row, and the pool's again in the
+    // footer. The second account has no token history, so it still gets its
+    // four rows, at zero.
+    assert_eq!(fact_values(&visible, "input"), ["183.1M", "0", "183.1M"]);
+    // AC-2: cached carries the read share of the prompt — 155.0M of 183.1M
+    // is 85%, where the pre-change code printed 161.0M (88%).
+    assert_eq!(
+        fact_values(&visible, "cached"),
+        ["155.0M (85%)", "0", "155.0M (85%)"]
     );
-    // The cache figure carries its share of the prompt the upstream saw: 161.0M of
-    // 161.0M + 22.1M is 88%, and that ratio is comparable across pools only because the
-    // counters are disjoint (ADR-0023, AC-12).
-    assert!(
-        visible.contains("cache 161.0M (88%)"),
-        "the cache figure does not carry its share: {visible}"
+    assert_eq!(fact_values(&visible, "uncached"), ["28.1M", "0", "28.1M"]);
+    assert_eq!(fact_values(&visible, "output"), ["401.2K", "0", "401.2K"]);
+    // The reasoning row appears only where there is reasoning, and says which
+    // total it is a share of, because reasoning is a breakdown of `output` and not a term
+    // beside it (ADR-0023): 64.0K of 401.2K is 16%.
+    assert_eq!(
+        fact_values(&visible, "reasoning"),
+        ["64.0K (16%)", "64.0K (16%)"]
     );
-    // The no-reasoning account omits the reasoning row (AC-6).
-    assert!(visible.contains("in 0  out 0  cache 0"));
-    assert!(!visible.contains("reasoning 0"));
+    // AC-6: no row is named `tokens` any more.
+    assert!(!visible.contains("│ tokens"), "{visible}");
+}
+
+#[test]
+fn accounts_renders_the_token_block_at_every_scope() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [
+                        account(json!({
+                            "email": "a@x.com",
+                            "available": true,
+                            "failureCount": 0,
+                            "totalRequests": 640,
+                            "totalSuccesses": 638,
+                            "totalInputTokens": 22_100_000,
+                            "totalOutputTokens": 401_200,
+                            "totalCacheCreationInputTokens": 6_000_000,
+                            "totalCacheReadInputTokens": 155_000_000,
+                            "totalReasoningOutputTokens": 64_000,
+                            "models": [{
+                                "model": "claude-opus-5",
+                                "successes": 638,
+                                "inputTokens": 2_300_000,
+                                "outputTokens": 4_800_000,
+                                "cacheCreationInputTokens": 49_000_000,
+                                "cacheReadInputTokens": 979_000_000,
+                                "reasoningOutputTokens": 1_600_000
+                            }],
+                            "planType": "max"
+                        }))
+                    ]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+
+    assert_eq!(outcome.code, 0);
+    let visible = strip_ansi(&outcome.stdout);
+    // AC-1: the block in order, at the account scope, the model scope and
+    // the pool footer. Three occurrences because the pool holds one account
+    // and one model, so its footer repeats both.
+    let order: Vec<String> = visible
+        .lines()
+        .filter_map(|line| {
+            let body = line.strip_prefix('│')?.trim();
+            let label = ["input", "cached", "uncached", "output", "reasoning"]
+                .into_iter()
+                .find(|label| {
+                    body.strip_prefix(label)
+                        .is_some_and(|rest| rest.starts_with(' '))
+                })?;
+            Some(label.to_string())
+        })
+        .collect();
+    assert_eq!(
+        order,
+        [
+            "input",
+            "cached",
+            "uncached",
+            "output",
+            "reasoning",
+            "input",
+            "cached",
+            "uncached",
+            "output",
+            "reasoning",
+            "input",
+            "cached",
+            "uncached",
+            "output",
+            "reasoning",
+        ],
+        "token block order: {visible}"
+    );
+    // AC-2: cached carries the read share of the prompt, not the two cache
+    // directions summed: 155.0M of 183.1M is 85%, where the pre-change code
+    // printed 161.0M (88%). The model is 979.0M of 1,030.3M, 95%.
+    assert_eq!(
+        fact_values(&visible, "cached"),
+        ["155.0M (85%)", "979.0M (95%)", "155.0M (85%)"]
+    );
+    // AC-3: uncached is the never-cached input plus the cache write, 22.1M +
+    // 6.0M, and carries no parenthetical of its own.
+    assert_eq!(
+        fact_values(&visible, "uncached"),
+        ["28.1M", "51.3M", "28.1M"]
+    );
+    // AC-4: input is cached + uncached, and the model's 1.0B is its own
+    // 979.0M + 51.3M.
+    assert_eq!(fact_values(&visible, "input"), ["183.1M", "1.0B", "183.1M"]);
+    assert_eq!(
+        fact_values(&visible, "output"),
+        ["401.2K", "4.8M", "401.2K"]
+    );
+    assert_eq!(
+        fact_values(&visible, "reasoning"),
+        ["64.0K (16%)", "1.6M (33%)", "64.0K (16%)"]
+    );
+    // AC-5: neither the cache write nor its 1h share is printed.
+    assert!(!visible.contains("1h write"), "{visible}");
+    assert!(!visible.contains("161.0M"), "{visible}");
+    // AC-6: no panel prints a `total` or a `pool` fact row, and no row is
+    // named `tokens` any more.
+    assert!(!visible.contains("│ pool"), "{visible}");
+    assert!(!visible.contains("│ total"), "{visible}");
+    assert!(!visible.contains("│ tokens"), "{visible}");
 }
 
 #[test]
@@ -737,14 +882,16 @@ fn accounts_detail_prints_usage_and_cooldown_per_account() {
     assert!(stdout.contains("  b@x.com on cooldown 3m10s failures=2 plan=pro\n"));
     // An unavailable snapshot with no future cooldownUntil keeps the old word.
     assert!(stdout.contains("  c@x.com unavailable failures=5\n"));
-    // Detail line under each account: requests (ok) plus token totals;
-    // reasoning prints only when non-zero (AC-5).
+    // Detail line under each account: requests (ok) plus the token block,
+    // in the same words and order as the panel (ADR-0024). reasoning prints
+    // only when non-zero.
     assert!(
         stdout.contains(
-            "    requests 640 (638 ok) in 22.1M out 401.2K cache 161.0M reasoning 64.0K\n"
-        )
+            "    requests 640 (638 ok) input 183.1M cached 155.0M (85%) uncached 28.1M output 401.2K reasoning 64.0K (16%)\n"
+        ),
+        "{stdout}"
     );
-    assert!(stdout.contains("    requests 0 (0 ok) in 0 out 0 cache 0\n"));
+    assert!(stdout.contains("    requests 0 (0 ok) input 0 cached 0 uncached 0 output 0\n"));
     assert!(!stdout.contains("reasoning 0"));
 }
 
@@ -1576,6 +1723,66 @@ fn a_command_level_config_wins_over_the_root_one() {
     assert_eq!(runtime.accounts_api_key.as_deref(), Some("sk-root"));
 }
 
+/// The pool `accounts_breaks_usage_down_per_model_on_a_tty` reads: one account
+/// whose two models arrive in the payload out of display order, and a second
+/// account serving one of them again.
+fn two_model_pool() -> Value {
+    json!({
+        "providers": {
+            "anthropic": {
+                "account_count": 2,
+                "accounts": [
+                    account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalRequests": 700,
+                        "totalSuccesses": 700,
+                        "totalInputTokens": 1_000,
+                        "totalOutputTokens": 2_000,
+                        "models": [
+                            // Deliberately not in display order: the
+                            // renderer sorts by tokens, not payload.
+                            {
+                                "model": "claude-sonnet-4-5",
+                                "successes": 67,
+                                "inputTokens": 100,
+                                "outputTokens": 200,
+                                "cacheCreationInputTokens": 0,
+                                "cacheReadInputTokens": 700,
+                                "reasoningOutputTokens": 0
+                            },
+                            {
+                                "model": "claude-fable-5-1",
+                                "successes": 612,
+                                "inputTokens": 300,
+                                "outputTokens": 400,
+                                "cacheCreationInputTokens": 500,
+                                "cacheReadInputTokens": 8_000,
+                                "reasoningOutputTokens": 42
+                            }
+                        ]
+                    })),
+                    account(json!({
+                        "email": "b@x.com",
+                        "available": true,
+                        "totalRequests": 3,
+                        "totalSuccesses": 3,
+                        "models": [{
+                            "model": "claude-fable-5-1",
+                            "successes": 3,
+                            "inputTokens": 10,
+                            "outputTokens": 20,
+                            "cacheCreationInputTokens": 0,
+                            "cacheReadInputTokens": 30,
+                            "reasoningOutputTokens": 0
+                        }]
+                    }))
+                ]
+            }
+        }
+    })
+}
+
 /// usage-by-model AC-5/AC-8/AC-9: model lines under each account, sorted
 /// by tokens, with no aggregate in the pool footer (AC-6, withdrawn).
 #[test]
@@ -1584,60 +1791,7 @@ fn accounts_breaks_usage_down_per_model_on_a_tty() {
     write_config(tmp.path(), "127.0.0.1", 8317);
     let mut runtime = FakeRuntime {
         rich: true,
-        accounts_payload: Some(json!({
-            "providers": {
-                "anthropic": {
-                    "account_count": 2,
-                    "accounts": [
-                        account(json!({
-                            "email": "a@x.com",
-                            "available": true,
-                            "totalRequests": 700,
-                            "totalSuccesses": 700,
-                            "totalInputTokens": 1_000,
-                            "totalOutputTokens": 2_000,
-                            "models": [
-                                // Deliberately not in display order: the
-                                // renderer sorts by tokens, not payload.
-                                {
-                                    "model": "claude-sonnet-4-5",
-                                    "successes": 67,
-                                    "inputTokens": 100,
-                                    "outputTokens": 200,
-                                    "cacheCreationInputTokens": 0,
-                                    "cacheReadInputTokens": 700,
-                                    "reasoningOutputTokens": 0
-                                },
-                                {
-                                    "model": "claude-fable-5-1",
-                                    "successes": 612,
-                                    "inputTokens": 300,
-                                    "outputTokens": 400,
-                                    "cacheCreationInputTokens": 500,
-                                    "cacheReadInputTokens": 8_000,
-                                    "reasoningOutputTokens": 42
-                                }
-                            ]
-                        })),
-                        account(json!({
-                            "email": "b@x.com",
-                            "available": true,
-                            "totalRequests": 3,
-                            "totalSuccesses": 3,
-                            "models": [{
-                                "model": "claude-fable-5-1",
-                                "successes": 3,
-                                "inputTokens": 10,
-                                "outputTokens": 20,
-                                "cacheCreationInputTokens": 0,
-                                "cacheReadInputTokens": 30,
-                                "reasoningOutputTokens": 0
-                            }]
-                        }))
-                    ]
-                }
-            }
-        })),
+        accounts_payload: Some(two_model_pool()),
         ..FakeRuntime::default()
     };
 
@@ -1663,18 +1817,44 @@ fn accounts_breaks_usage_down_per_model_on_a_tty() {
     assert!(fable < sonnet, "sorted by tokens: {visible}");
     assert!(lines[fable].contains("612 ok"));
     assert!(lines[fable].contains("9.2K"), "total: {}", lines[fable]);
-    // AC-9: reasoning is excluded from the total, shown in the detail line.
-    assert!(lines[fable + 1].contains("in 300"));
-    assert!(lines[fable + 1].contains("out 400"));
-    assert!(lines[fable + 1].contains("cache 8.5K"));
-    // AC-12: each share sits beside the figure it qualifies, on the same line. This is the
-    // widest realistic row — three long counts and two percentages — so a clipped row would
-    // show here as an ellipsis instead of the share. fable: 8.5K of 8.8K cached, 42 of its 400
-    // output tokens were reasoning; sonnet has no reasoning and so claims no share of out.
-    assert!(lines[fable + 1].contains("out 400 (11%) cache 8.5K (97%)"));
-    assert!(!lines[fable + 1].contains('…'), "the widest row clipped");
-    assert!(lines[sonnet + 1].contains("cache 700 (88%)"));
-    assert!(!lines[sonnet + 1].contains("reasoning"));
+    // AC-1: the model's own block, following its headline in the panel's
+    // order. fable is an 8.8K prompt, 8.0K of it served from cache, 800 never
+    // served, 400 generated of which 42 were reasoning. Exact equality is what
+    // proves the order and that no fifth row crept in.
+    assert_eq!(
+        block(&lines, fable + 1, 5),
+        [
+            "input 8.8K",
+            // AC-2: the share is the read share of the prompt, not the two
+            // cache directions summed: 8.0K of 8.8K is 91%, where the
+            // pre-change code printed 8.5K (97%).
+            "cached 8.0K (91%)",
+            "uncached 800",
+            "output 400",
+            // AC-9: reasoning is excluded from the total and carries its share
+            // of output — 42 of 400 is 11%.
+            "reasoning 42 (11%)",
+        ]
+    );
+    // This is the widest realistic block, so a clipped value would show here as
+    // an ellipsis.
+    assert!(
+        !lines[fable + 1..fable + 6]
+            .iter()
+            .any(|row| row.contains('…')),
+        "a block row clipped: {visible}"
+    );
+    // sonnet is an 800 prompt with 700 of it cached, and claims no reasoning
+    // row at all — a window of four rows is what says so.
+    assert_eq!(
+        block(&lines, sonnet + 1, 4),
+        [
+            "input 800",
+            "cached 700 (88%)",
+            "uncached 100",
+            "output 200"
+        ]
+    );
 
     // AC-6 (revised): the pool footer carries no model aggregate; the
     // per-account lines are the only breakdown.
@@ -1752,7 +1932,16 @@ fn accounts_lists_models_in_plain_output() {
     assert_eq!(outcome.code, 0);
     assert!(outcome.stdout.contains("claude-fable-5-1"));
     assert!(outcome.stdout.contains("10 ok"));
-    assert!(outcome.stdout.contains("in 300 out 400 cache 500"));
+    // AC-7: plain carries the same block as one line, in the panel's words:
+    // an 800 prompt with 500 of it served from cache (63%), 300 uncached,
+    // 400 generated of which 7 were reasoning.
+    assert!(
+        outcome
+            .stdout
+            .contains("input 800 cached 500 (63%) uncached 300 output 400 reasoning 7 (2%)"),
+        "{}",
+        outcome.stdout
+    );
     // AC-6 (revised): no pool aggregate in plain either.
     assert!(!outcome.stdout.contains("by model"));
 }
@@ -2389,8 +2578,8 @@ fn accounts_footer_rows_use_the_row_grammar() {
     let visible = strip_ansi(&outcome.stdout);
     let lines: Vec<&str> = visible.lines().collect();
     // The footer starts after the mid-panel separator; searching the whole
-    // panel would match the per-account `tokens`/`reasoning` rows instead
-    // and could not detect a footer row drifting out of column.
+    // panel would match the per-account rows instead — they carry the same
+    // labels — and could not detect a footer row drifting out of column.
     let separator = lines
         .iter()
         .position(|line| line.starts_with('\u{251c}'))
@@ -2407,10 +2596,17 @@ fn accounts_footer_rows_use_the_row_grammar() {
             .expect("value")
             + after
     };
-    let columns: Vec<usize> = ["requests", "tokens", "reasoning", "pool"]
-        .into_iter()
-        .map(value_column)
-        .collect();
+    let columns: Vec<usize> = [
+        "requests",
+        "input",
+        "cached",
+        "uncached",
+        "output",
+        "reasoning",
+    ]
+    .into_iter()
+    .map(value_column)
+    .collect();
     assert!(
         columns.windows(2).all(|pair| pair[0] == pair[1]),
         "footer values not aligned: {columns:?}\n{visible}"
@@ -3070,11 +3266,11 @@ fn usage_treats_an_out_of_window_history_as_empty() {
     );
 }
 
-/// ARCHITECTURE, "One word, one scope": three panels printed `total` for
-/// three different spans — one pool, another pool, and the whole relay.
-/// A pool footer names its own scope.
+/// ADR-0024: a pool footer carries no load row. The pool's carried load is `input + output`,
+/// and both are rows the token block already prints, so neither `pool` nor `total` is a label
+/// any panel uses — the header names the subject, the rows carry the facts.
 #[test]
-fn a_pool_footer_names_its_scope_rather_than_saying_total() {
+fn a_pool_footer_prints_no_load_row() {
     let tmp = tempdir().expect("tempdir");
     write_config(tmp.path(), "127.0.0.1", 8317);
     let mut runtime = FakeRuntime {
@@ -3104,9 +3300,13 @@ fn a_pool_footer_names_its_scope_rather_than_saying_total() {
         "a pool total is not the relay total: {visible}"
     );
     assert!(
-        visible.contains("│ pool"),
-        "footer names its scope: {visible}"
+        !visible.contains("│ pool"),
+        "the pool's load is not restated as a row: {visible}"
     );
+    // It is still readable: the fixture's 1.0K is the whole carried load, and
+    // `input + output` is what the block prints of it.
+    assert_eq!(fact_values(&visible, "input"), ["1.0K", "1.0K"]);
+    assert_eq!(fact_values(&visible, "output"), ["0", "0"]);
 }
 
 /// A day of failed requests is history: rich and plain must agree that it

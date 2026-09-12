@@ -78,22 +78,18 @@ pub(crate) fn print_accounts(payload: &Value, output: &mut Output, now: f64) {
                 write!(line, " plan={plan_type}").expect("write to String cannot fail");
             }
             output.line(&line);
-            let reasoning = i64_field(account, "totalReasoningOutputTokens");
-            let mut detail = format!(
-                "    requests {} ({} ok) in {} out {} cache {}",
+            let detail = format!(
+                "    requests {} ({} ok) {}",
                 format_exact(i64_field(account, "totalRequests")),
                 format_exact(i64_field(account, "totalSuccesses")),
-                format_count(i64_field(account, "totalInputTokens")),
-                format_count(i64_field(account, "totalOutputTokens")),
-                format_count(
-                    i64_field(account, "totalCacheReadInputTokens")
-                        + i64_field(account, "totalCacheCreationInputTokens")
+                token_line(
+                    i64_field(account, "totalInputTokens"),
+                    i64_field(account, "totalOutputTokens"),
+                    i64_field(account, "totalCacheReadInputTokens"),
+                    i64_field(account, "totalCacheCreationInputTokens"),
+                    i64_field(account, "totalReasoningOutputTokens"),
                 ),
             );
-            if reasoning != 0 {
-                write!(detail, " reasoning {}", format_count(reasoning))
-                    .expect("write to String cannot fail");
-            }
             output.line(&detail);
             // AC-7: the same per-model breakdown, plain.
             for row in model_rows(account) {
@@ -103,17 +99,7 @@ pub(crate) fn print_accounts(payload: &Value, output: &mut Output, now: f64) {
                     format_exact(row.successes),
                     format_count(row.tokens())
                 ));
-                output.line(&format!(
-                    "      in {} out {} cache {}{}",
-                    format_count(row.input),
-                    format_count(row.output),
-                    format_count(row.cache),
-                    if row.reasoning == 0 {
-                        String::new()
-                    } else {
-                        format!(" reasoning {}", format_count(row.reasoning))
-                    }
-                ));
+                output.line(&format!("      {}", row.token_line()));
             }
         }
     }
@@ -215,7 +201,8 @@ pub(crate) struct ModelRow {
     successes: i64,
     input: i64,
     output: i64,
-    cache: i64,
+    cache_read: i64,
+    cache_write: i64,
     reasoning: i64,
 }
 
@@ -223,7 +210,31 @@ impl ModelRow {
     /// The model's carried load, on the same definition as every other
     /// total in the view: in + out + cache, reasoning excluded.
     fn tokens(&self) -> i64 {
-        self.input + self.output + self.cache
+        self.input + self.output + self.cache_read + self.cache_write
+    }
+
+    /// The model's token block, on the same rows as every other scope
+    /// (ADR-0024).
+    fn facts(&self) -> Vec<Fact> {
+        token_block_facts(
+            self.input,
+            self.output,
+            self.cache_read,
+            self.cache_write,
+            self.reasoning,
+            DIM,
+        )
+    }
+
+    /// The model's block as one line, for the plain contract.
+    fn token_line(&self) -> String {
+        token_line(
+            self.input,
+            self.output,
+            self.cache_read,
+            self.cache_write,
+            self.reasoning,
+        )
     }
 
     /// `claude-fable-5-1   612 ok     9.2K` — `width` is the name column
@@ -238,36 +249,7 @@ impl ModelRow {
             tokens = POOL_TOKENS_WIDTH
         )
     }
-
-    /// `in 300 out 400 (34%) cache 8.5K (97%)` — the counts, each share in brackets after the
-    /// figure it qualifies. Three counts and two shares fit with room to spare, so there is no
-    /// shape this line cannot hold.
-    ///
-    /// A share is left out when it has no base to be a share of, and when the two counters
-    /// disagree — reasoning above output — because a percentage there would dress up two
-    /// numbers that cannot both be right.
-    fn detail(&self) -> String {
-        let mut detail = format!(
-            "in {} out {}",
-            format_count(self.input),
-            format_count(self.output)
-        );
-        if self.reasoning > 0
-            && self.reasoning <= self.output
-            && let Some(percent) = share(self.reasoning, self.output)
-        {
-            write!(detail, " ({percent}%)").expect("write to String cannot fail");
-        }
-        write!(detail, " cache {}", format_count(self.cache)).expect("write to String cannot fail");
-        if self.cache > 0
-            && let Some(percent) = share(self.cache, self.input.saturating_add(self.cache))
-        {
-            write!(detail, " ({percent}%)").expect("write to String cannot fail");
-        }
-        detail
-    }
 }
-
 /// The widest the model name cell may grow. The indented account row
 /// spends its 60 inner columns as 2 indent + name + 1 + ok 9 + 1 +
 /// tokens 9, so 38 is what is left; the widest id in the shipped catalog
@@ -305,8 +287,8 @@ pub(crate) fn model_rows(account: &Value) -> Vec<ModelRow> {
                         successes: i64_field(model, "successes"),
                         input: i64_field(model, "inputTokens"),
                         output: i64_field(model, "outputTokens"),
-                        cache: i64_field(model, "cacheReadInputTokens")
-                            + i64_field(model, "cacheCreationInputTokens"),
+                        cache_read: i64_field(model, "cacheReadInputTokens"),
+                        cache_write: i64_field(model, "cacheCreationInputTokens"),
                         reasoning: i64_field(model, "reasoningOutputTokens"),
                     })
                     .collect()
@@ -368,17 +350,25 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64) {
         // One label column for every fact in the panel -- the per-account
         // token rows and the footer rollup align down the whole box.
         let mut panel_facts: Vec<Fact> = accounts.iter().flat_map(account_detail_facts).collect();
+        panel_facts.extend(
+            accounts
+                .iter()
+                .flat_map(model_rows)
+                .flat_map(|row| row.facts()),
+        );
         panel_facts.extend(footer_facts(&totals));
         let column = label_column(&panel_facts);
         for account in accounts {
             output.line(&panel_row(&account_row(account, pool_total, now)));
             for fact in account_detail_facts(account) {
-                output.line(&panel_row(&fact_row(&fact, column)));
+                output.line(&panel_row(&format!("  {}", fact_row(&fact, column))));
             }
             // AC-5: the models this account served, heaviest first.
             for row in model_rows(account) {
                 output.line(&panel_row(&format!("  {}", row.headline(width))));
-                output.line(&panel_row(&paint(DIM, &format!("    {}", row.detail()))));
+                for fact in row.facts() {
+                    output.line(&panel_row(&format!("    {}", fact_row(&fact, column))));
+                }
             }
         }
 
@@ -603,7 +593,7 @@ pub(crate) fn print_relay_total_rich(
             "in {}  out {}  cache {}",
             paint(BOLD, &format_count(pool.input)),
             paint(BOLD, &format_count(pool.output)),
-            cache_with_share(pool.cache_read + pool.cache_write, pool.input),
+            cache_with_share(pool.cache_read, pool.input + pool.cache_write),
         ),
     ));
     if let Some(fact) = long_write_fact(pool) {
@@ -740,34 +730,91 @@ fn share(part: i64, whole: i64) -> Option<i64> {
     i64::try_from(percent).ok()
 }
 
-/// `1.3B (100%)` — a cache figure and its share of the prompt the upstream saw.
+/// `1.3B (94.8%)` — the cache read and its share of the prompt the upstream saw.
 ///
-/// This is the hit rate the counter model exists to make comparable. `in` is the uncached
-/// input and the two cache counters are disjoint from it (ADR-0023), so `cache / (in + cache)`
-/// means the same thing on every Provider; before that decision the `OpenAI` dialects reported
-/// the read *inside* the input, and the same ratio counted its numerator in its denominator.
+/// This is the hit rate the counter model exists to make comparable. `read` is the token a
+/// cache served and `rest` is every prompt token it did not — the never-cached input plus the
+/// cache write — so the ratio means the same thing on every Provider (ADR-0023). A write is
+/// not a hit, and counting one in the numerator is what printed 100% for a pool whose read
+/// share was 94.8% (ADR-0024).
 ///
-/// Bare `(100%)` rather than `(100% of prompt)` because the fact row has ~49 columns for its
-/// value and the longer label clipped the row with an ellipsis. The denominator is named where
-/// there is room for words: the per-model line reads `100% cached`.
-fn cache_with_share(cache: i64, input: i64) -> String {
-    let count = format_count(cache);
-    match share(cache, input.saturating_add(cache)) {
+/// Bare `(94.8%)` rather than `(94.8% of prompt)` because the fact row has ~49 columns for its
+/// value and the longer label clipped the row with an ellipsis.
+fn cache_with_share(read: i64, rest: i64) -> String {
+    let count = format_count(read);
+    match share(read, rest.saturating_add(read)) {
         Some(percent) => format!("{count} ({percent}%)"),
         None => count,
     }
 }
 
-/// The reasoning fact: the count, and the share of `out` it is part of.
+/// The token block: the rows every scope prints, in order — the prompt the upstream saw, how
+/// much of it a cache served, how much it did not, and what the model generated — with
+/// `reasoning` last, and only when there was any (ADR-0024).
 ///
-/// Reasoning is a breakdown of `out`, not a term beside it. Every vendor's
+/// `input` is `cached + uncached` by construction and `cached` carries the read share of it, so
+/// a reader can check the block without knowing which dialect the upstream spoke.
+fn token_block_facts(
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+    reasoning: i64,
+    colour: &str,
+) -> Vec<Fact> {
+    let uncached = input + cache_write;
+    let mut facts = vec![
+        Fact::new(
+            "input",
+            &paint(colour, &format_count(input + cache_read + cache_write)),
+        ),
+        Fact::new(
+            "cached",
+            &paint(colour, &cache_with_share(cache_read, uncached)),
+        ),
+        Fact::new("uncached", &paint(colour, &format_count(uncached))),
+        Fact::new("output", &paint(colour, &format_count(output))),
+    ];
+    if reasoning != 0 {
+        facts.push(reasoning_fact(reasoning, output, colour));
+    }
+    facts
+}
+
+/// The block as one line, for the plain contract: the panel's words in the panel's order
+/// (ADR-0024).
+fn token_line(
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+    reasoning: i64,
+) -> String {
+    let uncached = input + cache_write;
+    let mut line = format!(
+        "input {} cached {} uncached {} output {}",
+        format_count(input + cache_read + cache_write),
+        cache_with_share(cache_read, uncached),
+        format_count(uncached),
+        format_count(output),
+    );
+    if reasoning != 0 {
+        write!(line, " reasoning {}", reasoning_text(reasoning, output))
+            .expect("write to String cannot fail");
+    }
+    line
+}
+
+/// The reasoning figure and, when the two counters agree, the share of `output` it is part of.
+///
+/// Reasoning is a breakdown of `output`, not a term beside it. Every vendor's
 /// `output_tokens`/`completion_tokens` already includes it, and the two that report it apart
-/// are folded in before the counters see them (ADR-0023), so a bare figure under a `tokens`
-/// row reads as a fifth term that does not add up. The share is also the operator's only view
-/// of how much of the bill was thinking, which on some Providers is nearly all of it.
-fn reasoning_fact(reasoning: i64, output: i64, colour: &str) -> Fact {
+/// are folded in before the counters see them (ADR-0023), so a bare figure under a token row
+/// reads as a fifth term that does not add up. The share is also the operator's only view of
+/// how much of the bill was thinking, which on some Providers is nearly all of it.
+fn reasoning_text(reasoning: i64, output: i64) -> String {
     let count = format_count(reasoning);
-    let text = match share(reasoning, output) {
+    match share(reasoning, output) {
         // Reasoning above output means the two counters cannot both be right, and
         // a percentage would dress that up as a share of something. Two things
         // produce it, and neither is this function's to guess at: counters recorded before
@@ -778,43 +825,32 @@ fn reasoning_fact(reasoning: i64, output: i64, colour: &str) -> Fact {
         Some(_) if reasoning > output => format!("{count} (out {})", format_count(output)),
         Some(percent) => format!("{count} ({percent}%)"),
         None => count,
-    };
-    Fact::new("reasoning", &paint(colour, &text))
-}
-
-/// The per-account token facts shown under `accounts`: in/out/cache, plus
-/// reasoning only when that total is non-zero. Labelled like every other
-/// fact row so the panel has one column, not one per section.
-pub(crate) fn account_detail_facts(account: &Value) -> Vec<Fact> {
-    let input = i64_field(account, "totalInputTokens");
-    let cache = i64_field(account, "totalCacheReadInputTokens")
-        + i64_field(account, "totalCacheCreationInputTokens");
-    let mut facts = vec![Fact::new(
-        "tokens",
-        &paint(
-            DIM,
-            &format!(
-                "in {}  out {}  cache {}",
-                format_count(input),
-                format_count(i64_field(account, "totalOutputTokens")),
-                cache_with_share(cache, input),
-            ),
-        ),
-    )];
-    let reasoning = i64_field(account, "totalReasoningOutputTokens");
-    if reasoning != 0 {
-        facts.push(reasoning_fact(
-            reasoning,
-            i64_field(account, "totalOutputTokens"),
-            DIM,
-        ));
     }
-    facts
 }
 
-/// Footer rollup facts: requests, tokens, and reasoning when non-zero.
+fn reasoning_fact(reasoning: i64, output: i64, colour: &str) -> Fact {
+    Fact::new(
+        "reasoning",
+        &paint(colour, &reasoning_text(reasoning, output)),
+    )
+}
+
+/// The account's token block, on the same rows as every other scope (ADR-0024).
+pub(crate) fn account_detail_facts(account: &Value) -> Vec<Fact> {
+    token_block_facts(
+        i64_field(account, "totalInputTokens"),
+        i64_field(account, "totalOutputTokens"),
+        i64_field(account, "totalCacheReadInputTokens"),
+        i64_field(account, "totalCacheCreationInputTokens"),
+        i64_field(account, "totalReasoningOutputTokens"),
+        DIM,
+    )
+}
+
+/// Footer rollup facts: requests and the pool's token block. The pool's carried load is not a
+/// row — it is `input + output`, two rows the block already prints (ADR-0024).
 pub(crate) fn footer_facts(totals: &PoolTotals) -> Vec<Fact> {
-    let mut lines = vec![Fact::new(
+    let mut facts = vec![Fact::new(
         "requests",
         &format!(
             "{}  ({} ok, {} failed)",
@@ -823,28 +859,15 @@ pub(crate) fn footer_facts(totals: &PoolTotals) -> Vec<Fact> {
             format_exact(totals.failures)
         ),
     )];
-    lines.push(Fact::new(
-        "tokens",
-        &format!(
-            "in {}  out {}  cache {}",
-            paint(BOLD, &format_count(totals.input)),
-            paint(BOLD, &format_count(totals.output)),
-            cache_with_share(totals.cache_read + totals.cache_write, totals.input),
-        ),
+    facts.extend(token_block_facts(
+        totals.input,
+        totals.output,
+        totals.cache_read,
+        totals.cache_write,
+        totals.reasoning,
+        BOLD,
     ));
-    // Reasoning totals get their own row only when non-zero; one row for
-    // all five fields cannot fit the fixed width.
-    if totals.reasoning != 0 {
-        lines.push(reasoning_fact(totals.reasoning, totals.output, BOLD));
-    }
-    // Named for its scope: `status` prints `total` for the whole relay,
-    // and one word must not mean two spans (ARCHITECTURE, "One word, one
-    // scope").
-    lines.push(Fact::new(
-        "pool",
-        &paint(BOLD, &format_count(totals.tokens())),
-    ));
-    lines
+    facts
 }
 
 /// The account's carried load: every token that crossed it. This is what the
