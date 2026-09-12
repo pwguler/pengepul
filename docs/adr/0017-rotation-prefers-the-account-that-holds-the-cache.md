@@ -17,6 +17,13 @@ Measured on the live relay before changing anything:
 | anthropic | 1 | 99.8% |
 | commandcode | 2 | 45.6% |
 
+**That share is dialect-dependent, and the figures above were read from the relay's own
+counters.** On a Provider whose upstream reports the cache counts *inside* the prompt count —
+commandcode's does — `input` already contained the cache read, so the ratio's denominator
+held its numerator. Do not reuse these percentages as a baseline; ADR-0023 fixed what the
+counters mean, and any hit rate for such a pool should be recomputed from the vendor's own
+fields, which `docs/research/cache-usage-fields-by-provider.md` lists per Provider.
+
 The single-account pool cannot rotate and caches almost perfectly. That is not
 proof on its own — the two pools run different workloads — but the mechanism is
 not in doubt, and the topology was hiding it: of the two commandcode keys, one

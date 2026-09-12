@@ -2118,6 +2118,40 @@ async fn next_provider_account(
     Ok(manager.account(&email).unwrap_or(account))
 }
 
+/// Take the cache counts out of the input count, for the dialects that report them
+/// inside it.
+///
+/// An OpenAI-dialect prompt count is the *whole* prompt and the cache counts are slices
+/// of it: `OpenAI`'s own guide shows `input_tokens: 15000` beside `cached_tokens: 12000`
+/// and `cache_write_tokens: 3000`, and xAI, Groq, `OpenRouter`, Moonshot and Gemini follow
+/// the same convention. Anthropic is the other way round — its `input_tokens` is only
+/// the tokens after the last cache breakpoint, and the three counters are disjoint.
+/// Subtracting here is what makes `input_tokens` mean one thing on every Provider, and
+/// it is the only thing that keeps `carried_tokens` from counting a cache read twice
+/// (ADR-0023; docs/research/cache-usage-fields-by-provider.md).
+///
+/// Floored at zero: an upstream that reports more cached tokens than prompt tokens is
+/// broken, and a counter is the wrong place to notice, but it must not record a negative
+/// input for every later total to inherit. `saturating_sub` alone does not do that — it
+/// saturates at `i64::MIN`, not at 0 — so the floor is explicit, which is also what the
+/// Codex CLI itself writes: `(input_tokens - cached_input()).max(0)`.
+fn separate_cache_from_input(usage: &mut UsageData) {
+    let cached = usage
+        .cache_read_input_tokens
+        .saturating_add(usage.cache_creation_input_tokens);
+    usage.input_tokens = usage.input_tokens.saturating_sub(cached).max(0);
+}
+
+/// Record one success's outcome and its usage. Normalizing here rather than where a body
+/// is parsed is deliberate: this is the one seam every Provider passes through exactly
+/// once per request — the JSON path, the streaming path, and every dialect — while the
+/// streaming updaters run on every chunk and would subtract again on each one.
+///
+/// `provider.kind` is also the honest discriminant, because it describes the upstream
+/// that produced the body rather than the shape of the body. A Messages request to a
+/// configured OpenAI-compatible endpoint is answered with an Anthropic-shaped body for
+/// the client, but `usage` was read from the endpoint's own chat body, and it is Generic
+/// here.
 async fn record_provider_success(
     state: &AppState,
     provider: ProviderId,
@@ -2136,6 +2170,12 @@ async fn record_provider_success(
             manager.lock().await
         }
     };
+    let usage = usage.map(|mut usage| {
+        if provider.kind != ProviderKind::Anthropic {
+            separate_cache_from_input(&mut usage);
+        }
+        usage
+    });
     manager.record_success(account.token.email.as_str(), usage.as_ref(), model);
 }
 
@@ -2275,6 +2315,95 @@ fn classify_status(status: StatusCode) -> &'static str {
 
 /// Extract token usage from a provider response, accepting both schema families:
 /// Anthropic-native (`input_tokens`, `cache_read_input_tokens`, …) and OpenAI-style
+/// The four detail objects the dialects differ by, and nothing else: the input counts live
+/// in `input_tokens_details` (Responses) or `prompt_tokens_details` (chat), and the output
+/// breakdown in `output_tokens_details` (Responses) or `completion_tokens_details` (chat).
+const DETAILS_OBJECTS: [&str; 4] = [
+    "input_tokens_details",
+    "prompt_tokens_details",
+    "output_tokens_details",
+    "completion_tokens_details",
+];
+
+/// The value of `key` in whichever details object carries it.
+fn details_field<'a>(usage: &'a Value, key: &str) -> Option<&'a Value> {
+    DETAILS_OBJECTS
+        .iter()
+        .find_map(|details| usage.get(*details).and_then(|details| details.get(key)))
+}
+
+/// The tokens the model spent on reasoning, wherever the body reports them: OpenAI-style
+/// `reasoning_tokens`, or `thinking_tokens` from Anthropic's thinking-token-count beta.
+fn reasoning_from(usage: &Value) -> Option<i64> {
+    details_field(usage, "reasoning_tokens")
+        .or_else(|| details_field(usage, "thinking_tokens"))
+        .or_else(|| usage.get("reasoning_tokens"))
+        .and_then(Value::as_i64)
+}
+
+/// The output count a body reports, normalized to mean every token the model generated.
+///
+/// Anthropic and `OpenAI` already report it that way — the Anthropic SDK calls
+/// `output_tokens` "the inclusive, authoritative total used for billing", and `OpenAI`'s
+/// `reasoning_tokens` is a breakdown of `completion_tokens`. xAI's *chat* dialect is not:
+/// its own example is `prompt_tokens: 32, completion_tokens: 9, reasoning_tokens: 110,
+/// total_tokens: 151`, which is reasoning outside the completion count and inside the
+/// total, and Gemini's `thoughtsTokenCount` beside `candidatesTokenCount` reads the same.
+///
+/// The vendor's own arithmetic is the discriminant rather than a table of dialects, which
+/// is what makes both of xAI's wires come out right: its Responses dialect reports
+/// reasoning *inside* `output_tokens` (`131 + 624 = 755`, `reasoning_tokens: 246`), and
+/// that total does not match `input + output + reasoning`, so nothing is folded. Where a
+/// body reports no `total_tokens` the count is left alone, because guessing would hide the
+/// gap that docs/research/cache-usage-fields-by-provider.md records.
+fn output_from(usage: &Value) -> Option<i64> {
+    let output = usage
+        .get("output_tokens")
+        .or_else(|| usage.get("completion_tokens"))
+        .and_then(Value::as_i64);
+    let input = usage
+        .get("input_tokens")
+        .or_else(|| usage.get("prompt_tokens"))
+        .and_then(Value::as_i64);
+    let reasoning = reasoning_from(usage).unwrap_or(0);
+    let total = usage.get("total_tokens").and_then(Value::as_i64);
+    match (output, input, total) {
+        (Some(output), Some(input), Some(total))
+            if reasoning > 0 && total == input + output + reasoning =>
+        {
+            Some(output + reasoning)
+        }
+        (Some(output), _, _) => Some(output),
+        _ => None,
+    }
+}
+
+/// The cache read a body reports, under whichever name its vendor uses:
+/// `cache_read_input_tokens` (Anthropic), `cached_tokens` nested in a details object
+/// (`OpenAI`, Codex, xAI, Groq, `OpenRouter`), a **flat** `cached_tokens` (Moonshot/Kimi,
+/// whose schema has no details object at all), or `prompt_cache_hit_tokens` (`DeepSeek`,
+/// which publishes no `cached_tokens` anywhere). Every name and the semantics behind it
+/// are in docs/research/cache-usage-fields-by-provider.md; a vendor added there belongs
+/// here too, or its cache reads are recorded as zero.
+fn cache_read_from(usage: &Value) -> Option<i64> {
+    usage
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_i64)
+        .or_else(|| details_field(usage, "cached_tokens").and_then(Value::as_i64))
+        .or_else(|| usage.get("cached_tokens").and_then(Value::as_i64))
+        .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(Value::as_i64))
+}
+
+/// The cache write a body reports: Anthropic's flat `cache_creation_input_tokens`, or
+/// `cache_write_tokens` nested in a details object, which is where every other vendor that
+/// publishes one puts it.
+fn cache_write_from(usage: &Value) -> Option<i64> {
+    usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_i64)
+        .or_else(|| details_field(usage, "cache_write_tokens").and_then(Value::as_i64))
+}
+
 /// (`prompt_tokens`/`completion_tokens` with `prompt_tokens_details`/`completion_tokens_details`).
 fn usage_from_response(body: &Value) -> Option<UsageData> {
     let usage = body.get("usage")?;
@@ -2283,49 +2412,20 @@ fn usage_from_response(body: &Value) -> Option<UsageData> {
         .or_else(|| usage.get("prompt_tokens"))
         .and_then(Value::as_i64)
         .unwrap_or(0);
-    let output_tokens = usage
-        .get("output_tokens")
-        .or_else(|| usage.get("completion_tokens"))
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
+    let output_tokens = output_from(usage).unwrap_or_else(|| {
+        usage
+            .get("output_tokens")
+            .or_else(|| usage.get("completion_tokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+    });
     Some(UsageData {
         input_tokens,
         output_tokens,
-        cache_creation_input_tokens: usage
-            .get("cache_creation_input_tokens")
-            .and_then(Value::as_i64)
-            .unwrap_or(0),
+        cache_creation_input_tokens: cache_write_from(usage).unwrap_or(0),
         cache_creation_1h_input_tokens: UsageData::long_cache_write(usage),
-        cache_read_input_tokens: usage
-            .get("cache_read_input_tokens")
-            .or_else(|| {
-                usage
-                    .get("input_tokens_details")
-                    .and_then(|details| details.get("cached_tokens"))
-            })
-            .or_else(|| {
-                usage
-                    .get("prompt_tokens_details")
-                    .and_then(|details| details.get("cached_tokens"))
-            })
-            .and_then(Value::as_i64)
-            .unwrap_or(0),
-        reasoning_output_tokens: usage
-            .get("output_tokens_details")
-            .and_then(|details| {
-                // OpenAI-style `reasoning_tokens`; Anthropic (with the
-                // thinking-token-count beta) reports `thinking_tokens`.
-                details
-                    .get("reasoning_tokens")
-                    .or_else(|| details.get("thinking_tokens"))
-            })
-            .or_else(|| {
-                usage
-                    .get("completion_tokens_details")
-                    .and_then(|details| details.get("reasoning_tokens"))
-            })
-            .and_then(Value::as_i64)
-            .unwrap_or(0),
+        cache_read_input_tokens: cache_read_from(usage).unwrap_or(0),
+        reasoning_output_tokens: reasoning_from(usage).unwrap_or(0),
     })
 }
 
@@ -2605,17 +2705,11 @@ fn update_generic_stream_usage(data: &Value, usage: &mut UsageData) {
     // Chunks without usage (or with null fields) must not clobber what
     // earlier chunks recorded.
     usage.input_tokens = int_field_or(next, "prompt_tokens", usage.input_tokens);
-    usage.output_tokens = int_field_or(next, "completion_tokens", usage.output_tokens);
-    usage.cache_read_input_tokens = next
-        .get("prompt_tokens_details")
-        .and_then(|details| details.get("cached_tokens"))
-        .and_then(Value::as_i64)
-        .unwrap_or(usage.cache_read_input_tokens);
-    usage.reasoning_output_tokens = next
-        .get("completion_tokens_details")
-        .and_then(|details| details.get("reasoning_tokens"))
-        .and_then(Value::as_i64)
-        .unwrap_or(usage.reasoning_output_tokens);
+    usage.output_tokens = output_from(next).unwrap_or(usage.output_tokens);
+    usage.cache_read_input_tokens = cache_read_from(next).unwrap_or(usage.cache_read_input_tokens);
+    usage.cache_creation_input_tokens =
+        cache_write_from(next).unwrap_or(usage.cache_creation_input_tokens);
+    usage.reasoning_output_tokens = reasoning_from(next).unwrap_or(usage.reasoning_output_tokens);
 }
 
 fn update_anthropic_stream_usage(
