@@ -1079,6 +1079,44 @@ mod tests {
         assert_eq!(cache_with_share(0, 0), "0");
     }
 
+    /// AC-2: the share is the read's, and a cache write is not a hit.
+    #[test]
+    fn the_cache_share_is_the_read_share_of_the_prompt() {
+        use super::{DIM, Fact, token_block_facts};
+
+        let value = |fact: &Fact| strip_ansi(&fact.value);
+        // 155.0M read of a 183.1M prompt, 6.0M of it written. The pre-change code put the
+        // write in the numerator and printed 161.0M (88%).
+        let facts = token_block_facts(22_100_000, 401_200, 155_000_000, 6_000_000, 0, DIM);
+        assert_eq!(value(&facts[1]), "155.0M (85%)");
+        assert_ne!(value(&facts[1]), "161.0M (88%)");
+    }
+
+    /// AC-4: the block's rows partition the prompt, so a reader never has to add two of them
+    /// up to know the third.
+    #[test]
+    fn the_token_block_partitions_the_prompt() {
+        use super::{DIM, Fact, token_block_facts};
+
+        let facts = token_block_facts(300, 400, 500, 100, 0, DIM);
+        let value = |fact: &Fact| strip_ansi(&fact.value);
+        let count = |index: usize| {
+            value(&facts[index])
+                .split_whitespace()
+                .next()
+                .expect("a count")
+                .parse::<i64>()
+                .expect("a number")
+        };
+        // 300 never cached + 500 read + 100 written.
+        assert_eq!(count(0), 900);
+        assert_eq!(count(1), 500);
+        // Neither a read nor a write served the 300: the write folds in beside it.
+        assert_eq!(count(2), 400);
+        assert_eq!(count(3), 400);
+        assert_eq!(count(0), count(1) + count(2));
+    }
+
     #[test]
     fn cooldown_label_rounds_down_to_minutes_and_seconds() {
         let now = 1_000_000.0;

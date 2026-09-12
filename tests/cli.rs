@@ -844,6 +844,61 @@ fn accounts_renders_the_token_block_at_every_scope() {
     assert!(!visible.contains("│ tokens"), "{visible}");
 }
 
+/// AC-5: no command prints a cache write or its 1h share. The fixture wrote 3.0K at the 1h
+/// retention, which the pre-change code printed as `1h write 3.0K`, and the figure stays
+/// recorded and readable from `/admin/accounts` (ADR-0024).
+#[test]
+fn no_command_prints_a_cache_write() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalRequests": 3,
+                        "totalSuccesses": 3,
+                        "totalInputTokens": 100,
+                        "totalOutputTokens": 200,
+                        "totalCacheReadInputTokens": 300,
+                        "totalCacheCreationInputTokens": 4_000,
+                        "totalCacheCreation1hInputTokens": 3_000,
+                        "days": [{
+                            "date": today,
+                            "requests": 3,
+                            "successes": 3,
+                            "failures": 0,
+                            "inputTokens": 100,
+                            "outputTokens": 200,
+                            "cacheReadInputTokens": 300,
+                            "cacheCreationInputTokens": 4_000,
+                            "reasoningOutputTokens": 0
+                        }]
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    for verb in ["status", "accounts", "usage"] {
+        for style in [Style::Rich, Style::Plain] {
+            let stdout = strip_ansi(&run_style(&[verb], tmp.path(), &mut runtime, style).stdout);
+            for forbidden in ["1h write", "cache write", "written to cache"] {
+                assert!(
+                    !stdout.contains(forbidden),
+                    "{verb} in {style:?} printed {forbidden:?}:\n{stdout}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn accounts_reload_then_prints_runtime_accounts() {
     let tmp = tempdir().expect("tempdir");

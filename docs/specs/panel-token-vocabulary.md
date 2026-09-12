@@ -54,8 +54,9 @@ on `cached` that is the read share of the prompt, and no cache write anywhere in
   model-headline figure in both styles.
 - AC-7: Plain output carries the same four words, one line per subject, with `output` spelled
   as in the panel: `input … cached … (…) uncached … output …`, and `reasoning` when non-zero.
-  `tests/cli.rs::accounts_prints_one_token_line_per_subject` and
-  `tests/cli.rs::status_prints_one_token_line` assert the lines.
+  `tests/cli.rs::status_rolls_up_pool_health_and_token_totals_per_provider` asserts the
+  relay's line, and `::accounts_detail_prints_usage_and_cooldown_per_account` and
+  `::accounts_lists_models_in_plain_output` assert the account's and the model's.
 - AC-8: Plain output is no longer byte-identical to the previous release, and the
   `tests/cli.rs` and `tests/accounts.rs` assertions that pinned the old bytes are rewritten
   deliberately rather than deleted: each rewritten assertion names the label it now expects.
