@@ -253,6 +253,29 @@ impl ModelRow {
         }
         detail
     }
+    /// `100% cached  ·  33% of out was reasoning` — what the counts above imply, on a line
+    /// of its own because three counts and two shares do not fit one 60-column row.
+    ///
+    /// Either half is dropped when it has no count and no denominator, so a model that only
+    /// ever served uncached prompts says nothing here rather than `0% cached`. A reasoning
+    /// count above the output count is dropped too — the same rule [`reasoning_fact`] states,
+    /// for the same reason: a percentage would dress up two counters that cannot both be
+    /// right. The counts sit on the line above, where the disagreement is plain to see.
+    fn shares(&self) -> String {
+        let mut parts = Vec::new();
+        if self.cache > 0
+            && let Some(percent) = share(self.cache, self.input.saturating_add(self.cache))
+        {
+            parts.push(format!("{percent}% cached"));
+        }
+        if self.reasoning > 0
+            && self.reasoning <= self.output
+            && let Some(percent) = share(self.reasoning, self.output)
+        {
+            parts.push(format!("{percent}% of out was reasoning"));
+        }
+        parts.join("  ·  ")
+    }
 }
 
 /// The widest the model name cell may grow. The indented account row
@@ -366,6 +389,10 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64) {
             for row in model_rows(account) {
                 output.line(&panel_row(&format!("  {}", row.headline(width))));
                 output.line(&panel_row(&paint(DIM, &format!("    {}", row.detail()))));
+                let shares = row.shares();
+                if !shares.is_empty() {
+                    output.line(&panel_row(&paint(DIM, &format!("    {shares}"))));
+                }
             }
         }
 
@@ -587,18 +614,17 @@ pub(crate) fn print_relay_total_rich(
     facts.push(Fact::new(
         "tokens",
         &format!(
-            "in {}  out {}  cache {}{}",
+            "in {}  out {}  cache {}",
             paint(BOLD, &format_count(pool.input)),
             paint(BOLD, &format_count(pool.output)),
-            format_count(pool.cache_read + pool.cache_write),
-            long_write_suffix(pool)
+            cache_with_share(pool.cache_read + pool.cache_write, pool.input),
         ),
     ));
+    if let Some(fact) = long_write_fact(pool) {
+        facts.push(fact);
+    }
     if pool.reasoning != 0 {
-        facts.push(Fact::new(
-            "reasoning",
-            &paint(BOLD, &format_count(pool.reasoning)),
-        ));
+        facts.push(reasoning_fact(pool.reasoning, pool.output, BOLD));
     }
     facts.push(Fact::new(
         "total",
@@ -613,11 +639,27 @@ pub(crate) fn print_relay_total_rich(
 /// retention. Silent by default on purpose: a relay serving only 5m
 /// traffic reads exactly as it did before the split existed, and the line
 /// appears the moment the 2x write starts being paid for (ADR-0018).
+/// The same figure as a suffix on the plain rollup's token line.
+///
+/// The two differ on purpose. Plain output is a byte-stable contract scripts read, and a line
+/// of its own would be a new line in it; the panel has no such contract and gained the row so
+/// the cache share fits there.
 fn long_write_suffix(pool: &PoolTotals) -> String {
     if pool.cache_write_1h == 0 {
         return String::new();
     }
     format!("  1h write {}", format_count(pool.cache_write_1h))
+}
+
+/// The 1h share of the cache write as its own row, when a pool made one.
+///
+/// It used to be a suffix on the tokens row, which left that row one label-width short of the
+/// cache share's parentheses. The share is the more useful of the two — the 1h premium is a
+/// pricing detail (ADR-0018) while the hit rate is the point of the row — and a row of its own
+/// is only paid for when the figure is real.
+fn long_write_fact(pool: &PoolTotals) -> Option<Fact> {
+    (pool.cache_write_1h != 0)
+        .then(|| Fact::new("1h write", &paint(BOLD, &format_count(pool.cache_write_1h))))
 }
 
 /// The relay-wide rollup, plain: requests, tokens, reasoning when non-zero,
@@ -700,30 +742,85 @@ pub(crate) fn account_row(account: &Value, pool_total: i64, now: f64) -> String 
     .join(" ")
 }
 
+/// `part` as a rounded percentage of `whole`, or `None` when there is no whole to divide by.
+///
+/// `i128` so a counter near `i64::MAX` cannot overflow the multiply, and `None` rather than
+/// 0 so a caller can tell "no fraction worth printing" from "nothing to divide by".
+fn share(part: i64, whole: i64) -> Option<i64> {
+    if whole <= 0 {
+        return None;
+    }
+    let percent = (i128::from(part) * 100 + i128::from(whole) / 2) / i128::from(whole);
+    i64::try_from(percent).ok()
+}
+
+/// `1.3B (100%)` — a cache figure and its share of the prompt the upstream saw.
+///
+/// This is the hit rate the counter model exists to make comparable. `in` is the uncached
+/// input and the two cache counters are disjoint from it (ADR-0023), so `cache / (in + cache)`
+/// means the same thing on every Provider; before that decision the `OpenAI` dialects reported
+/// the read *inside* the input, and the same ratio counted its numerator in its denominator.
+///
+/// Bare `(100%)` rather than `(100% of prompt)` because the fact row has ~49 columns for its
+/// value and the longer label clipped the row with an ellipsis. The denominator is named where
+/// there is room for words: the per-model line reads `100% cached`.
+fn cache_with_share(cache: i64, input: i64) -> String {
+    let count = format_count(cache);
+    match share(cache, input.saturating_add(cache)) {
+        Some(percent) => format!("{count} ({percent}%)"),
+        None => count,
+    }
+}
+
+/// The reasoning fact: the count, and the share of `out` it is part of.
+///
+/// Reasoning is a breakdown of `out`, not a term beside it. Every vendor's
+/// `output_tokens`/`completion_tokens` already includes it, and the two that report it apart
+/// are folded in before the counters see them (ADR-0023), so a bare figure under a `tokens`
+/// row reads as a fifth term that does not add up. The share is also the operator's only view
+/// of how much of the bill was thinking, which on some Providers is nearly all of it.
+fn reasoning_fact(reasoning: i64, output: i64, colour: &str) -> Fact {
+    let count = format_count(reasoning);
+    let text = match share(reasoning, output) {
+        // Reasoning above output means the two counters cannot both be right, and
+        // `of out (1329%)` would dress that up as a percentage of something. Two things
+        // produce it, and neither is this function's to guess at: counters recorded before
+        // the fold existed (the grok pool's history holds `out 93` beside `reasoning 1,236`),
+        // and an upstream reporting reasoning outside the output count where no fold applied
+        // — the Gemini OpenAI-compatible shape the research file marks unverified. Printing
+        // both figures says which without inventing a reason.
+        Some(_) if reasoning > output => format!("{count} (out {})", format_count(output)),
+        Some(percent) => format!("{count} of out ({percent}%)"),
+        None => count,
+    };
+    Fact::new("reasoning", &paint(colour, &text))
+}
+
 /// The per-account token facts shown under `accounts`: in/out/cache, plus
 /// reasoning only when that total is non-zero. Labelled like every other
 /// fact row so the panel has one column, not one per section.
 pub(crate) fn account_detail_facts(account: &Value) -> Vec<Fact> {
+    let input = i64_field(account, "totalInputTokens");
+    let cache = i64_field(account, "totalCacheReadInputTokens")
+        + i64_field(account, "totalCacheCreationInputTokens");
     let mut facts = vec![Fact::new(
         "tokens",
         &paint(
             DIM,
             &format!(
                 "in {}  out {}  cache {}",
-                format_count(i64_field(account, "totalInputTokens")),
+                format_count(input),
                 format_count(i64_field(account, "totalOutputTokens")),
-                format_count(
-                    i64_field(account, "totalCacheReadInputTokens")
-                        + i64_field(account, "totalCacheCreationInputTokens")
-                ),
+                cache_with_share(cache, input),
             ),
         ),
     )];
     let reasoning = i64_field(account, "totalReasoningOutputTokens");
     if reasoning != 0 {
-        facts.push(Fact::new(
-            "reasoning",
-            &paint(DIM, &format_count(reasoning)),
+        facts.push(reasoning_fact(
+            reasoning,
+            i64_field(account, "totalOutputTokens"),
+            DIM,
         ));
     }
     facts
@@ -746,16 +843,13 @@ pub(crate) fn footer_facts(totals: &PoolTotals) -> Vec<Fact> {
             "in {}  out {}  cache {}",
             paint(BOLD, &format_count(totals.input)),
             paint(BOLD, &format_count(totals.output)),
-            format_count(totals.cache_read + totals.cache_write),
+            cache_with_share(totals.cache_read + totals.cache_write, totals.input),
         ),
     ));
     // Reasoning totals get their own row only when non-zero; one row for
     // all five fields cannot fit the fixed width.
     if totals.reasoning != 0 {
-        lines.push(Fact::new(
-            "reasoning",
-            &paint(BOLD, &format_count(totals.reasoning)),
-        ));
+        lines.push(reasoning_fact(totals.reasoning, totals.output, BOLD));
     }
     // Named for its scope: `status` prints `total` for the whole relay,
     // and one word must not mean two spans (ARCHITECTURE, "One word, one
@@ -1017,6 +1111,34 @@ mod tests {
             short.iter().all(|line| !line.contains("1h write")),
             "a 5m-only pool grew a 1h line: {short:?}"
         );
+    }
+
+    #[test]
+    fn shares_and_facts_state_the_ratios_the_counters_imply() {
+        use super::{Fact, cache_with_share, reasoning_fact};
+        use crate::render::DIM;
+
+        let value = |fact: &Fact| strip_ansi(&fact.value);
+
+        // The grok pool's own history is the disagreement: counters written before the fold
+        // existed hold `out 93` beside `reasoning 1,236`, and `of out (1329%)` would be a
+        // percentage of nothing. The two figures are printed instead.
+        let fact = reasoning_fact(64_000, 401_200, DIM);
+        assert_eq!(value(&fact), "64.0K of out (16%)");
+        let fact = reasoning_fact(1_236, 93, DIM);
+        assert_eq!(value(&fact), "1.2K (out 93)");
+        let fact = reasoning_fact(1_236, 1_329, DIM);
+        assert_eq!(value(&fact), "1.2K of out (93%)");
+        // No output to be a share of: the count stands alone rather than dividing by zero.
+        let fact = reasoning_fact(7, 0, DIM);
+        assert_eq!(value(&fact), "7");
+
+        // The cache figure carries its share of the prompt the upstream saw, which is the hit
+        // rate: an Anthropic pool reading 1.3B against 3.8M uncached is 100% of its prompt.
+        assert_eq!(cache_with_share(1_266_782_110, 3_822_778), "1.2B (100%)");
+        assert_eq!(cache_with_share(8_500, 300), "8.5K (97%)");
+        // Nothing cached and nothing uncached: no ratio to state, so just the count.
+        assert_eq!(cache_with_share(0, 0), "0");
     }
 
     #[test]
