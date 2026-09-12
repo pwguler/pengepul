@@ -1671,10 +1671,10 @@ fn accounts_breaks_usage_down_per_model_on_a_tty() {
     // widest realistic row — three long counts and two percentages — so a clipped row would
     // show here as an ellipsis instead of the share. fable: 8.5K of 8.8K cached, 42 of its 400
     // output tokens were reasoning; sonnet has no reasoning and so claims no share of out.
-    assert!(lines[fable + 1].contains("out 400 11% is reasoning cache 8.5K 97%"));
+    assert!(lines[fable + 1].contains("out 400 (11% reasoning) cache 8.5K (97%)"));
     assert!(!lines[fable + 1].contains('…'), "the widest row clipped");
-    assert!(lines[sonnet + 1].contains("cache 700 88%"));
-    assert!(!lines[sonnet + 1].contains("is reasoning"));
+    assert!(lines[sonnet + 1].contains("cache 700 (88%)"));
+    assert!(!lines[sonnet + 1].contains("reasoning"));
 
     // AC-6 (revised): the pool footer carries no model aggregate; the
     // per-account lines are the only breakdown.

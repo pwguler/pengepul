@@ -239,38 +239,44 @@ impl ModelRow {
         )
     }
 
-    /// `in 300 out 400 34% is reasoning cache 8.5K 97%` — the counts, each share said in
-    /// words beside the figure it qualifies.
+    /// `in 300 out 400 (34% reasoning) cache 8.5K (97%)` — the counts, each share in brackets
+    /// beside the figure it qualifies.
     ///
-    /// Single spaces and no brackets, because the widest realistic row is exactly 60 columns:
-    /// three six-character counts, `100% is reasoning` and two separators wider would clip, and
-    /// `pad` answers an over-long row with an ellipsis. The reasoning share reads `is reasoning`
-    /// rather than `of out` at the cost of the brackets that used to mark it.
+    /// Three six-character counts with a three-digit share reach 61 columns against the 56 this
+    /// line has, and `pad` answers an over-long row with an ellipsis rather than a wrap, so that
+    /// one shape drops the word and keeps the figure: `(100%)`. Nothing else changes.
     ///
     /// A share is left out when it has no base to be a share of, and when the two counters
     /// disagree — reasoning above output — because a percentage there would dress up two
     /// numbers that cannot both be right.
     fn detail(&self) -> String {
-        let mut detail = format!(
-            "in {} out {}",
-            format_count(self.input),
-            format_count(self.output)
-        );
-        if self.reasoning > 0
-            && self.reasoning <= self.output
-            && let Some(percent) = share(self.reasoning, self.output)
-        {
-            write!(detail, " {percent}% is reasoning").expect("write to String cannot fail");
+        let reasoning = (self.reasoning > 0 && self.reasoning <= self.output)
+            .then(|| share(self.reasoning, self.output))
+            .flatten();
+        let cache = (self.cache > 0)
+            .then(|| share(self.cache, self.input.saturating_add(self.cache)))
+            .flatten();
+        let line = |word: &str| {
+            format!(
+                "in {} out {}{} cache {}{}",
+                format_count(self.input),
+                format_count(self.output),
+                reasoning.map_or(String::new(), |percent| format!(" ({percent}%{word})")),
+                format_count(self.cache),
+                cache.map_or(String::new(), |percent| format!(" ({percent}%)")),
+            )
+        };
+        let labelled = line(" reasoning");
+        if labelled.chars().count() <= MODEL_DETAIL_WIDTH {
+            labelled
+        } else {
+            line("")
         }
-        write!(detail, " cache {}", format_count(self.cache)).expect("write to String cannot fail");
-        if self.cache > 0
-            && let Some(percent) = share(self.cache, self.input.saturating_add(self.cache))
-        {
-            write!(detail, " {percent}%").expect("write to String cannot fail");
-        }
-        detail
     }
 }
+
+/// The columns a model's detail line has: the panel's 60 less the four it is indented by.
+const MODEL_DETAIL_WIDTH: usize = 56;
 
 /// The widest the model name cell may grow. The indented account row
 /// spends its 60 inner columns as 2 indent + name + 1 + ok 9 + 1 +
