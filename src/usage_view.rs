@@ -239,20 +239,20 @@ impl ModelRow {
         )
     }
 
-    /// `in 300  out 400 (34% of out)  cache 8.5K (97%)` — the counts, each share beside the
-    /// figure it qualifies.
+    /// `in 300 out 400 34% is reasoning cache 8.5K 97%` — the counts, each share said in
+    /// words beside the figure it qualifies.
     ///
-    /// The reasoning share is spelled `of out` and not `reasoning` because that word is what
-    /// overflows the longest realistic row: three six-character counts with two labelled
-    /// percentages are 63 columns against the 60 available, and `pad` answers an over-long row
-    /// with an ellipsis. Beside `out`, `(34% of out)` reads without a label of its own.
+    /// Single spaces and no brackets, because the widest realistic row is exactly 60 columns:
+    /// three six-character counts, `100% is reasoning` and two separators wider would clip, and
+    /// `pad` answers an over-long row with an ellipsis. The reasoning share reads `is reasoning`
+    /// rather than `of out` at the cost of the brackets that used to mark it.
     ///
     /// A share is left out when it has no base to be a share of, and when the two counters
     /// disagree — reasoning above output — because a percentage there would dress up two
     /// numbers that cannot both be right.
     fn detail(&self) -> String {
         let mut detail = format!(
-            "in {}  out {}",
+            "in {} out {}",
             format_count(self.input),
             format_count(self.output)
         );
@@ -260,14 +260,13 @@ impl ModelRow {
             && self.reasoning <= self.output
             && let Some(percent) = share(self.reasoning, self.output)
         {
-            write!(detail, " ({percent}% of out)").expect("write to String cannot fail");
+            write!(detail, " {percent}% is reasoning").expect("write to String cannot fail");
         }
-        write!(detail, "  cache {}", format_count(self.cache))
-            .expect("write to String cannot fail");
+        write!(detail, " cache {}", format_count(self.cache)).expect("write to String cannot fail");
         if self.cache > 0
             && let Some(percent) = share(self.cache, self.input.saturating_add(self.cache))
         {
-            write!(detail, " ({percent}%)").expect("write to String cannot fail");
+            write!(detail, " {percent}%").expect("write to String cannot fail");
         }
         detail
     }
