@@ -1123,7 +1123,7 @@ async fn count_tokens(State(state): State<AppState>, headers: HeaderMap, body: B
                 provider.clone(),
                 &account,
                 StatusCode::BAD_GATEWAY,
-                Some(&error.to_string()),
+                Some(&error_chain(&error)),
             )
             .await;
             upstream_error_response(provider, &error)
@@ -1735,7 +1735,7 @@ async fn upstream_failure_response(
         provider.clone(),
         account,
         StatusCode::BAD_GATEWAY,
-        Some(&error.to_string()),
+        Some(&error_chain(error)),
     )
     .await;
     upstream_error_response(provider, error)
@@ -2089,7 +2089,7 @@ async fn next_provider_account(
             ));
         }
         Err(error) => {
-            manager.record_failure(&email, "auth", Some(&error.to_string()));
+            manager.record_failure(&email, "auth", Some(&error_chain(&error)));
             return Err(AppError::provider(
                 StatusCode::BAD_GATEWAY,
                 format!("failed to refresh {provider} account: {error}"),
@@ -2102,6 +2102,12 @@ async fn next_provider_account(
     // conversation landed on and why. `debug: off` keeps it out of the
     // default log; `RUST_LOG=pengepul=debug` turns it on for exactly this
     // question.
+    //
+    // `affinity="rotation"` on a retry does not mean the account is unhealthy: it means
+    // the previous one earned a cooldown, one second at the base (`FAILURE_BACKOFF` in
+    // src/accounts.rs) for a status-driven failure, or ten minutes for a billing one
+    // (`BILLING_COOLDOWN_SECONDS`). It also means "no record of this conversation at all",
+    // which is every first turn. Reading it as a health signal cost real time.
     tracing::debug!(
         provider = %provider,
         conversation = %conversation,
@@ -2175,6 +2181,23 @@ async fn record_billing_cooldown(
         }
     };
     manager.record_billing_cooldown(account.token.email.as_str(), detail);
+}
+
+/// An upstream error's whole source chain, for the operator-facing `lastError`.
+///
+/// `to_string()` reports only the outermost message, so every failure of a given shape
+/// reads identically: a connect timeout, a connection reset before the response headers,
+/// and a socket that closed after 31 s of silence all record the same
+/// `server: error sending request for url (...)`, and for a stream body only
+/// `server: error decoding response body`. One string for shapes that differ. That
+/// collapsed detail was the one undiagnosed event of a two-round investigation, so this
+/// is not a formatting preference.
+///
+/// anyhow's alternate form joins the chain as `outermost: source: source`. The result is
+/// still the `<kind>: <detail>` shape that `record_failure` composes; only the detail
+/// grows, and `GET /admin/accounts` is where an operator reads it.
+fn error_chain(error: &anyhow::Error) -> String {
+    format!("{error:#}")
 }
 
 async fn record_provider_failure(
@@ -2457,7 +2480,7 @@ fn transformed_sse_stream(
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(error) => {
-                    record_stream_failure(accounting.as_ref(), &error.to_string()).await;
+                    record_stream_failure(accounting.as_ref(), &error_chain(&error)).await;
                     Err(error)?;
                     unreachable!();
                 }
@@ -2466,7 +2489,7 @@ fn transformed_sse_stream(
             let events = match drain_complete_sse_events(&mut buffer) {
                 Ok(events) => events,
                 Err(error) => {
-                    record_stream_failure(accounting.as_ref(), &error.to_string()).await;
+                    record_stream_failure(accounting.as_ref(), &error_chain(&error)).await;
                     Err(error)?;
                     unreachable!();
                 }
@@ -2488,7 +2511,7 @@ fn transformed_sse_stream(
         let events = match finish_sse_events(&mut buffer) {
             Ok(events) => events,
             Err(error) => {
-                record_stream_failure(accounting.as_ref(), &error.to_string()).await;
+                record_stream_failure(accounting.as_ref(), &error_chain(&error)).await;
                 Err(error)?;
                 unreachable!();
             }
@@ -3441,6 +3464,117 @@ mod tests {
         assert_eq!(body["error"]["message"], "model overloaded");
     }
 
+    /// An upstream whose send fails like reqwest's, with the cause carried as a source.
+    ///
+    /// The strings are the ones reqwest actually produces for these two shapes (measured
+    /// against the locked `reqwest`/`hyper`, not invented), so the recorded text is
+    /// representative rather than merely well-formed. The outermost message is reqwest's
+    /// and says only that a request was sent.
+    struct FailingUpstream;
+
+    impl UpstreamClient for FailingUpstream {
+        fn anthropic_messages(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            Box::pin(async {
+                Err(anyhow::anyhow!(
+                    "client error (SendRequest): connection error: Connection reset by peer \
+                     (os error 104)"
+                )
+                .context("error sending request for url (https://upstream.example/v1/messages)"))
+            })
+        }
+
+        fn anthropic_messages_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            Box::pin(async {
+                Err(anyhow::anyhow!(
+                    "client error (SendRequest): connection closed before message completed"
+                )
+                .context("error sending request for url (https://upstream.example/v1/messages)"))
+            })
+        }
+
+        fn anthropic_count_tokens(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!("count_tokens not used here")
+        }
+
+        fn codex_responses(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!("codex not used here")
+        }
+
+        fn codex_responses_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!("codex stream not used here")
+        }
+
+        fn generic_chat(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!("generic chat not used here")
+        }
+
+        fn generic_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!("generic stream not used here")
+        }
+
+        fn fetch_models(
+            &self,
+            _kind: ProviderKind,
+            _account: AvailableAccount,
+            _config: Arc<Config>,
+        ) -> ModelsFuture {
+            Box::pin(async { Ok(FetchedModels::new(Vec::new())) })
+        }
+    }
+
+    /// A transport failure used to record only `error.to_string()`, so every failure of
+    /// this shape wrote the same `server: error sending request for url (...)`. A connect
+    /// timeout, a connection reset and a socket that went silent were one string, and the
+    /// silent one cost a two-round investigation. The cause has to reach `lastError`, and
+    /// it has to stay behind the `server: ` prefix `record_failure` composes.
+    #[tokio::test]
+    async fn a_transport_failure_records_its_cause_not_only_the_outermost_message() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        save_token(
+            tmp.path(),
+            &token(
+                "alice@example.com",
+                "anthropic-access-alice",
+                "2030-01-01T00:00:00Z",
+            ),
+        )
+        .expect("save alice");
+        let state = test_state(tmp.path(), Arc::new(FailingUpstream));
+
+        let response = route_provider_request(
+            &state,
+            &HeaderMap::new(),
+            &json!({
+                "model": "claude-sonnet-4-6",
+                "messages": [{"role": "user", "content": "reply exactly: pong"}]
+            }),
+            RequestRoute::Messages,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let recorded = {
+            let manager = state.account_managers.anthropic.lock().await;
+            manager.snapshots().remove(0)["lastError"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        assert!(
+            recorded.starts_with("server: "),
+            "the kind prefix the tests and the admin payload rely on must survive: {recorded}"
+        );
+        assert!(
+            recorded.contains("error sending request for url"),
+            "the outermost message is still expected: {recorded}"
+        );
+        assert!(
+            recorded.contains("Connection reset by peer (os error 104)"),
+            "the distinguishing cause was dropped, which is the bug: {recorded}"
+        );
+    }
+
     #[tokio::test]
     async fn route_tries_next_account_when_first_refresh_fails() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -3748,7 +3882,7 @@ mod tests {
         manager
     }
 
-    fn test_state(tmp: &std::path::Path, upstream: Arc<CapturingUpstream>) -> AppState {
+    fn test_state(tmp: &std::path::Path, upstream: Arc<dyn UpstreamClient>) -> AppState {
         let config = Arc::new(test_config(tmp.to_path_buf()));
         AppState {
             cloaking: Arc::new(StdRwLock::new(super::Cloaking::new(
