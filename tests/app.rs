@@ -1658,8 +1658,643 @@ async fn chat_completions_route_records_generic_stream_usage() {
     assert_eq!(account["totalSuccesses"], 1);
     // The fake upstream's final chunk carries usage before [DONE]; the
     // relay must read it the way it reads the non-streamed body.
-    assert_eq!(account["totalInputTokens"], 21);
+    //
+    // 17, not 21: an OpenAI-dialect `prompt_tokens` is the whole prompt and
+    // `cached_tokens` sits inside it, so a cache read is not input (ADR-0023,
+    // docs/specs/cache-counter-semantics.md AC-2).
+    assert_eq!(account["totalInputTokens"], 17);
     assert_eq!(account["totalOutputTokens"], 22);
+    assert_eq!(account["totalCacheReadInputTokens"], 4);
+}
+
+/// An upstream whose `usage` is whatever the test chose, served on both JSON routes this
+/// relay records from. It exists so one set of numbers can be sent through two Providers
+/// and the recorded counters compared: the cache counts sit *beside* `input_tokens` on
+/// the Anthropic wire and *inside* the prompt count on the `OpenAI` one, and that placement
+/// is the only thing under test.
+struct ChosenUsageUpstream {
+    usage: Value,
+}
+
+impl UpstreamClient for ChosenUsageUpstream {
+    fn generic_chat(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        let usage = self.usage.clone();
+        Box::pin(async move {
+            Ok(UpstreamJsonResponse {
+                status: axum::http::StatusCode::OK,
+                body: json!({
+                    "id": "chatcmpl_usage",
+                    "object": "chat.completion",
+                    "model": "llama-3.3-70b",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "pong"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": usage
+                }),
+            })
+        })
+    }
+
+    fn generic_chat_stream(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        unreachable!("the usage tests do not stream")
+    }
+
+    fn anthropic_messages(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        let usage = self.usage.clone();
+        Box::pin(async move {
+            Ok(UpstreamJsonResponse {
+                status: axum::http::StatusCode::OK,
+                body: json!({
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "pong"}],
+                    "stop_reason": "end_turn",
+                    "usage": usage
+                }),
+            })
+        })
+    }
+
+    fn anthropic_messages_stream(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        unreachable!("the usage tests do not stream")
+    }
+
+    fn anthropic_count_tokens(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("the usage tests do not count tokens")
+    }
+
+    fn codex_responses(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        let usage = self.usage.clone();
+        Box::pin(async move {
+            Ok(UpstreamJsonResponse {
+                status: axum::http::StatusCode::OK,
+                body: json!({
+                    "id": "resp_1",
+                    "object": "response",
+                    "status": "completed",
+                    "model": "gpt-5.4",
+                    "output": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "pong", "annotations": []}]
+                    }],
+                    "usage": usage
+                }),
+            })
+        })
+    }
+
+    fn codex_responses_stream(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        unreachable!("the usage tests do not stream")
+    }
+
+    fn fetch_models(
+        &self,
+        _kind: ProviderKind,
+        _account: AvailableAccount,
+        _config: Arc<Config>,
+    ) -> ModelsFuture {
+        Box::pin(async { Ok(FetchedModels::new(Vec::new())) })
+    }
+}
+
+/// One account, saved where the relay loads its pool from.
+fn save_provider_token(dir: &std::path::Path, provider: ProviderId, email: &str) {
+    save_token(
+        dir,
+        &TokenData {
+            access_token: format!("access-{email}"),
+            refresh_token: format!("refresh-{email}"),
+            email: email.to_string(),
+            expires_at: "2030-01-01T00:00:00Z".to_string(),
+            account_uuid: format!("acct-{email}"),
+            provider,
+            id_token: None,
+            last_refresh_at: None,
+            plan_type: None,
+        },
+    )
+    .expect("save token");
+}
+
+/// What `status` and `usage` call carried load: every token the upstream processed,
+/// counted once. It is the number this whole change exists to make dialect-independent,
+/// so it is asserted from the counters rather than recomputed in the view.
+fn carried_load(account: &Value) -> i64 {
+    [
+        "totalInputTokens",
+        "totalOutputTokens",
+        "totalCacheReadInputTokens",
+        "totalCacheCreationInputTokens",
+    ]
+    .iter()
+    .map(|field| account[*field].as_i64().unwrap_or(0))
+    .sum()
+}
+
+/// The counters of the pool's one account, as `/admin/accounts` reports them.
+async fn recorded_usage(app: axum::Router, pool: &str) -> Value {
+    let (status, body) = json_response(
+        app,
+        axum::http::Request::builder()
+            .method("GET")
+            .uri("/admin/accounts")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    body["providers"][pool]["accounts"][0].clone()
+}
+
+#[tokio::test]
+async fn an_anthropic_usage_keeps_its_input_beside_its_cache_counts() {
+    // Anthropic's `input_tokens` is already the uncached tail — the tokens after the last
+    // cache breakpoint — so the two cache counters beside it must not be subtracted a
+    // second time. The numbers are the same shape as the Codex test below and the answer
+    // is the opposite one, because the dialect decides and not the field name (AC-3).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_provider_token(tmp.path(), ProviderId::anthropic(), "anthropic@example.com");
+    let upstream = Arc::new(ChosenUsageUpstream {
+        usage: json!({
+            "input_tokens": 100,
+            "output_tokens": 5,
+            "cache_read_input_tokens": 2,
+            "cache_creation_input_tokens": 1
+        }),
+    });
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream);
+
+    let (status, _) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{"role": "user", "content": "reply exactly: pong"}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let account = recorded_usage(app, "anthropic").await;
+    assert_eq!(
+        account["totalInputTokens"], 100,
+        "an Anthropic input count was treated as though it held the cache"
+    );
+    assert_eq!(account["totalCacheReadInputTokens"], 2);
+    assert_eq!(account["totalCacheCreationInputTokens"], 1);
+    // 100 + 5 + 2 + 1: this 103-token prompt is counted once. The OpenAI-dialect
+    // sibling describes the same prompt as `input_tokens: 103` with the cache inside
+    // it and must land on the same total (AC-8).
+    assert_eq!(carried_load(&account), 108);
+}
+
+#[tokio::test]
+async fn a_codex_usage_records_only_the_uncached_input() {
+    // The Responses wire reports `input_tokens` as the whole input, with
+    // `input_tokens_details.cached_tokens` a slice of it: 40 of these 100 tokens were
+    // served from cache and 60 were not (AC-1, and AC-2 on the Responses shape).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_provider_token(tmp.path(), ProviderId::codex(), "codex@example.com");
+    let upstream = Arc::new(ChosenUsageUpstream {
+        usage: json!({
+            "input_tokens": 100,
+            "output_tokens": 5,
+            "total_tokens": 105,
+            "input_tokens_details": {"cached_tokens": 40}
+        }),
+    });
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream);
+
+    let (status, _) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .body(Body::from(
+                json!({
+                    "model": "gpt-5.4",
+                    "input": [{"role": "user", "content": "reply exactly: pong"}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let account = recorded_usage(app, "codex").await;
+    assert_eq!(account["totalInputTokens"], 60);
+    assert_eq!(account["totalCacheReadInputTokens"], 40);
+}
+
+#[tokio::test]
+async fn more_cached_tokens_than_input_records_no_negative_input() {
+    // An upstream that reports more cached tokens than prompt tokens is broken, and a
+    // token counter is the wrong place to notice. What it must not do is record a
+    // negative input for every later total to inherit (AC-7).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_provider_token(tmp.path(), ProviderId::codex(), "codex@example.com");
+    let upstream = Arc::new(ChosenUsageUpstream {
+        usage: json!({
+            "input_tokens": 10,
+            "output_tokens": 1,
+            "total_tokens": 11,
+            "input_tokens_details": {"cached_tokens": 5000}
+        }),
+    });
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream);
+
+    let (status, _) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .body(Body::from(
+                json!({
+                    "model": "gpt-5.4",
+                    "input": [{"role": "user", "content": "reply exactly: pong"}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let account = recorded_usage(app, "codex").await;
+    assert_eq!(account["totalInputTokens"], 0);
+    assert_eq!(account["totalCacheReadInputTokens"], 5000);
+}
+
+#[tokio::test]
+async fn a_codex_cache_write_is_recorded_as_a_cache_write() {
+    // GPT-5.6 writes cache and reports it *inside* the input count, at
+    // `input_tokens_details.cache_write_tokens`. Recording it is what makes the two input
+    // categories the vendor bills separately — cached and written — visible at all, and
+    // subtracting it beside the cache read is what keeps these 103 prompt tokens counted
+    // once (AC-6, AC-8). Its sibling on the other wire is
+    // `an_anthropic_usage_keeps_its_input_beside_its_cache_counts`, which describes the
+    // same 103-token prompt and must reach the same 108.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_provider_token(tmp.path(), ProviderId::codex(), "codex@example.com");
+    let upstream = Arc::new(ChosenUsageUpstream {
+        usage: json!({
+            "input_tokens": 103,
+            "output_tokens": 5,
+            "total_tokens": 108,
+            "input_tokens_details": {"cached_tokens": 2, "cache_write_tokens": 1}
+        }),
+    });
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream);
+
+    let (status, _) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .body(Body::from(
+                json!({
+                    "model": "gpt-5.4",
+                    "input": [{"role": "user", "content": "reply exactly: pong"}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let account = recorded_usage(app, "codex").await;
+    assert_eq!(
+        account["totalInputTokens"], 100,
+        "the cache write was left inside the input count"
+    );
+    assert_eq!(account["totalCacheReadInputTokens"], 2);
+    assert_eq!(
+        account["totalCacheCreationInputTokens"], 1,
+        "a Responses cache write was not recorded at all"
+    );
+    assert_eq!(carried_load(&account), 108);
+}
+
+#[tokio::test]
+async fn a_chat_cache_write_is_recorded_as_a_cache_write() {
+    // OpenRouter publishes `cache_write_tokens` in the *chat* shape, beside `cached_tokens`
+    // in the same `prompt_tokens_details` object, so a chat-only reader loses it.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &groq_key_token()).expect("save groq key");
+    let upstream = Arc::new(ChosenUsageUpstream {
+        usage: json!({
+            "prompt_tokens": 103,
+            "completion_tokens": 5,
+            "total_tokens": 108,
+            "prompt_tokens_details": {"cached_tokens": 2, "cache_write_tokens": 1}
+        }),
+    });
+    let app = create_app_with_upstream(config_with_groq(tmp.path().to_path_buf()), upstream);
+
+    let (status, _) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .body(Body::from(
+                json!({
+                    "model": "groq/llama-3.3-70b",
+                    "messages": [{"role": "user", "content": "reply exactly: pong"}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let account = recorded_usage(app, "groq").await;
+    assert_eq!(account["totalInputTokens"], 100);
+    assert_eq!(account["totalCacheReadInputTokens"], 2);
+    assert_eq!(
+        account["totalCacheCreationInputTokens"], 1,
+        "a chat cache write was not recorded at all"
+    );
+    assert_eq!(carried_load(&account), 108);
+}
+
+#[tokio::test]
+async fn a_flat_cached_tokens_is_read_beside_the_nested_one() {
+    // Moonshot/Kimi define `cached_tokens` as a sibling of `prompt_tokens` — there is no
+    // `prompt_tokens_details` in that schema at all — so a nested-only reader records 0
+    // cache reads for every Kimi request (AC-4).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &groq_key_token()).expect("save groq key");
+    let upstream = Arc::new(ChosenUsageUpstream {
+        usage: json!({
+            "prompt_tokens": 21,
+            "completion_tokens": 5,
+            "total_tokens": 26,
+            "cached_tokens": 4
+        }),
+    });
+    let app = create_app_with_upstream(config_with_groq(tmp.path().to_path_buf()), upstream);
+
+    let (status, _) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .body(Body::from(
+                json!({
+                    "model": "groq/llama-3.3-70b",
+                    "messages": [{"role": "user", "content": "reply exactly: pong"}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let account = recorded_usage(app, "groq").await;
+    assert_eq!(
+        account["totalCacheReadInputTokens"], 4,
+        "a flat cached_tokens was not read"
+    );
+    assert_eq!(account["totalInputTokens"], 17);
+}
+
+#[tokio::test]
+async fn a_deepseek_cache_hit_becomes_the_cache_read_and_the_miss_the_input() {
+    // DeepSeek publishes no `cached_tokens` at all: it splits the input into
+    // `prompt_cache_hit_tokens` and `prompt_cache_miss_tokens`. Reading the hit as a cache
+    // read leaves the miss as the input, which is the same number DeepSeek reports for it
+    // — the split is complementary, so `prompt_tokens - hit = miss` (AC-5).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &groq_key_token()).expect("save groq key");
+    let upstream = Arc::new(ChosenUsageUpstream {
+        usage: json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "total_tokens": 105,
+            "prompt_cache_hit_tokens": 90,
+            "prompt_cache_miss_tokens": 10
+        }),
+    });
+    let app = create_app_with_upstream(config_with_groq(tmp.path().to_path_buf()), upstream);
+
+    let (status, _) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .body(Body::from(
+                json!({
+                    "model": "groq/llama-3.3-70b",
+                    "messages": [{"role": "user", "content": "reply exactly: pong"}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let account = recorded_usage(app, "groq").await;
+    assert_eq!(
+        account["totalCacheReadInputTokens"], 90,
+        "a DeepSeek cache hit was recorded as 0"
+    );
+    assert_eq!(
+        account["totalInputTokens"], 10,
+        "the uncached input is the miss count, and 10 is what DeepSeek calls it"
+    );
+}
+
+#[tokio::test]
+async fn output_tokens_include_reasoning_where_the_vendor_counts_it_outside() {
+    // `output_tokens` means every token the model generated, so `carried load` is the
+    // `total_tokens` the vendor billed. xAI's chat dialect counts reasoning *outside*
+    // `completion_tokens` and inside `total_tokens` (its own example: 32 + 9 + 110 = 151),
+    // so 9 must become 119 or carried load reads 41 against a billed 151. OpenAI counts
+    // reasoning *inside* `completion_tokens`, so folding there would make carried 135
+    // against a billed 120 (AC-10).
+    let cases = [
+        (
+            "xai chat",
+            json!({
+                "prompt_tokens": 32,
+                "completion_tokens": 9,
+                "total_tokens": 151,
+                "prompt_tokens_details": {"cached_tokens": 8},
+                "completion_tokens_details": {"reasoning_tokens": 110}
+            }),
+            119,
+            110,
+            151,
+        ),
+        (
+            "openai",
+            json!({
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "total_tokens": 120,
+                "completion_tokens_details": {"reasoning_tokens": 15}
+            }),
+            20,
+            15,
+            120,
+        ),
+    ];
+    for (label, usage, output, reasoning, billed) in cases {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        save_token(tmp.path(), &groq_key_token()).expect("save groq key");
+        let upstream = Arc::new(ChosenUsageUpstream { usage });
+        let app = create_app_with_upstream(config_with_groq(tmp.path().to_path_buf()), upstream);
+
+        let (status, _) = json_response(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-test")
+                .header("content-type", "application/json")
+                .header("content-length", "1")
+                .body(Body::from(
+                    json!({
+                        "model": "groq/llama-3.3-70b",
+                        "messages": [{"role": "user", "content": "reply exactly: pong"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, 200, "[{label}]");
+
+        let account = recorded_usage(app, "groq").await;
+        assert_eq!(account["totalOutputTokens"], output, "[{label}] out");
+        assert_eq!(
+            account["totalReasoningOutputTokens"], reasoning,
+            "[{label}] reasoning"
+        );
+        assert_eq!(
+            carried_load(&account),
+            billed,
+            "[{label}] carried load is not the total the vendor billed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_anthropic_iterations_array_is_not_summed_into_the_counters() {
+    // Anthropic's usage also carries `iterations[]`, each entry repeating the whole set of
+    // counters for one internal pass. Nothing reads it, and that is the correct behaviour:
+    // summing it would multiply every count by the number of passes. The numbers here are
+    // the ones `an_anthropic_usage_keeps_its_input_beside_its_cache_counts` uses, so the
+    // two tests disagree the moment a reader starts walking the array (AC-9).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_provider_token(tmp.path(), ProviderId::anthropic(), "anthropic@example.com");
+    let pass = |kind: &str| {
+        json!({
+            "input_tokens": 100,
+            "output_tokens": 5,
+            "cache_read_input_tokens": 2,
+            "cache_creation_input_tokens": 1,
+            "type": kind
+        })
+    };
+    let upstream = Arc::new(ChosenUsageUpstream {
+        usage: json!({
+            "input_tokens": 100,
+            "output_tokens": 5,
+            "cache_read_input_tokens": 2,
+            "cache_creation_input_tokens": 1,
+            "iterations": [pass("message"), pass("compaction")]
+        }),
+    });
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream);
+
+    let (status, _) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{"role": "user", "content": "reply exactly: pong"}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let account = recorded_usage(app, "anthropic").await;
+    assert_eq!(
+        account["totalInputTokens"], 100,
+        "the iterations array was summed into the input count"
+    );
+    assert_eq!(account["totalOutputTokens"], 5);
+    assert_eq!(account["totalCacheReadInputTokens"], 2);
+    assert_eq!(account["totalCacheCreationInputTokens"], 1);
 }
 
 #[tokio::test]
