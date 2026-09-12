@@ -35,6 +35,7 @@ question of what each vendor reports.
   never speaks the native API, `thoughtsTokenCount` appears in no code, and Google's
   OpenAI-compatible usage shape is itself unverified in the research file. The Gemini half of
   this criterion is a vendor fact recorded for the next dialect, not a tested path.
+- AC-13: The `usage` panel states figures, not sentences — `peak <count>  <date>`, `window <count>`, `all time <count>` — so nothing in the box explains what a row means. The header names the window and the bars show its content, which is why a window holding one recorded day cannot claim a length it does not have.
 - AC-11: The reasoning figure a panel shows carries its share — `64.0K (16%)` — because reasoning is a breakdown of `output_tokens` and not a term beside it. A row whose `output_tokens` is 0 shows the count alone rather than dividing by zero, and a row whose reasoning exceeds its output shows both counts — `1.2K (out 93)` — because a percentage there would dress up two counters that cannot both be right.
 - AC-12: The cache figure a row shows carries its share of the prompt the upstream saw — `cache 1.3B (100%)` — and each model carries both of its shares on its own counts line beside the figure each qualifies, `out 720.0K (11%) cache 8.5K (97%)`, because a separate shares line per model doubles the panel for the same information. This ratio is the hit rate the counter model exists to make comparable across Providers (ADR-0023). A share is left out rather than printed as `0%` when its count or its denominator is zero, and left out rather than printed above 100% when the two counters disagree.
 
@@ -59,6 +60,7 @@ cargo test --test app an_anthropic_iterations_array_is_not_summed_into_the_count
 cargo test --test app output_tokens_include_reasoning_where_the_vendor_counts_it_outside  # AC-10
 cargo test --test cli accounts_renders_panels_with_detail_lines_on_a_tty   # AC-11, AC-12
 cargo test --test cli accounts_breaks_usage_down_per_model_on_a_tty        # AC-12
+cargo test --test cli usage_renders_a_thirty_day_sparkline                # AC-13
 cargo test --lib usage_from_response
 cargo test --test accounts
 cargo test --locked --all-targets --all-features

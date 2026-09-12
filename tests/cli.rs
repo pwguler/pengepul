@@ -2778,6 +2778,18 @@ fn usage_renders_a_thirty_day_sparkline() {
         "window sums pools: {}",
         lines[3]
     );
+    // The panel states figures, not sentences: the peak row keeps its date and drops the
+    // word joining them, and the window row is a total rather than a phrase about days.
+    assert!(
+        !lines[2].contains(" on "),
+        "the peak row carries a word it does not need: {}",
+        lines[2]
+    );
+    assert!(
+        !lines[3].contains("across") && !lines[3].contains("recorded"),
+        "the window row is prose, not a figure: {}",
+        lines[3]
+    );
     for line in &lines {
         assert_eq!(line.chars().count(), 64, "off the fixed width: {line}");
     }
@@ -2876,9 +2888,9 @@ fn usage_plain_is_one_line_per_day() {
     );
 }
 
-/// usage-trend AC-8 (extended): a window holding one day of thirty must
-/// not claim "across 30 days". The reader compares that total against
-/// `status` and concludes the trend is broken, when it is only new.
+/// The panel states figures, not sentences: a window holding one day of thirty must not
+/// claim a length it does not have. With the day count gone there is no claim left to make,
+/// so this guards that the prose does not come back.
 #[test]
 fn usage_says_how_much_history_it_actually_has() {
     let tmp = tempdir().expect("tempdir");
@@ -2913,16 +2925,27 @@ fn usage_says_how_much_history_it_actually_has() {
 
     assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
-    // The total names the history it has, not the window it drew.
+    // The window row is a figure. No day count, no phrase about how much history exists:
+    // the header says which window is drawn and the bars show what is in it.
+    let window = visible
+        .lines()
+        .find(|line| line.contains("window"))
+        .expect("window row");
+    for word in ["day", "days", "across", "recorded"] {
+        assert!(
+            !window.contains(word),
+            "the window row carries prose ({word}): {window}"
+        );
+    }
     assert!(
-        !visible.contains("across 30 days"),
-        "claims a full window it does not have: {visible}"
+        window.chars().any(|c| c.is_ascii_digit()),
+        "the window row carries no total: {window}"
     );
-    // The window row carries how much history exists; the empty bars need
-    // no second row explaining themselves.
+    // A day of history exists, so the panel draws its bars rather than
+    // reporting that nothing was ever recorded.
     assert!(
-        visible.contains("1 day recorded"),
-        "must say how much history exists: {visible}"
+        !visible.contains("no usage recorded yet"),
+        "history exists and the panel denies it: {visible}"
     );
     assert_eq!(
         visible.lines().count(),
@@ -3375,9 +3398,15 @@ fn a_day_of_failures_is_one_day_recorded_not_zero() {
         .lines()
         .find(|line| line.contains("window"))
         .expect("window row");
+    // The day carries failures and no tokens. It is still a day of history: the panel draws
+    // the window and states its total rather than falling back to "no usage recorded yet".
     assert!(
-        window.contains("1 day recorded"),
-        "a day of failures counted as zero: {window}"
+        !visible.contains("no usage recorded yet"),
+        "a day of failures was counted as no history at all: {visible}"
+    );
+    assert!(
+        window.chars().any(|c| c.is_ascii_digit()),
+        "the window row carries no total: {window}"
     );
     let peak = visible
         .lines()

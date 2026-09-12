@@ -972,11 +972,6 @@ pub(crate) fn print_trend_rich(payload: &Value, output: &mut Output, today: &str
         .max_by_key(|day| day.tokens)
         .expect("non-empty window");
     let total: i64 = values.iter().sum();
-    // Only days that actually carry traffic are history; the rest of the
-    // window is drawn but was never recorded. Saying "across 30 days"
-    // when one day exists invites the reader to compare the total against
-    // `status` and conclude the trend is broken, when it is only new.
-    let recorded: Vec<&TrendDay> = days.iter().filter(|day| day.recorded).collect();
     // The all-time figure comes from the same sum `status` prints, over the
     // same payload, so the two verbs cannot drift and the window is
     // visibly a subset rather than a competing total.
@@ -996,23 +991,14 @@ pub(crate) fn print_trend_rich(payload: &Value, output: &mut Output, today: &str
     let all_time = all_time.max(total);
     let facts = vec![
         Fact::new("tokens", &sparkline(&values)),
+        // Figures, not sentences: the peak row carries its count and its day, and the
+        // window row carries its total. The panel header already says the window is the
+        // last 30 days, so words explaining either would be the only prose in the box.
         Fact::new(
             "peak",
-            &format!(
-                "{} on {}",
-                paint(BOLD, &format_count(peak.tokens)),
-                peak.date
-            ),
+            &format!("{}  {}", paint(BOLD, &format_count(peak.tokens)), peak.date),
         ),
-        Fact::new(
-            "window",
-            &format!(
-                "{} across {} {} recorded",
-                paint(BOLD, &format_count(total)),
-                recorded.len(),
-                if recorded.len() == 1 { "day" } else { "days" }
-            ),
-        ),
+        Fact::new("window", &paint(BOLD, &format_count(total))),
         Fact::new("all time", &paint(BOLD, &format_count(all_time))),
     ];
     for line in fact_panel("usage ─ last 30 days", &facts) {
