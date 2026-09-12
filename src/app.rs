@@ -3493,11 +3493,11 @@ mod tests {
         );
     }
 
-    /// Records every `tracing` event as its fields, so a test can assert what a
-    /// log line carries rather than how it happens to render.
     /// The fields of one captured event, as `(name, value)` pairs.
     type CapturedFields = Vec<Vec<(String, String)>>;
 
+    /// Records every `tracing` event as its fields, so a test can assert what a log line
+    /// carries rather than how it happens to render.
     #[derive(Clone, Default)]
     struct CapturedEvents(Arc<std::sync::Mutex<CapturedFields>>);
 
@@ -3539,6 +3539,53 @@ mod tests {
         fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
             self.0.push((field.name().to_string(), value.to_string()));
         }
+    }
+
+    /// The process-wide capture, installed once.
+    ///
+    /// This is a global subscriber rather than `subscriber::set_default`, which is
+    /// thread-local. The thread-local version failed about once in 30 runs under a loaded,
+    /// parallel harness, always with an empty capture: the events were emitted somewhere the
+    /// guard did not reach, so nothing recorded them. Rather than explain that, the test
+    /// stops depending on it. Events are attributed by the `conversation` field, which is
+    /// unique to this test, so a concurrently running test that emits the same
+    /// "account selected" message cannot be counted here.
+    static CAPTURE: std::sync::OnceLock<Arc<std::sync::Mutex<CapturedFields>>> =
+        std::sync::OnceLock::new();
+
+    fn capture() -> Arc<std::sync::Mutex<CapturedFields>> {
+        CAPTURE
+            .get_or_init(|| {
+                let store = Arc::new(std::sync::Mutex::new(CapturedFields::new()));
+                // A process can hold one global subscriber. If something else claimed it
+                // first the capture stays empty and the test fails loudly, which is the
+                // correct outcome: a silent pass would retire the coverage this test exists
+                // for. Nothing in this crate installs one in a test.
+                let _ = tracing::subscriber::set_global_default(CapturedEvents(store.clone()));
+                store
+            })
+            .clone()
+    }
+
+    /// The conversations this test drives, and the only events it counts.
+    const OWNED_CONVERSATIONS: [&str; 3] = ["conversation-a", "conversation-b", "conversation-c"];
+
+    /// The selection lines this test caused, in order. Another test's events are filtered
+    /// out by conversation, so a shared capture cannot change the count.
+    fn selections_for_this_test(events: &CapturedFields) -> Vec<&Vec<(String, String)>> {
+        events
+            .iter()
+            .filter(|fields| {
+                fields
+                    .iter()
+                    .any(|(key, value)| key == "message" && value.contains("account selected"))
+            })
+            .filter(|fields| {
+                fields.iter().any(|(key, value)| {
+                    key == "conversation" && OWNED_CONVERSATIONS.contains(&value.as_str())
+                })
+            })
+            .collect()
     }
 
     /// One field off a captured event, with the quotes a `Debug`-recorded value
@@ -3593,8 +3640,7 @@ mod tests {
         let upstream = Arc::new(CapturingUpstream::default());
         let state = test_state(tmp.path(), upstream);
 
-        let captured = CapturedEvents::default();
-        let _guard = tracing::subscriber::set_default(captured.clone());
+        let captured = capture();
 
         // conversation-a twice: no affinity entry, then the one it just recorded.
         let a_first =
@@ -3624,16 +3670,13 @@ mod tests {
         );
         assert_eq!(c.token.email, "carol@example.com");
 
-        let events = captured.0.lock().expect("capture lock").clone();
-        let selected: Vec<_> = events
-            .iter()
-            .filter(|fields| {
-                fields
-                    .iter()
-                    .any(|(key, value)| key == "message" && value.contains("account selected"))
-            })
-            .collect();
-        assert_eq!(selected.len(), 4, "one line per decision: {events:?}");
+        let events = captured.lock().expect("capture lock");
+        let selected = selections_for_this_test(&events);
+        assert_eq!(
+            selected.len(),
+            4,
+            "one line per decision, for {OWNED_CONVERSATIONS:?}: {events:?}"
+        );
         for line in &selected {
             assert_eq!(field_of(line, "target"), "pengepul::app");
         }
