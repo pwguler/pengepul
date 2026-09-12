@@ -239,44 +239,34 @@ impl ModelRow {
         )
     }
 
-    /// `in 300 out 400 (34% reasoning) cache 8.5K (97%)` — the counts, each share in brackets
-    /// beside the figure it qualifies.
-    ///
-    /// Three six-character counts with a three-digit share reach 61 columns against the 56 this
-    /// line has, and `pad` answers an over-long row with an ellipsis rather than a wrap, so that
-    /// one shape drops the word and keeps the figure: `(100%)`. Nothing else changes.
+    /// `in 300 out 400 (34%) cache 8.5K (97%)` — the counts, each share in brackets after the
+    /// figure it qualifies. Three counts and two shares fit with room to spare, so there is no
+    /// shape this line cannot hold.
     ///
     /// A share is left out when it has no base to be a share of, and when the two counters
     /// disagree — reasoning above output — because a percentage there would dress up two
     /// numbers that cannot both be right.
     fn detail(&self) -> String {
-        let reasoning = (self.reasoning > 0 && self.reasoning <= self.output)
-            .then(|| share(self.reasoning, self.output))
-            .flatten();
-        let cache = (self.cache > 0)
-            .then(|| share(self.cache, self.input.saturating_add(self.cache)))
-            .flatten();
-        let line = |word: &str| {
-            format!(
-                "in {} out {}{} cache {}{}",
-                format_count(self.input),
-                format_count(self.output),
-                reasoning.map_or(String::new(), |percent| format!(" ({percent}%{word})")),
-                format_count(self.cache),
-                cache.map_or(String::new(), |percent| format!(" ({percent}%)")),
-            )
-        };
-        let labelled = line(" reasoning");
-        if labelled.chars().count() <= MODEL_DETAIL_WIDTH {
-            labelled
-        } else {
-            line("")
+        let mut detail = format!(
+            "in {} out {}",
+            format_count(self.input),
+            format_count(self.output)
+        );
+        if self.reasoning > 0
+            && self.reasoning <= self.output
+            && let Some(percent) = share(self.reasoning, self.output)
+        {
+            write!(detail, " ({percent}%)").expect("write to String cannot fail");
         }
+        write!(detail, " cache {}", format_count(self.cache)).expect("write to String cannot fail");
+        if self.cache > 0
+            && let Some(percent) = share(self.cache, self.input.saturating_add(self.cache))
+        {
+            write!(detail, " ({percent}%)").expect("write to String cannot fail");
+        }
+        detail
     }
 }
-
-/// The columns a model's detail line has: the panel's 60 less the four it is indented by.
-const MODEL_DETAIL_WIDTH: usize = 56;
 
 /// The widest the model name cell may grow. The indented account row
 /// spends its 60 inner columns as 2 indent + name + 1 + ok 9 + 1 +
@@ -779,14 +769,14 @@ fn reasoning_fact(reasoning: i64, output: i64, colour: &str) -> Fact {
     let count = format_count(reasoning);
     let text = match share(reasoning, output) {
         // Reasoning above output means the two counters cannot both be right, and
-        // `of out (1329%)` would dress that up as a percentage of something. Two things
+        // a percentage would dress that up as a share of something. Two things
         // produce it, and neither is this function's to guess at: counters recorded before
         // the fold existed (the grok pool's history holds `out 93` beside `reasoning 1,236`),
         // and an upstream reporting reasoning outside the output count where no fold applied
         // — the Gemini OpenAI-compatible shape the research file marks unverified. Printing
         // both figures says which without inventing a reason.
         Some(_) if reasoning > output => format!("{count} (out {})", format_count(output)),
-        Some(percent) => format!("{count} of out ({percent}%)"),
+        Some(percent) => format!("{count} ({percent}%)"),
         None => count,
     };
     Fact::new("reasoning", &paint(colour, &text))
@@ -1120,11 +1110,11 @@ mod tests {
         // existed hold `out 93` beside `reasoning 1,236`, and `of out (1329%)` would be a
         // percentage of nothing. The two figures are printed instead.
         let fact = reasoning_fact(64_000, 401_200, DIM);
-        assert_eq!(value(&fact), "64.0K of out (16%)");
+        assert_eq!(value(&fact), "64.0K (16%)");
         let fact = reasoning_fact(1_236, 93, DIM);
         assert_eq!(value(&fact), "1.2K (out 93)");
         let fact = reasoning_fact(1_236, 1_329, DIM);
-        assert_eq!(value(&fact), "1.2K of out (93%)");
+        assert_eq!(value(&fact), "1.2K (93%)");
         // No output to be a share of: the count stands alone rather than dividing by zero.
         let fact = reasoning_fact(7, 0, DIM);
         assert_eq!(value(&fact), "7");

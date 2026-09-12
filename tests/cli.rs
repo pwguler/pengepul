@@ -646,8 +646,8 @@ fn accounts_renders_panels_with_detail_lines_on_a_tty() {
     // The reasoning row says which total it is a share of, because reasoning is a
     // breakdown of `out` and not a term beside it (ADR-0023): 64.0K of 401.2K is 16%.
     assert!(
-        visible.contains("64.0K of out (16%)"),
-        "the reasoning row does not name the total it is part of: {visible}"
+        visible.contains("64.0K (16%)"),
+        "the reasoning row lost its share: {visible}"
     );
     // The cache figure carries its share of the prompt the upstream saw: 161.0M of
     // 161.0M + 22.1M is 88%, and that ratio is comparable across pools only because the
@@ -1671,7 +1671,7 @@ fn accounts_breaks_usage_down_per_model_on_a_tty() {
     // widest realistic row — three long counts and two percentages — so a clipped row would
     // show here as an ellipsis instead of the share. fable: 8.5K of 8.8K cached, 42 of its 400
     // output tokens were reasoning; sonnet has no reasoning and so claims no share of out.
-    assert!(lines[fable + 1].contains("out 400 (11% reasoning) cache 8.5K (97%)"));
+    assert!(lines[fable + 1].contains("out 400 (11%) cache 8.5K (97%)"));
     assert!(!lines[fable + 1].contains('…'), "the widest row clipped");
     assert!(lines[sonnet + 1].contains("cache 700 (88%)"));
     assert!(!lines[sonnet + 1].contains("reasoning"));
