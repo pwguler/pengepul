@@ -26,7 +26,6 @@ pengepul login --provider anthropic # authorize an Anthropic account
 pengepul login --provider codex # authorize a ChatGPT/Codex account
 pengepul serve # binds 127.0.0.1:8317
 pengepul serve --host 0.0.0.0 --port 8317 # reachable across your network
-pengepul launch claude # run Claude Code on the pool
 ```
 
 Log in more than once per provider to pool accounts; requests rotate across them.
@@ -166,8 +165,6 @@ pengepul serve # start the relay (the default with no subcommand)
 pengepul login --provider anthropic # authorize an account in a browser (--provider codex for Codex)
 pengepul login --provider groq --key $KEY # save a static key for a configured provider
 pengepul login --provider groq --base-url $URL --key $KEY # register a new OpenAI-compatible provider and save its key
-pengepul launch claude # run Claude Code on the pool (picks a model, --model skips the picker)
-pengepul launch pi # run pi on the pool
 pengepul status # health of the running relay
 pengepul accounts # loaded accounts (--reload re-reads from disk)
 pengepul usage # the last 30 days of tokens, as a sparkline

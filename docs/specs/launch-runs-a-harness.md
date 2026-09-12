@@ -16,6 +16,18 @@ dengan tangan per klien — biaya yang memang sengaja ditaruh di operator
 generik, kliennya tetap yang menyesuaikan diri. Yang berubah, penyesuaian
 itu hidup selama satu proses saja.
 
+## Penyimpangan yang diterima
+
+README tidak lagi mendokumentasikan `launch`. Perintahnya tetap ada dan tetap
+berperilaku persis seperti spesifikasi ini; yang dicabut hanya penyebutannya di
+README, sampai verb ini teruji di lapangan. Alasannya bukan kekurangan yang
+diketahui, melainkan kehati-hatian: yang belum teruji jangan dijanjikan di
+halaman depan.
+
+Akibatnya satu hal: penemuan sekarang lewat `pengepul help launch` saja, karena
+itu satu-satunya tempat prasyarat ekstensi pi masih tertulis. Bagian
+`ANTHROPIC_API_KEY` dan picker di bawah tetap berlaku tanpa perubahan.
+
 ## The shape
 
 ```
@@ -117,7 +129,8 @@ hanya penolakan.
   berdiri sendiri, tapi diukur: +2 detik di **setiap** peluncuran, untuk
   menutup satu instalasi sekali seumur hidup. Tanpa itu pi menolak dengan
   `Unknown provider "pengepul"` — nyaring dan menunjuk. `pengepul help
-  launch` dan README menyebut perintah pemasangannya.
+  launch` menyebut perintah pemasangannya; README tidak lagi, lihat
+    "Penyimpangan yang diterima" di atas.
 
 ## Non-goals
 

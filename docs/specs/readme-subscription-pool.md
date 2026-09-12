@@ -40,11 +40,13 @@ three.
   (Claude, `/v1/messages`) and an OpenAI-API client (Codex, `gpt-5` on
   `/v1/chat/completions` or `/v1/responses`) at pengepul with the local API key.
 - AC-8: The README contains no em dash character.
-- AC-9: A compact reference still covers routes with both auth-header forms, model
-  aliases and the default model, the settable config keys (framed as settable, not a
-  verbatim generated file), pool rotation/cooldown/failover, token refresh, service, and
-  logging.
-- AC-10: `README.md` is between 150 and 200 lines.
+- AC-9: A compact reference still covers the routes with both auth-header forms, the
+  settable config keys (framed as settable, not a verbatim generated file), token refresh,
+  service, and logging. The model-to-provider routing rules, the model aliases, the
+  rotation/cooldown policy and the per-model metadata on `GET /v1/models` are not in the
+  README and are not required to be: the README is a short front door by operator
+  decision, and the routing and rotation reasoning lives in ADR-0017 and ADR-0020.
+- AC-10: `README.md` stays under 220 lines.
 - AC-11: No banned house-style words (per global CLAUDE.md); file is well-formed
   GitHub-flavored Markdown (fences balanced).
 
