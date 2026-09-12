@@ -93,33 +93,6 @@ ssh -L 1455:localhost:1455 user@host # codex
 
 ## Clients
 
-### claude and pi
-
-One command points a harness at the pool for as long as it runs. Nothing is written to
-disk, so `claude` and `pi` started any other way still find their own accounts and their
-own models:
-
-```sh
-pengepul launch claude # pick a model from the relay, then run
-pengepul launch claude --model gpt-5.4 # ... or name one and skip the picker
-pengepul launch pi --model anthropic/claude-opus-5
-pengepul launch claude -- --resume # arguments after `--` reach the harness
-```
-
-Without `--model` on a terminal, `launch` lists everything the relay serves and lets you
-pick: arrows move, typing searches, enter runs, esc cancels. Piped, nothing is asked — the
-harness gets its own default, so scripts behave as they always did.
-
-Every model the relay serves is on both lists. Claude Code speaks Anthropic Messages and a
-configured OpenAI-compatible endpoint speaks Chat Completions; pengepul translates between
-them, so a `groq/…` or `openrouter/…` model runs under `launch claude` like any other.
-
-`launch pi` needs pi's pengepul provider, installed once with `pi install
-npm:@pwguler/pi-pengepul-provider`; without it pi refuses with `Unknown provider
-"pengepul"`. pi binds a provider only together with a model, so a model is required
-there — from the picker, or from `--model`. Claude Code brings its own model list, so
-both are optional for `claude`.
-
 ### openclaw
 
 The embedded runner talks native Anthropic Messages. In `~/.openclaw/openclaw.json`,
@@ -219,20 +192,6 @@ Routes: `POST /v1/messages`, `POST /v1/chat/completions`, `POST /v1/responses`,
 `POST /v1/messages/count_tokens`, `GET /v1/models`, `GET /admin/accounts`,
 `POST /admin/reload`, and `GET /health` (unauthenticated). Every route but `/health` needs
 the local API key, as either `Authorization: Bearer <key>` or `x-api-key: <key>`.
-
-The provider is chosen by model id: `gpt-5`, `gpt-5.*`, `gpt-5-*`, `o<N>` and `codex-*`
-route to Codex, `claude-*` to Anthropic, and `<id>/<model>` routes to the configured
-provider `id` (`groq/llama-3.3-70b-versatile`). A request with no `model` is rejected
-with 400, as is a prefix no configured provider claims. A configured provider speaks
-Chat Completions upstream: a Messages request is translated onto it, while
-`count_tokens` and Responses answer 501 there.
-
-`GET /v1/models` entries also carry optional per-model metadata when pengepul knows it:
-`context_window`, `max_output_tokens`, `input_modalities` and `pricing` (per-million
-rates for input, output and cache reads/writes). Direct anthropic and codex models get
-these from a curated table; configured providers pass through whatever their own
-`/v1/models` publishes. Fields are omitted when unknown, and clients reading only `id`
-are unaffected.
 
 pengepul writes `~/.pengepul/config.yaml` when it is missing, generating a fresh
 `sk-local-…` key. The keys you can set:
