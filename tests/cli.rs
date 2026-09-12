@@ -643,6 +643,19 @@ fn accounts_renders_panels_with_detail_lines_on_a_tty() {
     assert!(visible.contains("│ tokens"));
     assert!(visible.contains("│ reasoning"));
     assert!(visible.contains("64.0K"));
+    // The reasoning row says which total it is a share of, because reasoning is a
+    // breakdown of `out` and not a term beside it (ADR-0023): 64.0K of 401.2K is 16%.
+    assert!(
+        visible.contains("64.0K of out (16%)"),
+        "the reasoning row does not name the total it is part of: {visible}"
+    );
+    // The cache figure carries its share of the prompt the upstream saw: 161.0M of
+    // 161.0M + 22.1M is 88%, and that ratio is comparable across pools only because the
+    // counters are disjoint (ADR-0023, AC-12).
+    assert!(
+        visible.contains("cache 161.0M (88%)"),
+        "the cache figure does not carry its share: {visible}"
+    );
     // The no-reasoning account omits the reasoning row (AC-6).
     assert!(visible.contains("in 0  out 0  cache 0"));
     assert!(!visible.contains("reasoning 0"));
@@ -1654,6 +1667,13 @@ fn accounts_breaks_usage_down_per_model_on_a_tty() {
     assert!(lines[fable + 1].contains("in 300"));
     assert!(lines[fable + 1].contains("out 400"));
     assert!(lines[fable + 1].contains("cache 8.5K"));
+    // AC-12: the shares the counts imply get their own line under each model, because three
+    // counts and two shares do not fit one 60-column row. fable: 8.5K of 8.8K cached, and 42
+    // of its 400 output tokens were reasoning.
+    assert!(lines[fable + 2].contains("97% cached  ·  11% of out was reasoning"));
+    // A model with no reasoning claims no share of out: sonnet served 700 cached of 800.
+    assert!(lines[sonnet + 2].contains("88% cached"));
+    assert!(!lines[sonnet + 2].contains("of out"));
 
     // AC-6 (revised): the pool footer carries no model aggregate; the
     // per-account lines are the only breakdown.

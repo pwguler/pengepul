@@ -27,13 +27,16 @@ question of what each vendor reports.
 - AC-7: The subtraction saturates at 0. An upstream that reports more cached tokens than prompt tokens cannot record a negative input count.
 - AC-8: `carried_tokens` is the same number for the same true prompt whether the upstream was Anthropic or OpenAI-dialect.
 - AC-9: An Anthropic usage that also carries `usage.iterations[]`, each entry with its own input and cache counters, records the top-level counters once. Today nothing pins that, so a future change that sums every counter it finds would silently multiply them.
-- AC-10: `output_tokens` means every token the model generated, reasoning included. The Anthropic and OpenAI dialects already report it that way — the Anthropic SDK states *"`output_tokens` remains the inclusive, authoritative total used for billing"* — and reasoning is folded into it where the vendor keeps the two apart, which is xAI's Chat dialect (`prompt_tokens: 32, completion_tokens: 9, reasoning_tokens: 110, total_tokens: 151`). After this, reasoning is a breakdown of `output_tokens` on every Provider, which is the assumption `carried_tokens` already makes.
+- AC-10: `output_tokens` means every token the model generated, reasoning included.
+ The Anthropic and OpenAI dialects already report it that way — the Anthropic SDK states *"`output_tokens` remains the inclusive, authoritative total used for billing"* — and reasoning is folded into it where the vendor keeps the two apart, which is xAI's Chat dialect (`prompt_tokens: 32, completion_tokens: 9, reasoning_tokens: 110, total_tokens: 151`). After this, reasoning is a breakdown of `output_tokens` on every Provider, which is the assumption `carried_tokens` already makes.
 
   The rule is total, so it also covers Gemini's `thoughtsTokenCount` beside
   `candidatesTokenCount` — but **no test covers Gemini and none can from here**: the relay
   never speaks the native API, `thoughtsTokenCount` appears in no code, and Google's
   OpenAI-compatible usage shape is itself unverified in the research file. The Gemini half of
   this criterion is a vendor fact recorded for the next dialect, not a tested path.
+- AC-11: The reasoning figure a panel shows names the total it is part of — `64.0K of out (16%)` — because reasoning is a breakdown of `output_tokens` and not a term beside it. A row whose `output_tokens` is 0 shows the count alone rather than dividing by zero, and a row whose reasoning exceeds its output shows both counts — `1.2K (out 93)` — because a percentage there would dress up two counters that cannot both be right.
+- AC-12: The cache figure a row shows carries its share of the prompt the upstream saw — `cache 1.3B (100%)` — and each model carries both of its shares on a line of its own, `97% cached  ·  11% of out was reasoning`, because three counts and two shares do not fit one 60-column row. This ratio is the hit rate the counter model exists to make comparable across Providers (ADR-0023). A share is left out rather than printed as `0%` when its count or its denominator is zero, and left out rather than printed above 100% when the two counters disagree.
 
 ## Verification
 
@@ -54,6 +57,8 @@ cargo test --test app a_chat_cache_write_is_recorded_as_a_cache_write      # AC-
 cargo test --test app more_cached_tokens_than_input_records_no_negative_input  # AC-7
 cargo test --test app an_anthropic_iterations_array_is_not_summed_into_the_counters  # AC-9
 cargo test --test app output_tokens_include_reasoning_where_the_vendor_counts_it_outside  # AC-10
+cargo test --test cli accounts_renders_panels_with_detail_lines_on_a_tty   # AC-11, AC-12
+cargo test --test cli accounts_breaks_usage_down_per_model_on_a_tty        # AC-12
 cargo test --lib usage_from_response
 cargo test --test accounts
 cargo test --locked --all-targets --all-features
