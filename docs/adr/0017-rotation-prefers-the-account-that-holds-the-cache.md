@@ -163,6 +163,13 @@ it. No window can avoid this without reading the whole list, which is what a
 byte-budget design was trying to prevent; a harness that opens its turn with a unique
 first user message (pi does) never hits it.
 
+`system` and `tools` are the mirror image of that choice, and stay unbounded on
+purpose. The window tolerates truncation because appends land at its end, so its opening
+identifies a conversation; a system prompt has no such property, and cutting one would
+collide two projects that share a preamble and differ only past the cut. The asymmetry
+is a decision, not an oversight, and a `tools` blob large enough to matter is refused by
+the body limit rather than by this key.
+
 The header path had the same class of bug and was missed. `header_str` returned any
 value, including an empty one, so a client sending `x-session-id:` with nothing after
 it gave every one of its conversations the key `""` and one failover moved all of

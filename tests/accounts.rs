@@ -426,6 +426,76 @@ async fn an_unreadable_usage_file_is_not_overwritten_with_zeros_at_load() {
 }
 
 #[tokio::test]
+async fn a_lost_usage_file_demotes_until_the_accounts_next_success() {
+    // ADR-0020 records that the ceiling reads persisted history, so losing `usage.json`
+    // demotes every account and a proven key can be parked for an hour. It also claims
+    // the reach of that is bounded. This pins the bound, because the ADR's account of
+    // the blast radius rests on it: the ceiling reads `total_successes` in memory, and
+    // `record_success` increments that same field, so one served request ends the
+    // demotion with no operator action and no restored file.
+    //
+    // The escalation is what makes this observable: the first billing rejection is
+    // always ten minutes, so a single failure distinguishes nothing. A demoted account
+    // keeps doubling toward the hour, a proven one stays flat.
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("proven@example.com")).expect("save token");
+    let usage = tmp.path().join("commandcode").join("usage.json");
+
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs_f64()
+    };
+    let remaining = |manager: &mut AccountManager| {
+        manager.snapshots().remove(0)["cooldownUntil"]
+            .as_f64()
+            .expect("cooldownUntil")
+            - now()
+    };
+
+    // First establish real history: this account has served, so the hour ceiling does
+    // not apply to it.
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    manager.record_success("proven@example.com", None, "deepseek-v4.1-flash");
+    assert!(
+        persisted(&usage)["proven@example.com"]["total_successes"]
+            .as_i64()
+            .expect("total_successes")
+            >= 1,
+        "the history this test removes has to exist first, or the test proves nothing"
+    );
+
+    // The file is lost — an operator tidying up, a fresh host, a bad restore.
+    fs::remove_file(&usage).expect("remove usage");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load without history");
+
+    // Demoted: four rejections that would hold a proven account at ten minutes now
+    // climb to the hour, because `total_successes` loaded as zero.
+    for _ in 0..4 {
+        manager.record_billing_cooldown("proven@example.com", "insufficient credits");
+    }
+    let demoted = remaining(&mut manager);
+    assert!(
+        (3_600.0 - 0.5..=3_600.0).contains(&demoted),
+        "a lost usage file should demote a proven account to the hour ceiling, got {demoted}s"
+    );
+
+    // One served request ends it, in this process, with nobody restoring anything.
+    manager.record_success("proven@example.com", None, "deepseek-v4.1-flash");
+    for _ in 0..4 {
+        manager.record_billing_cooldown("proven@example.com", "insufficient credits");
+    }
+    let recovered = remaining(&mut manager);
+    assert!(
+        (600.0 - 0.5..=600.0).contains(&recovered),
+        "one success should return the account to the flat billing cooldown, got {recovered}s"
+    );
+}
+
+#[tokio::test]
 async fn a_missing_usage_file_is_written_normally_not_treated_as_unreadable() {
     // The guard must not fire for a provider that simply has no history yet, or a first
     // run would never create the file.

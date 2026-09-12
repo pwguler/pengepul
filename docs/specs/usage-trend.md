@@ -131,7 +131,7 @@ before.
   landing judge.
 - **A fourth writer missed its bucket.** `record_refresh_exhausted`
   incremented `total_failures` with no daily counterpart, so cumulative
-  and bucketed failures diverged permanently on every reauth lockout.
+  and bucketed failures diverged permanently on every reauth cooldown.
   AC-1 named three methods; there were four.
 - **Emptiness was judged over the wrong set.** `trend_days` tested every
   bucket in the payload, not the buckets in the window, so a relay whose
@@ -218,10 +218,10 @@ before.
   failure. Found by the landing judge in the one case I told it I could
   not reason about. It is an in-flight **count** now; capping that count
   at 1 fails the test.
-- **A reauth lockout collapsed to two seconds.** `record_refresh_exhausted`
-  sets a 24-hour lockout, and the caller then recorded a failure for the
+- **A reauth cooldown collapsed to two seconds.** `record_refresh_exhausted`
+  sets a 24-hour cooldown, and the caller then recorded a failure for the
   same attempt — a call I added in round 2 for an outcome that was
-  already recorded. The 2-second backoff overwrote the lockout and the
+  already recorded. The 2-second backoff overwrote the cooldown and the
   operator's "re-run login" message, re-selecting a dead account into a
   failure loop. The redundant call is gone, and a cooldown now only ever
   grows.

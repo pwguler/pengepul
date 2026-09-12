@@ -128,9 +128,16 @@ asserting anything about *why* an account is failing.
   becomes indistinguishable from a dead one and its ceiling moves from ten minutes to
   an hour. Measured: the same account with `usage.json` intact caps at `600s` after
   four billing failures; with the file removed, the same four failures give `3600s`.
-  The rule is a policy decision resting on a reporting file, and the honest statement
-  of its reach is that a relay whose history is gone will be slow to retry proven keys
-  for as long as the histories stay gone.
+  The rule is a policy decision resting on a reporting file, so its reach is worth
+  stating exactly. That reach is bounded by the next success, not by the file: a served
+  request increments the same `total_successes` in memory, and the ceiling reads that
+  counter, so an account that serves once is out of the never-succeeded regime for the
+  rest of the run whether or not the file is ever restored (pinned by
+  `a_lost_usage_file_demotes_until_the_accounts_next_success`). What remains is the gap
+  between the loss and each account's next success — one request for a healthy pool, and
+  long only for a pool that is failing anyway, where the ceiling is the policy working as
+  intended rather than misfiring. Restoring the file is a separate matter: a served
+  request rewrites it, so putting a saved copy back needs an idle relay.
 - **What is protected is the load path, and only that.** `load_usage` maps an absent,
   truncated, malformed or non-object file to an empty map — a permissive contract the
   usage-persistence spec fixes for counters (its AC-5), and one this change does not

@@ -189,18 +189,30 @@ impl CliRuntime for FakeRuntime {
     }
 }
 
-fn run(argv: &[&str], home: &Path, runtime: &mut impl CliRuntime) -> RunOutcome {
-    // Default test path is Plain; the rich tests call run_style explicitly.
-    run_with_env(argv, home, home, runtime, Style::Plain).expect("cli run")
+fn run_ok(
+    argv: &[&str],
+    home: &Path,
+    cwd: &Path,
+    runtime: &mut impl CliRuntime,
+    style: Style,
+) -> RunOutcome {
+    // The status is asserted here rather than at each call site, and that is the
+    // point: a non-zero status is a failure even when `run_with_env` returned
+    // `Ok`. `--version` once exited 1 with the correct bytes, and no test could
+    // see it because the bytes were all they asserted (ADR-0021).
+    let outcome = run_with_env(argv, home, cwd, runtime, style)
+        .unwrap_or_else(|error| panic!("{argv:?} failed: {error:#}"));
+    assert_eq!(
+        outcome.code, 0,
+        "{argv:?} exited {} with stderr {:?}",
+        outcome.code, outcome.stderr
+    );
+    outcome
 }
 
-/// The error a failing command reports. `run` panics on failure, which
-/// is right for the happy path and useless for testing a refusal.
-fn run_err(argv: &[&str], home: &Path, runtime: &mut impl CliRuntime) -> String {
-    match run_with_env(argv, home, home, runtime, Style::Plain) {
-        Ok(outcome) => panic!("expected a refusal, got: {}", outcome.stdout),
-        Err(error) => format!("{error:#}"),
-    }
+fn run(argv: &[&str], home: &Path, runtime: &mut impl CliRuntime) -> RunOutcome {
+    // Default test path is Plain; the rich tests call run_style explicitly.
+    run_ok(argv, home, home, runtime, Style::Plain)
 }
 
 fn run_style(
@@ -209,7 +221,28 @@ fn run_style(
     runtime: &mut impl CliRuntime,
     style: Style,
 ) -> RunOutcome {
-    run_with_env(argv, home, home, runtime, style).expect("cli run")
+    run_ok(argv, home, home, runtime, style)
+}
+
+/// The message a refused command reports, in whichever shape the refusal takes.
+///
+/// `run_with_env` reports a runtime failure as `Err` and a usage error as an
+/// `Ok` outcome with a non-zero status (ADR-0021), so a helper that knew only
+/// about `Err` would read a rejected flag as a success. `run_ok` asserts the
+/// opposite, so a happy path cannot reach here.
+fn run_err(argv: &[&str], home: &Path, runtime: &mut impl CliRuntime) -> String {
+    match run_with_env(argv, home, home, runtime, Style::Plain) {
+        Err(error) => format!("{error:#}"),
+        Ok(outcome) if outcome.code != 0 => {
+            assert!(
+                outcome.stdout.is_empty(),
+                "a refusal wrote to stdout: {:?}",
+                outcome.stdout
+            );
+            outcome.stderr
+        }
+        Ok(outcome) => panic!("expected a refusal, got exit 0: {}", outcome.stdout),
+    }
 }
 
 #[test]
@@ -817,18 +850,18 @@ fn login_rejects_removed_provider() {
     write_config(tmp.path(), "127.0.0.1", 8317);
     let mut runtime = FakeRuntime::default();
 
-    // The removed provider fails at argument parsing, before any runtime call.
-    assert!(
-        run_with_env(
-            &["login", "--provider", "opencode"],
-            tmp.path(),
-            tmp.path(),
-            &mut runtime,
-            Style::Plain,
-        )
-        .is_err(),
-        "removed provider must be rejected at parse time"
+    // Not a parse error, though this comment claimed one for as long as the
+    // test existed: `--provider` is a free string, so opencode is rejected in
+    // the verb, because a provider that is neither built in nor configured has
+    // nowhere to send a request. Asserting the reason rather than `is_err()` is
+    // what keeps that distinction visible.
+    let error = run_err(
+        &["login", "--provider", "opencode"],
+        tmp.path(),
+        &mut runtime,
     );
+    assert!(error.contains("opencode"), "{error}");
+    assert!(error.contains("not configured"), "{error}");
     assert!(runtime.login_provider.is_none());
 }
 
@@ -885,17 +918,12 @@ fn login_without_key_for_a_configured_provider_fails() {
     );
     let mut runtime = FakeRuntime::default();
 
-    assert!(
-        run_with_env(
-            &["login", "--provider", "groq"],
-            tmp.path(),
-            tmp.path(),
-            &mut runtime,
-            Style::Plain,
-        )
-        .is_err(),
-        "a configured provider needs a --key"
-    );
+    // Asserting the reason rather than only that it failed: `is_err()` alone is
+    // satisfied by any refusal, including one from a parse error or a different
+    // verb, which is the shape that let `--version` ship broken.
+    let error = run_err(&["login", "--provider", "groq"], tmp.path(), &mut runtime);
+    assert!(error.contains("groq"), "{error}");
+    assert!(error.contains("--key"), "{error}");
     assert!(runtime.login_provider.is_none());
 }
 
@@ -2491,6 +2519,20 @@ fn version_prints_the_same_bytes_in_both_styles() {
 /// The companion case: `--help` is what a user pipes into a pager or greps,
 /// and it is the same clap path as `--version`, so it must land on stdout
 /// with a zero status too. It had no test at all before this one.
+/// The other half of the contract: a usage error is a refusal too, and it
+/// arrives as an `Ok` outcome with status 2 rather than an `Err` (ADR-0021).
+/// `run_err` is the only helper that has to read both shapes, so this drives
+/// the branch that a helper knowing only about `Err` would leave dead — and
+/// would report as a success.
+#[test]
+fn a_rejected_flag_is_refused_not_a_success() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime = FakeRuntime::default();
+
+    let message = run_err(&["--no-such-flag"], tmp.path(), &mut runtime);
+    assert!(message.contains("--no-such-flag"), "{message}");
+}
+
 #[test]
 fn help_prints_to_stdout_and_succeeds() {
     let tmp = tempdir().expect("tempdir");
@@ -3886,7 +3928,7 @@ fn registration_follows_a_migrated_legacy_config() {
     .expect("write legacy config");
     let mut runtime = FakeRuntime::default();
 
-    run_with_env(
+    run_ok(
         &[
             "login",
             "--provider",
@@ -3900,8 +3942,7 @@ fn registration_follows_a_migrated_legacy_config() {
         &cwd,
         &mut runtime,
         Style::Plain,
-    )
-    .expect("cli run");
+    );
 
     let home_config = std::fs::read_to_string(tmp.path().join(".pengepul").join("config.yaml"))
         .expect("the migrated config was not written");
@@ -4207,7 +4248,7 @@ fn a_failed_config_write_takes_its_credential_back() {
     std::fs::set_permissions(&config_path, permissions).expect("chmod");
     let mut runtime = FakeRuntime::default();
 
-    let error = run_with_env(
+    let error = run_err(
         &[
             "--config",
             config_path.to_str().expect("path"),
@@ -4220,13 +4261,8 @@ fn a_failed_config_write_takes_its_credential_back() {
             "sk-orphan",
         ],
         tmp.path(),
-        tmp.path(),
         &mut runtime,
-        Style::Plain,
-    )
-    .expect_err("a failed config write reported success");
-
-    let error = format!("{error:#}");
+    );
     assert!(
         error.contains("Permission denied") || error.contains("failed to write"),
         "the failure was not reported: {error}"
@@ -4264,7 +4300,7 @@ fn the_cleanup_never_empties_an_existing_pool() {
     let mut runtime = FakeRuntime::default();
     // Seed the pool through the CLI, so the file carries the label the
     // key actually hashes to and the second run overwrites it.
-    run_with_env(
+    run(
         &[
             "--config",
             config_path.to_str().expect("path"),
@@ -4275,11 +4311,8 @@ fn the_cleanup_never_empties_an_existing_pool() {
             "sk-legit",
         ],
         tmp.path(),
-        tmp.path(),
         &mut runtime,
-        Style::Plain,
-    )
-    .expect("seed the pool");
+    );
     let seeded: Vec<_> = std::fs::read_dir(&pool)
         .expect("read pool")
         .filter_map(|entry| {
@@ -4298,7 +4331,11 @@ fn the_cleanup_never_empties_an_existing_pool() {
     // The configured URL and the seeded key: accepted, so save_token
     // overwrites key-legit.json, and only then does the config write
     // fail.
-    let _ = run_with_env(
+    // Expected to fail: the config is read-only, so the write cannot land. The
+    // refusal is asserted rather than discarded, because a success here would
+    // mean the read-only config was written and the artifact assertions below
+    // would be checking the wrong thing.
+    let refusal = run_with_env(
         &[
             "--config",
             config_path.to_str().expect("path"),
@@ -4314,6 +4351,10 @@ fn the_cleanup_never_empties_an_existing_pool() {
         tmp.path(),
         &mut runtime,
         Style::Plain,
+    );
+    assert!(
+        refusal.is_err(),
+        "a read-only config was written: {refusal:?}"
     );
 
     assert!(
@@ -4410,7 +4451,7 @@ fn a_pool_that_outlives_its_config_entry_is_not_rolled_back() {
     )
     .expect("write config");
     let mut runtime = FakeRuntime::default();
-    run_with_env(
+    run(
         &[
             "--config",
             config_path.to_str().expect("path"),
@@ -4421,11 +4462,8 @@ fn a_pool_that_outlives_its_config_entry_is_not_rolled_back() {
             "sk-legit",
         ],
         tmp.path(),
-        tmp.path(),
         &mut runtime,
-        Style::Plain,
-    )
-    .expect("seed the pool");
+    );
     let seeded: Vec<_> = std::fs::read_dir(auth_dir.join("groq"))
         .expect("read pool")
         .filter_map(|entry| {
@@ -4444,7 +4482,11 @@ fn a_pool_that_outlives_its_config_entry_is_not_rolled_back() {
     permissions.set_readonly(true);
     std::fs::set_permissions(&config_path, permissions).expect("chmod");
 
-    let _ = run_with_env(
+    // Expected to fail: the config is read-only, so the write cannot land. The
+    // refusal is asserted rather than discarded, because a success here would
+    // mean the read-only config was written and the artifact assertions below
+    // would be checking the wrong thing.
+    let refusal = run_with_env(
         &[
             "--config",
             config_path.to_str().expect("path"),
@@ -4460,6 +4502,10 @@ fn a_pool_that_outlives_its_config_entry_is_not_rolled_back() {
         tmp.path(),
         &mut runtime,
         Style::Plain,
+    );
+    assert!(
+        refusal.is_err(),
+        "a read-only config was written: {refusal:?}"
     );
 
     assert!(

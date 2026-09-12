@@ -65,3 +65,17 @@ those to stderr with status 1.
   is not evidence about how a non-failure presents itself, and a test comment
   naming a mechanism is not evidence that the mechanism is reached. Both were
   present here, in the one test written to protect this surface.
+- The same blindness sat one level up and was fixed with it. The `run` and
+  `run_style` helpers asserted only that `run_with_env` returned `Ok`, so a happy
+  path exiting non-zero was invisible to all 118 call sites using them (measured:
+  66 `run(` plus 52 `run_style(`, definitions excluded — a `grep` for `run(&[` finds
+  99, missing the `run(argv, ...)` form, which is the mistake an earlier draft made).
+  This change adds two of its own, so the same count reads 120 afterwards. They now
+  assert status 0 through `run_ok`, and `run_err` reads both refusal shapes — an
+  `Err` and a non-zero outcome — because a helper that knew only about `Err`
+  would report a rejected flag as a success. Two sites that discarded the result
+  with `let _ =` now assert the refusal they were relying on.
+- Measured, not assumed: making a happy path exit 1 fails 95 CLI tests where it
+  previously failed 62. The 33 that gained sensitivity are tests that never
+  checked a status at all. None of the original 62 covered the clap path, which
+  is why the bug outlived them.

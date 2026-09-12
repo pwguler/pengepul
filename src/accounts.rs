@@ -65,7 +65,8 @@ pub struct RefreshPolicy {
     pub seconds: i64,
 }
 
-/// Where a selection's account came from. Logged at the selection site so a
+/// Where the account a request was handed to came from. Logged where Rotation
+/// decides, so a
 /// cache miss can be correlated with the account switch that caused it: a
 /// conversation re-reads its prefix cold every time its recorded account
 /// stops being selectable, and nothing else in the logs says so (ADR-0017).
@@ -507,10 +508,10 @@ impl AccountManager {
         let multiplier = 2_f64.powi(i32::try_from(state.failure_count - 1).unwrap_or(0));
         let cooldown = unix_now() + (base * multiplier).min(maximum);
         // Same rule as `record_failure`: a cooldown only ever grows, so a billing
-        // rejection cannot collapse a 24-hour reauth lockout back to minutes — and the
+        // rejection cannot collapse a 24-hour reauth cooldown back to minutes — and the
         // recorded reason belongs inside that guard for the same reason its sibling keeps
         // it there. Writing "billing" outside would leave an account parked on the reauth
-        // lockout with `lastError` claiming exhausted credits, hiding the one field
+        // cooldown with `lastError` claiming exhausted credits, hiding the one field
         // CONTEXT.md tells the operator to read for a Reauth.
         if cooldown > state.cooldown_until {
             state.cooldown_until = cooldown;
@@ -530,7 +531,7 @@ impl AccountManager {
         let (base, maximum) = state.failure_cooldown(kind);
         let multiplier = 2_f64.powi(i32::try_from(state.failure_count - 1).unwrap_or(0));
         let cooldown = unix_now() + (base * multiplier).min(maximum);
-        // A cooldown only ever grows. A reauth lockout is 24 hours; a
+        // A cooldown only ever grows. A reauth cooldown is 24 hours; a
         // failure recorded after it must not collapse the account back to
         // seconds and re-select it into a failure loop.
         if cooldown > state.cooldown_until {

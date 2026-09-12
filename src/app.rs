@@ -1889,12 +1889,17 @@ const AFFINITY_MESSAGE_BYTES: usize = 4 * 1024;
 /// does not preserve a cache so much as switch Rotation off.
 ///
 /// Only the message window is byte-bounded. `system` and `tools` are serialized
-/// whole, as they always have been, so a pathological tool list is still hashed in
-/// full — pre-existing, and not free: measured against a 200 MB body limit, the
-/// message window costs ~1 ms while a 20 MB `tools` description costs ~2.4 s per
-/// call. Real harness tool lists are three orders of magnitude smaller than that, so
-/// this is a latent cost rather than a live one, but it is unbounded by design and
-/// the window next to it is not.
+/// whole, as they always have been, so a pathological tool list is hashed in full —
+/// measured against a 200 MB body limit, the window costs ~1 ms while a 20 MB `tools`
+/// description costs ~2.4 s per call.
+///
+/// That is left alone deliberately, and the reason is the collision bounding it would
+/// buy. The window tolerates truncation because appends land at its end, so its opening
+/// is what identifies a conversation; `system` has no such property, and truncating it
+/// would let two projects sharing a long system preamble, differing only past the cut,
+/// share one affinity entry — the class of bug this key exists to remove. Real harness
+/// payloads sit orders of magnitude below the trigger, and the cost needs a valid API
+/// key, so the unbounded hash is cheaper than the collision. ADR-0017 records it.
 fn conversation_key(headers: &HeaderMap, body: &Value, route: RequestRoute) -> String {
     // `header_str` treats a blank value as absent. It did not always: a client sending
     // `x-session-id:` with nothing after it collapsed every one of its conversations
@@ -2057,8 +2062,8 @@ async fn next_provider_account(
         Ok(false) => {
             // The outcome is already recorded: `refresh_if_due` reaches
             // here only after `record_refresh_exhausted`, which settled
-            // the attempt and set the 24-hour reauth lockout. Recording a
-            // failure here would collapse that lockout to seconds and
+            // the attempt and set the 24-hour reauth cooldown. Recording a
+            // failure here would collapse that cooldown to seconds and
             // overwrite the operator's "re-run login" message.
             return Err(AppError::provider(
                 StatusCode::BAD_GATEWAY,
@@ -2077,7 +2082,7 @@ async fn next_provider_account(
             ));
         }
     }
-    // One line per selection, and the only one that says which account a
+    // One line per Rotation decision, and the only one that says which account a
     // conversation landed on and why. `debug: off` keeps it out of the
     // default log; `RUST_LOG=pengepul=debug` turns it on for exactly this
     // question.
@@ -2112,7 +2117,7 @@ async fn record_provider_success(
     manager.record_success(account.token.email.as_str(), usage.as_ref(), model);
 }
 
-/// Count a routing refusal against the account that was selected, without
+/// Count a routing refusal against the account Rotation handed it to, without
 /// the cooldown a real failure earns.
 async fn record_provider_refusal(
     state: &AppState,
@@ -3497,6 +3502,180 @@ mod tests {
             *upstream.calls.lock().expect("calls lock"),
             ["bob@example.com"]
         );
+    }
+
+    /// Records every `tracing` event as its fields, so a test can assert what a
+    /// log line carries rather than how it happens to render.
+    /// The fields of one captured event, as `(name, value)` pairs.
+    type CapturedFields = Vec<Vec<(String, String)>>;
+
+    #[derive(Clone, Default)]
+    struct CapturedEvents(Arc<std::sync::Mutex<CapturedFields>>);
+
+    impl tracing::Subscriber for CapturedEvents {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut capture = FieldCapture::default();
+            event.record(&mut capture);
+            let mut fields = vec![("target".to_string(), event.metadata().target().to_string())];
+            fields.extend(capture.0);
+            self.0.lock().expect("capture lock").push(fields);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[derive(Default)]
+    struct FieldCapture(Vec<(String, String)>);
+
+    impl tracing::field::Visit for FieldCapture {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .push((field.name().to_string(), format!("{value:?}")));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.push((field.name().to_string(), value.to_string()));
+        }
+    }
+
+    /// One field off a captured event, with the quotes a `Debug`-recorded value
+    /// carries stripped, so an assertion is about the value and not its form.
+    fn field_of<'a>(fields: &'a [(String, String)], name: &str) -> &'a str {
+        for (key, value) in fields {
+            if key == name {
+                return value.trim_matches('"');
+            }
+        }
+        panic!("no {name} field in {fields:?}")
+    }
+
+    /// The line Rotation logs is the only place that says which account a conversation
+    /// landed on and why, and it had no test: a field could be renamed or dropped with
+    /// nothing to notice, which is the same blindness `--version` had. The request path
+    /// is not needed to reach it — the decision emits it.
+    ///
+    /// The fixture carries two accounts on one provider, a second conversation and a
+    /// second provider, because a single-account fixture passes while the line logs
+    /// constants: every value it asserts is then also the only value it could print.
+    /// So each assertion below compares two decisions against each other, or against
+    /// the account the decision actually returned, rather than against a literal.
+    #[tokio::test]
+    async fn the_selection_logs_the_conversation_the_account_and_the_outcome() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        save_token(
+            tmp.path(),
+            &token(
+                "alice@example.com",
+                "anthropic-access-alice",
+                "2030-01-01T00:00:00Z",
+            ),
+        )
+        .expect("save alice");
+        save_token(
+            tmp.path(),
+            &token(
+                "bob@example.com",
+                "anthropic-access-bob",
+                "2030-01-01T00:00:00Z",
+            ),
+        )
+        .expect("save bob");
+        let mut carol = token(
+            "carol@example.com",
+            "codex-access-carol",
+            "2030-01-01T00:00:00Z",
+        );
+        carol.provider = ProviderId::codex();
+        save_token(tmp.path(), &carol).expect("save carol");
+        let upstream = Arc::new(CapturingUpstream::default());
+        let state = test_state(tmp.path(), upstream);
+
+        let captured = CapturedEvents::default();
+        let _guard = tracing::subscriber::set_default(captured.clone());
+
+        // conversation-a twice: no affinity entry, then the one it just recorded.
+        let a_first =
+            super::next_provider_account(&state, ProviderId::anthropic(), "conversation-a")
+                .await
+                .expect("conversation-a, first");
+        let a_again =
+            super::next_provider_account(&state, ProviderId::anthropic(), "conversation-a")
+                .await
+                .expect("conversation-a, second");
+        // conversation-b is new, so Rotation advances to the other anthropic account.
+        let b = super::next_provider_account(&state, ProviderId::anthropic(), "conversation-b")
+            .await
+            .expect("conversation-b");
+        // A different provider, so the logged provider cannot be a constant.
+        let c = super::next_provider_account(&state, ProviderId::codex(), "conversation-c")
+            .await
+            .expect("conversation-c");
+
+        // What the fixture guarantees, stated so the assertions below are checkable:
+        // the repeat holds its account, a new conversation moves to the other one, and
+        // codex has only carol.
+        assert_eq!(a_first.token.email, a_again.token.email);
+        assert_ne!(
+            a_first.token.email, b.token.email,
+            "the fixture needs two anthropic accounts for this test to mean anything"
+        );
+        assert_eq!(c.token.email, "carol@example.com");
+
+        let events = captured.0.lock().expect("capture lock").clone();
+        let selected: Vec<_> = events
+            .iter()
+            .filter(|fields| {
+                fields
+                    .iter()
+                    .any(|(key, value)| key == "message" && value.contains("account selected"))
+            })
+            .collect();
+        assert_eq!(selected.len(), 4, "one line per decision: {events:?}");
+        for line in &selected {
+            assert_eq!(field_of(line, "target"), "pengepul::app");
+        }
+
+        // Conversation: hardcoding it collapses these four into one value.
+        assert_eq!(field_of(selected[0], "conversation"), "conversation-a");
+        assert_eq!(field_of(selected[1], "conversation"), "conversation-a");
+        assert_eq!(field_of(selected[2], "conversation"), "conversation-b");
+        assert_eq!(field_of(selected[3], "conversation"), "conversation-c");
+
+        // Account: matched against the decision's own return, and the two anthropic
+        // accounts have to differ or a constant would satisfy this.
+        assert_eq!(field_of(selected[0], "account"), a_first.token.email);
+        assert_eq!(field_of(selected[1], "account"), a_first.token.email);
+        assert_eq!(field_of(selected[2], "account"), b.token.email);
+        assert_ne!(
+            field_of(selected[2], "account"),
+            field_of(selected[0], "account")
+        );
+        assert_eq!(field_of(selected[3], "account"), "carol@example.com");
+
+        // Provider: two of them, so a constant fails one line or the other.
+        assert_eq!(field_of(selected[0], "provider"), "anthropic");
+        assert_eq!(field_of(selected[2], "provider"), "anthropic");
+        assert_eq!(field_of(selected[3], "provider"), "codex");
+
+        // Outcome: the only field whose value varies without the fixture varying.
+        assert_eq!(field_of(selected[0], "affinity"), "rotation");
+        assert_eq!(field_of(selected[1], "affinity"), "honored");
+        assert_eq!(field_of(selected[2], "affinity"), "rotation");
+        assert_eq!(field_of(selected[3], "affinity"), "rotation");
     }
 
     fn test_config(auth_dir: std::path::PathBuf) -> Config {
