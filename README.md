@@ -1,12 +1,12 @@
 # pengepul
 
 Run your own API relay for your AI subscriptions. Log in your Claude and ChatGPT/Codex
-accounts once; pengepul serves every request from the pool, so your harness runs on your
-subscription instead of a per-token API key.
+accounts once and every request is served from the pool, so your harness runs on your
+subscription instead of a per-token key.
 
 - Pools several subscription accounts per provider and spreads requests across them.
 - Serves your subscription inside openclaw and hermes, with no API key.
-- Relays any OpenAI-compatible API (groq, openrouter, deepseek, ...) through the same pool.
+- Relays any OpenAI-compatible API (groq, openrouter, deepseek, ...) through the pool.
 - Exposes the pool as a REST API, local or networked, for your own tools.
 
 ## Install
@@ -29,17 +29,16 @@ pengepul serve --host 0.0.0.0 --port 8317 # reachable across your network
 pengepul launch claude # run Claude Code on the pool
 ```
 
-Log in more than once per provider to pool several accounts; requests round-robin across
-them. Credentials live under `~/.pengepul` (`0600`); a running relay picks up a fresh
-login on restart or `pengepul accounts --reload`. Read the local API key clients use from
-`pengepul config api-key`. Exposed on a network, that key is the only thing guarding your
-pooled subscriptions, so keep it secret and prefer a trusted network or an SSH tunnel.
+Log in more than once per provider to pool accounts; requests rotate across them.
+Credentials live in `~/.pengepul` (`0600`); a running relay picks up a fresh login on
+restart or `pengepul accounts --reload`. Read the key clients use with `pengepul config
+api-key`. That key alone guards your subscriptions, so keep it secret and prefer a trusted
+network or an SSH tunnel.
 
 ### OpenAI-compatible endpoints
 
-Point the pool at any service that speaks the OpenAI API. One command registers the
-endpoint and saves its key; requests address its models with a `<provider>/<model>`
-prefix:
+Point the pool at any service speaking the OpenAI API. One command registers the
+endpoint and saves its key; address its models as `<provider>/<model>`:
 
 ```sh
 pengepul login --provider openrouter \
@@ -47,20 +46,17 @@ pengepul login --provider openrouter \
 systemctl --user restart pengepul   # or: pengepul service restart
 ```
 
-A provider id becomes a directory name under the auth dir, so it may hold letters,
-digits, `.`, `-` and `_`; `.` and `..` are refused, since a filesystem
-reads them as somewhere else. Providers are read at startup, so the relay needs a restart
-before it will serve a new one. Registration is for new providers only: an id already in
-the file with a different `base-url` is an error naming the URL it kept, so a mistyped
-flag cannot move a live provider's traffic to another host. Repeating the same command
-is safe. Changing an endpoint, or removing one, means editing the file.
+A provider id becomes a directory under the auth dir: letters, digits, `.`, `-`, `_`;
+never `.` or `..`, which a filesystem reads as somewhere else. Providers load at startup, so a new one needs a restart. Registration
+only adds: an id already present with a different `base-url` errors, naming the URL it
+kept, so a mistyped flag cannot move live traffic. Repeating is safe; changing or removing
+one means editing the file.
 
-Registration rewrites `config.yaml`, so values survive but comments do not, and it holds
-a `config.yaml.lock` beside it for the length of the write. If a registration is killed,
-that lock can outlive it: the next one names the file and stops, and removing the file
-is the whole recovery.
+Registration rewrites `config.yaml`: values survive, comments do not. It holds a
+`config.yaml.lock` for the write, and a killed registration can leave that lock behind.
+The next one then names the file and stops, and removing it is the whole recovery.
 
-Editing the file by hand works too — one entry per endpoint, then `pengepul login
+Editing the file by hand works too: one entry per endpoint, then `pengepul login
 --provider <id> --key $KEY`:
 
 ```sh
@@ -80,11 +76,11 @@ curl -sS http://127.0.0.1:8317/v1/chat/completions \
   "messages": [{"role": "user", "content": "reply exactly: pong"}]}'
 ```
 
-Configured endpoints accept the Chat Completions dialect and rotate across their keys
-with the same failure handling as the subscription providers.
+Configured endpoints speak Chat Completions and rotate across their keys with the same
+failure handling as subscription providers.
 
-Login opens a browser and completes on a localhost callback. On a remote host, forward the
-callback port first:
+Login opens a browser and finishes on a localhost callback. On a remote host, forward the
+port first:
 
 ```sh
 ssh -L 54545:localhost:54545 user@host # anthropic
@@ -95,8 +91,8 @@ ssh -L 1455:localhost:1455 user@host # codex
 
 ### openclaw
 
-The embedded runner talks native Anthropic Messages. In `~/.openclaw/openclaw.json`,
-register a `pengepul` provider and select it with a `pengepul/`-prefixed model. A bare
+The embedded runner speaks native Anthropic Messages. In `~/.openclaw/openclaw.json`,
+register a `pengepul` provider and select it with a `pengepul/`-prefixed model; a bare
 `claude-…` resolves to the claude-cli backend and bypasses pengepul:
 
 ```json
@@ -119,8 +115,7 @@ register a `pengepul` provider and select it with a `pengepul/`-prefixed model. 
 
 ### hermes
 
-Register pengepul as a named provider on the native Messages wire, in
-`HERMES_HOME/config.yaml`:
+Register pengepul on the native Messages wire in `HERMES_HOME/config.yaml`:
 
 ```sh
 hermes config set model.provider pengepul
@@ -130,19 +125,18 @@ hermes config set providers.pengepul.api_mode anthropic_messages
 hermes config set providers.pengepul.api_key <pengepul api-key>
 ```
 
-- `api_mode: anthropic_messages` forces the native wire. The `base_url` may be the root
-  or end in `/v1`; both work.
-- Use `provider: pengepul`, not `anthropic`. An `anthropic` provider makes hermes
-  autodiscover the operator's `~/.claude` OAuth and route to `api.anthropic.com`,
-  bypassing pengepul.
-- Rotating `providers.*.api_key` in an existing home caches the old key's rejection in
-  `auth.json`; use a fresh home or delete `auth.json`.
+- `api_mode: anthropic_messages` forces the native wire. `base_url` may be the root or
+  end in `/v1`.
+- Use `provider: pengepul`, not `anthropic`: that makes hermes autodiscover `~/.claude`
+  OAuth and route to `api.anthropic.com`, bypassing pengepul.
+- Rotating `providers.*.api_key` caches the old key's rejection in `auth.json`; use a
+  fresh home or delete it.
 
 ### Your own harness
 
-pengepul is a plain REST relay, so any client that speaks the Anthropic or OpenAI API can
+pengepul is a plain REST relay, so any client speaking the Anthropic or OpenAI API can
 run on the pool. Point it at `http://127.0.0.1:8317/v1` with the local API key; a root
-base URL without `/v1` works as well.
+URL without `/v1` works too.
 
 ```sh
 # Claude, on the Anthropic Messages API
@@ -183,7 +177,7 @@ pengepul service install|start|stop|restart|status|uninstall|logs # manage the u
 ```
 
 Run `pengepul <command> --help` for flags. The service is user-scoped, so
-`systemctl status pengepul` will not find it; use `pengepul service status`, or add
+`systemctl status pengepul` will not find it: use `pengepul service status` or add
 `--user`.
 
 ## Reference
@@ -191,10 +185,10 @@ Run `pengepul <command> --help` for flags. The service is user-scoped, so
 Routes: `POST /v1/messages`, `POST /v1/chat/completions`, `POST /v1/responses`,
 `POST /v1/messages/count_tokens`, `GET /v1/models`, `GET /admin/accounts`,
 `POST /admin/reload`, and `GET /health` (unauthenticated). Every route but `/health` needs
-the local API key, as either `Authorization: Bearer <key>` or `x-api-key: <key>`.
+the local API key, sent as `Authorization: Bearer <key>` or `x-api-key: <key>`.
 
-pengepul writes `~/.pengepul/config.yaml` when it is missing, generating a fresh
-`sk-local-…` key. The keys you can set:
+pengepul writes `~/.pengepul/config.yaml` when missing, with a fresh `sk-local-…` key. The
+keys you can set:
 
 ```yaml
 host: '' # empty binds 127.0.0.1, not every interface
