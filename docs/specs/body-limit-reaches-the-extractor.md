@@ -60,5 +60,23 @@ AC-4 is verified by making `load_config` swallow the parse error, which must fai
 `an_unparseable_body_limit_is_refused_at_load`. AC-5 and AC-6 are verified by grep and by
 `body_limit_loads_as_the_number_it_spells`.
 
-Live, against a relay built from this tree with `body-limit: 200mb`: a 2,097,153-byte body
-must be read (not 413), where the shipped build answered 413.
+Live, against the deployed relay (`pengepul 0.19.2`, `body-limit: 200mb`): a 2,097,153-byte
+body must be read (not 413), where the shipped build answered 413.
+
+**That live run is done**, driven as a real growing session on both dialects, all 15 turns
+single-attempt:
+
+| turn | dialect | body bytes | status |
+| --- | --- | --- | --- |
+| chat t5 | /v1/chat/completions | 2,314,846 | 200 |
+| chat t8 | /v1/chat/completions | 3,211,968 | 200 |
+| messages t2 | /v1/messages | 2,160,981 | 200 |
+| messages t4 | /v1/messages | 2,814,186 | 200 |
+| boundary | both | 2,097,153 | 200 |
+
+Ten of the fifteen bodies were over 2 MiB and all returned 200; the largest served was
+3,211,968 bytes. The relay's log recorded zero `length limit exceeded` across the run. The
+bodies were real content, not padding: the bytes-per-token ratio held at 4.15-4.41 as the
+session grew, which a truncated body would have collapsed. The upper direction is **not**
+verified by this: nothing near 200 MB was sent, so that a body above the configured limit is
+still refused rests on AC-2's boundary test and not on this run.
