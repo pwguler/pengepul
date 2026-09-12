@@ -253,29 +253,3 @@ timeouts:
   count-tokens-ms: 30000
 debug: off # off | errors | verbose
 ```
-
-`body-limit` is enforced while the body is read, so it is the number that actually bounds
-a request; it is also checked against the declared `Content-Length`. A value that does
-not parse stops the relay at startup rather than being answered per request. Leaving it
-empty means no ceiling at all — and a body is buffered before the API key is checked, so
-set it unless the relay is unreachable by anything you would not trust with your memory
-(ADR-0022).
-
-Requests round-robin across accounts, preferring the account that already holds a
-conversation's cached prefix and never waiting for it — a cooling account is passed
-over rather than stalled for (ADR-0017). Failover re-enters rotation, so a request
-fails over once per account on upstream 401, 403, 429, 500 and 502-599. Failover
-never crosses providers: a request stays on the endpoint or subscription family it
-named. A failed account sits out a failure cooldown that doubles from a second and
-caps at 5 minutes — an hour for one that has never once succeeded (ADR-0020) — and
-a dead refresh token locks it out for 24 hours until a fresh `pengepul login`.
-
-`pengepul status` shows one block: where the relay is, one summary line per pool, and
-the relay-wide totals — requests served and tokens in/out/cache. `pengepul accounts`
-is the detailed view: a panel per pool with per-account rows, share-of-pool bars, and
-the models each account served. `pengepul usage` shows the last 30 days as a
-sparkline, with the peak day, this window's tokens, and the all-time figure `status`
-prints. In a terminal all three render as panels; piped or `NO_COLOR` output stays
-plain — `usage` piped is one parseable row per day. The counters persist to
-`usage.json` in each provider's auth directory, so they survive a restart; daily
-buckets are kept for 90 days and cooldowns are not persisted at all.

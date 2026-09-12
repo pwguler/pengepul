@@ -167,7 +167,7 @@ first user message (pi does) never hits it.
 purpose. The window tolerates truncation because appends land at its end, so its opening
 identifies a conversation; a system prompt has no such property, and cutting one would
 collide two projects that share a preamble and differ only past the cut. The asymmetry
-is a decision, not an oversight, and a `tools` blob large enough to matter is refused by
+is a decision, not an oversight, and a `tools` blob large enough to matter is turned away by
 the body limit rather than by this key.
 
 The header path had the same class of bug and was missed. `header_str` returned any
