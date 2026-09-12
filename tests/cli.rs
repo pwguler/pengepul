@@ -2461,28 +2461,51 @@ fn the_service_header_does_not_repeat_the_state_row() {
     );
 }
 
-/// consistent-panels AC-8: `--version` is the one plain surface with no
-/// test at all, and it is the surface most likely to be parsed by a
-/// script. It leaves through clap's own exit path, never the verb
-/// dispatch, so neither Style can turn it into a panel.
+/// consistent-panels AC-8: `--version` is the surface most likely to be
+/// parsed by a script, so it has to be readable the way a script reads it.
+/// It leaves through clap's own path, never the verb dispatch, so neither
+/// Style can turn it into a panel — but that path still has to answer on
+/// stdout with a zero status. It used to surface as an error on stderr with
+/// status 1, which emptied `$(pengepul --version)`.
 #[test]
 fn version_prints_the_same_bytes_in_both_styles() {
     let tmp = tempdir().expect("tempdir");
     let mut runtime = FakeRuntime::default();
 
-    let mut text = |style: Style| -> String {
-        let error = run_with_env(&["--version"], tmp.path(), tmp.path(), &mut runtime, style)
-            .expect_err("--version leaves through clap");
-        error.to_string()
+    let mut outcome = |style: Style| -> RunOutcome {
+        run_with_env(&["--version"], tmp.path(), tmp.path(), &mut runtime, style)
+            .expect("--version is an answer, not a failure")
     };
 
-    let plain = text(Style::Plain);
+    let plain = outcome(Style::Plain);
+    assert_eq!(plain.code, 0, "a version request is not an error");
+    assert_eq!(plain.stderr, "", "a script reads stdout, not stderr");
     assert_eq!(
-        plain.trim_end(),
+        plain.stdout.trim_end(),
         format!("pengepul {}", env!("CARGO_PKG_VERSION"))
     );
     // Same bytes under a rich terminal: a version string is machine-read.
-    assert_eq!(plain, text(Style::Rich));
+    assert_eq!(plain.stdout, outcome(Style::Rich).stdout);
+}
+
+/// The companion case: `--help` is what a user pipes into a pager or greps,
+/// and it is the same clap path as `--version`, so it must land on stdout
+/// with a zero status too. It had no test at all before this one.
+#[test]
+fn help_prints_to_stdout_and_succeeds() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime = FakeRuntime::default();
+
+    let outcome = run_style(&["--help"], tmp.path(), &mut runtime, Style::Plain);
+
+    assert_eq!(outcome.code, 0, "asking for help is not a failure");
+    assert_eq!(outcome.stderr, "", "help is read through a pipe");
+    assert!(
+        outcome.stdout.contains("Usage: pengepul"),
+        "{}",
+        outcome.stdout
+    );
+    assert!(outcome.stdout.contains("serve"), "{}", outcome.stdout);
 }
 
 /// consistent-panels AC-9: an over-long *header* is marked when clipped,
@@ -4670,18 +4693,21 @@ fn launch_refuses_a_harness_it_does_not_know() {
     write_config(tmp.path(), "127.0.0.1", 8317);
     let mut runtime = FakeRuntime::default();
 
-    let error = run_with_env(
+    // clap rejects an unknown harness before the verb runs, so this is a usage
+    // error: the complaint on stderr, exit status 2, and nothing on stdout.
+    let outcome = run_with_env(
         &["launch", "openclaw"],
         tmp.path(),
         tmp.path(),
         &mut runtime,
         Style::Plain,
     )
-    .expect_err("an unknown harness must be rejected");
+    .expect("a usage error is an outcome the process reports, not a library failure");
 
-    let error = format!("{error:#}");
-    assert!(error.contains("claude"), "{error}");
-    assert!(error.contains("pi"), "{error}");
+    assert_eq!(outcome.code, 2, "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "a usage error must not pollute stdout");
+    assert!(outcome.stderr.contains("claude"), "{}", outcome.stderr);
+    assert!(outcome.stderr.contains("pi"), "{}", outcome.stderr);
     assert!(runtime.launch_plan.is_none());
 }
 

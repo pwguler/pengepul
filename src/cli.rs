@@ -382,7 +382,10 @@ pub fn run_with_env(
     let mut raw = Vec::with_capacity(argv.len() + 1);
     raw.push("pengepul");
     raw.extend_from_slice(argv);
-    let parsed_args = Args::try_parse_from(raw)?;
+    let parsed_args = match Args::try_parse_from(raw) {
+        Ok(parsed_args) => parsed_args,
+        Err(error) => return Ok(clap_outcome(&error)),
+    };
     let mut output = Output::default();
 
     let root_env = CommandEnv::new(parsed_args.config.as_deref(), home, cwd);
@@ -475,6 +478,37 @@ pub fn run_with_env(
         stdout: output.stdout,
         stderr: output.stderr,
     })
+}
+
+/// Turn clap's answer into a process outcome (ADR-0021).
+///
+/// clap returns `--help` and `--version` as an error that is routed to stdout with
+/// status 0, and a usage error as one routed to stderr with status 2. Both are
+/// answers the process reports rather than library failures, so neither is
+/// propagated as `Err`. `use_stderr` and `exit_code` read the same predicate
+/// inside clap, so the stream and the status cannot disagree, and neither is
+/// re-derived here.
+///
+/// This used to be `?`. That flattened both into a single exit-1 error printed to
+/// stderr, which emptied `$(pengepul --version)` and made `pengepul --help | less`
+/// print nothing, on the two surfaces `consistent-panels` AC-8 calls the ones a
+/// script reads.
+fn clap_outcome(error: &clap::Error) -> RunOutcome {
+    let code = error.exit_code();
+    let rendered = error.render().to_string();
+    if error.use_stderr() {
+        RunOutcome {
+            code,
+            stdout: String::new(),
+            stderr: rendered,
+        }
+    } else {
+        RunOutcome {
+            code,
+            stdout: rendered,
+            stderr: String::new(),
+        }
+    }
 }
 
 /// Where a verb looks for its config: the `--config` override (command-
