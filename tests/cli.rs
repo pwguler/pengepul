@@ -23,6 +23,7 @@ fn write_config(home: &Path, host: &str, port: u16) {
 struct FakeRuntime {
     service_status_text: Option<String>,
     service_status_error: Option<String>,
+    binary_modified_at: Option<f64>,
     server_host: Option<String>,
     server_port: Option<u16>,
     health_url: Option<String>,
@@ -153,6 +154,10 @@ impl CliRuntime for FakeRuntime {
     fn restart_service(&mut self) -> Result<()> {
         self.calls.push("service:restart".to_string());
         Ok(())
+    }
+
+    fn binary_modified_at(&mut self) -> Option<f64> {
+        self.binary_modified_at
     }
 
     fn service_status(&mut self) -> Result<String> {
@@ -3551,6 +3556,174 @@ fn usage_rich_prints_the_relay_total_panel_below_the_trend() {
         requests(&out),
         requests(&status),
         "usage and status disagree about the relay rollup"
+    );
+}
+
+/// version-uptime-and-usage-total AC-1: `status` names the build and how long the service
+/// has been up. Both are local facts: the version is this binary's, and the uptime comes from
+/// the same `service status` text and the same parse `pengepul service status` uses.
+#[test]
+fn status_shows_the_version_and_the_service_uptime() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        service_status_text: Some(
+            "     Active: active (running) since Sat 2026-09-05 04:09:31 WIB; 4min 28s ago\n"
+                .to_string(),
+        ),
+        ..FakeRuntime::default()
+    };
+
+    let out = strip_ansi(&run_style(&["status"], tmp.path(), &mut runtime, Style::Rich).stdout);
+    let version = out
+        .lines()
+        .find(|line| line.contains("version"))
+        .unwrap_or_else(|| panic!("no version row in: {out}"));
+    assert!(
+        version.contains(env!("CARGO_PKG_VERSION")),
+        "the row must name this binary's build: {version:?}"
+    );
+    let uptime = out
+        .lines()
+        .find(|line| line.contains("uptime"))
+        .unwrap_or_else(|| panic!("no uptime row in: {out}"));
+    // AC-1: the value `pengepul service status` prints for the same manager text. Compared
+    // rather than hardcoded, because the claim is that one parse serves both verbs — a
+    // repeat of the literal would pass while the two disagreed.
+    let service = strip_ansi(
+        &run_style(
+            &["service", "status"],
+            tmp.path(),
+            &mut runtime,
+            Style::Rich,
+        )
+        .stdout,
+    );
+    let service_uptime = service
+        .lines()
+        .find(|line| line.contains("uptime"))
+        .unwrap_or_else(|| panic!("no uptime row in the service panel: {service}"));
+    let cell = |line: &str| {
+        line.trim_matches(['\u{2502}', ' '])
+            .split_whitespace()
+            .last()
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert_eq!(
+        cell(uptime),
+        cell(service_uptime),
+        "status and service disagree about uptime"
+    );
+    assert!(!cell(uptime).is_empty());
+
+    // AC-1 plain: one line each, inside the connection group, before the pool line.
+    let plain = run_style(&["status"], tmp.path(), &mut runtime, Style::Plain).stdout;
+    let order: Vec<&str> = plain
+        .lines()
+        .filter(|line| {
+            line.starts_with("url ")
+                || line.starts_with("version ")
+                || line.starts_with("uptime ")
+                || line.contains("account")
+        })
+        .collect();
+    let at = |needle: &str| {
+        order
+            .iter()
+            .position(|line| line.starts_with(needle))
+            .unwrap_or_else(|| panic!("no {needle:?} line in: {plain}"))
+    };
+    assert!(at("url ") < at("version "), "{plain}");
+    assert!(at("version ") < at("uptime "), "{plain}");
+    assert!(
+        plain.contains(&format!("version {}", env!("CARGO_PKG_VERSION"))),
+        "{plain}"
+    );
+    assert!(
+        plain.contains(&format!("uptime {}", cell(uptime))),
+        "plain must carry the same uptime: {plain}"
+    );
+}
+
+/// AC-3: observability is never a gate. A relay the service manager knows nothing about still
+/// answers `status`, with the uptime row simply absent.
+#[test]
+fn status_omits_uptime_when_the_service_manager_cannot_answer() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        service_status_error: Some(
+            "systemctl exited with 1: Unit pengepul.service not found.".to_string(),
+        ),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run_style(&["status"], tmp.path(), &mut runtime, Style::Plain);
+    assert_eq!(outcome.code, 0, "status must not fail without systemd");
+    assert!(
+        !outcome.stdout.contains("uptime"),
+        "an unanswerable uptime must not print a guess: {}",
+        outcome.stdout
+    );
+    // The version is local, so it survives.
+    assert!(outcome.stdout.contains(env!("CARGO_PKG_VERSION")));
+}
+
+/// AC-4: an installed binary newer than the running service is the update-without-restart
+/// case, and the version row has to say so — that mismatch is invisible otherwise.
+#[test]
+fn status_marks_the_version_when_the_binary_is_newer_than_the_service() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs_f64();
+    let service_text =
+        "     Active: active (running) since Sat 2026-09-05 04:09:31 WIB; 4min 28s ago\n"
+            .to_string();
+
+    let status_with = |modified: Option<f64>| {
+        let mut runtime = FakeRuntime {
+            service_status_text: Some(service_text.clone()),
+            binary_modified_at: modified,
+            ..FakeRuntime::default()
+        };
+        strip_ansi(&run_style(&["status"], tmp.path(), &mut runtime, Style::Rich).stdout)
+    };
+
+    // Written a minute ago, service up 4min 28s: newer than the process → marked.
+    let stale = status_with(Some(now - 60.0));
+    let stale_row = stale
+        .lines()
+        .find(|line| line.contains("version"))
+        .expect("version row");
+    assert!(
+        stale_row.contains("not the running build"),
+        "a newer binary must be marked as not serving: {stale_row:?}"
+    );
+
+    // Written before the service started: nothing to report.
+    let current = status_with(Some(now - 3_600.0));
+    let current_row = current
+        .lines()
+        .find(|line| line.contains("version"))
+        .expect("version row");
+    assert!(
+        !current_row.contains("not the running build"),
+        "a running build must not carry the marker: {current_row:?}"
+    );
+
+    // No mtime readable: the row is honest and unmarked rather than guessed.
+    let unknown = status_with(None);
+    let unknown_row = unknown
+        .lines()
+        .find(|line| line.contains("version"))
+        .expect("version row");
+    assert!(
+        !unknown_row.to_lowercase().contains("restart"),
+        "{unknown_row:?}"
     );
 }
 

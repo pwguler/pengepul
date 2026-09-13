@@ -514,6 +514,15 @@ pub(crate) struct Connection {
     pub(crate) config: String,
     pub(crate) url: String,
     pub(crate) server: String,
+    /// The build of the binary making the call. Local by necessity — a client cannot learn
+    /// the serving process's version — so `stale` is what says when the two differ.
+    pub(crate) version: String,
+    /// How long the service has been up, when the service manager could say. `None` is a
+    /// fact too: the row is then absent rather than guessed.
+    pub(crate) uptime: Option<String>,
+    /// The binary making the call is newer than the service that is running: an install
+    /// that has not been restarted into, or simply a newer local build.
+    pub(crate) stale: bool,
 }
 
 /// The `Style::Plain` relay block: header, connection, one line per pool,
@@ -530,6 +539,10 @@ pub(crate) fn print_relay_total_plain(
         "url {} \u{2014} server {}",
         connection.url, connection.server
     ));
+    output.line(&version_line(connection));
+    if let Some(uptime) = &connection.uptime {
+        output.line(&format!("uptime {uptime}"));
+    }
     for pool in &totals.lines {
         output.line(pool.render().trim_end());
     }
@@ -560,13 +573,43 @@ pub(crate) fn print_relay_total_rich(
             "server",
             &format!("{} {}", status_glyph(health), connection.server),
         ),
+        Fact::new("version", &version_value(connection)),
     ];
+    if let Some(uptime) = &connection.uptime {
+        facts.push(Fact::new("uptime", uptime));
+    }
     for line in &totals.lines {
         facts.push(Fact::new(&line.name, &line.render_value()));
     }
     facts.extend(aggregate_facts(&totals));
     for line in fact_panel(&relay_header_rich(&totals), &facts) {
         output.line(&line);
+    }
+}
+
+/// The plain `version` line: the build, and that it is not the one serving when the binary
+/// making the call is newer than the service. The note names the condition rather than the
+/// action, because the mark fires for a freshly built binary too, and "restart to apply"
+/// would be false advice there.
+fn version_line(connection: &Connection) -> String {
+    if connection.stale {
+        format!("version {}  (not the running build)", connection.version)
+    } else {
+        format!("version {}", connection.version)
+    }
+}
+
+/// The rich `version` row: the same two facts, with the attention glyph carrying the state
+/// the way `server` carries its own.
+fn version_value(connection: &Connection) -> String {
+    if connection.stale {
+        format!(
+            "{} {}  not the running build",
+            status_glyph(ActionGlyph::Attention),
+            connection.version
+        )
+    } else {
+        connection.version.clone()
     }
 }
 

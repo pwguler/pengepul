@@ -223,7 +223,48 @@ fn run(runner: &mut impl FnMut(&[String]) -> Result<ExitStatus>, command: &[&str
 /// on macOS) into the structured `service` panel. Unrecognized lines are
 /// dropped; a text with no recognizable state renders as unknown rather
 /// than failing — the panel is observability, never a gate.
+/// The `Active:` line of a service manager's status text, as its state and the elapsed part
+/// after the `;`: `active (running) since Sat 2026-09-05 04:09:31 WIB; 4min 28s ago` →
+/// (`active (running)`, `4min 28s ago`). `None` when no `Active:` line exists.
+fn active_line(text: &str) -> Option<(&str, &str)> {
+    for line in text.lines() {
+        let Some((key, value)) = line.trim().split_once(':') else {
+            continue;
+        };
+        if key.trim() != "Active" {
+            continue;
+        }
+        let state = value
+            .split_once(" since ")
+            .map_or(value.trim(), |(state, _)| state.trim());
+        let elapsed = value
+            .split_once(" since ")
+            .and_then(|(_, rest)| rest.split_once("; "))
+            .map_or("", |(_, ago)| ago);
+        return Some((state, elapsed));
+    }
+    None
+}
+
+/// How long the service has been `active`, from the same manager text and the same parse
+/// `pengepul service status` uses. `None` when the text carries no elapsed part — a stopped
+/// unit, or a manager whose output has another shape.
+pub(crate) fn service_uptime_seconds(text: &str) -> Option<f64> {
+    let (_, ago) = active_line(text)?;
+    let elapsed = parse_relative_seconds(ago);
+    (elapsed > 0.0).then_some(elapsed)
+}
+
+/// Whether the binary on disk is newer than the process serving: an install that has not been
+/// restarted into, which nothing else in `status` would show. The service's start instant is
+/// `now - uptime`, so this needs no absolute timestamp from the manager and no clock read
+/// beyond what the caller passes.
+pub(crate) fn installed_after_start(now: f64, modified: f64, uptime_seconds: f64) -> bool {
+    modified > now - uptime_seconds
+}
+
 pub(crate) fn service_status_panel(text: &str) -> Vec<String> {
+    let active = active_line(text);
     let mut state: Option<String> = None;
     let mut enabled: Option<String> = None;
     let mut since: Option<String> = None;
@@ -248,15 +289,16 @@ pub(crate) fn service_status_panel(text: &str) -> Vec<String> {
             let value = value.trim();
             match key.trim() {
                 "Active" => {
-                    // `active (running) since Sat 2026-09-05 04:09:31 WIB; 4min 28s ago`
-                    let mut fields = value.splitn(2, " since ");
-                    let active = fields.next().unwrap_or(value).trim();
-                    state = Some(active.to_string());
-                    if let Some((_, ago)) = fields.next().and_then(|rest| rest.split_once("; ")) {
+                    // One parse for both consumers: the panel's `state` and `uptime` rows, and
+                    // `status`'s uptime row (`service_uptime_seconds`).
+                    if let Some((state_text, ago)) = active {
+                        state = Some(state_text.to_string());
                         let elapsed = parse_relative_seconds(ago);
                         if elapsed > 0.0 {
                             since = Some(format_duration(elapsed));
                         }
+                    } else {
+                        state = Some(value.to_string());
                     }
                 }
                 "Loaded" => {

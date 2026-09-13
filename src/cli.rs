@@ -7,8 +7,10 @@ use serde_json::Value;
 
 use crate::config::{Config, load_config, register_provider, selected_config_path};
 pub use crate::render::Style;
-use crate::render::{ActionGlyph, BOLD, DIM, Fact, Output, fact_panel, paint, status_glyph};
-use crate::service::service_status_panel;
+use crate::render::{
+    ActionGlyph, BOLD, DIM, Fact, Output, fact_panel, format_duration, paint, status_glyph,
+};
+use crate::service::{installed_after_start, service_status_panel, service_uptime_seconds};
 use crate::tokens::save_token;
 use crate::types::{ProviderId, ProviderKind, TokenData};
 use crate::usage_view::{
@@ -138,6 +140,13 @@ pub trait CliRuntime {
     ///
     /// Returns an error if the service manager command fails.
     fn service_status(&mut self) -> Result<String>;
+
+    /// The modification time of the binary running this command, in unix seconds.
+    ///
+    /// Read here rather than in a renderer: `status` compares it with the service's start to
+    /// notice an install that has not been restarted into, and a renderer that read the clock
+    /// and the filesystem could not be tested from a fixture.
+    fn binary_modified_at(&mut self) -> Option<f64>;
 
     /// Uninstall the user service.
     ///
@@ -577,10 +586,24 @@ fn status(
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_string();
+    // Local facts, and never a gate: a relay the service manager knows nothing about still
+    // answers `status`, with the uptime row absent rather than guessed.
+    let uptime_seconds = runtime
+        .service_status()
+        .ok()
+        .as_deref()
+        .and_then(service_uptime_seconds);
+    let stale_build = match (uptime_seconds, runtime.binary_modified_at()) {
+        (Some(uptime), Some(modified)) => installed_after_start(unix_now(), modified, uptime),
+        _ => false,
+    };
     let connection = Connection {
         config: env.config_file().display().to_string(),
         url: base_url.clone(),
         server,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        uptime: uptime_seconds.map(format_duration),
+        stale: stale_build,
     };
     let accounts = runtime.accounts(&base_url, &first_api_key(&config)?)?;
     // status-total-only: the relay block is the whole view; per-pool and

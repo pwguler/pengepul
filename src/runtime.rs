@@ -131,6 +131,19 @@ impl CliRuntime for RealRuntime {
         control_platform_service("restart")
     }
 
+    fn binary_modified_at(&mut self) -> Option<f64> {
+        let modified = std::env::current_exe()
+            .ok()?
+            .metadata()
+            .ok()?
+            .modified()
+            .ok()?;
+        modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|elapsed| elapsed.as_secs_f64())
+    }
+
     fn service_status(&mut self) -> Result<String> {
         platform_service_status()
     }
