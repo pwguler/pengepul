@@ -585,6 +585,7 @@ fn status_renders_panels_on_a_tty() {
                             "totalInputTokens": 22_100_000,
                             "totalOutputTokens": 401_200,
                             "totalCacheCreationInputTokens": 6_000_000,
+                            "totalCacheCreation1hInputTokens": 7_216_000,
                             "totalCacheReadInputTokens": 155_000_000,
                             "totalReasoningOutputTokens": 64_000,
                             "planType": "max"

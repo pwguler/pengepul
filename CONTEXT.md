@@ -72,7 +72,7 @@ _Avoid_: stats file, metrics, telemetry
 
 **Input**:
 The whole prompt the upstream saw — a request's **Cached** tokens plus its **Uncached** tokens — printed first in a token block.
-_Avoid_: tokens in, prompt tokens, total input
+_Avoid_: prompt tokens, total input
 
 **Cached**:
 The prompt tokens an upstream served from its cache, printed with their share of **Input**.
@@ -80,7 +80,7 @@ _Avoid_: cache, cache read, cache hit
 
 **Uncached**:
 Every prompt token no cache served, which includes the tokens a cache write created. Printed without a breakdown.
-_Avoid_: tokens in, misses, fresh input
+_Avoid_: tokens in, in, misses, fresh input
 
 ### Clients
 

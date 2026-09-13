@@ -194,10 +194,10 @@ pub(crate) struct ModelRow {
 }
 
 impl ModelRow {
-    /// The model's carried load, on the same definition as every other
-    /// total in the view: in + out + cache, reasoning excluded.
+    /// The model's carried load, on the same definition as every other total
+    /// in the view: `input + output + cached + written`, reasoning excluded.
     fn tokens(&self) -> i64 {
-        self.input + self.output + self.cache_read + self.cache_write
+        carried_tokens(self.input, self.output, self.cache_read, self.cache_write)
     }
 
     /// The model's token block, on the same rows as every other scope

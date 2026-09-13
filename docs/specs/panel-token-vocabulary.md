@@ -31,17 +31,17 @@ on `cached` that is the read share of the prompt, and no cache write anywhere in
 - AC-1: Every scope that reports a subject prints the block in order — `input`, `cached`,
   `uncached`, `output` — with `reasoning` after `output` when non-zero: the relay block in
   `status`, and the pool, account and model blocks in `accounts` (ADR-0024).
-  `tests/cli.rs::accounts_renders_the_token_block_at_every_scope` and
-  `tests/cli.rs::status_renders_the_relay_token_block` assert the four labels at each scope
-  against a fixture.
+  `tests/cli.rs::accounts_renders_the_token_block_at_every_scope` asserts the exact label
+  sequence at the account, model and footer scopes, and
+  `tests/cli.rs::status_renders_panels_on_a_tty` asserts the relay's own block.
 - AC-2: `cached` carries `read / input`, not the two cache directions summed.
   `the_cache_share_is_the_read_share_of_the_prompt` pins `cache_with_share` for a fixture
   whose cache write is non-zero, and asserts the value the pre-change code printed is *not*
-  produced. For the anthropic fixture this is `cached 1.3B (94.8%)` where the pre-change code
-  printed `(100%)`.
+  produced: 155.0M read of a 183.1M prompt is `cached 155.0M (85%)`, where the pre-change code
+  printed `161.0M (88%)`.
 - AC-3: `uncached` prints the never-cached input plus the cache write, with no parenthetical
-  and no trailing breakdown. For the anthropic fixture, input 3,833,848 + write 66,031,901
-  renders `uncached 69.9M`.
+  and no trailing breakdown. For the anthropic fixture, input 22.1M + write 6.0M renders
+  `uncached 28.1M`, and a parenthetical there would fail the exact-equality assertions.
 - AC-4: `input = cached + uncached` holds for every printed subject. A test derives the three
   figures from the fixture's counters and asserts the rendered strings satisfy it, so a
   subject whose three rows do not agree fails rather than prints.
@@ -58,9 +58,10 @@ on `cached` that is the read share of the prompt, and no cache write anywhere in
   relay's line, and `::accounts_detail_prints_usage_and_cooldown_per_account` and
   `::accounts_lists_models_in_plain_output` assert the account's and the model's.
 - AC-8: Plain output is no longer byte-identical to the previous release, and the
-  `tests/cli.rs` and `tests/accounts.rs` assertions that pinned the old bytes are rewritten
-  deliberately rather than deleted: each rewritten assertion names the label it now expects.
-  The version in `Cargo.toml` is bumped.
+  `tests/cli.rs` assertions that pinned the old bytes are rewritten deliberately rather than
+  deleted: each rewritten assertion names the label it now expects. No test function is
+  removed. `tests/accounts.rs` asserts the recorded counters, which this change does not
+  touch, so it is unchanged and still green. The version in `Cargo.toml` is bumped.
 - AC-9: `CONTEXT.md` defines **Input**, **Cached** and **Uncached**, states that the recorded
   `input` counter is narrower than the printed `Uncached` by the cache write, lists `in` and
   `cache` as avoided spellings, and no longer describes the plain contract as byte-stable.
@@ -69,6 +70,13 @@ on `cached` that is the read share of the prompt, and no cache write anywhere in
   a labelled total above its own breakdown; "One word, one scope" no longer claims `status`
   prints an all-time figure beside `usage`'s; and the `Style` bullet no longer claims piped
   output is byte-stable for scripts, which ADR-0024 gave up.
+- AC-11: A fact row may open an indented breakdown beneath it, one level per scope: the token
+  block sits at two spaces under an account row and at four under a model headline, with the
+  pool footer's at the panel's own margin. Inside a block the value column is one offset from
+  that block's indent, not shared with the scopes around it — the indent is what says whose
+  rows these are. `tests/cli.rs::accounts_renders_the_token_block_at_every_scope` asserts the
+  block's order at each scope, and every panel row still measures 64 columns
+  (`usage_view::tests::rich_renderer_panels_are_exactly_the_fixed_width`).
 
 ## Verification
 

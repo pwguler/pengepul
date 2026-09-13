@@ -179,8 +179,10 @@ impl Fact {
 const LABEL_WIDTH_CAP: usize = 14;
 
 /// The label column for one panel: the longest label present plus two
-/// columns of air, capped. Computed once per panel so values align down
-/// the whole box rather than per section (AC-9).
+/// columns of air, capped. One width for the whole panel, so every value
+/// starts at the same offset from its own indent — a nested block's values
+/// sit further right on purpose, because the indent is what says whose rows
+/// they are (ADR-0024).
 pub(crate) fn label_column(facts: &[Fact]) -> usize {
     facts
         .iter()
