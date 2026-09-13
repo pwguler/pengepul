@@ -69,7 +69,7 @@ says it cannot see an image. `max_tokens` must be generous: a reasoning model
 spends the front of the budget on `reasoning_content` and returns empty content
 with `finish_reason: "length"`, which reads like a vision failure and is not one.
 
-| id | route | advertised before | measured |
+| id | Provider | advertised before | measured |
 | --- | --- | --- | --- |
 | `deepseek/deepseek-v4.1-flash` | commandcode | `["text"]` | reads images (two questions) |
 | `deepseek/deepseek-v4.1-flash` | openrouter | `["text"]` | reads images (4/4 quadrants) |
@@ -85,8 +85,8 @@ with `finish_reason: "length"`, which reads like a vision failure and is not one
 | `z-ai/glm-5.3-flash` | commandcode | absent | reads images |
 
 One half of the problem is left open. The family tables claim
-`["text","image"]` for 21 live commandcode ids (`claude-*`, `gpt-*`,
-`moonshotai/Kimi-*`, `xai/grok-*`) from vendor documentation rather than from a
+`["text","image"]` for 21 live commandcode ids — the claude, gpt, moonshotai/Kimi and
+xai/grok families plus `deepseek/deepseek-v4-flash-vision-exp` — from vendor documentation rather than from a
 measurement against the Provider serving them, and the OpenRouter result shows
 that inference can be wrong per Provider. Those claims were not measured and stay
 as they are. A false positive is the more expensive direction — a client attaches
@@ -95,7 +95,7 @@ an image the upstream refuses, which on OpenRouter is the `404` above, booked as
 
 Two conclusions the table now encodes:
 
-1. **A modality claim is a claim about a route, not about a model name.**
+1. **A modality claim is a claim about a Provider, not about a model name.**
    `deepseek/deepseek-v4-flash` reads images through commandcode and refuses them
    through OpenRouter, so no table keyed by the bare id can be right for both.
    `PROVIDER_MODALITIES` names the Provider each measured claim was measured
@@ -133,4 +133,4 @@ image to a text-only id on OpenRouter earns a `404`, which pengepul books as a
 `503 no available openrouter account; last failure: network`. A client that
 trusts an advertised `["text", "image"]` for a model that has none therefore
 costs more than a dropped image, which is why the measured positives here are
-scoped to the route that produced them.
+scoped to the Provider that produced them.

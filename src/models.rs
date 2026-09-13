@@ -169,7 +169,7 @@ fn curated_metadata(id: &str, provider: &ProviderId) -> Option<ModelMetadata> {
 /// The name in the middle is the **Provider id** — the config entry name from
 /// `pengepul login --provider <name>`, or `anthropic` / `codex` / `grok`. Registering the same
 /// upstream under a second name therefore gets no claim until it is measured under that name,
-/// and a name that points somewhere else inherits the claim of the route it is named after.
+/// and a name that points somewhere else inherits the claim of the Provider it is named after.
 ///
 /// Matched **exactly**, not by prefix: every id here is one model, and a prefix rule would leak
 /// a claim onto its neighbours (`deepseek/deepseek-v4-flash` onto `-flash-fast`, which refuses
@@ -192,10 +192,11 @@ const PROVIDER_MODALITIES: &[(&str, Option<&str>, &[&str])] = &[
         Some("commandcode"),
         TEXT_IMAGE,
     ),
-    // commandcode relays these to endpoints that read images; the family tables have no entry
-    // for them, so without this they advertise nothing and a client that has no catalog of its own
-    // drops the image (issue #8). `xiaomi/mimo-v2.5` reaches this table as the only metadata it
-    // has; the other two keep the `reasoning` their family entry already carried.
+    // commandcode relays these to endpoints that read images; no family entry claims modalities
+    // for them, so without this they advertise none and a client that has no catalog of its own
+    // drops the image (issue #8). `xiaomi/mimo-v2.5` has no family entry at all and reaches this
+    // table as the only metadata it gets; `google/gemini-3.8-flash` and `z-ai/glm-5.3-flash` keep
+    // the `reasoning` their family entry already carried.
     ("google/gemini-3.8-flash", Some("commandcode"), TEXT_IMAGE),
     ("xiaomi/mimo-v2.5", Some("commandcode"), TEXT_IMAGE),
     ("z-ai/glm-5.3-flash", Some("commandcode"), TEXT_IMAGE),
@@ -843,7 +844,8 @@ mod tests {
 
     /// The seam the issue is about: what `/v1/models` publishes, after the catalog has been
     /// built from a commandcode-style body (ids plus `context_length`, no modalities). The
-    /// advertised entry is what a client gates its image path on.
+    /// advertised entry is what a client gates its image path on, and these three ids have no
+    /// family entry claiming modalities, so the table is the only source for them.
     #[test]
     fn the_advertised_payload_carries_the_measured_modalities() {
         // shape taken from the live endpoint: 69 entries, each id/name/context_length only
@@ -883,7 +885,7 @@ mod tests {
             commandcode["commandcode/deepseek/deepseek-v4-flash"],
             vec!["text".to_string(), "image".to_string()]
         );
-        // Unchanged: measured text-only, and the parent of the route-scoped entry.
+        // Unchanged: measured text-only, and the parent of the Provider-scoped entry.
         assert_eq!(
             commandcode["commandcode/deepseek/deepseek-v4-flash-fast"],
             vec!["text".to_string()]
@@ -920,12 +922,12 @@ mod tests {
         }
     }
 
-    /// The measured route splits, pinned so a later simplification of the table cannot make
+    /// The measured Provider splits, pinned so a later simplification of the table cannot make
     /// the id advertise one capability everywhere again. Measured 2026-09-14 with a
     /// four-quadrant image: commandcode reads it, `OpenRouter` answers
     /// `404 No endpoints found that support image input`.
     #[test]
-    fn a_route_scoped_modality_claim_holds_only_on_the_route_it_was_measured_on() {
+    fn a_provider_scoped_claim_holds_only_on_the_provider_it_was_measured_on() {
         let body = |id: &str| json!({"data": [{"id": id}]});
         let modalities = |id: &str, provider: &ProviderId| {
             parse_openai(&body(id), provider)
@@ -946,7 +948,7 @@ mod tests {
             Some(vec!["text".to_string()])
         );
 
-        // Measured on both routes, so the claim is not scoped.
+        // Measured against both Providers, so the claim is not scoped.
         for provider in [&commandcode, &openrouter] {
             assert_eq!(
                 modalities("deepseek/deepseek-v4.1-flash", provider),
@@ -971,7 +973,7 @@ mod tests {
         }
 
         // The three ids the table had no entry for at all: the claim is the only metadata they
-        // get, and it is scoped to the route it was measured on.
+        // get, and it is scoped to the Provider it was measured on.
         for id in [
             "google/gemini-3.8-flash",
             "xiaomi/mimo-v2.5",
@@ -985,7 +987,7 @@ mod tests {
             assert_eq!(
                 modalities(id, &openrouter),
                 None,
-                "{id} must claim nothing on an unmeasured route"
+                "{id} must claim nothing on a Provider it was not measured against"
             );
         }
     }

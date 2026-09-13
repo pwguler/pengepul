@@ -69,7 +69,7 @@ cargo fmt --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 ```
 
-AC-1..AC-4 are `a_route_scoped_modality_claim_holds_only_on_the_route_it_was_measured_on` and
+AC-1..AC-4 are `a_provider_scoped_claim_holds_only_on_the_provider_it_was_measured_on` and
 AC-5 is `the_advertised_payload_carries_the_measured_modalities`, both in `src/models.rs`.
 AC-6 is `the_fetch_asks_each_provider_for_its_own_modality_claims` in `src/app.rs`, which binds
 a loopback port and drives the real fetch. AC-7 is the unchanged family tables plus the
