@@ -600,9 +600,9 @@ impl ModelCatalog {
 /// name); an unrelated id containing `/` is left intact.
 ///
 /// Nothing else is touched. A client-side shorthand such as pi's `:high` travels as part of
-/// the name it was given: the relay does not know the vendor's model names well enough to
-/// remove a colon-word, and a served id like `LongCat-2.0:free` shows the two are the same
-/// shape.
+/// the name it was given: the relay cannot tell a colon-word the catalog does not list from a
+/// vendor tag it has not learned, and a served id like `LongCat-2.0:free` shows the shape is
+/// not the signal.
 #[must_use]
 pub fn upstream_model<'a>(model: &'a str, provider: &ProviderId) -> &'a str {
     let prefix = provider.id.as_ref();

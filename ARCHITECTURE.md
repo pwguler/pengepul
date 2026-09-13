@@ -141,10 +141,11 @@ in files.
 - **One model id resolves to exactly one Provider**, and an id nobody claims is
   refused 400 before any Account is touched. A bare id never routes to a
   configured endpoint — only an explicit `<provider>/` prefix does.
-- **The `<provider>/` prefix is the only rewrite.** `upstream_model` removes it so the
-  request asks the vendor for a model by the name the client gave after the prefix, and
-  Usage counters key on that same name. Nothing else is rewritten — not a colon-word, which
-  is a name whether it is the served `LongCat-2.0:free` or pi's `:high` shorthand (ADR-0025).
+- **The `<provider>/` prefix is the only rewrite of a model id.** `upstream_model` removes
+  it so the request asks the vendor for a model by the name the client gave after the prefix,
+  and Usage counters key on that same name. Nothing else in the id is rewritten — not a
+  colon-word, which is a name whether it is the served `LongCat-2.0:free` or pi's `:high`
+  shorthand (ADR-0025).
 - **Failover only moves a request between Accounts of the same Provider**,
   resolved once before the attempt loop.
 - **Rotation prefers the Account holding the cache, and never waits for it.**
