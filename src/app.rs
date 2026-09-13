@@ -1192,6 +1192,7 @@ async fn route_provider_request(
     // One request, one conversation: computed before the attempt loop, not
     // inside it, because the body does not change between attempts.
     let conversation = conversation_key(headers, body, route);
+    log_cacheable_prefix(&provider, route, &model, &conversation, body);
     let mut last_response = None;
 
     for _ in 0..attempts {
@@ -1936,6 +1937,24 @@ fn conversation_key(headers: &HeaderMap, body: &Value, route: RequestRoute) -> S
     {
         return key.to_string();
     }
+    format!("prefix:{}", cacheable_prefix_fingerprint(body, route))
+}
+
+/// The bytes a conversation's prompt cache is keyed on, canonicalized: the system
+/// blocks, the tool list, the model, and the opening of the message list.
+///
+/// This is what [`conversation_key`] hashes when a client names no session, and what the
+/// `"cacheable prefix"` log line hashes for every request. One definition, because the two
+/// exist to make the same claim about the same bytes: two requests whose values match
+/// differ nowhere inside this material.
+///
+/// It is **not** the whole request. Anything appended after the opening window is outside
+/// it by construction — that is what makes it stable across turns of one conversation — so
+/// a mismatch in the tail is invisible here. That is the one thing the fingerprint does
+/// not see, and it is why it is worth printing: an unchanged fingerprint beside a collapsed
+/// cache read rules out every writer this relay and its client control, leaving the
+/// upstream's own cache.
+fn cacheable_prefix(body: &Value, route: RequestRoute) -> String {
     let mut prefix = json!({
         "system": body.get("system"),
         "tools": body.get("tools"),
@@ -1948,7 +1967,58 @@ fn conversation_key(headers: &HeaderMap, body: &Value, route: RequestRoute) -> S
     // and `model` — which every conversation in one project shares, the same
     // collapse that made Chat Completions re-bill (ADR-0017).
     prefix.push_str(&cacheable_opening(body, route));
-    format!("prefix:{}", sha256_hex(&prefix))
+    prefix
+}
+
+/// [`cacheable_prefix`] as one comparison-ready value, for the `"cacheable prefix"` line.
+fn cacheable_prefix_fingerprint(body: &Value, route: RequestRoute) -> String {
+    sha256_hex(&cacheable_prefix(body, route))
+}
+
+/// How many turns the dialect's message list carries, for the `"cacheable prefix"` line.
+///
+/// The opening window is a fixed slice of this list, so the count is what says whether a
+/// repeat fingerprint came from a request that grew (the expected shape) or from one that
+/// replaced the tail. Responses keeps its turns in `input`, with `messages` as the
+/// fallback the route itself takes.
+fn message_count(body: &Value, route: RequestRoute) -> usize {
+    let turns = match route {
+        RequestRoute::Chat | RequestRoute::Messages => body.get("messages"),
+        RequestRoute::Responses => body
+            .get("input")
+            .filter(|value| !value.is_null())
+            .or_else(|| body.get("messages")),
+    };
+    message_items(turns).count()
+}
+
+/// The `"cacheable prefix"` line: one request's cacheable material as a hash, beside the
+/// turn count that says how far the list behind it has run.
+///
+/// One line per client request, and the line a cache miss is read against. An upstream
+/// bills the whole prefix when the bytes it cached no longer match, so a fingerprint that
+/// repeats while the billed cache read (`"upstream usage"`) collapses puts the writer
+/// upstream, and one that changes names the relay or the harness as the writer. The
+/// fingerprint covers exactly what [`cacheable_prefix`] covers, and no more.
+///
+/// Both values are built only while this level is on: `tracing` evaluates field
+/// expressions lazily, so `debug: off` pays neither the hash nor the allocation.
+fn log_cacheable_prefix(
+    provider: &ProviderId,
+    route: RequestRoute,
+    model: &str,
+    conversation: &str,
+    body: &Value,
+) {
+    tracing::debug!(
+        provider = %provider,
+        route = ?route,
+        model = %model,
+        conversation = %conversation,
+        messages = message_count(body, route),
+        prefix = %cacheable_prefix_fingerprint(body, route),
+        "cacheable prefix"
+    );
 }
 
 /// The opening of a request's cacheable content, canonicalized: the first
@@ -2176,6 +2246,24 @@ async fn record_provider_success(
         }
         usage
     });
+    // The billed cache read, per request, in the normalized sense the panels use: `input`
+    // excludes the cache read for every Provider (ADR-0023). Read beside the request's own
+    // `"cacheable prefix"` line, this is the pair that separates an upstream that dropped
+    // its cache from a body that changed. Silent when there is no usage at all —
+    // count-tokens, or a 2xx whose usage would not parse — because a line of zeroes would
+    // claim a measurement nobody made.
+    if let Some(usage) = usage.as_ref() {
+        tracing::debug!(
+            provider = %provider,
+            account = %account.token.email,
+            model = %model,
+            input = usage.input_tokens,
+            cache_read = usage.cache_read_input_tokens,
+            cache_write = usage.cache_creation_input_tokens,
+            output = usage.output_tokens,
+            "upstream usage"
+        );
+    }
     manager.record_success(account.token.email.as_str(), usage.as_ref(), model);
 }
 
@@ -3303,9 +3391,9 @@ mod tests {
     use super::{
         AccountManagers, AppState, BodyLimit, ModelsFuture, RateLimitBucket, RequestRoute,
         StdRwLock, UpstreamClient, UpstreamFuture, UpstreamJsonResponse, UpstreamRequest,
-        UpstreamSseFuture, build_upstream_request, conversation_key, decode_upstream_body,
-        forward_refusal_event, is_decoded_upstream_error, refresh_model_catalog,
-        route_provider_request,
+        UpstreamSseFuture, build_upstream_request, cacheable_prefix_fingerprint, conversation_key,
+        decode_upstream_body, forward_refusal_event, is_decoded_upstream_error, message_count,
+        refresh_model_catalog, route_provider_request,
     };
     use crate::accounts::{AccountManager, RefreshPolicy};
     use crate::config::{CloakingConfig, Config, DebugMode, TimeoutConfig};
@@ -3471,6 +3559,70 @@ mod tests {
                 }
                 Ok(FetchedModels::new(Vec::new()))
             })
+        }
+    }
+
+    /// Succeeds with a cache read the test chooses, so an assertion about the billed cache
+    /// read is about the number the upstream reported rather than about zero, which a log
+    /// line that read nothing would also print.
+    struct ReportingUpstream {
+        input: i64,
+        cache_read: i64,
+    }
+
+    impl UpstreamClient for ReportingUpstream {
+        fn anthropic_messages(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            let (input, cache_read) = (self.input, self.cache_read);
+            Box::pin(async move {
+                Ok(UpstreamJsonResponse {
+                    status: StatusCode::OK,
+                    body: json!({
+                        "id": "msg_1",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-sonnet-4-6",
+                        "content": [{"type": "text", "text": "pong"}],
+                        "usage": {
+                            "input_tokens": input,
+                            "output_tokens": 7,
+                            "cache_read_input_tokens": cache_read
+                        }
+                    }),
+                })
+            })
+        }
+
+        fn anthropic_messages_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!("stream not used in the cache-log test")
+        }
+
+        fn anthropic_count_tokens(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!("count_tokens not used in the cache-log test")
+        }
+
+        fn codex_responses(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!("codex not used in the cache-log test")
+        }
+
+        fn codex_responses_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!("codex stream not used in the cache-log test")
+        }
+
+        fn generic_chat(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!("generic chat not used in the cache-log test")
+        }
+
+        fn generic_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!("generic stream not used in the cache-log test")
+        }
+
+        fn fetch_models(
+            &self,
+            _kind: ProviderKind,
+            _account: AvailableAccount,
+            _config: Arc<Config>,
+        ) -> ModelsFuture {
+            Box::pin(async { Ok(FetchedModels::new(Vec::new())) })
         }
     }
 
@@ -3827,6 +3979,33 @@ mod tests {
         panic!("no {name} field in {fields:?}")
     }
 
+    /// Whether one captured event carries `name` with exactly `value`, quotes stripped the
+    /// way `field_of` strips them.
+    fn field_is(fields: &[(String, String)], name: &str, value: &str) -> bool {
+        fields
+            .iter()
+            .any(|(key, field)| key == name && field.trim_matches('"') == value)
+    }
+
+    /// The lines named `message` that belong to this test. The capture is shared and global,
+    /// so each line is picked out by a value only this test can produce — a session name or
+    /// an account — rather than by counting every event the process emits.
+    fn lines_named<'a>(
+        events: &'a CapturedFields,
+        message: &str,
+        name: &str,
+        value: &str,
+    ) -> Vec<&'a [(String, String)]> {
+        events
+            .iter()
+            .filter(|fields| {
+                field_is(fields.as_slice(), "message", message)
+                    && field_is(fields.as_slice(), name, value)
+            })
+            .map(Vec::as_slice)
+            .collect()
+    }
+
     /// The line Rotation logs is the only place that says which account a conversation
     /// landed on and why, and it had no test: a field could be renamed or dropped with
     /// nothing to notice, which is the same blindness `--version` had. The request path
@@ -3936,6 +4115,114 @@ mod tests {
         assert_eq!(field_of(selected[1], "affinity"), "honored");
         assert_eq!(field_of(selected[2], "affinity"), "rotation");
         assert_eq!(field_of(selected[3], "affinity"), "rotation");
+    }
+
+    /// The `"cacheable prefix"` line says what this request's opening hashed to; the
+    /// `"upstream usage"` line says what the upstream billed for it. Together they settle the
+    /// one question a cache miss leaves open — did the request change, or did the upstream
+    /// drop the cache — and neither line had a test, so a field could be swapped or dropped
+    /// with nothing to notice.
+    ///
+    /// Both lines are about this test's own request: the fixture reports a cache read it
+    /// chooses, and the two requests share an opening while the second grows a turn, which is
+    /// the shape the fingerprint exists to survive.
+    #[tokio::test]
+    async fn the_request_log_carries_the_cacheable_prefix_and_the_cache_read() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        save_token(
+            tmp.path(),
+            &token(
+                "prefix-log@example.com",
+                "anthropic-access-prefix-log",
+                "2030-01-01T00:00:00Z",
+            ),
+        )
+        .expect("save the log test's account");
+        let state = test_state(
+            tmp.path(),
+            Arc::new(ReportingUpstream {
+                input: 11,
+                cache_read: 4096,
+            }),
+        );
+
+        // A named session, because the capture is shared with every other test in the
+        // process and the name is what makes these events attributable. A nameless
+        // conversation logs `prefix:<hash>` as its own name, which is the value under test
+        // and so cannot also be the filter.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-session-id",
+            "prefix-log-conversation".parse().expect("header value"),
+        );
+        let opening = json!({
+            "model": "claude-sonnet-4-6",
+            "system": "SYS",
+            "messages": [
+                {"role": "user", "content": "one"},
+                {"role": "assistant", "content": "two"},
+            ],
+        });
+        let mut grown = opening.clone();
+        grown["messages"]
+            .as_array_mut()
+            .expect("messages")
+            .push(json!({"role": "user", "content": "three"}));
+
+        let captured = capture();
+        for body in [&opening, &grown] {
+            let response =
+                route_provider_request(&state, &headers, body, RequestRoute::Messages).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let events = captured.lock().expect("capture lock");
+        let prefixes = lines_named(
+            &events,
+            "cacheable prefix",
+            "conversation",
+            "prefix-log-conversation",
+        );
+        assert_eq!(prefixes.len(), 2, "one line per request: {events:?}");
+
+        // The fingerprint is the point of the line: one opening, so one value, while the
+        // turn count moves under it. A constant, a per-request value and a count that never
+        // grows each fail one of these.
+        let prefix = field_of(prefixes[0], "prefix");
+        assert_eq!(
+            prefix.len(),
+            64,
+            "a sha256 in hex, not a Debug of one: {prefix}"
+        );
+        assert!(prefix.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(prefix, field_of(prefixes[1], "prefix"));
+        // Against the bytes this request was handed, not against stability alone: a
+        // constant of the right shape satisfies every other assertion here.
+        assert_eq!(
+            prefix,
+            cacheable_prefix_fingerprint(&opening, RequestRoute::Messages),
+            "the line printed something other than this request's fingerprint"
+        );
+        assert_eq!(field_of(prefixes[0], "messages"), "2");
+        assert_eq!(field_of(prefixes[1], "messages"), "3");
+        assert_eq!(field_of(prefixes[0], "provider"), "anthropic");
+        assert_eq!(field_of(prefixes[0], "model"), "claude-sonnet-4-6");
+        assert_eq!(field_of(prefixes[0], "route"), "Messages");
+
+        let usage = lines_named(
+            &events,
+            "upstream usage",
+            "account",
+            "prefix-log@example.com",
+        );
+        assert_eq!(usage.len(), 2, "one line per success: {events:?}");
+        for line in usage {
+            assert_eq!(field_of(line, "cache_read"), "4096");
+            assert_eq!(field_of(line, "input"), "11");
+            assert_eq!(field_of(line, "output"), "7");
+            assert_eq!(field_of(line, "provider"), "anthropic");
+            assert_eq!(field_of(line, "model"), "claude-sonnet-4-6");
+        }
     }
 
     fn test_config(auth_dir: std::path::PathBuf) -> Config {
@@ -4405,6 +4692,112 @@ mod tests {
             key_for(&HeaderMap::new(), &opening),
             key_for(&HeaderMap::new(), &grown),
             "a short conversation re-keyed itself as it grew"
+        );
+    }
+
+    #[test]
+    fn the_prefix_log_hashes_what_the_fallback_key_hashes() {
+        // Two spellings of one claim, so they cannot drift: the value the log prints is the
+        // value `conversation_key` hashes when a client names no session. A second
+        // definition would let the log keep printing one hash while Rotation keyed on
+        // another, which is exactly the misreading this line exists to prevent.
+        let body = chat_turn(&["opening-a", "opening-b", "tail"], None);
+        assert_eq!(
+            key_for(&HeaderMap::new(), &body),
+            format!(
+                "prefix:{}",
+                cacheable_prefix_fingerprint(&body, RequestRoute::Chat)
+            )
+        );
+    }
+
+    #[test]
+    fn the_prefix_fingerprint_holds_while_the_tail_grows_and_moves_with_the_opening() {
+        // The two halves of what the line can prove. A growing tail must leave it alone —
+        // otherwise every turn prints a new hash and a cache miss can never be attributed —
+        // and a rewritten opening must move it, or a request whose head changed would read
+        // as an upstream that dropped its cache.
+        let opening = chat_body(
+            &[
+                ("developer", "a stable opening"),
+                ("user", "the first turn"),
+            ],
+            "the second turn",
+        );
+        let mut grown = opening.clone();
+        grown["messages"]
+            .as_array_mut()
+            .expect("messages")
+            .push(json!({"role": "assistant", "content": "an answer"}));
+        assert_eq!(
+            cacheable_prefix_fingerprint(&opening, RequestRoute::Chat),
+            cacheable_prefix_fingerprint(&grown, RequestRoute::Chat),
+            "the fingerprint moved as the tail was appended"
+        );
+
+        // A rewritten *tail* also leaves it alone, and that is a stated limit rather than a
+        // bug: the window reads a fixed opening, so this line can rule the relay out and can
+        // never rule it in. Pinned so a later window change has to re-argue it.
+        let mut retailed = opening.clone();
+        retailed["messages"][2] = json!({"role": "user", "content": "a rewritten second turn"});
+        assert_eq!(
+            cacheable_prefix_fingerprint(&opening, RequestRoute::Chat),
+            cacheable_prefix_fingerprint(&retailed, RequestRoute::Chat),
+            "the fingerprint is reading past its opening window"
+        );
+
+        let rewritten_opening = chat_body(
+            &[
+                ("developer", "a rewritten opening"),
+                ("user", "the first turn"),
+            ],
+            "the second turn",
+        );
+        assert_ne!(
+            cacheable_prefix_fingerprint(&opening, RequestRoute::Chat),
+            cacheable_prefix_fingerprint(&rewritten_opening, RequestRoute::Chat),
+            "a rewritten opening left the fingerprint where it was"
+        );
+
+        // Model and tools are inside the hash too, and each on its own: a request that kept
+        // its messages and changed either one is a request the upstream cannot match.
+        let mut other_model = opening.clone();
+        other_model["model"] = json!("another-model");
+        assert_ne!(
+            cacheable_prefix_fingerprint(&opening, RequestRoute::Chat),
+            cacheable_prefix_fingerprint(&other_model, RequestRoute::Chat)
+        );
+        let mut other_tools = opening.clone();
+        other_tools["tools"] = json!([]);
+        assert_ne!(
+            cacheable_prefix_fingerprint(&opening, RequestRoute::Chat),
+            cacheable_prefix_fingerprint(&other_tools, RequestRoute::Chat)
+        );
+    }
+
+    #[test]
+    fn the_prefix_log_counts_the_turns_each_dialect_carries() {
+        // The count is what tells a repeated fingerprint from a grown request apart from a
+        // shortened one, so it has to read the field the route itself reads: `input` for a
+        // Responses body, with `messages` as the fallback `responses_to_anthropic` also takes.
+        let chat = chat_turn(&["one", "two", "three"], None);
+        assert_eq!(message_count(&chat, RequestRoute::Chat), 3);
+        assert_eq!(message_count(&chat, RequestRoute::Messages), 3);
+
+        let responses = json!({
+            "model": "gpt-5.5",
+            "instructions": "SYS",
+            "input": [{"role": "user", "content": "one"}, {"role": "user", "content": "two"}],
+        });
+        assert_eq!(message_count(&responses, RequestRoute::Responses), 2);
+
+        let responses_as_messages = json!({
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "one"}],
+        });
+        assert_eq!(
+            message_count(&responses_as_messages, RequestRoute::Responses),
+            1
         );
     }
 
