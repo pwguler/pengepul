@@ -132,17 +132,67 @@ fn number_from(value: &Value) -> Option<f64> {
 /// without metadata rather than with guessed ones. Ordered longest-prefix first, so
 /// `claude-fable-5-1` wins over the `claude-fable` family default and dated aliases
 /// (`claude-opus-5-20260101`) match their family.
-fn curated_metadata(id: &str) -> Option<ModelMetadata> {
+fn curated_metadata(id: &str, provider: &ProviderId) -> Option<ModelMetadata> {
     /// (context window, max output, input $/M, output $/M, cache-read $/M, cache-write $/M).
     /// `None` cache-write: the vendor does not bill a separate write rate for the family.
     const GPT5_LIMITS: (u64, u64, f64, f64, f64, Option<f64>) =
         (400_000, 128_000, 1.25, 10.0, 0.125, None);
     let mut entries = claude_family_entries();
     entries.extend(gpt_and_vendor_family_entries(GPT5_LIMITS));
-    entries
+    let base = entries
         .iter()
         .find(|(prefix, _)| id.starts_with(prefix))
-        .map(|(_, metadata)| metadata.clone())
+        .map(|(_, metadata)| metadata.clone());
+    let Some(modalities) = route_modalities(id, provider) else {
+        return base;
+    };
+    let mut metadata = base.unwrap_or_default();
+    metadata.input_modalities = Some(modalities.iter().map(|s| (*s).to_string()).collect());
+    Some(metadata)
+}
+
+/// Modality claims measured on one route, for ids where the provider-agnostic table cannot be
+/// right.
+///
+/// The same bare id can accept images on one Provider and refuse them on another. Measured
+/// 2026-09-14: `deepseek/deepseek-v4-flash` reads a four-quadrant image through commandcode and
+/// answers `404 No endpoints found that support image input` through `OpenRouter`, and
+/// `deepseek/deepseek-v4.1-flash` reads images through both. A table keyed by the bare id alone
+/// cannot state that, so an entry names the route it was measured on, or `None` when it was
+/// measured on every route pengepul reaches.
+///
+/// Matched **exactly**, not by prefix: every id here is one model, and a prefix rule would leak
+/// a claim onto its neighbours (`deepseek/deepseek-v4-flash` onto `-flash-fast`, which refuses
+/// images).
+///
+/// Everything absent from this table keeps the provider-agnostic claim above it, including the
+/// claims nothing has measured. An unmeasured `["text"]` is a claim pengepul has not refuted;
+/// a measured one that is false — which is what this table exists for — is a bug reported by
+/// the clients that trust it.
+const ROUTE_MODALITIES: &[(&str, Option<&str>, &[&str])] = &[
+    ("deepseek/deepseek-v4.1-flash", None, TEXT_IMAGE),
+    (
+        "deepseek/deepseek-v4-flash",
+        Some("commandcode"),
+        TEXT_IMAGE,
+    ),
+    // commandcode relays these to endpoints that read images; the table has no entry for them,
+    // so without this they advertise nothing and a client that has no catalog of its own drops
+    // the image (issue #8).
+    ("google/gemini-3.8-flash", Some("commandcode"), TEXT_IMAGE),
+    ("xiaomi/mimo-v2.5", Some("commandcode"), TEXT_IMAGE),
+    ("z-ai/glm-5.3-flash", Some("commandcode"), TEXT_IMAGE),
+];
+
+/// The modalities measured for `id` on `provider`'s route, when the table carries a claim for
+/// that exact pair.
+fn route_modalities(id: &str, provider: &ProviderId) -> Option<&'static [&'static str]> {
+    ROUTE_MODALITIES
+        .iter()
+        .find(|(model, route, _)| {
+            *model == id && route.is_none_or(|route| route == provider.id.as_ref())
+        })
+        .map(|(_, _, modalities)| *modalities)
 }
 
 /// The claude families the direct anthropic catalog serves. A data table; the line count
@@ -637,9 +687,10 @@ fn heuristic_provider(model: &str) -> Option<ProviderKind> {
 #[must_use]
 pub fn grok_static_models() -> FetchedModels {
     let ids = vec!["grok-4.6".to_string(), "grok-4.5".to_string()];
+    let provider = ProviderId::grok();
     let metadata = ids
         .iter()
-        .filter_map(|id| curated_metadata(id).map(|meta| (id.clone(), meta)))
+        .filter_map(|id| curated_metadata(id, &provider).map(|meta| (id.clone(), meta)))
         .collect();
     FetchedModels::with_metadata(ids, metadata)
 }
@@ -647,11 +698,11 @@ pub fn grok_static_models() -> FetchedModels {
 /// Models from an Anthropic `/v1/models` body (`{"data": [{"id": ...}]}`). The upstream
 /// carries ids only, so metadata comes from the curated table where one claims the id.
 #[must_use]
-pub fn parse_anthropic(body: &Value) -> FetchedModels {
+pub fn parse_anthropic(body: &Value, provider: &ProviderId) -> FetchedModels {
     let ids = ids_from(body.get("data"), "id");
     let metadata = ids
         .iter()
-        .filter_map(|id| curated_metadata(id).map(|meta| (id.clone(), meta)))
+        .filter_map(|id| curated_metadata(id, provider).map(|meta| (id.clone(), meta)))
         .collect();
     FetchedModels::with_metadata(ids, metadata)
 }
@@ -659,8 +710,12 @@ pub fn parse_anthropic(body: &Value) -> FetchedModels {
 /// Merge the curated table with whatever one upstream entry publishes: the curated entry
 /// is the per-field base, the upstream body wins field by field. `None` when neither has
 /// anything.
-fn merge_curated(id: &str, upstream: Option<ModelMetadata>) -> Option<ModelMetadata> {
-    match (curated_metadata(id), upstream) {
+fn merge_curated(
+    id: &str,
+    provider: &ProviderId,
+    upstream: Option<ModelMetadata>,
+) -> Option<ModelMetadata> {
+    match (curated_metadata(id, provider), upstream) {
         (Some(base), Some(upstream)) => Some(base.merged_with(upstream)),
         (base, upstream) => upstream.or(base),
     }
@@ -670,7 +725,7 @@ fn merge_curated(id: &str, upstream: Option<ModelMetadata>) -> Option<ModelMetad
 /// fields the upstream publishes override the curated table field by field; anything it
 /// leaves out falls back to the curated entry.
 #[must_use]
-pub fn parse_codex(body: &Value) -> FetchedModels {
+pub fn parse_codex(body: &Value, provider: &ProviderId) -> FetchedModels {
     let entries = body
         .get("models")
         .and_then(Value::as_array)
@@ -685,7 +740,8 @@ pub fn parse_codex(body: &Value) -> FetchedModels {
         .iter()
         .zip(entries.iter())
         .filter_map(|(id, entry)| {
-            merge_curated(id, ModelMetadata::from_json(entry)).map(|meta| (id.clone(), meta))
+            merge_curated(id, provider, ModelMetadata::from_json(entry))
+                .map(|meta| (id.clone(), meta))
         })
         .collect();
     FetchedModels::with_metadata(ids, metadata)
@@ -696,7 +752,7 @@ pub fn parse_codex(body: &Value) -> FetchedModels {
 /// overrides the curated table field by field; a model with no curated entry and a silent
 /// upstream stays bare.
 #[must_use]
-pub fn parse_openai(body: &Value) -> FetchedModels {
+pub fn parse_openai(body: &Value, provider: &ProviderId) -> FetchedModels {
     let entries = body
         .get("data")
         .and_then(Value::as_array)
@@ -711,7 +767,8 @@ pub fn parse_openai(body: &Value) -> FetchedModels {
         .iter()
         .zip(entries.iter())
         .filter_map(|(id, entry)| {
-            merge_curated(id, ModelMetadata::from_json(entry)).map(|meta| (id.clone(), meta))
+            merge_curated(id, provider, ModelMetadata::from_json(entry))
+                .map(|meta| (id.clone(), meta))
         })
         .collect();
     FetchedModels::with_metadata(ids, metadata)
@@ -742,25 +799,172 @@ mod tests {
     #[test]
     fn parses_each_provider_body_shape() {
         assert_eq!(
-            parse_anthropic(&json!({"data": [{"id": "claude-opus-5"}, {"id": "claude-sonnet-5"}]}))
-                .ids,
+            parse_anthropic(
+                &json!({"data": [{"id": "claude-opus-5"}, {"id": "claude-sonnet-5"}]}),
+                &ProviderId::anthropic()
+            )
+            .ids,
             vec!["claude-opus-5", "claude-sonnet-5"]
         );
         assert_eq!(
-            parse_codex(&json!({"models": [{"slug": "gpt-5.5"}, {"slug": "gpt-5.4"}]})).ids,
+            parse_codex(
+                &json!({"models": [{"slug": "gpt-5.5"}, {"slug": "gpt-5.4"}]}),
+                &ProviderId::codex()
+            )
+            .ids,
             vec!["gpt-5.5", "gpt-5.4"]
         );
         assert_eq!(
-            parse_openai(&json!({"data": [{"id": "llama-3.3-70b"}]})).ids,
+            parse_openai(
+                &json!({"data": [{"id": "llama-3.3-70b"}]}),
+                &ProviderId::generic("commandcode")
+            )
+            .ids,
             vec!["llama-3.3-70b"]
         );
     }
 
+    /// The seam the issue is about: what `/v1/models` publishes, after the catalog has been
+    /// built from a commandcode-style body (ids plus `context_length`, no modalities). The
+    /// advertised entry is what a client gates its image path on.
+    #[test]
+    fn the_advertised_payload_carries_the_measured_modalities() {
+        // shape taken from the live endpoint: 69 entries, each id/name/context_length only
+        let body = json!({"data": [
+            {"id": "deepseek/deepseek-v4.1-flash", "context_length": 1_000_000},
+            {"id": "deepseek/deepseek-v4-flash", "context_length": 1_000_000},
+            {"id": "deepseek/deepseek-v4-flash-fast", "context_length": 1_000_000},
+            {"id": "z-ai/glm-5.3-flash", "context_length": 1_000_000},
+        ]});
+        let advertised = |provider: &str| {
+            let id = ProviderId::generic(provider);
+            let mut catalog = ModelCatalog::default();
+            catalog.set_generic(provider, parse_openai(&body, &id));
+            catalog
+                .advertised()
+                .into_iter()
+                .map(|model| {
+                    (
+                        model.id,
+                        model
+                            .metadata
+                            .and_then(|meta| meta.input_modalities)
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+
+        let commandcode = advertised("commandcode");
+        assert_eq!(
+            commandcode["commandcode/deepseek/deepseek-v4.1-flash"],
+            vec!["text".to_string(), "image".to_string()]
+        );
+        assert_eq!(
+            commandcode["commandcode/deepseek/deepseek-v4-flash"],
+            vec!["text".to_string(), "image".to_string()]
+        );
+        // Unchanged: measured text-only, and the parent of the route-scoped entry.
+        assert_eq!(
+            commandcode["commandcode/deepseek/deepseek-v4-flash-fast"],
+            vec!["text".to_string()]
+        );
+        assert_eq!(
+            commandcode["commandcode/z-ai/glm-5.3-flash"],
+            vec!["text".to_string(), "image".to_string()]
+        );
+
+        let openrouter = advertised("openrouter");
+        assert_eq!(
+            openrouter["openrouter/deepseek/deepseek-v4-flash"],
+            vec!["text".to_string()],
+            "OpenRouter refuses image input for this id, and now the payload says so"
+        );
+        assert_eq!(
+            openrouter["openrouter/z-ai/glm-5.3-flash"],
+            Vec::<String>::new(),
+            "an unmeasured route must claim nothing"
+        );
+    }
+
+    /// The measured route splits, pinned so a later simplification of the table cannot make
+    /// the id advertise one capability everywhere again. Measured 2026-09-14 with a
+    /// four-quadrant image: commandcode reads it, `OpenRouter` answers
+    /// `404 No endpoints found that support image input`.
+    #[test]
+    fn a_route_scoped_modality_claim_holds_only_on_the_route_it_was_measured_on() {
+        let body = |id: &str| json!({"data": [{"id": id}]});
+        let modalities = |id: &str, provider: &ProviderId| {
+            parse_openai(&body(id), provider)
+                .metadata
+                .remove(id)
+                .and_then(|meta| meta.input_modalities)
+        };
+        let commandcode = ProviderId::generic("commandcode");
+        let openrouter = ProviderId::generic("openrouter");
+
+        // One bare id, two answers. A single provider-agnostic entry cannot express this.
+        assert_eq!(
+            modalities("deepseek/deepseek-v4-flash", &commandcode),
+            Some(vec!["text".to_string(), "image".to_string()])
+        );
+        assert_eq!(
+            modalities("deepseek/deepseek-v4-flash", &openrouter),
+            Some(vec!["text".to_string()])
+        );
+
+        // Measured on both routes, so the claim is not scoped.
+        for provider in [&commandcode, &openrouter] {
+            assert_eq!(
+                modalities("deepseek/deepseek-v4.1-flash", provider),
+                Some(vec!["text".to_string(), "image".to_string()]),
+                "{} lost the claim",
+                provider.id
+            );
+        }
+
+        // The exact match is what keeps the claim off the siblings the same prefix covers.
+        for text_only in [
+            "deepseek/deepseek-v4-flash-fast",
+            "deepseek/deepseek-v4-flash-0731",
+            "deepseek/deepseek-v4-pro",
+            "deepseek/deepseek-v4-pro-0813",
+        ] {
+            assert_eq!(
+                modalities(text_only, &commandcode),
+                Some(vec!["text".to_string()]),
+                "{text_only} must stay text-only"
+            );
+        }
+
+        // The three ids the table had no entry for at all: the claim is the only metadata they
+        // get, and it is scoped to the route it was measured on.
+        for id in [
+            "google/gemini-3.8-flash",
+            "xiaomi/mimo-v2.5",
+            "z-ai/glm-5.3-flash",
+        ] {
+            assert_eq!(
+                modalities(id, &commandcode),
+                Some(vec!["text".to_string(), "image".to_string()]),
+                "{id} must advertise the vision it was measured to have"
+            );
+            assert_eq!(
+                modalities(id, &openrouter),
+                None,
+                "{id} must claim nothing on an unmeasured route"
+            );
+        }
+    }
+
     #[test]
     fn anthropic_ids_get_curated_metadata() {
-        let fetched = parse_anthropic(&json!({"data": [
-            {"id": "claude-fable-5-1"}, {"id": "claude-opus-5"}, {"id": "claude-opus-9"}
-        ]}));
+        let fetched = parse_anthropic(
+            &json!({"data": [
+                {"id": "claude-fable-5-1"}, {"id": "claude-opus-5"}, {"id": "claude-opus-9"}
+            ]}),
+            &ProviderId::anthropic(),
+        );
         assert_eq!(
             fetched.ids,
             vec!["claude-fable-5-1", "claude-opus-5", "claude-opus-9"]
@@ -794,10 +998,13 @@ mod tests {
         assert_eq!(opus_pricing.cache_read_per_million, Some(0.5));
         assert_eq!(opus_pricing.cache_write_per_million, Some(6.25));
         // the 4.x models the upstream still serves are covered too
-        let fetched_4x = parse_anthropic(&json!({"data": [
-            {"id": "claude-opus-4-8"}, {"id": "claude-opus-4-5"},
-            {"id": "claude-sonnet-4-6"}, {"id": "claude-sonnet-4-5"}
-        ]}));
+        let fetched_4x = parse_anthropic(
+            &json!({"data": [
+                {"id": "claude-opus-4-8"}, {"id": "claude-opus-4-5"},
+                {"id": "claude-sonnet-4-6"}, {"id": "claude-sonnet-4-5"}
+            ]}),
+            &ProviderId::anthropic(),
+        );
         let window = |id: &str| fetched_4x.metadata.get(id).and_then(|m| m.context_window);
         assert_eq!(window("claude-opus-4-8"), Some(1_000_000));
         assert_eq!(window("claude-opus-4-5"), Some(200_000));
@@ -815,7 +1022,7 @@ mod tests {
              "pricing": {"input_per_million": 0.5, "output_per_million": "1.5"}},
             {"id": "plain"}
         ]});
-        let fetched = parse_openai(&body);
+        let fetched = parse_openai(&body, &ProviderId::generic("commandcode"));
         assert_eq!(fetched.ids, vec!["big", "plain"]);
         let big = fetched.metadata.get("big").expect("big metadata");
         assert_eq!(big.context_window, Some(131_072));
@@ -834,9 +1041,12 @@ mod tests {
 
     #[test]
     fn codex_body_metadata_wins_over_the_curated_table() {
-        let fetched = parse_codex(&json!({"models": [
-            {"slug": "gpt-5.5", "context_window": 272_000}
-        ]}));
+        let fetched = parse_codex(
+            &json!({"models": [
+                {"slug": "gpt-5.5", "context_window": 272_000}
+            ]}),
+            &ProviderId::codex(),
+        );
         assert_eq!(
             fetched
                 .metadata
@@ -860,11 +1070,14 @@ mod tests {
     #[test]
     fn openai_metadata_merges_the_curated_base_with_upstream_overrides() {
         // commandcode-style body: context_length published, everything else silent
-        let fetched = parse_openai(&json!({"data": [
-            {"id": "deepseek/deepseek-v4-pro", "context_length": 1_000_000},
-            {"id": "google/gemini-3.8-flash", "context_length": 1_000_000},
-            {"id": "totally-unknown-model"}
-        ]}));
+        let fetched = parse_openai(
+            &json!({"data": [
+                {"id": "deepseek/deepseek-v4-pro", "context_length": 1_000_000},
+                {"id": "google/gemini-3.8-flash", "context_length": 1_000_000},
+                {"id": "totally-unknown-model"}
+            ]}),
+            &ProviderId::generic("commandcode"),
+        );
         let pro = fetched
             .metadata
             .get("deepseek/deepseek-v4-pro")
@@ -936,7 +1149,7 @@ mod tests {
             .iter()
             .map(|id| json!({"id": id, "context_length": 999_999}))
             .collect::<Vec<_>>()});
-        let fetched = parse_openai(&body);
+        let fetched = parse_openai(&body, &ProviderId::generic("commandcode"));
         for id in sourced {
             let metadata = fetched
                 .metadata
@@ -977,7 +1190,7 @@ mod tests {
             .iter()
             .map(|id| json!({"id": id, "context_length": 999_999}))
             .collect::<Vec<_>>()});
-        let fetched = parse_openai(&body);
+        let fetched = parse_openai(&body, &ProviderId::generic("commandcode"));
         for id in unsourced {
             let metadata = fetched
                 .metadata
@@ -1088,15 +1301,21 @@ mod tests {
         let mut catalog = ModelCatalog::default();
         catalog.set_direct(
             ProviderKind::Anthropic,
-            parse_anthropic(&json!({"data": [
-                {"id": "claude-fable-5-1"}
-            ]})),
+            parse_anthropic(
+                &json!({"data": [
+                    {"id": "claude-fable-5-1"}
+                ]}),
+                &ProviderId::anthropic(),
+            ),
         );
         catalog.set_generic(
             "groq",
-            parse_openai(&json!({"data": [
-                {"id": "llama-3.3-70b", "context_window": 131_072}
-            ]})),
+            parse_openai(
+                &json!({"data": [
+                    {"id": "llama-3.3-70b", "context_window": 131_072}
+                ]}),
+                &ProviderId::generic("commandcode"),
+            ),
         );
         let advertised = catalog.advertised();
         let fable = advertised

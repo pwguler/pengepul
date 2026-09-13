@@ -504,7 +504,7 @@ impl UpstreamClient for HttpUpstreamClient {
                     let headers = generic_chat_headers(&account);
                     let body =
                         send_get(client, format!("{base_url}/models"), headers, timeout).await?;
-                    Ok(parse_openai(&body))
+                    Ok(parse_openai(&body, &account.provider))
                 }
                 ProviderKind::Anthropic => {
                     let headers = BTreeMap::from([
@@ -522,7 +522,7 @@ impl UpstreamClient for HttpUpstreamClient {
                         timeout,
                     )
                     .await?;
-                    Ok(parse_anthropic(&body))
+                    Ok(parse_anthropic(&body, &account.provider))
                 }
                 ProviderKind::Codex => {
                     let version = config
@@ -534,7 +534,7 @@ impl UpstreamClient for HttpUpstreamClient {
                         format!("{CODEX_BASE_URL}{CODEX_MODELS_PATH}?client_version={version}");
                     let headers = codex_headers(&account, false, &config);
                     let body = send_get(client, url, headers, timeout).await?;
-                    Ok(parse_codex(&body))
+                    Ok(parse_codex(&body, &account.provider))
                 }
                 // Grok's catalog is static — two models, known up front — so
                 // the fetch is local and cannot fail.
