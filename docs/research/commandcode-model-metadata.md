@@ -50,3 +50,60 @@ No vendor documentation was found in this pass for: `xiaomi/mimo-v2.5(-pro)`,
 curated metadata (context still passes through from commandcode); a client
 falls back to its own catalog for them. Extending the table later is a data
 change, not a code change.
+
+## Input modalities, measured on the wire
+
+Researched 2026-09-14 (pengepul 0.102.0), after issue #8 reported that
+`input_modalities` was wrong in both directions. commandcode's `/v1/models`
+publishes only `context_length`, so every modality value the relay advertises
+comes from `ROUTE_MODALITIES` or the family tables in `src/models.rs` — there is
+no upstream field to pass through.
+
+Method. A 256x256 PNG in four 128px quadrants — top-left olive, top-right teal,
+bottom-left maroon, bottom-right navy — sent as a data URL, and a question that
+needs the image: name the colour of each quadrant, or say which quadrant holds a
+named colour. A blind model can only guess, one quadrant in four per question,
+and must also name the colour; a text-only model does not fail loudly, it answers
+with a confident wrong quadrant (`deepseek/deepseek-v4-pro` did exactly that) or
+says it cannot see an image. `max_tokens` must be generous: a reasoning model
+spends the front of the budget on `reasoning_content` and returns empty content
+with `finish_reason: "length"`, which reads like a vision failure and is not one.
+
+| id | route | advertised before | measured |
+| --- | --- | --- | --- |
+| `deepseek/deepseek-v4.1-flash` | commandcode | `["text"]` | reads images (two questions) |
+| `deepseek/deepseek-v4.1-flash` | openrouter | `["text"]` | reads images (4/4 quadrants) |
+| `deepseek/deepseek-v4-flash` | commandcode | `["text"]` | reads images |
+| `deepseek/deepseek-v4-flash` | openrouter | `["text"]` | **refuses** — `404 No endpoints found that support image input` |
+| `deepseek/deepseek-v4-flash-fast` | commandcode | `["text"]` | text-only, and says so: *"no image was provided in your message"* |
+| `deepseek/deepseek-v4-pro` | commandcode | `["text"]` | text-only, and says so: *"the image is unsupported"* |
+| `deepseek/deepseek-v4-pro`, `-pro-0813`, `-flash-0731` | openrouter | `["text"]` | **refuse** — `404 No endpoints found that support image input` |
+| `deepseek/deepseek-v4-pro-0813:batch` | openrouter | `["text"]` | unmeasured — the account was cooled by the 404s above before it answered |
+| `deepseek/deepseek-v4-flash-0731:batch` | openrouter | `["text"]` | not served over chat at all: *"only available through the Batch API"* |
+| `google/gemini-3.8-flash` | commandcode | absent | reads images |
+| `xiaomi/mimo-v2.5` | commandcode | absent | reads images |
+| `z-ai/glm-5.3-flash` | commandcode | absent | reads images |
+
+Two conclusions the table now encodes:
+
+1. **A modality claim is a claim about a route, not about a model name.**
+   `deepseek/deepseek-v4-flash` reads images through commandcode and refuses them
+   through OpenRouter, so no table keyed by the bare id can be right for both.
+   `ROUTE_MODALITIES` names the route each measured claim holds on, and matches
+   exactly rather than by prefix, so the claim cannot leak onto
+   `deepseek-v4-flash-fast`, which refuses images.
+2. **An unmeasured `["text"]` is left alone.** The family tables still assert
+   `["text"]` for ids nothing has measured; that is a claim pengepul has not
+   refuted, and it is recorded here rather than silently weakened, because
+   omitting the field is not equivalent for a client — pi defaults a missing
+   `input` to `["text"]` (`dist/core/provider-composer.js`), so omission and a
+   false `["text"]` behave identically there. Only a correct positive claim
+   restores the image path.
+
+Cost of the measurement: 20 requests, plus one account cooldown. Attaching an
+image to a text-only id on OpenRouter earns a `404`, which pengepul books as a
+`network` failure, so the account cools down and the next requests answer
+`503 no available openrouter account; last failure: network`. A client that
+trusts an advertised `["text", "image"]` for a model that has none therefore
+costs more than a dropped image, which is why the measured positives here are
+scoped to the route that produced them.
