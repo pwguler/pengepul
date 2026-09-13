@@ -3931,12 +3931,12 @@ async fn six_concurrent_requests_each_count_exactly_once() {
     }
 }
 
-/// AC-7: usage counters key on the name the vendor was asked for, so a
-/// `:high` request and a plain request to the same model share one row.
-/// Keying on the client's string would split one model's history in two
-/// the moment a harness started appending a thinking level.
+/// The vendor is asked for the id the client named, suffix and all: the relay removes the
+/// `<provider>/` prefix and nothing else. This test replaces the one that pinned the
+/// opposite, when a trailing `:high` was stripped before the vendor saw it — if that strip
+/// comes back, this fails on both the names asked for and the usage rows.
 #[tokio::test]
-async fn a_thinking_level_does_not_split_a_models_usage_row() {
+async fn a_model_id_reaches_the_vendor_whole_and_keys_its_own_usage_row() {
     let tmp = tempfile::tempdir().expect("tempdir");
     save_token(
         tmp.path(),
@@ -3975,7 +3975,6 @@ async fn a_thinking_level_does_not_split_a_models_usage_row() {
         assert_eq!(status, 200, "{model} did not succeed");
     }
 
-    // The vendor was asked for the same model both times.
     let asked: Vec<String> = upstream
         .calls()
         .iter()
@@ -3990,9 +3989,9 @@ async fn a_thinking_level_does_not_split_a_models_usage_row() {
         asked,
         vec![
             "claude-sonnet-4-6".to_string(),
-            "claude-sonnet-4-6".to_string()
+            "claude-sonnet-4-6:high".to_string()
         ],
-        "the thinking level reached the vendor"
+        "the id was rewritten on its way to the vendor"
     );
 
     let usage: Value = serde_json::from_str(
@@ -4013,8 +4012,8 @@ async fn a_thinking_level_does_not_split_a_models_usage_row() {
     names.sort();
     assert_eq!(
         names,
-        vec!["claude-sonnet-4-6"],
-        "the thinking level opened a second usage row: {names:?}"
+        vec!["claude-sonnet-4-6", "claude-sonnet-4-6:high"],
+        "the counter keyed on something other than the id the vendor was asked for: {names:?}"
     );
 }
 

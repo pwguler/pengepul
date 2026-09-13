@@ -201,9 +201,8 @@ headers, standard OIDC):
   A stale pin fails closed with a clean 426 naming the minimum, so detection
   is cheap: bump the pinned `x-grok-client-version` when that body changes.
 - **`reasoning_content`** rides in the assistant message on chat-completions
-  responses. Decide pass-through vs strip (the strip-thinking-suffix machinery
-  already exists); OpenAI-style clients that don't expect the field will
-  tolerate it, but it counts toward billed completion tokens.
+  responses. Decide pass-through vs strip; OpenAI-style clients that don't expect
+  the field will tolerate it, but it counts toward billed completion tokens.
 - **`cost_in_usd_ticks`** is a new usage field, useful for the usage console
   once tick scale is confirmed (unverified).
 - **Tokens are broad.** The server grants more scopes than requested

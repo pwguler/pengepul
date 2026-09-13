@@ -598,37 +598,18 @@ impl ModelCatalog {
 /// Strip a leading `<provider>/` from a model id so the bare id goes upstream. The prefix
 /// must be the resolved provider's own id (`anthropic`, `codex`, or the `providers:` entry
 /// name); an unrelated id containing `/` is left intact.
+///
+/// Nothing else is touched. A client-side shorthand such as pi's `:high` travels as part of
+/// the name it was given: the relay does not know the vendor's model names well enough to
+/// remove a colon-word, and a served id like `LongCat-2.0:free` shows the two are the same
+/// shape.
 #[must_use]
 pub fn upstream_model<'a>(model: &'a str, provider: &ProviderId) -> &'a str {
     let prefix = provider.id.as_ref();
-    let named = model
+    model
         .strip_prefix(prefix)
         .and_then(|rest| rest.strip_prefix('/'))
-        .unwrap_or(model);
-    strip_thinking_level(named)
-}
-
-/// The thinking levels pi appends to a model id as shorthand
-/// (`pi --model sonnet:high`, README). Client vocabulary: no vendor
-/// parses them.
-const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-
-/// Drop a trailing `:<level>` so the vendor is asked for a model it has.
-///
-/// An allowlist, not a split on the last colon: the relay serves
-/// `meituan/LongCat-2.0:free`, and ollama-style tags (`qwen:7b`) are the
-/// same shape. Only the seven words pi defines are a level, which is the
-/// same set pi's own `splitKnownThinkingSuffix` recognises.
-fn strip_thinking_level(model: &str) -> &str {
-    let Some((name, tail)) = model.rsplit_once(':') else {
-        return model;
-    };
-    // A bare `:high` has no model in front of it; asking upstream for an
-    // empty name is worse than passing the oddity through.
-    if name.is_empty() || !THINKING_LEVELS.contains(&tail) {
-        return model;
-    }
-    name
+        .unwrap_or(model)
 }
 
 /// Route an id no fetched list claims, by name shape. Broad on purpose: a new `gpt-*` or
@@ -1136,55 +1117,57 @@ mod tests {
         );
     }
 
-    /// AC-1/AC-2/AC-3: a thinking level is client vocabulary, so it is
-    /// removed before the vendor sees it; a colon-word that is not a
-    /// level is part of the name and survives. The relay serves
-    /// `LongCat-2.0:free` today, so a blanket split would break it.
+    /// AC-1/AC-2: the prefix strip is the only rewrite. Everything after it is the name,
+    /// including a colon-word on either side of a slash, because the relay cannot tell a
+    /// client's shorthand from a vendor's tag.
     #[test]
-    fn upstream_model_strips_a_thinking_level_but_keeps_other_tags() {
+    fn upstream_model_strips_the_provider_prefix_and_nothing_else() {
         let anthropic = ProviderId::anthropic();
         let generic = ProviderId::generic("commandcode");
-        // AC-1: every level pi defines.
+        // AC-1: the prefix goes, for every provider.
+        assert_eq!(
+            super::upstream_model("anthropic/claude-opus-5", &anthropic),
+            "claude-opus-5"
+        );
+        assert_eq!(
+            super::upstream_model("codex/gpt-5.5", &ProviderId::codex()),
+            "gpt-5.5"
+        );
+        assert_eq!(
+            super::upstream_model("commandcode/some-model", &generic),
+            "some-model"
+        );
+        // AC-2: a colon-word travels whole, whatever it says. No level is special any more:
+        // every one of the seven the relay used to drop now survives, so a partial
+        // re-introduction of the old allowlist fails here rather than shipping.
         for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
+            let suffixed = format!("anthropic/claude-opus-5:{level}");
             assert_eq!(
-                super::upstream_model(&format!("anthropic/claude-opus-5:{level}"), &anthropic),
-                "claude-opus-5",
-                "level {level} was not stripped"
+                super::upstream_model(&suffixed, &anthropic),
+                format!("claude-opus-5:{level}"),
+                "{level} was stripped"
             );
         }
-        // AC-2: not a level, so not a suffix.
         assert_eq!(
             super::upstream_model("commandcode/meituan/LongCat-2.0:free", &generic),
             "meituan/LongCat-2.0:free"
         );
         assert_eq!(super::upstream_model("qwen:7b", &generic), "qwen:7b");
-        // AC-3: the rule is not per-provider.
-        assert_eq!(
-            super::upstream_model("codex/gpt-5.5:high", &ProviderId::codex()),
-            "gpt-5.5"
-        );
-        assert_eq!(
-            super::upstream_model("commandcode/some-model:high", &generic),
-            "some-model"
-        );
-    }
-
-    /// AC-5/AC-6: the edges. Only the final segment counts, and a strip
-    /// never empties the name.
-    #[test]
-    fn stripping_a_level_never_leaves_nothing_behind() {
-        let anthropic = ProviderId::anthropic();
-        // AC-5: no colon at all.
-        assert_eq!(
-            super::upstream_model("anthropic/claude-opus-5", &anthropic),
-            "claude-opus-5"
-        );
-        // AC-5: a bare level with no model before it stays as it is,
-        // rather than becoming an empty request.
         assert_eq!(super::upstream_model(":high", &anthropic), ":high");
-        // AC-6: only the last segment, and only once.
-        assert_eq!(super::upstream_model("a:high/b", &anthropic), "a:high/b");
-        assert_eq!(super::upstream_model("x:high:high", &anthropic), "x:high");
+        assert_eq!(
+            super::upstream_model("anthropic/x:high:high", &anthropic),
+            "x:high:high"
+        );
+        // A colon before a slash, inside the name, is part of the name too.
+        assert_eq!(
+            super::upstream_model("anthropic/x:high/y", &anthropic),
+            "x:high/y"
+        );
+        // A prefix that is not this provider's is part of the name.
+        assert_eq!(
+            super::upstream_model("openrouter/anthropic/claude-opus-5", &generic),
+            "openrouter/anthropic/claude-opus-5"
+        );
     }
 
     #[test]
