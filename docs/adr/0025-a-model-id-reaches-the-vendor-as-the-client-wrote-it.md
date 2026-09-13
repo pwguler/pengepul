@@ -26,13 +26,14 @@ why the fix does not survive review:
   effort the body's own `reasoning_effort` asked for, that being the only channel held to the
   upstream. A client that wrote its level into the id and nowhere else asked for high and
   got the upstream's default, with a 200 saying otherwise.
-- **The relay was maintaining a guess about a client's vocabulary.** The spec justifies its
-  seven-word allowlist as "the same set pi's own `splitKnownThinkingSuffix` recognises".
-  That function does not exist in the installed pi build (0.85.1), and no `:level` parser
-  turned up in its dist — the client-side half of the contract is at least a version behind
-  the name the relay cites, and pi's README documents the shorthand while the code that
-  consumes it is not findable. A relay cannot maintain an allowlist for another project's
-  CLI syntax it cannot see.
+- **The relay was mirroring a rule it does not own.** The spec justifies its seven-word
+  allowlist as "the same set pi's own `splitKnownThinkingSuffix` recognises". That function
+  is real, and it lives in a client-side extension, not in the harness core:
+  `pi-subagents/src/shared/model-info.ts` splits a model string into `baseModel` and
+  `thinkingSuffix`, the level it returns is applied as the child's thinking configuration,
+  and the dispatch carries the base model (`runs/shared/model-scope.ts`). So for the client
+  the rule was written for, the relay's copy was already redundant — and a second copy of a
+  rule owned by another package is one that drifts with a release pengepul cannot see.
 - **Shape cannot separate the two cases.** The allowlist was needed because
   `commandcode/meituan/LongCat-2.0:free` is a served model id and `qwen:7b` is an
   ollama-style tag: a colon-word is a vendor tag as often as it is a client shorthand. Only
@@ -64,6 +65,10 @@ that channel, and a client that wants an effort must use the field.
   `not_found_error` naming the whole id. The failure is loud but the diagnosis is not: the
   vendor error does not say that the colon is the problem. That is the accepted cost of not
   rewriting a client's id, and it is the reason this ADR records the reproduction above.
+  Measured on the machine this was decided on: no installed client sends one — pi holds a
+  level in the model's thinking configuration and splits a suffixed `subagent` argument into
+  base model plus level before dispatch, and no configuration, session record, history entry
+  or script carries a suffixed id on the wire.
 - **The usage axis gains a row per id variant.** `LongCat-2.0:free` and a hypothetical
   `claude-opus-5:high` each key their own per-model row, which is the honest reading: those
   are the names the vendor was asked for. The panels treat a model name as an opaque string
