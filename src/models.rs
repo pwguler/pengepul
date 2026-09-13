@@ -126,12 +126,16 @@ fn number_from(value: &Value) -> Option<f64> {
         .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
 }
 
-/// Per-model metadata for the direct anthropic and codex catalogs. The anthropic upstream
-/// advertises only ids, so these numbers come from the vendor's published model docs
-/// (see `docs/research/claude-model-metadata.md`); a model no entry claims is advertised
-/// without metadata rather than with guessed ones. Ordered longest-prefix first, so
-/// `claude-fable-5-1` wins over the `claude-fable` family default and dated aliases
-/// (`claude-opus-5-20260101`) match their family.
+/// Per-model metadata for one Provider's catalog. The anthropic upstream advertises only ids,
+/// and commandcode publishes only `context_length`, so these numbers come from the vendor's
+/// published model docs (see `docs/research/`) or from measurements recorded in
+/// [`PROVIDER_MODALITIES`]; a model no entry claims is advertised without metadata rather than
+/// with guessed ones. Ordered longest-prefix first, so `claude-fable-5-1` wins over the
+/// `claude-fable` family default and dated aliases (`claude-opus-5-20260101`) match their
+/// family.
+///
+/// `provider` decides one field only: modalities that were measured per Provider, which the
+/// family tables below cannot express because they are keyed by the bare id.
 fn curated_metadata(id: &str, provider: &ProviderId) -> Option<ModelMetadata> {
     /// (context window, max output, input $/M, output $/M, cache-read $/M, cache-write $/M).
     /// `None` cache-write: the vendor does not bill a separate write rate for the family.
@@ -143,7 +147,7 @@ fn curated_metadata(id: &str, provider: &ProviderId) -> Option<ModelMetadata> {
         .iter()
         .find(|(prefix, _)| id.starts_with(prefix))
         .map(|(_, metadata)| metadata.clone());
-    let Some(modalities) = route_modalities(id, provider) else {
+    let Some(modalities) = provider_modalities(id, provider) else {
         return base;
     };
     let mut metadata = base.unwrap_or_default();
@@ -151,46 +155,59 @@ fn curated_metadata(id: &str, provider: &ProviderId) -> Option<ModelMetadata> {
     Some(metadata)
 }
 
-/// Modality claims measured on one route, for ids where the provider-agnostic table cannot be
-/// right.
+/// Modality claims measured against one Provider, for ids where the family tables above cannot
+/// be right.
 ///
 /// The same bare id can accept images on one Provider and refuse them on another. Measured
-/// 2026-09-14: `deepseek/deepseek-v4-flash` reads a four-quadrant image through commandcode and
-/// answers `404 No endpoints found that support image input` through `OpenRouter`, and
-/// `deepseek/deepseek-v4.1-flash` reads images through both. A table keyed by the bare id alone
-/// cannot state that, so an entry names the route it was measured on, or `None` when it was
-/// measured on every route pengepul reaches.
+/// 2026-09-14 (`docs/research/commandcode-model-metadata.md`): `deepseek/deepseek-v4-flash` reads
+/// a four-quadrant image through commandcode and answers `404 No endpoints found that support
+/// image input` through `OpenRouter`, while `deepseek/deepseek-v4.1-flash` reads images through
+/// both. A table keyed by the bare id alone cannot state that, so an entry names the Provider it
+/// was measured against, or `None` when it was measured against every Provider pengepul was
+/// pointed at.
+///
+/// The name in the middle is the **Provider id** — the config entry name from
+/// `pengepul login --provider <name>`, or `anthropic` / `codex` / `grok`. Registering the same
+/// upstream under a second name therefore gets no claim until it is measured under that name,
+/// and a name that points somewhere else inherits the claim of the route it is named after.
 ///
 /// Matched **exactly**, not by prefix: every id here is one model, and a prefix rule would leak
 /// a claim onto its neighbours (`deepseek/deepseek-v4-flash` onto `-flash-fast`, which refuses
 /// images).
 ///
-/// Everything absent from this table keeps the provider-agnostic claim above it, including the
-/// claims nothing has measured. An unmeasured `["text"]` is a claim pengepul has not refuted;
-/// a measured one that is false — which is what this table exists for — is a bug reported by
-/// the clients that trust it.
-const ROUTE_MODALITIES: &[(&str, Option<&str>, &[&str])] = &[
+/// Everything absent from this table keeps the family table's claim, including the claims nothing
+/// has measured. An unmeasured `["text"]` is a claim pengepul has not refuted; a measured one that
+/// is false — which is what this table exists for — is a bug reported by the clients that trust it.
+/// The family tables' `["text","image"]` entries are the same inference from vendor documentation
+/// rather than from a measurement against the Provider serving them, so a false positive remains
+/// possible there: that direction costs more than a dropped image, because a client attaches an
+/// image the upstream refuses (issue #8's `404`). Measuring those is not done yet.
+///
+/// `merge_curated` still lets an upstream's own `input_modalities` win, so a claim here holds only
+/// while the Provider stays silent about modalities, as commandcode does.
+const PROVIDER_MODALITIES: &[(&str, Option<&str>, &[&str])] = &[
     ("deepseek/deepseek-v4.1-flash", None, TEXT_IMAGE),
     (
         "deepseek/deepseek-v4-flash",
         Some("commandcode"),
         TEXT_IMAGE,
     ),
-    // commandcode relays these to endpoints that read images; the table has no entry for them,
-    // so without this they advertise nothing and a client that has no catalog of its own drops
-    // the image (issue #8).
+    // commandcode relays these to endpoints that read images; the family tables have no entry
+    // for them, so without this they advertise nothing and a client that has no catalog of its own
+    // drops the image (issue #8). `xiaomi/mimo-v2.5` reaches this table as the only metadata it
+    // has; the other two keep the `reasoning` their family entry already carried.
     ("google/gemini-3.8-flash", Some("commandcode"), TEXT_IMAGE),
     ("xiaomi/mimo-v2.5", Some("commandcode"), TEXT_IMAGE),
     ("z-ai/glm-5.3-flash", Some("commandcode"), TEXT_IMAGE),
 ];
 
-/// The modalities measured for `id` on `provider`'s route, when the table carries a claim for
-/// that exact pair.
-fn route_modalities(id: &str, provider: &ProviderId) -> Option<&'static [&'static str]> {
-    ROUTE_MODALITIES
+/// The modalities measured for `id` against `provider`, when the table carries a claim for that
+/// exact pair.
+fn provider_modalities(id: &str, provider: &ProviderId) -> Option<&'static [&'static str]> {
+    PROVIDER_MODALITIES
         .iter()
-        .find(|(model, route, _)| {
-            *model == id && route.is_none_or(|route| route == provider.id.as_ref())
+        .find(|(model, measured_on, _)| {
+            *model == id && measured_on.is_none_or(|name| name == provider.id.as_ref())
         })
         .map(|(_, _, modalities)| *modalities)
 }
@@ -835,6 +852,8 @@ mod tests {
             {"id": "deepseek/deepseek-v4-flash", "context_length": 1_000_000},
             {"id": "deepseek/deepseek-v4-flash-fast", "context_length": 1_000_000},
             {"id": "z-ai/glm-5.3-flash", "context_length": 1_000_000},
+            {"id": "google/gemini-3.8-flash", "context_length": 1_000_000},
+            {"id": "xiaomi/mimo-v2.5", "context_length": 1_000_000},
         ]});
         let advertised = |provider: &str| {
             let id = ProviderId::generic(provider);
@@ -869,10 +888,18 @@ mod tests {
             commandcode["commandcode/deepseek/deepseek-v4-flash-fast"],
             vec!["text".to_string()]
         );
-        assert_eq!(
-            commandcode["commandcode/z-ai/glm-5.3-flash"],
-            vec!["text".to_string(), "image".to_string()]
-        );
+        // All three ids the family tables never claimed, at the seam that ships.
+        for id in [
+            "commandcode/z-ai/glm-5.3-flash",
+            "commandcode/google/gemini-3.8-flash",
+            "commandcode/xiaomi/mimo-v2.5",
+        ] {
+            assert_eq!(
+                commandcode[id],
+                vec!["text".to_string(), "image".to_string()],
+                "{id} lost its measured claim"
+            );
+        }
 
         let openrouter = advertised("openrouter");
         assert_eq!(
@@ -880,11 +907,17 @@ mod tests {
             vec!["text".to_string()],
             "OpenRouter refuses image input for this id, and now the payload says so"
         );
-        assert_eq!(
-            openrouter["openrouter/z-ai/glm-5.3-flash"],
-            Vec::<String>::new(),
-            "an unmeasured route must claim nothing"
-        );
+        for id in [
+            "openrouter/z-ai/glm-5.3-flash",
+            "openrouter/google/gemini-3.8-flash",
+            "openrouter/xiaomi/mimo-v2.5",
+        ] {
+            assert_eq!(
+                openrouter[id],
+                Vec::<String>::new(),
+                "{id} claims modalities on a Provider it was never measured against"
+            );
+        }
     }
 
     /// The measured route splits, pinned so a later simplification of the table cannot make

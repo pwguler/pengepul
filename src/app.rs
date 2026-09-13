@@ -4225,6 +4225,114 @@ mod tests {
         }
     }
 
+    /// An account for a configured (static-key) provider, as the fetch sees it.
+    fn generic_account(name: &str) -> AvailableAccount {
+        let provider = ProviderId::generic(name);
+        AvailableAccount {
+            token: TokenData {
+                access_token: "gsk-test".to_string(),
+                refresh_token: String::new(),
+                email: format!("key-{name}"),
+                expires_at: String::new(),
+                account_uuid: String::new(),
+                provider: provider.clone(),
+                id_token: None,
+                last_refresh_at: None,
+                plan_type: None,
+            },
+            device_id: "device".to_string(),
+            account_uuid: String::new(),
+            provider,
+            chatgpt_account_id: None,
+        }
+    }
+
+    /// The invariant the per-provider modality claims rest on: the **provider decides the claim**,
+    /// and the thing that carries the provider is `account.provider` at the fetch that ships.
+    ///
+    /// A test over `parse_openai` cannot see a wrong argument at that call site — hard-coding
+    /// `ProviderId::generic("commandcode")` there leaves the whole suite green — so this drives the
+    /// real `HttpUpstreamClient` against a local endpoint serving one commandcode-shaped body, and
+    /// asks about the same bare id twice. Only `account.provider` differs between the two answers,
+    /// so a constant substituted at the call site fails here.
+    #[tokio::test]
+    async fn the_fetch_asks_each_provider_for_its_own_modality_claims() {
+        use axum::routing::get;
+
+        // The shape the live endpoint serves: ids and context_length, no modalities.
+        let body = json!({"data": [
+            {"id": "deepseek/deepseek-v4-flash", "context_length": 1_000_000},
+            {"id": "deepseek/deepseek-v4.1-flash", "context_length": 1_000_000},
+        ]});
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("bound address");
+        let served = body.clone();
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/v1/models",
+                get(move || {
+                    let served = served.clone();
+                    async move { axum::Json(served) }
+                }),
+            );
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(tmp.path().to_path_buf());
+        for name in ["commandcode", "openrouter"] {
+            config.providers.insert(
+                name.to_string(),
+                crate::config::ConfiguredProvider {
+                    base_url: format!("http://{addr}/v1"),
+                },
+            );
+        }
+        let config = Arc::new(config);
+        let client = super::HttpUpstreamClient::default();
+
+        let fetch_for = |provider: &'static str| {
+            let config = Arc::clone(&config);
+            let client = client.clone();
+            async move {
+                client
+                    .fetch_models(ProviderKind::Generic, generic_account(provider), config)
+                    .await
+                    .expect("the local endpoint answers")
+            }
+        };
+        let claims = |fetched: &crate::models::FetchedModels, id: &str| {
+            fetched
+                .metadata
+                .get(id)
+                .and_then(|meta| meta.input_modalities.clone())
+        };
+
+        // One body, two providers, two answers: commandcode reads images for this id, OpenRouter
+        // answers `404 No endpoints found that support image input`.
+        let from_commandcode = fetch_for("commandcode").await;
+        assert_eq!(
+            claims(&from_commandcode, "deepseek/deepseek-v4-flash"),
+            Some(vec!["text".to_string(), "image".to_string()]),
+            "the fetch did not carry commandcode's own claim"
+        );
+        let from_openrouter = fetch_for("openrouter").await;
+        assert_eq!(
+            claims(&from_openrouter, "deepseek/deepseek-v4-flash"),
+            Some(vec!["text".to_string()]),
+            "the fetch carried another provider's claim"
+        );
+        // Measured on both, so the claim is not provider-scoped.
+        for fetched in [&from_commandcode, &from_openrouter] {
+            assert_eq!(
+                claims(fetched, "deepseek/deepseek-v4.1-flash"),
+                Some(vec!["text".to_string(), "image".to_string()])
+            );
+        }
+    }
+
     fn test_config(auth_dir: std::path::PathBuf) -> Config {
         Config {
             host: String::new(),
