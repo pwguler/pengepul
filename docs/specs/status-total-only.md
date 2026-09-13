@@ -68,6 +68,9 @@ the total"*, then, choosing the shape: total **plus one line per pool**.
 
 ## Revisions
 
+- `version-uptime-and-usage-total` adds two lines to the connection group: `version`, always,
+  and `uptime` when the service manager can answer. AC-1's list and AC-2's box gain them; the
+  per-pool lines and the aggregate are unchanged, and so is the arithmetic.
 - The two chosen previews disagreed on the aggregate: the content option
   showed `requests` + `total` only, the style option showed the
   `tokens in/out/cache` breakdown. **Merged: both.** Dropping the

@@ -104,6 +104,10 @@ before.
 
 ## Revisions
 
+- `version-uptime-and-usage-total` appends the relay total below the trend, in both styles, so
+  AC-5's "one panel" is now two and plain no longer ends at AC-7's last day line. The trend
+  panel is unchanged; its own row count is what the row-count assertions now pin, and the
+  appended block is the relay's lifetime rollup, which AC-11's reconciliation already covers.
 - **The payload gap.** AC-9 sums days relay-wide and the CLI reads
   `/admin/accounts`, but no criterion said the payload carries `days`.
   Found while implementing AC-1; folded into AC-9 rather than left
