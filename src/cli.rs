@@ -13,7 +13,7 @@ use crate::tokens::save_token;
 use crate::types::{ProviderId, ProviderKind, TokenData};
 use crate::usage_view::{
     Connection, print_accounts, print_pool_rich, print_relay_total_plain, print_relay_total_rich,
-    print_trend_plain, print_trend_rich,
+    print_trend_plain, print_trend_rich, print_usage_total_plain, print_usage_total_rich,
 };
 use crate::utils::{local_today, sha256_hex};
 
@@ -629,8 +629,18 @@ fn usage(
     let accounts = runtime.accounts(&base_url, &first_api_key(&config)?)?;
     let today = local_today();
     match style {
-        Style::Plain => print_trend_plain(&accounts, output, &today),
-        Style::Rich => print_trend_rich(&accounts, output, &today),
+        Style::Plain => {
+            print_trend_plain(&accounts, output, &today);
+            // version-uptime-and-usage-total AC-5: the trend keeps its lines and the relay
+            // total follows them. The block is all-time while the trend is a 30-day window,
+            // so it keeps the `relay total` wording `status` uses rather than a total that
+            // could be read as the window's.
+            print_usage_total_plain(&accounts, output);
+        }
+        Style::Rich => {
+            print_trend_rich(&accounts, output, &today);
+            print_usage_total_rich(&accounts, output);
+        }
     }
     Ok(())
 }

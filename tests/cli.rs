@@ -3028,6 +3028,17 @@ fn a_control_character_cannot_split_a_panel_row() {
 
 /// usage-trend AC-5/AC-6/AC-9: one panel, a 30-character sparkline of
 /// relay-wide daily tokens, a peak row naming its day, and a total.
+/// The inner rows of the first box in `text` — the trend panel in `usage`, whose row count
+/// these tests pin. `version-uptime-and-usage-total` appends a second panel below it, so the
+/// subject has to be named rather than counted as the whole output.
+fn first_panel_rows(text: &str) -> usize {
+    text.lines()
+        .skip_while(|line| !line.starts_with('\u{250c}'))
+        .skip(1)
+        .take_while(|line| !line.starts_with('\u{2514}'))
+        .count()
+}
+
 #[test]
 fn usage_renders_a_thirty_day_sparkline() {
     let tmp = tempdir().expect("tempdir");
@@ -3086,7 +3097,11 @@ fn usage_renders_a_thirty_day_sparkline() {
     assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
     let lines: Vec<&str> = visible.lines().collect();
-    assert_eq!(lines.len(), 6, "four rows in a box: {visible}");
+    assert_eq!(
+        first_panel_rows(&visible),
+        4,
+        "four rows in the trend box: {visible}"
+    );
     // all time contains the window, never the other way round.
     assert!(
         lines[4].contains("50.0K"),
@@ -3168,8 +3183,8 @@ fn usage_says_so_when_no_history_exists() {
     // Not `!contains("▁▁▁")`: this path returns before `sparkline` is
     // called, so that assertion cannot fail. Pin the shape instead.
     assert_eq!(
-        visible.lines().count(),
-        3,
+        first_panel_rows(&visible),
+        1,
         "one row in a box, no bars: {visible}"
     );
 }
@@ -3287,8 +3302,8 @@ fn usage_says_how_much_history_it_actually_has() {
         "history exists and the panel denies it: {visible}"
     );
     assert_eq!(
-        visible.lines().count(),
-        6,
+        first_panel_rows(&visible),
+        4,
         "four rows whatever the history: {visible}"
     );
     for line in visible.lines() {
@@ -3358,6 +3373,185 @@ fn usage_all_time_equals_the_status_pool_row() {
     // And the window is visibly a subset, not a competing total.
     assert!(usage.contains("window"), "{usage}");
     assert!(!usage.contains("│ total"), "one word, one scope: {usage}");
+}
+
+/// version-uptime-and-usage-total AC-5: `usage` plain keeps one line per day and then,
+/// after a blank line, prints the relay total — the same header and the same aggregate lines
+/// `status` prints for the same payload. Before this, `usage` had no relay-wide numbers at all.
+#[test]
+fn usage_plain_ends_with_the_relay_total_block() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let mut runtime = FakeRuntime {
+        rich: false,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 1,
+                    "accounts": [account(json!({
+                        "email": "a@x.com",
+                        "available": true,
+                        "totalRequests": 20,
+                        "totalSuccesses": 18,
+                        "totalFailures": 2,
+                        "totalInputTokens": 700_000,
+                        "totalOutputTokens": 900_000,
+                        "totalCacheReadInputTokens": 289_000_000,
+                        "days": [{
+                            "date": today,
+                            "requests": 20,
+                            "successes": 18,
+                            "failures": 2,
+                            "inputTokens": 700_000,
+                            "outputTokens": 900_000,
+                            "cacheCreationInputTokens": 0,
+                            "cacheReadInputTokens": 289_000_000,
+                            "reasoningOutputTokens": 0
+                        }]
+                    }))]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let out = run_style(&["usage"], tmp.path(), &mut runtime, Style::Plain).stdout;
+    let lines: Vec<&str> = out.lines().collect();
+
+    // The trend is untouched and still first.
+    assert!(
+        lines.iter().any(|line| line.starts_with(&today)),
+        "the per-day line moved or vanished: {out}"
+    );
+    // Then the relay total: header, requests, tokens.
+    let header = lines
+        .iter()
+        .position(|line| line.starts_with("relay total: 1 pool, 1 account"))
+        .unwrap_or_else(|| panic!("no relay total header in: {out}"));
+    // The block follows the trend directly: the views stack without a blank line, and the
+    // `relay total` wording is what separates lifetime figures from the window above.
+    assert!(
+        lines[header - 1].starts_with(&today),
+        "the block did not follow the trend's last day line: {out}"
+    );
+    assert!(
+        lines[header + 1].starts_with("requests 20  (18 ok, 2 failed)"),
+        "the requests line is not the relay rollup: {out}"
+    );
+    let tokens = lines[header + 2];
+    assert!(
+        tokens.starts_with("input ") && tokens.contains("cached ") && tokens.contains("output "),
+        "the token line is missing or wrong: {tokens:?}"
+    );
+    assert_eq!(
+        lines.len(),
+        header + 3,
+        "the block must end the output: {out}"
+    );
+}
+
+/// AC-6: rich `usage` stays one trend panel and gains a second, the relay total, below it —
+/// aggregate rows only, so no pool appears in it. AC-7: the figures are the same rollup
+/// `status` takes, not a second computation.
+#[test]
+fn usage_rich_prints_the_relay_total_panel_below_the_trend() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let payload = json!({
+        "providers": {
+            "anthropic": {
+                "account_count": 1,
+                "accounts": [account(json!({
+                    "email": "a@x.com",
+                    "available": true,
+                    "totalRequests": 20,
+                    "totalSuccesses": 18,
+                    "totalFailures": 2,
+                    "totalInputTokens": 700_000,
+                    "totalOutputTokens": 900_000,
+                    "totalCacheReadInputTokens": 289_000_000,
+                    "days": [{
+                        "date": today,
+                        "requests": 20,
+                        "successes": 18,
+                        "failures": 2,
+                        "inputTokens": 700_000,
+                        "outputTokens": 900_000,
+                        "cacheCreationInputTokens": 0,
+                        "cacheReadInputTokens": 289_000_000,
+                        "reasoningOutputTokens": 0
+                    }]
+                }))]
+            }
+        }
+    });
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(payload.clone()),
+        ..FakeRuntime::default()
+    };
+
+    let out = strip_ansi(&run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich).stdout);
+    let lines: Vec<&str> = out.lines().collect();
+
+    let trend = lines
+        .iter()
+        .position(|line| line.contains("usage ─ last 30 days"))
+        .expect("the trend panel is missing");
+    let total = lines
+        .iter()
+        .position(|line| line.contains("relay total ─ 1 pool, 1 account"))
+        .unwrap_or_else(|| panic!("no relay total panel in: {out}"));
+    assert!(total > trend, "the block must sit below the trend: {out}");
+
+    // AC-6: the block is a panel of its own, with the aggregate rows and no pool row.
+    let body = &lines[total..];
+    assert!(
+        body.iter().any(|line| line
+            .trim_start_matches('│')
+            .trim_start()
+            .starts_with("requests")),
+        "no requests row in the block: {body:?}"
+    );
+    for word in ["input", "cached", "uncached", "output"] {
+        assert!(
+            body.iter().any(|line| line.contains(word)),
+            "the {word} row is missing from the block: {body:?}"
+        );
+    }
+    assert!(
+        !body
+            .iter()
+            .any(|line| line.contains("anthropic") && line.contains("req")),
+        "the block repeats the per-pool detail: {body:?}"
+    );
+    // Every line of the box is the panel width, borders included.
+    for line in body.iter().take_while(|line| !line.starts_with('└')) {
+        assert_eq!(
+            line.chars().count(),
+            64,
+            "a block line is not 64 columns: {line:?}"
+        );
+    }
+
+    // AC-7: the same rollup `status` prints, by the same path.
+    let status = strip_ansi(&run_style(&["status"], tmp.path(), &mut runtime, Style::Rich).stdout);
+    // The two panels align their label columns to their own widest label, so the raw bytes
+    // differ by padding. The figures are what must agree.
+    let requests = |text: &str| {
+        let line = text
+            .lines()
+            .find(|line| line.contains("requests"))
+            .expect("requests row");
+        line.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    assert_eq!(
+        requests(&out),
+        requests(&status),
+        "usage and status disagree about the relay rollup"
+    );
 }
 
 /// usage-trend AC-8: a relay whose only buckets predate the window is

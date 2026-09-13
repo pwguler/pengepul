@@ -546,7 +546,6 @@ pub(crate) fn print_relay_total_rich(
     connection: &Connection,
 ) {
     let totals = RelayTotals::from_payload(payload);
-    let pool = &totals.totals;
     // The glyph marks a state, never a plain fact: `server` earns one,
     // `config` and `url` do not.
     let health = if connection.server == "ok" {
@@ -565,7 +564,19 @@ pub(crate) fn print_relay_total_rich(
     for line in &totals.lines {
         facts.push(Fact::new(&line.name, &line.render_value()));
     }
-    facts.push(Fact::new(
+    facts.extend(aggregate_facts(&totals));
+    for line in fact_panel(&relay_header_rich(&totals), &facts) {
+        output.line(&line);
+    }
+}
+
+/// The relay-wide rollup, rich: the requests breakdown, then the token block in the
+/// vocabulary ADR-0024 settled. One function because two verbs print it — `status` inside
+/// its connection panel, `usage` under the trend — and the whole point of the second copy is
+/// that the figures cannot drift from the first.
+fn aggregate_facts(totals: &RelayTotals) -> Vec<Fact> {
+    let pool = &totals.totals;
+    let mut facts = vec![Fact::new(
         "requests",
         &format!(
             "{}  ({} ok, {} failed)",
@@ -573,7 +584,7 @@ pub(crate) fn print_relay_total_rich(
             format_exact(pool.successes),
             format_exact(pool.failures)
         ),
-    ));
+    )];
     facts.extend(token_block_facts(
         pool.input,
         pool.output,
@@ -582,7 +593,27 @@ pub(crate) fn print_relay_total_rich(
         pool.reasoning,
         BOLD,
     ));
-    for line in fact_panel(&relay_header_rich(&totals), &facts) {
+    facts
+}
+
+/// `usage`'s relay total, plain: the header and the aggregate lines, with no blank line
+/// before them — the views stack panels without a gap, and the header is what marks the
+/// change of scope. The trend above covers 30 days; these figures do not, which is why it
+/// keeps the wording `status` uses.
+pub(crate) fn print_usage_total_plain(payload: &Value, output: &mut Output) {
+    let totals = RelayTotals::from_payload(payload);
+    output.line(&relay_header(&totals));
+    for line in aggregate_lines(&totals) {
+        output.line(&line);
+    }
+}
+
+/// `usage`'s relay total, rich: the same content as one panel below the trend panel, with
+/// the aggregate rows only — no `config`, no `url`, no per-pool line, because where-and-which
+/// facts are `status`'s and per-pool detail is `accounts`'.
+pub(crate) fn print_usage_total_rich(payload: &Value, output: &mut Output) {
+    let totals = RelayTotals::from_payload(payload);
+    for line in fact_panel(&relay_header_rich(&totals), &aggregate_facts(&totals)) {
         output.line(&line);
     }
 }
