@@ -216,9 +216,14 @@ Every selection that reaches an account logs the resolved key, the chosen accoun
 whether the affinity entry was honored or fell through to Rotation — a selection that
 finds no account at all, or whose token refresh fails, returns before that line — so a
 re-billed prefix can be tied to the account switch that caused it. The `honored`/`rotation` value that line prints
-is unit-tested through `AccountResult`; the log format itself was verified by
-running the relay with `RUST_LOG=pengepul=debug` and reading its output, and is not
-covered by an automated test.
+is unit-tested through `AccountResult`, and the line's own fields through
+`the_selection_logs_the_conversation_the_account_and_the_outcome`.
+
+A selection is not the only writer that can re-bill a prefix, and a pool of one cannot be
+diagnosed by that line at all: there is no switch to find. The relay therefore also prints
+each request's own cacheable prefix beside the cache read the upstream billed for it, so an
+unchanged prefix and a collapsed read put the writer upstream —
+`docs/specs/cache-miss-attribution.md`.
 
 ## Verification
 
