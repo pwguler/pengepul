@@ -56,7 +56,7 @@ change, not a code change.
 Researched 2026-09-14 (pengepul 0.102.0), after issue #8 reported that
 `input_modalities` was wrong in both directions. commandcode's `/v1/models`
 publishes only `context_length`, so every modality value the relay advertises
-comes from `ROUTE_MODALITIES` or the family tables in `src/models.rs` — there is
+comes from `PROVIDER_MODALITIES` or the family tables in `src/models.rs` — there is
 no upstream field to pass through.
 
 Method. A 256x256 PNG in four 128px quadrants — top-left olive, top-right teal,
@@ -84,23 +84,50 @@ with `finish_reason: "length"`, which reads like a vision failure and is not one
 | `xiaomi/mimo-v2.5` | commandcode | absent | reads images |
 | `z-ai/glm-5.3-flash` | commandcode | absent | reads images |
 
+One half of the problem is left open. The family tables claim
+`["text","image"]` for 21 live commandcode ids (`claude-*`, `gpt-*`,
+`moonshotai/Kimi-*`, `xai/grok-*`) from vendor documentation rather than from a
+measurement against the Provider serving them, and the OpenRouter result shows
+that inference can be wrong per Provider. Those claims were not measured and stay
+as they are. A false positive is the more expensive direction — a client attaches
+an image the upstream refuses, which on OpenRouter is the `404` above, booked as a
+`network` failure and a cooldown.
+
 Two conclusions the table now encodes:
 
 1. **A modality claim is a claim about a route, not about a model name.**
    `deepseek/deepseek-v4-flash` reads images through commandcode and refuses them
    through OpenRouter, so no table keyed by the bare id can be right for both.
-   `ROUTE_MODALITIES` names the route each measured claim holds on, and matches
-   exactly rather than by prefix, so the claim cannot leak onto
-   `deepseek-v4-flash-fast`, which refuses images.
+   `PROVIDER_MODALITIES` names the Provider each measured claim was measured
+   against, and matches exactly rather than by prefix, so the claim cannot leak
+   onto `deepseek-v4-flash-fast`, which refuses images. An entry naming no
+   Provider was measured against every Provider pengepul was pointed at — two
+   here, commandcode and OpenRouter — not against every Provider that could be
+   configured; the same upstream registered under a new name gets no claim until
+   it is measured under that name.
 2. **An unmeasured `["text"]` is left alone.** The family tables still assert
    `["text"]` for ids nothing has measured; that is a claim pengepul has not
-   refuted, and it is recorded here rather than silently weakened, because
-   omitting the field is not equivalent for a client — pi defaults a missing
-   `input` to `["text"]` (`dist/core/provider-composer.js`), so omission and a
-   false `["text"]` behave identically there. Only a correct positive claim
-   restores the image path.
+   refuted, and it is recorded here rather than silently weakened.
 
-Cost of the measurement: 20 requests, plus one account cooldown. Attaching an
+   Omitting the field instead is not the cheap fix it looks like, and the reason
+   is not the one this note first gave. The client decides: the
+   `pi-pengepul-provider` extension looks a relay id up in pi's own catalogs by
+   full id, then by last segment, then by namespace-stripped id, and a builtin
+   entry wins over its heuristic, which always answers `["text"]`
+   (`extensions/models.ts:109-141,171`). Verified 2026-09-14 against the installed
+   catalogs: `commandcode/google/gemini-3.8-flash` resolves to `gemini-3.8-flash`
+   (github-copilot, `["text","image"]`), `commandcode/xiaomi/mimo-v2.5` to
+   `mimo-v2.5` (opencode-go, `["text","image"]`) and `commandcode/z-ai/glm-5.3-flash`
+   to `glm-5.3-flash` (opencode, `["text","image"]`) — so for those three, omitting
+   the field would have restored the image through the client's own catalog.
+   `commandcode/deepseek/deepseek-v4.1-flash` matches no catalog entry and would
+   fall to the heuristic, staying text-only. Advertising the measured truth is
+   therefore what fixes all six ids, for every client rather than for pi alone.
+   `dist/core/provider-composer.js`'s `input ?? ["text"]` is not the deciding
+   layer: the provider always ships an `input`.
+
+Cost of the measurement: 23 requests in four runs (7 + 2 + 9 + 5), plus one
+   account cooldown on the OpenRouter pool. Attaching an
 image to a text-only id on OpenRouter earns a `404`, which pengepul books as a
 `network` failure, so the account cools down and the next requests answer
 `503 no available openrouter account; last failure: network`. A client that
