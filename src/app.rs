@@ -1192,6 +1192,7 @@ async fn route_provider_request(
     // One request, one conversation: computed before the attempt loop, not
     // inside it, because the body does not change between attempts.
     let conversation = conversation_key(headers, body, route);
+    log_cacheable_prefix(&provider, route, &model, &conversation, body);
     let mut last_response = None;
 
     for _ in 0..attempts {
@@ -1936,6 +1937,24 @@ fn conversation_key(headers: &HeaderMap, body: &Value, route: RequestRoute) -> S
     {
         return key.to_string();
     }
+    format!("prefix:{}", cacheable_prefix_fingerprint(body, route))
+}
+
+/// The bytes a conversation's prompt cache is keyed on, canonicalized: the system
+/// blocks, the tool list, the model, and the opening of the message list.
+///
+/// This is what [`conversation_key`] hashes when a client names no session, and what the
+/// `"cacheable prefix"` log line hashes for every request. One definition, because the two
+/// exist to make the same claim about the same bytes: two requests whose values match
+/// differ nowhere inside this material.
+///
+/// It is **not** the whole request. Anything appended after the opening window is outside
+/// it by construction — that is what makes it stable across turns of one conversation — so
+/// a mismatch in the tail is invisible here. That is the one thing the fingerprint does
+/// not see, and it is why it is worth printing: an unchanged fingerprint beside a collapsed
+/// cache read rules out every writer this relay and its client control, leaving the
+/// upstream's own cache.
+fn cacheable_prefix(body: &Value, route: RequestRoute) -> String {
     let mut prefix = json!({
         "system": body.get("system"),
         "tools": body.get("tools"),
@@ -1948,7 +1967,58 @@ fn conversation_key(headers: &HeaderMap, body: &Value, route: RequestRoute) -> S
     // and `model` — which every conversation in one project shares, the same
     // collapse that made Chat Completions re-bill (ADR-0017).
     prefix.push_str(&cacheable_opening(body, route));
-    format!("prefix:{}", sha256_hex(&prefix))
+    prefix
+}
+
+/// [`cacheable_prefix`] as one comparison-ready value, for the `"cacheable prefix"` line.
+fn cacheable_prefix_fingerprint(body: &Value, route: RequestRoute) -> String {
+    sha256_hex(&cacheable_prefix(body, route))
+}
+
+/// How many turns the dialect's message list carries, for the `"cacheable prefix"` line.
+///
+/// The opening window is a fixed slice of this list, so the count is what says whether a
+/// repeat fingerprint came from a request that grew (the expected shape) or from one that
+/// replaced the tail. Responses keeps its turns in `input`, with `messages` as the
+/// fallback the route itself takes.
+fn message_count(body: &Value, route: RequestRoute) -> usize {
+    let turns = match route {
+        RequestRoute::Chat | RequestRoute::Messages => body.get("messages"),
+        RequestRoute::Responses => body
+            .get("input")
+            .filter(|value| !value.is_null())
+            .or_else(|| body.get("messages")),
+    };
+    message_items(turns).count()
+}
+
+/// The `"cacheable prefix"` line: one request's cacheable material as a hash, beside the
+/// turn count that says how far the list behind it has run.
+///
+/// One line per client request, and the line a cache miss is read against. An upstream
+/// bills the whole prefix when the bytes it cached no longer match, so a fingerprint that
+/// repeats while the billed cache read (`"upstream usage"`) collapses puts the writer
+/// upstream, and one that changes names the relay or the harness as the writer. The
+/// fingerprint covers exactly what [`cacheable_prefix`] covers, and no more.
+///
+/// Both values are built only while this level is on: `tracing` evaluates field
+/// expressions lazily, so `debug: off` pays neither the hash nor the allocation.
+fn log_cacheable_prefix(
+    provider: &ProviderId,
+    route: RequestRoute,
+    model: &str,
+    conversation: &str,
+    body: &Value,
+) {
+    tracing::debug!(
+        provider = %provider,
+        route = ?route,
+        model = %model,
+        conversation = %conversation,
+        messages = message_count(body, route),
+        prefix = %cacheable_prefix_fingerprint(body, route),
+        "cacheable prefix"
+    );
 }
 
 /// The opening of a request's cacheable content, canonicalized: the first
@@ -2176,6 +2246,24 @@ async fn record_provider_success(
         }
         usage
     });
+    // The billed cache read, per request, in the normalized sense the panels use: `input`
+    // excludes the cache read for every Provider (ADR-0023). Read beside the request's own
+    // `"cacheable prefix"` line, this is the pair that separates an upstream that dropped
+    // its cache from a body that changed. Silent when there is no usage at all —
+    // count-tokens, or a 2xx whose usage would not parse — because a line of zeroes would
+    // claim a measurement nobody made.
+    if let Some(usage) = usage.as_ref() {
+        tracing::debug!(
+            provider = %provider,
+            account = %account.token.email,
+            model = %model,
+            input = usage.input_tokens,
+            cache_read = usage.cache_read_input_tokens,
+            cache_write = usage.cache_creation_input_tokens,
+            output = usage.output_tokens,
+            "upstream usage"
+        );
+    }
     manager.record_success(account.token.email.as_str(), usage.as_ref(), model);
 }
 
