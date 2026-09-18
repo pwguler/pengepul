@@ -42,8 +42,13 @@ zeroes them. They must be persisted to disk and reloaded on startup.
   `totalFailures` (cooldown itself is not persisted: a fresh process
   must not stay blocked).
 - AC-3: `record_attempt` (requests) persists.
-- AC-4: unknown emails in `usage.json` are ignored; accounts added
-  later start at zero; `load` with no file succeeds and yields zeros.
+- AC-4: ~~unknown emails in `usage.json` are ignored; accounts added
+  later start at zero; `load` with no file succeeds and yields zeros.~~
+  **The second half is reversed by `usage-after-removal`**: an email with no token
+  file is still not an account — it never joins rotation — but its record is no
+  longer dropped by the next write, and it is listed as an account that cannot
+  serve. The load half stands: `load` with no file succeeds and yields zeros, and
+  an entry is only ever merged into an account that has a credential.
 - AC-5: a corrupted `usage.json` does not break startup — the manager
   loads with zeros (permissive, like token loading) and overwrites the
   file on the next write.
@@ -57,3 +62,13 @@ zeroes them. They must be persisted to disk and reloaded on startup.
   today, just surviving restarts.
 - No persistence of cooldown *walls* across restarts (a restart is an
   operator action; the account retries immediately).
+
+## Revisions
+
+- **Deleting a credential no longer deletes its counters.** This spec's shape said
+  writes rebuild the file from the loaded accounts, and its AC-4 said a stranger's
+  entry is dropped "instead of keeping it". `usage-after-removal` reverses that
+  half, at the user's ask: the traffic behind a removed key happened, and the
+  operator asked to keep seeing it in `usage` and `status`. What survives is
+  unchanged — one file per Provider under the auth dir, `0600`, atomic
+  temp-plus-rename, per email — and so is everything else in this spec.

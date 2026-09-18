@@ -180,7 +180,11 @@ in files.
   successes, and per local calendar day — are written to `usage.json` after
   every outcome, Refusals included and reloaded at startup; a fresh process always retries every
   Account. Daily buckets are trimmed to 90 days on write. Deleting the file
-  is the only reset.
+  is the only reset. **Removing a credential removes a way to serve, never the
+  record.** The entry stays in `usage.json`, in the admin payload and in every
+  view that counts or lists accounts, where it reads as an account that cannot
+  serve: no Cooldown, no failure, `available: false`. Rotation never hands it out,
+  and re-adding the same key resumes its counters.
 - **A counter counts outcomes, never attempts.** Every recorder settles
   through one private seam (`AccountState::settle`), which increments
   `requests` in the same call that increments `successes` or `failures`,
