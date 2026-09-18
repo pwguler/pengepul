@@ -260,6 +260,90 @@ impl From<&AccountState> for PersistedUsage {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Usage snapshots
+// ---------------------------------------------------------------------------
+
+/// One record's usage counters, under the field names an account entry has
+/// always used.
+///
+/// Shared by an account with a credential and one without, rather than written
+/// twice: the CLI sums and lists both through these names, and two builders would
+/// be two vocabularies to keep in step (usage-after-removal).
+fn usage_json(email: &str, usage: &PersistedUsage, cutoff: &str) -> serde_json::Map<String, Value> {
+    let mut fields = serde_json::Map::new();
+    fields.insert("email".to_string(), json!(email));
+    fields.insert("totalRequests".to_string(), json!(usage.requests));
+    fields.insert("totalSuccesses".to_string(), json!(usage.successes));
+    fields.insert("totalFailures".to_string(), json!(usage.failures));
+    fields.insert("totalInputTokens".to_string(), json!(usage.input_tokens));
+    fields.insert("totalOutputTokens".to_string(), json!(usage.output_tokens));
+    fields.insert(
+        "totalCacheCreationInputTokens".to_string(),
+        json!(usage.cache_creation_input_tokens),
+    );
+    fields.insert(
+        "totalCacheCreation1hInputTokens".to_string(),
+        json!(usage.cache_creation_1h_input_tokens),
+    );
+    fields.insert(
+        "totalCacheReadInputTokens".to_string(),
+        json!(usage.cache_read_input_tokens),
+    );
+    fields.insert(
+        "totalReasoningOutputTokens".to_string(),
+        json!(usage.reasoning_output_tokens),
+    );
+    fields.insert(
+        "models".to_string(),
+        Value::Array(
+            usage
+                .models
+                .iter()
+                .map(|(model, usage)| {
+                    json!({
+                        "model": model,
+                        "successes": usage.successes,
+                        "inputTokens": usage.input_tokens,
+                        "outputTokens": usage.output_tokens,
+                        "cacheCreationInputTokens": usage.cache_creation_input_tokens,
+                        "cacheCreation1hInputTokens": usage.cache_creation_1h_input_tokens,
+                        "cacheReadInputTokens": usage.cache_read_input_tokens,
+                        "reasoningOutputTokens": usage.reasoning_output_tokens
+                    })
+                })
+                .collect(),
+        ),
+    );
+    // The window bounds what is served, not only what is written: a record
+    // carrying a bucket its own file no longer holds is not served either.
+    fields.insert(
+        "days".to_string(),
+        Value::Array(
+            usage
+                .days
+                .iter()
+                .filter(|(date, _)| date.as_str() >= cutoff)
+                .map(|(date, day)| {
+                    json!({
+                        "date": date,
+                        "requests": day.requests,
+                        "successes": day.successes,
+                        "failures": day.failures,
+                        "inputTokens": day.input_tokens,
+                        "outputTokens": day.output_tokens,
+                        "cacheCreationInputTokens": day.cache_creation_input_tokens,
+                        "cacheCreation1hInputTokens": day.cache_creation_1h_input_tokens,
+                        "cacheReadInputTokens": day.cache_read_input_tokens,
+                        "reasoningOutputTokens": day.reasoning_output_tokens
+                    })
+                })
+                .collect(),
+        ),
+    );
+    fields
+}
+
 pub struct AccountManager {
     auth_dir: PathBuf,
     provider: ProviderId,
@@ -269,8 +353,9 @@ pub struct AccountManager {
     order: Vec<String>,
     last_used_index: Option<usize>,
     /// Usage counters read from disk at `load()` and merged into fresh
-    /// account states; never updated afterwards. Writes rebuild the file
-    /// from the live accounts, dropping unknown entries.
+    /// account states. Never updated afterwards: writes rebuild the accounts that
+    /// loaded from memory and carry the rest of the file through unchanged
+    /// (usage-after-removal).
     persisted_usage: BTreeMap<String, PersistedUsage>,
     /// Conversation key -> the account that served it last.
     affinity: BTreeMap<String, String>,
@@ -559,63 +644,68 @@ impl AccountManager {
         self.persist_usage();
     }
 
+    /// Every account the relay has a record for, in account-key order.
+    ///
+    /// That includes a record whose credential the auth directory no longer holds:
+    /// removing a credential removes a way to serve, not the traffic it carried.
+    /// The entry keeps the account's field names and carries the liveness defaults
+    /// of an account that cannot serve, so no reader needs a second shape and no
+    /// view needs a second rule (usage-after-removal).
+    ///
+    /// Serving is not this list. Rotation walks `accounts`, which holds only
+    /// records with a credential, so such a record is never handed a request.
     #[must_use]
     pub fn snapshots(&self) -> Vec<Value> {
-        // The window bounds what is served, not only what is written: a
-        // process idle since the window moved would otherwise carry
-        // buckets its own file no longer holds.
         let cutoff = retention_cutoff();
         let now = unix_now();
-        self.accounts
-            .values()
-            .map(|state| {
+        let mut records: BTreeMap<String, Value> = self
+            .accounts
+            .iter()
+            .map(|(email, state)| {
                 let cooldown_remaining = (state.cooldown_until - now).max(0.0);
-                json!({
-                    "email": state.token.email,
-                    "available": cooldown_remaining == 0.0,
-                    "cooldownUntil": if cooldown_remaining == 0.0 { 0.0 } else { state.cooldown_until },
-                    "failureCount": state.failure_count,
-                    "lastError": state.last_error,
-                    "lastFailureAt": state.last_failure_at,
-                    "lastSuccessAt": state.last_success_at,
-                    "lastRefreshAt": state.last_refresh_at,
-                    "totalRequests": state.total_requests,
-                    "totalSuccesses": state.total_successes,
-                    "totalFailures": state.total_failures,
-                    "totalInputTokens": state.total_input_tokens,
-                    "totalOutputTokens": state.total_output_tokens,
-                    "totalCacheCreationInputTokens": state.total_cache_creation_input_tokens,
-                    "totalCacheCreation1hInputTokens": state.total_cache_creation_1h_input_tokens,
-                    "totalCacheReadInputTokens": state.total_cache_read_input_tokens,
-                    "totalReasoningOutputTokens": state.total_reasoning_output_tokens,
-                    "models": state.models.iter().map(|(model, usage)| json!({
-                        "model": model,
-                        "successes": usage.successes,
-                        "inputTokens": usage.input_tokens,
-                        "outputTokens": usage.output_tokens,
-                        "cacheCreationInputTokens": usage.cache_creation_input_tokens,
-                        "cacheCreation1hInputTokens": usage.cache_creation_1h_input_tokens,
-                        "cacheReadInputTokens": usage.cache_read_input_tokens,
-                        "reasoningOutputTokens": usage.reasoning_output_tokens
-                    })).collect::<Vec<_>>(),
-                    "days": state.days.iter().filter(|(date, _)| **date >= cutoff).map(|(date, day)| json!({
-                        "date": date,
-                        "requests": day.requests,
-                        "successes": day.successes,
-                        "failures": day.failures,
-                        "inputTokens": day.input_tokens,
-                        "outputTokens": day.output_tokens,
-                        "cacheCreationInputTokens": day.cache_creation_input_tokens,
-                        "cacheCreation1hInputTokens": day.cache_creation_1h_input_tokens,
-                        "cacheReadInputTokens": day.cache_read_input_tokens,
-                        "reasoningOutputTokens": day.reasoning_output_tokens
-                    })).collect::<Vec<_>>(),
-                    "expiresAt": state.token.expires_at,
-                    "refreshing": false,
-                    "planType": state.token.plan_type
-                })
+                let mut fields =
+                    usage_json(&state.token.email, &PersistedUsage::from(state), &cutoff);
+                fields.insert("available".to_string(), json!(cooldown_remaining == 0.0));
+                fields.insert(
+                    "cooldownUntil".to_string(),
+                    json!(if cooldown_remaining == 0.0 {
+                        0.0
+                    } else {
+                        state.cooldown_until
+                    }),
+                );
+                fields.insert("failureCount".to_string(), json!(state.failure_count));
+                fields.insert("lastError".to_string(), json!(state.last_error));
+                fields.insert("lastFailureAt".to_string(), json!(state.last_failure_at));
+                fields.insert("lastSuccessAt".to_string(), json!(state.last_success_at));
+                fields.insert("lastRefreshAt".to_string(), json!(state.last_refresh_at));
+                fields.insert("expiresAt".to_string(), json!(state.token.expires_at));
+                fields.insert("refreshing".to_string(), json!(false));
+                fields.insert("planType".to_string(), json!(state.token.plan_type));
+                (email.clone(), Value::Object(fields))
             })
-            .collect()
+            .collect();
+        for (email, usage) in &self.persisted_usage {
+            if self.accounts.contains_key(email) {
+                continue;
+            }
+            let mut fields = usage_json(email, usage, &cutoff);
+            // An account that cannot serve: no Cooldown to name (there is nothing
+            // to wait out) and no failure to report (nothing has been attempted since
+            // its credential went away).
+            fields.insert("available".to_string(), json!(false));
+            fields.insert("cooldownUntil".to_string(), json!(0.0));
+            fields.insert("failureCount".to_string(), json!(0));
+            fields.insert("lastError".to_string(), Value::Null);
+            fields.insert("lastFailureAt".to_string(), Value::Null);
+            fields.insert("lastSuccessAt".to_string(), Value::Null);
+            fields.insert("lastRefreshAt".to_string(), Value::Null);
+            fields.insert("expiresAt".to_string(), json!(""));
+            fields.insert("refreshing".to_string(), json!(false));
+            fields.insert("planType".to_string(), Value::Null);
+            records.insert(email.clone(), Value::Object(fields));
+        }
+        records.into_values().collect()
     }
 
     #[must_use]
@@ -746,20 +836,30 @@ impl AccountManager {
     /// are swallowed: losing an increment of observability must never
     /// fail the request that produced it.
     fn persist_usage(&self) {
-        // Only loaded accounts are written: entries in the file for
-        // unknown emails are dropped rather than carried forever.
-        // One cutoff for the whole write, so every account's window ends on
-        // the same day (usage-trend AC-4).
+        // One cutoff for the whole write, so every record's window ends on the
+        // same day (usage-trend AC-4).
         let cutoff = retention_cutoff();
-        let usage: BTreeMap<String, PersistedUsage> = self
-            .accounts
+        // Records whose credential is gone are carried through, not dropped: the
+        // file is the record of what the relay carried, not only a snapshot of what
+        // it can serve, and `status` and `usage` count the difference
+        // (usage-after-removal).
+        let mut usage: BTreeMap<String, PersistedUsage> = self
+            .persisted_usage
             .iter()
-            .map(|(email, state)| {
-                let mut persisted = PersistedUsage::from(state);
+            .filter(|(email, _)| !self.accounts.contains_key(*email))
+            .map(|(email, persisted)| {
+                let mut persisted = persisted.clone();
                 persisted.days = trim_days(&persisted.days, &cutoff);
                 (email.clone(), persisted)
             })
             .collect();
+        // A loaded account overwrites its own record: its in-memory counters are the
+        // running ones.
+        for (email, state) in &self.accounts {
+            let mut persisted = PersistedUsage::from(state);
+            persisted.days = trim_days(&persisted.days, &cutoff);
+            usage.insert(email.clone(), persisted);
+        }
         // Write failures are swallowed: losing an increment of
         // observability must never fail the request that produced it.
         let _ = save_usage(&self.auth_dir, &self.provider, &usage);

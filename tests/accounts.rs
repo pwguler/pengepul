@@ -635,7 +635,7 @@ async fn usage_counters_survive_a_manager_rebuild() {
 }
 
 #[tokio::test]
-async fn usage_file_lies_per_provider_and_ignores_strangers() {
+async fn usage_file_lies_per_provider_and_keeps_a_record_it_cannot_serve() {
     let tmp = tempdir().expect("tempdir");
     save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
     // AC-4: a usage.json entry for an email with no token is ignored...
@@ -654,15 +654,32 @@ async fn usage_file_lies_per_provider_and_ignores_strangers() {
 
     let mut manager = never_refresh_manager(tmp.path().to_path_buf());
     manager.load().expect("load");
-    let snapshot = &manager.snapshots()[0];
-    assert_eq!(snapshot["totalRequests"], 5);
-    assert_eq!(snapshot["totalInputTokens"], 50);
+    let live = manager
+        .snapshots()
+        .into_iter()
+        .find(|record| record["email"] == "k@example.com")
+        .expect("the loaded account");
+    assert_eq!(live["totalRequests"], 5);
+    assert_eq!(live["totalInputTokens"], 50);
     assert!(manager.account("ghost@example.com").is_none());
 
-    // ...and the next write drops the stranger instead of keeping it.
+    // ...and since usage-after-removal a record the relay cannot serve is kept in the
+    // file and listed as an account that cannot serve, instead of being dropped. That
+    // reverses the second half of AC-4: the traffic behind the record happened, and a
+    // report that shed it would stop reconciling the day the credential was removed.
     manager.record_success("k@example.com", None, "claude-fable-5-1");
     let stored = persisted(&usage_path);
-    assert!(stored.get("ghost@example.com").is_none());
+    assert_eq!(
+        stored["ghost@example.com"]["total_requests"], 99,
+        "a record whose credential is gone was dropped from the file"
+    );
+    let listed = manager
+        .snapshots()
+        .into_iter()
+        .find(|record| record["email"] == "ghost@example.com")
+        .expect("the record is listed");
+    assert_eq!(listed["totalRequests"], 99);
+    assert_eq!(listed["available"], false);
 }
 
 #[tokio::test]
@@ -1750,5 +1767,201 @@ async fn a_conversation_that_failed_over_stays_on_the_account_that_rescued_it() 
     assert_eq!(
         next_turn.token.email, rescued,
         "failover did not re-pin: the conversation steered back to {drew}, which rejects it"
+    );
+}
+
+#[tokio::test]
+async fn a_removed_credential_keeps_its_usage_record_in_the_payload() {
+    // The ask: delete a key, keep its meter. The record outlives the credential in
+    // the file, and it stays in the payload as an account that cannot serve — so
+    // `status` and `usage` go on counting it and `accounts` goes on listing it
+    // (usage-after-removal AC-1, AC-2).
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("stays@example.com")).expect("save token");
+    let token_path = save_token(tmp.path(), &static_token("goes@example.com")).expect("save token");
+    let usage_path = tmp.path().join("commandcode").join("usage.json");
+
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    manager.record_success("stays@example.com", None, "deepseek-v4.1-flash");
+    manager.record_success("goes@example.com", None, "deepseek-v4.1-flash");
+    assert_eq!(
+        persisted(&usage_path)["goes@example.com"]["total_requests"],
+        1,
+        "the traffic this test removes has to exist first, or it proves nothing"
+    );
+
+    // The operator deletes the key, and the relay restarts.
+    fs::remove_file(&token_path).expect("remove the token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+
+    let entry = manager
+        .snapshots()
+        .into_iter()
+        .find(|record| record["email"] == "goes@example.com")
+        .expect("a removed key's record left the payload");
+    assert_eq!(entry["totalRequests"], 1);
+    assert_eq!(
+        entry["available"], false,
+        "an account with no credential must not read as servable"
+    );
+    // The liveness defaults of an account that cannot serve: nothing to wait out,
+    // nothing attempted since the credential went away.
+    assert_eq!(entry["cooldownUntil"], 0.0);
+    assert_eq!(entry["failureCount"], 0);
+    assert!(entry["lastError"].is_null());
+    assert!(entry["lastSuccessAt"].is_null());
+    assert!(entry["lastFailureAt"].is_null());
+    assert!(entry["lastRefreshAt"].is_null());
+    assert!(entry["planType"].is_null());
+    assert_eq!(entry["expiresAt"], "");
+
+    // A later write for the surviving account carries the record through, and the
+    // record's own counters are not re-derived from the live process.
+    manager.record_success("stays@example.com", None, "deepseek-v4.1-flash");
+    let file = persisted(&usage_path);
+    assert_eq!(file["goes@example.com"]["total_requests"], 1);
+    assert_eq!(file["stays@example.com"]["total_requests"], 2);
+    assert_eq!(manager.snapshots().len(), 2);
+}
+
+#[tokio::test]
+async fn rotation_never_hands_out_a_record_without_a_credential() {
+    // AC-4: the record is listed and counted, and it is not an account the pool can
+    // use. A deleted key must not absorb a request or a failover attempt.
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("stays@example.com")).expect("save token");
+    let provider_dir = tmp.path().join("commandcode");
+    fs::create_dir_all(&provider_dir).expect("provider dir");
+    fs::write(
+        provider_dir.join("usage.json"),
+        json!({"goes@example.com": {"total_requests": 7, "total_successes": 7}}).to_string(),
+    )
+    .expect("write usage");
+
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+
+    // The serving set and the listed set differ on purpose: one credential, two
+    // records.
+    assert_eq!(manager.account_count(), 1);
+    assert_eq!(manager.snapshots().len(), 2);
+    for _ in 0..4 {
+        let next = manager.next_account().expect("an account");
+        assert_eq!(
+            next.token.email, "stays@example.com",
+            "rotation handed out a credential-less record"
+        );
+    }
+
+    // And with the one usable account parked, rotation has nothing to hand out. The
+    // record is not a candidate that comes up when the pool runs dry — there is no
+    // credential to serve with, and no Cooldown to wait out. A billing cooldown, not an
+    // ordinary failure: the ordinary one lasts a second, and a stalled test thread would
+    // find the account servable again and report a defect that is not there.
+    manager.record_billing_cooldown("stays@example.com", "insufficient credits");
+    assert!(
+        manager.next_account().is_none(),
+        "rotation fell through to a credential-less record"
+    );
+}
+
+#[tokio::test]
+async fn re_adding_a_credential_resumes_its_usage_record() {
+    // AC-5: the same key returns to the same entry, so a re-login resumes the
+    // counters instead of starting the operator's history over at zero.
+    let tmp = tempdir().expect("tempdir");
+    let token_path = save_token(tmp.path(), &static_token("goes@example.com")).expect("save token");
+    save_token(tmp.path(), &static_token("stays@example.com")).expect("save token");
+    let usage_path = tmp.path().join("commandcode").join("usage.json");
+
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    manager.record_success("goes@example.com", None, "deepseek-v4.1-flash");
+    fs::remove_file(&token_path).expect("remove the token");
+
+    // The relay keeps serving the account that stayed, so the file is rewritten while
+    // the deleted key's record sits in it. That write is the step the test cannot skip:
+    // it is what used to drop the record, and without it the entry survives on disk
+    // untouched and the resume below proves nothing.
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    manager.record_success("stays@example.com", None, "deepseek-v4.1-flash");
+    assert_eq!(
+        persisted(&usage_path)["goes@example.com"]["total_requests"],
+        1,
+        "a write for another account dropped the record"
+    );
+
+    save_token(tmp.path(), &static_token("goes@example.com")).expect("save the token again");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+
+    let entry = manager
+        .snapshots()
+        .into_iter()
+        .find(|record| record["email"] == "goes@example.com")
+        .expect("the re-added credential");
+    assert_eq!(
+        entry["totalRequests"], 1,
+        "a re-added credential started over instead of resuming its record"
+    );
+    assert_eq!(
+        entry["available"], true,
+        "the credential is back; it serves"
+    );
+    manager.record_success("goes@example.com", None, "deepseek-v4.1-flash");
+    assert_eq!(
+        persisted(&usage_path)["goes@example.com"]["total_requests"],
+        2
+    );
+}
+
+#[tokio::test]
+async fn a_removed_credentials_days_age_out_on_the_same_window() {
+    // AC-1: the record is carried, not embalmed. Retention reaches it on the same
+    // write and by the same cutoff as a live account's buckets, so an old day leaves
+    // the file rather than riding along forever.
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("stays@example.com")).expect("save token");
+    let provider_dir = tmp.path().join("commandcode");
+    fs::create_dir_all(&provider_dir).expect("provider dir");
+    let usage_path = provider_dir.join("usage.json");
+    // The window's edge, not a day comfortably outside it: a cutoff off by one would
+    // keep every bucket and still pass a 120-day fixture.
+    let stale = (chrono::Local::now() - chrono::Duration::days(90))
+        .format("%Y-%m-%d")
+        .to_string();
+    let recent = (chrono::Local::now() - chrono::Duration::days(89))
+        .format("%Y-%m-%d")
+        .to_string();
+    fs::write(
+        &usage_path,
+        json!({
+            "goes@example.com": {
+                "total_requests": 7,
+                "days": {
+                    stale.clone(): {"requests": 7, "successes": 7},
+                    recent.clone(): {"requests": 1, "successes": 1}
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write usage");
+
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    manager.record_success("stays@example.com", None, "deepseek-v4.1-flash");
+
+    let days = persisted(&usage_path)["goes@example.com"]["days"].clone();
+    assert!(
+        days.get(&stale).is_none(),
+        "an out-of-window bucket was carried forever: {days}"
+    );
+    assert!(
+        days.get(&recent).is_some(),
+        "the carry-through dropped a bucket inside the window: {days}"
     );
 }

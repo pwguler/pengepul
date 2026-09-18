@@ -4789,3 +4789,114 @@ async fn one_chat_conversation_failing_over_does_not_re_bill_another() {
     assert_failover_does_not_re_bill_a_sibling(ChatIdentity::BodyKey).await;
     assert_failover_does_not_re_bill_a_sibling(ChatIdentity::DerivedPrefix).await;
 }
+
+#[tokio::test]
+async fn admin_accounts_lists_a_record_whose_credential_is_gone() {
+    // usage-after-removal AC-2 and AC-7: the payload's `accounts` array holds a record
+    // with no credential, `account_count` is that array's length rather than a separate
+    // count, and the entry carries the field names every account entry carries — so no
+    // reader needs a second shape and no view needs a second rule.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_key_token("commandcode", "key-90445c90")).expect("save key");
+    let provider_dir = tmp.path().join("commandcode");
+    std::fs::create_dir_all(&provider_dir).expect("provider dir");
+    std::fs::write(
+        provider_dir.join("usage.json"),
+        json!({
+            "key-4f84698d": {
+                "total_requests": 7,
+                "total_successes": 7,
+                "total_input_tokens": 2_000,
+                "days": {}
+            }
+        })
+        .to_string(),
+    )
+    .expect("write usage");
+
+    let app = create_app_with_upstream(
+        config_with_static_provider("commandcode", tmp.path().to_path_buf()),
+        Arc::new(FakeUpstream::default()),
+    );
+    let (status, body) = json_response(
+        app,
+        axum::http::Request::builder()
+            .uri("/admin/accounts")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    let provider = &body["providers"]["commandcode"];
+    let accounts = provider["accounts"]
+        .as_array()
+        .expect("accounts array")
+        .clone();
+    assert_eq!(accounts.len(), 2, "both records are listed: {body}");
+    assert_eq!(
+        provider["account_count"], 2,
+        "the count must be the list it counts: {body}"
+    );
+
+    let gone = accounts
+        .iter()
+        .find(|account| account["email"] == "key-4f84698d")
+        .expect("the record whose credential is gone");
+    assert_eq!(gone["totalRequests"], 7);
+    assert_eq!(gone["totalInputTokens"], 2_000);
+    assert_eq!(gone["available"], false);
+    assert_eq!(gone["cooldownUntil"], 0.0);
+    assert_eq!(gone["failureCount"], 0);
+    assert!(gone["lastError"].is_null());
+    assert!(gone["models"].is_array());
+    assert!(gone["days"].is_array());
+
+    let served = accounts
+        .iter()
+        .find(|account| account["email"] == "key-90445c90")
+        .expect("the account holding the credential");
+    assert_eq!(served["available"], true);
+
+    // One shape, not two: a reader that sums or lists these entries must not need a
+    // second field table, so the entries carry the same keys (AC-7). The vocabulary is
+    // spelled out rather than compared entry to entry: a field added or renamed on both
+    // branches would pass a comparison and still be a shape change.
+    let mut live_keys: Vec<&String> = served.as_object().expect("entry object").keys().collect();
+    live_keys.sort();
+    assert_eq!(
+        live_keys,
+        [
+            "available",
+            "cooldownUntil",
+            "days",
+            "email",
+            "expiresAt",
+            "failureCount",
+            "lastError",
+            "lastFailureAt",
+            "lastRefreshAt",
+            "lastSuccessAt",
+            "models",
+            "planType",
+            "refreshing",
+            "totalCacheCreation1hInputTokens",
+            "totalCacheCreationInputTokens",
+            "totalCacheReadInputTokens",
+            "totalFailures",
+            "totalInputTokens",
+            "totalOutputTokens",
+            "totalReasoningOutputTokens",
+            "totalRequests",
+            "totalSuccesses",
+        ],
+        "the account entry's field vocabulary changed"
+    );
+    let mut gone_keys: Vec<&String> = gone.as_object().expect("entry object").keys().collect();
+    gone_keys.sort();
+    assert_eq!(
+        gone_keys, live_keys,
+        "a record without a credential carries a different shape"
+    );
+}

@@ -887,24 +887,15 @@ async fn admin_accounts(State(state): State<AppState>, headers: HeaderMap) -> Re
     let mut providers = serde_json::Map::from_iter([
         (
             ProviderId::anthropic().to_string(),
-            json!({
-                "accounts": anthropic.snapshots(),
-                "account_count": anthropic.account_count()
-            }),
+            provider_entry(&anthropic.snapshots()),
         ),
         (
             ProviderId::codex().to_string(),
-            json!({
-                "accounts": codex.snapshots(),
-                "account_count": codex.account_count()
-            }),
+            provider_entry(&codex.snapshots()),
         ),
         (
             ProviderId::grok().to_string(),
-            json!({
-                "accounts": grok.snapshots(),
-                "account_count": grok.account_count()
-            }),
+            provider_entry(&grok.snapshots()),
         ),
     ]);
     drop(anthropic);
@@ -912,16 +903,20 @@ async fn admin_accounts(State(state): State<AppState>, headers: HeaderMap) -> Re
     drop(grok);
     for (id, manager) in &state.account_managers.generic {
         let manager = manager.lock().await;
-        providers.insert(
-            id.clone(),
-            json!({
-                "accounts": manager.snapshots(),
-                "account_count": manager.account_count()
-            }),
-        );
+        providers.insert(id.clone(), provider_entry(&manager.snapshots()));
     }
 
     Json(json!({"providers": providers, "generated_at": now_iso()})).into_response()
+}
+
+/// One provider's entry in the payload: its accounts, and how many there are.
+///
+/// The count is the list's own length rather than a separate call, because the
+/// header and the per-pool lines read the count while the view prints the list:
+/// a count that disagreed with what is listed is the disagreement the header
+/// exists to prevent (usage-after-removal).
+fn provider_entry(accounts: &[Value]) -> Value {
+    json!({"account_count": accounts.len(), "accounts": accounts})
 }
 
 async fn admin_reload(State(state): State<AppState>, headers: HeaderMap) -> Response {

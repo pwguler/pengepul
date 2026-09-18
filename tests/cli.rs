@@ -5846,3 +5846,143 @@ fn a_failed_credential_write_leaves_the_config_byte_identical() {
         "a failed credential write left the provider registered"
     );
 }
+
+/// The payload a relay hands back after `key-90445c90` was deleted: its record is
+/// still listed, as an account that cannot serve, beside the key that stayed
+/// (usage-after-removal).
+///
+/// The payload test in `tests/app.rs` is the one that bites on the change — it drives
+/// a real app over an auth directory whose credential is gone. The two tests below pin
+/// the view instead: they hand this payload to the CLI and assert nothing new appears
+/// on screen (AC-3), which is a regression guard on the renderer, not on the store.
+fn payload_with_a_removed_key() -> Value {
+    let day = |requests: i64, input: i64| {
+        json!({
+            "date": chrono::Local::now().format("%Y-%m-%d").to_string(),
+            "requests": requests,
+            "successes": requests,
+            "failures": 0,
+            "inputTokens": input,
+            "outputTokens": 0,
+            "cacheCreationInputTokens": 0,
+            "cacheReadInputTokens": 0,
+            "reasoningOutputTokens": 0
+        })
+    };
+    json!({
+        "providers": {
+            "commandcode": {
+                "account_count": 2,
+                "accounts": [
+                    account(json!({
+                        "email": "key-90445c90",
+                        "available": true,
+                        "totalRequests": 100,
+                        "totalSuccesses": 100,
+                        "totalInputTokens": 10_000,
+                        "days": [day(100, 10_000)]
+                    })),
+                    account(json!({
+                        "email": "key-4f84698d",
+                        "available": false,
+                        "cooldownUntil": 0.0,
+                        "failureCount": 0,
+                        "lastError": null,
+                        "totalRequests": 7,
+                        "totalSuccesses": 7,
+                        "totalInputTokens": 2_000,
+                        "days": [day(7, 2_000)]
+                    }))
+                ]
+            }
+        }
+    })
+}
+
+#[test]
+fn a_removed_keys_record_is_counted_by_status_and_usage() {
+    // AC-2: the record is not a second kind of thing to sum. `status`'s aggregate and
+    // `usage`'s trend count it because it is an account entry, not because a reader
+    // was taught about a credential-less one.
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        accounts_payload: Some(payload_with_a_removed_key()),
+        ..FakeRuntime::default()
+    };
+
+    let status = run(&["status"], tmp.path(), &mut runtime);
+    assert_eq!(status.code, 0);
+    assert!(
+        status
+            .stdout
+            .starts_with("relay total: 1 pool, 2 accounts\n"),
+        "{}",
+        status.stdout
+    );
+    // Both records are in the aggregate, and the count matches the list.
+    assert!(
+        status.stdout.contains("requests 107  (107 ok, 0 failed)\n"),
+        "{}",
+        status.stdout
+    );
+
+    // The trend is per recorded day, so one day carries both records' traffic.
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let usage = run(&["usage"], tmp.path(), &mut runtime);
+    assert_eq!(usage.code, 0);
+    assert!(
+        usage.stdout.contains(&format!("{today} 107 12000 0 0 0")),
+        "{}",
+        usage.stdout
+    );
+}
+
+#[test]
+fn a_removed_keys_record_is_listed_by_accounts_as_usual() {
+    // AC-3: no new field, no new state. The row, its tokens and its models print in
+    // the vocabulary that was already there.
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        accounts_payload: Some(payload_with_a_removed_key()),
+        ..FakeRuntime::default()
+    };
+
+    let accounts = run(&["accounts"], tmp.path(), &mut runtime);
+    assert_eq!(accounts.code, 0);
+    assert!(
+        accounts.stdout.contains("commandcode: 2 accounts\n"),
+        "{}",
+        accounts.stdout
+    );
+    assert!(
+        accounts
+            .stdout
+            .contains("  key-4f84698d unavailable failures=0"),
+        "{}",
+        accounts.stdout
+    );
+    assert!(
+        accounts.stdout.contains("    requests 7 (7 ok)"),
+        "{}",
+        accounts.stdout
+    );
+
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(payload_with_a_removed_key()),
+        ..FakeRuntime::default()
+    };
+    let rich = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+    assert_eq!(rich.code, 0);
+    let visible = strip_ansi(&rich.stdout);
+    assert!(
+        visible.contains("key-4f84698d"),
+        "the deleted key is missing from the pool panel: {visible}"
+    );
+    assert!(
+        visible.contains("unresponsive"),
+        "an account with no credential should read as it always did: {visible}"
+    );
+}
