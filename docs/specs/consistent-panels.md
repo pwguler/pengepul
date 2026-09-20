@@ -44,13 +44,13 @@ built by hand rather than by `fact_panel`.
 - **No new verbs, flags, colors, or panel width.** 64 columns stands.
 - **`service logs`, `config show`, `help`, and errors on stderr stay
   plain** in both styles, as today.
-- **The rich/plain wording split for one state is deliberate.** An
-  account with no future cooldown reads `unavailable` in plain and
-  `unresponsive` in rich. `CONTEXT.md` puts `unavailable` on the Cooldown
-  avoid-list and `cli-style-dashboard` prescribes `unresponsive`, but
-  plain bytes are frozen by the non-goal above, so the two cannot be
-  reconciled without breaking a script. Recorded here so a later reader
-  does not "fix" one of them.
+- **No new state word.** An account that cannot serve with no future
+  cooldown reads `unavailable` in both styles. This spec's first cut split
+  the two — `unavailable` in plain, `unresponsive` in rich — arguing the
+  words could not be reconciled without breaking a script. They could: the
+  frozen bytes belong to the plain branch, and the odd word was rich's.
+  The one word also matches the admin payload's `available: false`, so the
+  row and the wire agree as well as the two styles do.
 - **No re-litigating what a panel *says*.** Only how it is shaped:
   `status` keeps its pool lines, `accounts` keeps its per-model lines.
 
@@ -129,6 +129,12 @@ built by hand rather than by `fact_panel`.
   which names plain as the surface that can be trusted for a full id. The
   plain name cell is a minimum now, not a clamp; rich still clips, since
   it carries the name as a label.
+- **The state word is one word again.** Rich printed `● unresponsive` for
+  an account that cannot serve with no future cooldown, one word away from
+  the plain branch's `unavailable` for the very same state. The non-goal
+  above argued the split was forced by byte stability; it was not, and the
+  owner asked for the two to match. Rich prints `● unavailable` now, and
+  `unavailable` remains barred from naming a **Cooldown**.
 
 ## Verification
 

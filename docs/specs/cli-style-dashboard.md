@@ -50,13 +50,14 @@ today's plain text.
   cells and no percentage.
 - AC-5: Account rows carry `● available` (green) for available accounts,
   `● cooldown 4m12s` (amber, remaining time from `cooldownUntil` via the
-  existing pure helper) otherwise, and — for an unavailable account with no
-  future cooldown — `● unresponsive` (red), the glossary-safe wording for
-  the leftover case (CONTEXT.md's Cooldown avoid-list bars "unavailable";
-  plain-branch output is grandfathered). "unresponsive" covers an account
-  whose credential exists but cannot currently serve. Rollup numbers are
-  bold; labels are dim. Color wraps only the glyph/state spans, never the
-  whole line.
+  existing pure helper) otherwise, and — for an account that cannot serve
+  and has no future cooldown — `● unavailable` (red), the word plain
+  `accounts` prints for the same state, so one state has one name in both
+  styles. It covers an account whose credential exists but cannot currently
+  serve, and one whose credential file is gone. `unavailable` stays on
+  CONTEXT.md's Cooldown avoid-list: what is barred is the word naming a
+  **Cooldown**, not the word naming this. Rollup numbers are bold; labels
+  are dim. Color wraps only the glyph/state spans, never the whole line.
 - AC-6: With `Rich`, `accounts` renders the same panels as `status` and adds
   beneath each account row a dim detail line with in, out, read/write
   totals, plus a second `reasoning` line only when that total is non-zero
