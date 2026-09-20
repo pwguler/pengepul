@@ -704,9 +704,12 @@ pub(crate) fn account_row(account: &Value, pool_total: i64, now: f64) -> String 
             .unwrap_or(&raw_cooldown)
             .to_string()
     } else {
-        // Glossary-safe: "unavailable" is on the Cooldown avoid-list; the
-        // leftover case (no future cooldownUntil) reads "unresponsive".
-        "unresponsive".to_string()
+        // The leftover case: no future `cooldownUntil`, so nothing to wait
+        // out. One word for it, in both styles, and the same word the
+        // payload's `available` field names it with. It stays on the
+        // Cooldown avoid-list, which bars it from naming a cooldown, not
+        // this state.
+        "unavailable".to_string()
     };
     let state_color = if is_available {
         GREEN

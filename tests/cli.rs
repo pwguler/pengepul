@@ -711,7 +711,7 @@ fn accounts_renders_panels_with_detail_lines_on_a_tty() {
     assert!(visible.contains("┌─ pool anthropic"));
     assert!(visible.contains('└'));
     assert!(visible.contains("● available"));
-    assert!(visible.contains("● unresponsive"));
+    assert!(visible.contains("● unavailable"));
     // AC-1: the block under each account row, and the pool's again in the
     // footer. The second account has no token history, so it still gets its
     // four rows, at zero.
@@ -5982,7 +5982,8 @@ fn a_removed_keys_record_is_listed_by_accounts_as_usual() {
         "the deleted key is missing from the pool panel: {visible}"
     );
     assert!(
-        visible.contains("unresponsive"),
-        "an account with no credential should read as it always did: {visible}"
+        visible.contains("● unavailable"),
+        "an account with no credential should read as unavailable, the word plain \
+         prints for the same state: {visible}"
     );
 }
