@@ -87,6 +87,7 @@ async fn exhausted_refresh_token_marks_account_for_reauth() {
         .to_string(),
     )
     .expect("write token");
+    add_codex_sibling(tmp.path(), "zed@example.com");
     let mut manager = AccountManager::new(
         tmp.path().to_path_buf(),
         "codex".parse().unwrap(),
@@ -112,11 +113,13 @@ async fn exhausted_refresh_token_marks_account_for_reauth() {
     );
 
     let snapshots = manager.snapshots();
-    assert_eq!(snapshots[0]["available"], false);
-    assert_eq!(snapshots[0]["failureCount"], 1);
-    assert_eq!(snapshots[0]["totalFailures"], 1);
+    let row = &snapshots[0];
+    assert_eq!(row["email"], "bob@example.com");
+    assert_eq!(row["available"], false);
+    assert_eq!(row["failureCount"], 1);
+    assert_eq!(row["totalFailures"], 1);
     assert_eq!(
-        snapshots[0]["lastError"],
+        row["lastError"],
         "refresh token invalid_grant; re-run login for codex"
     );
 }
@@ -139,6 +142,7 @@ async fn failure_cooldown_doubles_from_one_second() {
         .to_string(),
     )
     .expect("write codex token");
+    add_codex_sibling(tmp.path(), "zed@example.com");
     let mut manager = AccountManager::new(
         tmp.path().to_path_buf(),
         "codex".parse().unwrap(),
@@ -154,7 +158,7 @@ async fn failure_cooldown_doubles_from_one_second() {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_secs_f64();
-        let snapshot = manager.snapshots().remove(0);
+        let snapshot = record(&mut manager, "codex-abc12345");
         assert_eq!(snapshot["available"], false);
         let remaining = snapshot["cooldownUntil"].as_f64().expect("cooldownUntil") - now;
         assert!(
@@ -189,6 +193,7 @@ async fn a_credential_that_never_succeeded_is_parked_past_the_transient_error_ce
         .to_string(),
     )
     .expect("write codex token");
+    add_codex_sibling(tmp.path(), "zed@example.com");
     let mut manager = AccountManager::new(
         tmp.path().to_path_buf(),
         "codex".parse().unwrap(),
@@ -204,7 +209,7 @@ async fn a_credential_that_never_succeeded_is_parked_past_the_transient_error_ce
             .as_secs_f64()
     };
     let remaining = |manager: &mut AccountManager| {
-        manager.snapshots().remove(0)["cooldownUntil"]
+        record(manager, "codex-abc12345")["cooldownUntil"]
             .as_f64()
             .expect("cooldownUntil")
             - now()
@@ -244,6 +249,7 @@ async fn a_depleted_key_that_never_succeeded_escalates_past_the_flat_billing_coo
     // exactly that cycle -- 600s at failure_count=1, then 600s again, indefinitely.
     let tmp = tempdir().expect("tempdir");
     save_token(tmp.path(), &static_token("broke@example.com")).expect("save token");
+    add_sibling(tmp.path(), "zz-sibling@example.com");
     let mut manager = never_refresh_manager(tmp.path().to_path_buf());
     manager.load().expect("load");
 
@@ -254,7 +260,7 @@ async fn a_depleted_key_that_never_succeeded_escalates_past_the_flat_billing_coo
             .as_secs_f64()
     };
     let remaining = |manager: &mut AccountManager| {
-        manager.snapshots().remove(0)["cooldownUntil"]
+        record(manager, "broke@example.com")["cooldownUntil"]
             .as_f64()
             .expect("cooldownUntil")
             - now()
@@ -307,6 +313,7 @@ async fn a_billing_rejection_does_not_shorten_a_longer_cooldown() {
     // only ever grows"; this is the same rule applied to its sibling.
     let tmp = tempdir().expect("tempdir");
     save_token(tmp.path(), &static_token("locked@example.com")).expect("save token");
+    add_sibling(tmp.path(), "zz-sibling@example.com");
     let mut manager = never_refresh_manager(tmp.path().to_path_buf());
     manager.load().expect("load");
 
@@ -317,7 +324,7 @@ async fn a_billing_rejection_does_not_shorten_a_longer_cooldown() {
             .as_secs_f64()
     };
     let remaining = |manager: &mut AccountManager| {
-        manager.snapshots().remove(0)["cooldownUntil"]
+        record(manager, "locked@example.com")["cooldownUntil"]
             .as_f64()
             .expect("cooldownUntil")
             - now()
@@ -326,7 +333,7 @@ async fn a_billing_rejection_does_not_shorten_a_longer_cooldown() {
     manager.record_refresh_exhausted("locked@example.com", "invalid_grant");
     let locked = remaining(&mut manager);
     assert!(
-        locked > 3_600.0,
+        (86_400.0 - 0.5..=86_400.0).contains(&locked),
         "the reauth cooldown should be ~24h, got {locked}s"
     );
 
@@ -340,7 +347,7 @@ async fn a_billing_rejection_does_not_shorten_a_longer_cooldown() {
     // cooldown was rejected by the guard, so the operator must still be told to re-run
     // login: that field is the tell CONTEXT.md names for a Reauth, and a sibling test
     // (`a_reauth_lockout_is_not_clobbered_by_the_paired_failure`) pins the same rule.
-    let snap = manager.snapshots().remove(0);
+    let snap = record(&mut manager, "locked@example.com");
     let error = snap["lastError"].as_str().unwrap_or_default();
     assert!(
         error.contains("re-run login"),
@@ -439,6 +446,7 @@ async fn a_lost_usage_file_demotes_until_the_accounts_next_success() {
     // keeps doubling toward the hour, a proven one stays flat.
     let tmp = tempdir().expect("tempdir");
     save_token(tmp.path(), &static_token("proven@example.com")).expect("save token");
+    add_sibling(tmp.path(), "zz-sibling@example.com");
     let usage = tmp.path().join("commandcode").join("usage.json");
 
     let now = || {
@@ -448,7 +456,7 @@ async fn a_lost_usage_file_demotes_until_the_accounts_next_success() {
             .as_secs_f64()
     };
     let remaining = |manager: &mut AccountManager| {
-        manager.snapshots().remove(0)["cooldownUntil"]
+        record(manager, "proven@example.com")["cooldownUntil"]
             .as_f64()
             .expect("cooldownUntil")
             - now()
@@ -515,6 +523,7 @@ async fn counters_written_as_floats_or_strings_still_count() {
     // shapes a JSON writer might produce.
     let tmp = tempdir().expect("tempdir");
     save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    add_sibling(tmp.path(), "zz-sibling@example.com");
     let provider_dir = tmp.path().join("commandcode");
     fs::create_dir_all(&provider_dir).expect("provider dir");
     fs::write(
@@ -532,7 +541,7 @@ async fn counters_written_as_floats_or_strings_still_count() {
 
     let mut manager = never_refresh_manager(tmp.path().to_path_buf());
     manager.load().expect("load");
-    let snapshot = manager.snapshots().remove(0);
+    let snapshot = record(&mut manager, "k@example.com");
     assert_eq!(
         snapshot["totalSuccesses"], 7100,
         "a string counter was read as 0"
@@ -551,7 +560,7 @@ async fn counters_written_as_floats_or_strings_still_count() {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_secs_f64();
-    let remaining = manager.snapshots().remove(0)["cooldownUntil"]
+    let remaining = record(&mut manager, "k@example.com")["cooldownUntil"]
         .as_f64()
         .expect("cooldownUntil")
         - now;
@@ -587,6 +596,151 @@ fn never_refresh_manager(auth_dir: PathBuf) -> AccountManager {
             seconds: 0,
         },
     )
+}
+
+/// A second credential in the same Pool.
+///
+/// A Cooldown exists to hand the next request to a sibling, so a Pool that holds one
+/// account earns none at all (ADR-0027) — every test about cooldown mechanics therefore
+/// needs two accounts. Pass an email that sorts after the account under test where the
+/// test reads `snapshots()[0]`.
+fn add_sibling(auth_dir: &Path, email: &str) {
+    save_token(auth_dir, &static_token(email)).expect("save sibling token");
+}
+
+/// A second Codex credential in the same Pool, for the tests whose fixture writes its
+/// token file by hand (see [`add_sibling`]).
+fn add_codex_sibling(auth_dir: &Path, email: &str) {
+    fs::write(
+        auth_dir.join("codex").join(format!("{email}.json")),
+        json!({
+            "access_token": format!("sk-{email}"),
+            "refresh_token": "",
+            "email": email,
+            "type": "codex",
+            "expired": "9999-12-31T23:59:59Z",
+            "account_uuid": ""
+        })
+        .to_string(),
+    )
+    .expect("write sibling token");
+}
+
+/// The listed record for one account, so a test reads the row it means rather than the
+/// row that happens to sort first.
+fn record(manager: &mut AccountManager, email: &str) -> Value {
+    manager
+        .snapshots()
+        .into_iter()
+        .find(|snapshot| snapshot["email"] == email)
+        .unwrap_or_else(|| panic!("{email} is missing from the payload"))
+}
+
+#[tokio::test]
+async fn a_pool_of_one_never_earns_a_cooldown() {
+    // ADR-0027. A Cooldown is a Rotation signal — "hand the next request to the
+    // sibling" — and a Pool that holds one account has no sibling. Parking it
+    // withholds the only way this Provider has to serve, and the client gets a local
+    // 503 in place of the vendor's own answer, which is the one thing it could act on.
+    //
+    // All three duration policies are covered, because all three used to end the same
+    // way for a lone account: a ten-minute billing park, a 24-hour reauth park, and an
+    // hour-long never-succeeded park.
+    let tmp = tempdir().expect("tempdir");
+    let codex_dir = tmp.path().join("codex");
+    fs::create_dir_all(&codex_dir).expect("codex dir");
+    fs::write(
+        codex_dir.join("solo.json"),
+        json!({
+            "access_token": "sk-solo",
+            "refresh_token": "",
+            "email": "solo@example.com",
+            "type": "codex",
+            "expired": "9999-12-31T23:59:59Z",
+            "account_uuid": ""
+        })
+        .to_string(),
+    )
+    .expect("write codex token");
+    let mut manager = AccountManager::new(
+        tmp.path().to_path_buf(),
+        "codex".parse().unwrap(),
+        |_refresh_token| Box::pin(async { anyhow::bail!("unused refresh") }),
+        RefreshPolicy::default(),
+    );
+    manager.load().expect("load accounts");
+    assert_eq!(manager.account_count(), 1);
+
+    let outcomes: [(&str, &str, &str); 3] = [
+        ("upstream", "400", "upstream: 400"),
+        (
+            "billing",
+            "insufficient credits",
+            "billing: insufficient credits",
+        ),
+        // The tell CONTEXT.md names for a Reauth, which a truncated error would lose.
+        ("auth", "invalid_grant", "re-run login"),
+    ];
+    for (kind, detail, expected) in outcomes {
+        match kind {
+            "billing" => manager.record_billing_cooldown("solo@example.com", detail),
+            "auth" => manager.record_refresh_exhausted("solo@example.com", "invalid_grant"),
+            _ => manager.record_failure("solo@example.com", kind, Some(detail)),
+        }
+
+        let snapshot = record(&mut manager, "solo@example.com");
+        assert_eq!(
+            snapshot["available"], true,
+            "a lone account was withheld after a {kind} failure"
+        );
+        assert_eq!(
+            snapshot["cooldownUntil"], 0.0,
+            "a lone account earned a {kind} cooldown"
+        );
+        assert!(
+            snapshot["lastError"]
+                .as_str()
+                .is_some_and(|error| error.contains(expected)),
+            "the failure itself must still be reported as {expected:?}: {}",
+            snapshot["lastError"]
+        );
+        assert!(
+            snapshot["lastFailureAt"].as_str().is_some(),
+            "the failure timestamp must still be recorded"
+        );
+        assert_eq!(
+            manager
+                .next_account()
+                .expect("the lone account")
+                .token
+                .email,
+            "solo@example.com",
+            "rotation refused the only account in the Pool"
+        );
+    }
+
+    // The failure counters keep climbing: the rule is about withholding an account
+    // from Rotation, not about pretending the request went well. `totalFailures` counts
+    // two, not three, because `record_billing_cooldown` rides on an outcome the request
+    // already recorded (ADR-0015) while the streak counts the rejection itself.
+    let snapshot = record(&mut manager, "solo@example.com");
+    assert_eq!(snapshot["failureCount"], 3);
+    assert_eq!(snapshot["totalFailures"], 2);
+    assert_eq!(snapshot["totalSuccesses"], 0);
+
+    // And one sibling is all it takes to put the mechanism back: the pool is no longer
+    // a Pool of one, so the cooldown is earned again and rotation falls through to the
+    // account that can still serve.
+    add_codex_sibling(tmp.path(), "zed@example.com");
+    manager.reload().expect("reach two accounts");
+    manager.record_billing_cooldown("solo@example.com", "insufficient credits");
+    let snapshot = record(&mut manager, "solo@example.com");
+    assert_eq!(snapshot["available"], false);
+    assert!(snapshot["cooldownUntil"].as_f64().unwrap_or(0.0) > 0.0);
+    assert_eq!(
+        manager.next_account().expect("the sibling").token.email,
+        "zed@example.com"
+    );
 }
 
 fn persisted(path: &Path) -> Value {
@@ -1603,6 +1757,7 @@ async fn two_attempts_in_flight_both_reach_an_outcome() {
 async fn a_reauth_lockout_is_not_clobbered_by_the_paired_failure() {
     let tmp = tempdir().expect("tempdir");
     save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
+    add_sibling(tmp.path(), "zz-sibling@example.com");
     let mut manager = never_refresh_manager(tmp.path().to_path_buf());
     manager.load().expect("load");
     let now = || {
@@ -1614,10 +1769,10 @@ async fn a_reauth_lockout_is_not_clobbered_by_the_paired_failure() {
     manager.record_refresh_exhausted("k@example.com", "expired");
     manager.record_failure("k@example.com", "auth", Some("token refresh declined"));
 
-    let snapshot = &manager.snapshots()[0];
+    let snapshot = record(&mut manager, "k@example.com");
     let remaining = snapshot["cooldownUntil"].as_f64().unwrap_or(0.0) - now();
     assert!(
-        remaining > 3_600.0,
+        (86_400.0 - 0.5..=86_400.0).contains(&remaining),
         "the 24h lockout collapsed to {remaining:.0}s"
     );
     assert!(
@@ -1832,6 +1987,7 @@ async fn rotation_never_hands_out_a_record_without_a_credential() {
     // use. A deleted key must not absorb a request or a failover attempt.
     let tmp = tempdir().expect("tempdir");
     save_token(tmp.path(), &static_token("stays@example.com")).expect("save token");
+    save_token(tmp.path(), &static_token("also-stays@example.com")).expect("save token");
     let provider_dir = tmp.path().join("commandcode");
     fs::create_dir_all(&provider_dir).expect("provider dir");
     fs::write(
@@ -1843,24 +1999,27 @@ async fn rotation_never_hands_out_a_record_without_a_credential() {
     let mut manager = never_refresh_manager(tmp.path().to_path_buf());
     manager.load().expect("load");
 
-    // The serving set and the listed set differ on purpose: one credential, two
+    // The serving set and the listed set differ on purpose: two credentials, three
     // records.
-    assert_eq!(manager.account_count(), 1);
-    assert_eq!(manager.snapshots().len(), 2);
+    assert_eq!(manager.account_count(), 2);
+    assert_eq!(manager.snapshots().len(), 3);
     for _ in 0..4 {
         let next = manager.next_account().expect("an account");
-        assert_eq!(
-            next.token.email, "stays@example.com",
+        assert_ne!(
+            next.token.email, "goes@example.com",
             "rotation handed out a credential-less record"
         );
     }
 
-    // And with the one usable account parked, rotation has nothing to hand out. The
+    // And with every usable account parked, rotation has nothing to hand out. The
     // record is not a candidate that comes up when the pool runs dry — there is no
     // credential to serve with, and no Cooldown to wait out. A billing cooldown, not an
     // ordinary failure: the ordinary one lasts a second, and a stalled test thread would
-    // find the account servable again and report a defect that is not there.
-    manager.record_billing_cooldown("stays@example.com", "insufficient credits");
+    // find the accounts servable again and report a defect that is not there. Two live
+    // accounts, because a Pool of one earns no Cooldown at all (ADR-0027).
+    for email in ["stays@example.com", "also-stays@example.com"] {
+        manager.record_billing_cooldown(email, "insufficient credits");
+    }
     assert!(
         manager.next_account().is_none(),
         "rotation fell through to a credential-less record"
