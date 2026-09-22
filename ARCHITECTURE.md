@@ -164,6 +164,11 @@ in files.
   at an hour instead, so a depleted key stops spending a round trip every ten
   minutes. It is delayed, never excluded, and its first success restores the
   ordinary regime (ADR-0020).
+- **A Pool that holds one Account keeps no Cooldown.** A Cooldown hands the next
+  request to a sibling, so with no sibling it would withhold the only way that
+  Provider has to serve. The failure is still recorded — streak, counters,
+  `lastError` — and the next request reaches the vendor, whose own error answers the
+  client instead of a local `503` (ADR-0027).
 - **Every route authenticates before it parses a body.** `/health` is the only
   unauthenticated route.
 - **One Account holds exactly one credential**, on disk at `0600` and never

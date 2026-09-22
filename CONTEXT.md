@@ -43,7 +43,7 @@ The state an account enters when its refresh token is itself rejected, where not
 _Avoid_: refresh exhausted, invalid_grant, dead token
 
 **Cooldown**:
-A period during which an account is passed over by rotation, entered on failure and cleared by the next success or by reloading accounts after a fresh login.
+A period during which an account is passed over by rotation, entered on failure and cleared by the next success or by reloading accounts after a fresh login. A Pool that holds one account earns none: a Cooldown hands the next request to a sibling, and with no sibling it would only withhold the account the Pool has (ADR-0027).
 _Avoid_: backoff, lockout, unavailable, cooling down
 
 **Rotation**:
@@ -108,7 +108,7 @@ _Avoid_: billing classifier, detector, filter
 - One **Provider** has zero or more **Accounts**; one **Account** belongs to exactly one **Provider**.
 - Within one **Provider** an **Account** is keyed by exactly one email (anthropic/codex) or by a label derived from the key (static-key providers), and keys are unique.
 - One **Account** holds exactly one credential: an access-token/refresh-token pair for anthropic and codex, or one static API key for a configured OpenAI-compatible **Provider**.
-- One **Account** has at most one **Cooldown** in effect, with three duration policies: an ordinary failure cooldown, a longer one for **Reauth**, and a separate ceiling of up to an hour for an account that has never once succeeded — shorter than Reauth's, because it bounds how often a dead key is probed while a Reauth waits for a human (ADR-0020).
+- One **Account** has at most one **Cooldown** in effect, with three duration policies: an ordinary failure cooldown, a longer one for **Reauth**, and a separate ceiling of up to an hour for an account that has never once succeeded — shorter than Reauth's, because it bounds how often a dead key is probed while a Reauth waits for a human (ADR-0020). A **Pool** of one account has none of the three: the account keeps serving its failures, and the client sees the vendor's own error (ADR-0027).
 - One model id resolves to exactly one **Provider**.
 - One client request is served by one **Account** at a time, and **Failover** only moves it between **Accounts** of the same **Provider**.
 - **Cloaking** applies to requests bound for the anthropic and codex **Upstreams**; configured OpenAI-compatible endpoints are never cloaked. The **Local API key** applies to requests arriving from a client.

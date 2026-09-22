@@ -1122,6 +1122,137 @@ async fn messages_route_retries_next_account_after_retryable_upstream_failure() 
     );
 }
 
+/// Answer every Messages request with the same rejection, keeping the accounts it was
+/// asked for.
+#[derive(Default)]
+struct RateLimitedUpstream {
+    calls: Mutex<Vec<UpstreamRequest>>,
+}
+
+impl RateLimitedUpstream {
+    fn calls(&self) -> Vec<UpstreamRequest> {
+        self.calls.lock().expect("calls lock").clone()
+    }
+}
+
+impl UpstreamClient for RateLimitedUpstream {
+    fn anthropic_messages(
+        &self,
+        request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        self.calls.lock().expect("calls lock").push(request);
+        Box::pin(async {
+            Ok(UpstreamJsonResponse {
+                status: axum::http::StatusCode::TOO_MANY_REQUESTS,
+                body: json!({"error": {"message": "rate limited"}}),
+            })
+        })
+    }
+
+    fn generic_chat(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("not exercised")
+    }
+    fn anthropic_messages_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!("not exercised")
+    }
+    fn anthropic_count_tokens(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("not exercised")
+    }
+    fn codex_responses(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("not exercised")
+    }
+    fn codex_responses_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!("not exercised")
+    }
+    fn generic_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!("not exercised")
+    }
+    fn fetch_models(
+        &self,
+        _kind: ProviderKind,
+        _account: AvailableAccount,
+        _config: Arc<Config>,
+    ) -> ModelsFuture {
+        unreachable!("not exercised")
+    }
+    fn fetch_cli_versions(&self) -> CliVersionsFuture {
+        unreachable!("not exercised")
+    }
+}
+
+/// ADR-0027, at the surface the client sees. A Pool that holds one account has no
+/// sibling for a Cooldown to hand the next request to, so the vendor's rejection is
+/// answered as-is. Before this, one 429 parked the only account — a second at the base,
+/// doubling per consecutive failure — and the next request was refused with a 503
+/// `no_account_for_provider` before it left the process: a local error the client could
+/// do nothing with, in place of the one it could act on.
+#[tokio::test]
+async fn a_lone_account_is_never_parked_out_of_rotation() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(
+        tmp.path(),
+        &TokenData {
+            access_token: "anthropic-access-solo".to_string(),
+            refresh_token: "anthropic-refresh-solo".to_string(),
+            email: "solo@example.com".to_string(),
+            expires_at: "2030-01-01T00:00:00Z".to_string(),
+            account_uuid: "solo@example.com".to_string(),
+            provider: ProviderId::anthropic(),
+            id_token: None,
+            last_refresh_at: None,
+            plan_type: None,
+        },
+    )
+    .expect("save token");
+    let upstream = Arc::new(RateLimitedUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    for attempt in 1..=2 {
+        let (status, body) = json_response(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("authorization", "Bearer sk-test")
+                .header("content-type", "application/json")
+                .header("content-length", "1")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-sonnet-4-6",
+                        "messages": [{"role": "user", "content": "reply exactly: pong"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(status, 429, "request {attempt} did not reach the upstream");
+        assert_eq!(body["error"]["message"], "rate limited");
+    }
+
+    let calls = upstream.calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "the relay answered its own 503 instead of asking the lone account again"
+    );
+    assert!(
+        calls
+            .iter()
+            .all(|call| call.account.token.email == "solo@example.com")
+    );
+}
+
 #[tokio::test]
 async fn chat_completions_route_adapts_anthropic_response_to_openai() {
     let tmp = tempfile::tempdir().expect("tempdir");

@@ -24,6 +24,9 @@ pub type RefreshFn = Box<dyn Fn(String) -> RefreshFuture + Send + Sync>;
 /// retries keep a single static key (or a lone account) from being locked out by one
 /// transient error. The *ceiling* is what varies — billing, reauth, and a credential
 /// that has never succeeded each sit out longer; see [`AccountState::failure_cooldown`].
+///
+/// A Cooldown needs a sibling to be worth anything: it exists to send the next request
+/// somewhere else, so a Pool that holds one account earns none at all (ADR-0027).
 const FAILURE_BACKOFF: (f64, f64) = (1.0, 5.0 * 60.0);
 
 /// Billing failures (an account out of credits or quota) do not recover mid-session the
@@ -387,6 +390,15 @@ impl AccountManager {
         self.accounts.len()
     }
 
+    /// Whether a Cooldown has a sibling to send the next request to.
+    ///
+    /// It does not, for a Pool that holds one account: withholding that account is
+    /// withholding the only way this Provider has to serve, which turns the vendor's
+    /// own error into a local one the client can do nothing with (ADR-0027).
+    fn has_sibling(&self) -> bool {
+        self.order.len() > 1
+    }
+
     /// Load provider token files from disk.
     ///
     /// # Errors
@@ -580,11 +592,20 @@ impl AccountManager {
     /// whose request already reached an outcome. Counts no new outcome:
     /// `requests` must keep equalling `successes + failures`.
     pub fn record_billing_cooldown(&mut self, email: &str, detail: &str) {
+        let has_sibling = self.has_sibling();
         let Some(state) = self.accounts.get_mut(email) else {
             return;
         };
         state.failure_count += 1;
         state.last_failure_at = Some(now_iso());
+        // A lone account keeps serving (see `has_sibling`); what a sibling's cooldown
+        // would do is the guard below.
+        if !has_sibling {
+            state.last_failure_kind = Some("billing".to_string());
+            state.last_error = Some(format!("billing: {detail}"));
+            self.persist_usage();
+            return;
+        }
         // An account with successes behind it gets the flat billing cooldown it
         // always has. One that has never succeeded escalates instead: it is not
         // going to clear mid-session either, and a flat ten minutes forever is the
@@ -607,12 +628,25 @@ impl AccountManager {
     }
 
     pub fn record_failure(&mut self, email: &str, kind: &str, detail: Option<&str>) {
+        let has_sibling = self.has_sibling();
         let Some(state) = self.accounts.get_mut(email) else {
             return;
         };
         state.failure_count += 1;
         let _ = state.settle(false);
         state.last_failure_at = Some(now_iso());
+        // A lone account records the failure — streak, counters, `lastError`, the
+        // fields the panels read — and keeps serving, so the client sees the
+        // upstream's own error instead of "no available account". Nothing is
+        // inherited either: a Cooldown is never persisted, so a Pool that lost a
+        // credential between restarts cannot come up holding one (ADR-0027).
+        if !has_sibling {
+            state.last_failure_kind = Some(kind.to_string());
+            state.last_error =
+                Some(detail.map_or_else(|| kind.to_string(), |detail| format!("{kind}: {detail}")));
+            self.persist_usage();
+            return;
+        }
         let (base, maximum) = state.failure_cooldown(kind);
         let multiplier = 2_f64.powi(i32::try_from(state.failure_count - 1).unwrap_or(0));
         let cooldown = unix_now() + (base * multiplier).min(maximum);
@@ -629,6 +663,7 @@ impl AccountManager {
     }
 
     pub fn record_refresh_exhausted(&mut self, email: &str, reason: &str) {
+        let has_sibling = self.has_sibling();
         let Some(state) = self.accounts.get_mut(email) else {
             return;
         };
@@ -640,7 +675,14 @@ impl AccountManager {
             "refresh token {reason}; re-run login for {}",
             self.provider
         ));
-        state.cooldown_until = unix_now() + REAUTH_COOLDOWN_SECONDS;
+        // A Reauth is the one failure a Cooldown cannot help with at all: the
+        // credential will not serve again without a human. For a lone account the
+        // relay asks for one refresh per request instead, and every request answers
+        // with the message that says what to do, which is more use than a 24-hour
+        // local refusal (ADR-0027).
+        if has_sibling {
+            state.cooldown_until = unix_now() + REAUTH_COOLDOWN_SECONDS;
+        }
         self.persist_usage();
     }
 
