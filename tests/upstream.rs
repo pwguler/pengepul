@@ -6,7 +6,7 @@ use pengepul::config::{
 };
 use pengepul::types::{AvailableAccount, ProviderId, ProviderKind, TokenData};
 use pengepul::upstream::{
-    anthropic_headers, apply_cloaking, build_beta_header, codex_headers,
+    RequestShape, anthropic_headers, apply_cloaking, build_beta_header, codex_headers,
     detect_classifier_tripping_in_messages, generic_base_url, generic_chat_headers,
     normalize_codex_responses_body,
 };
@@ -73,7 +73,7 @@ fn anthropic_headers_include_cloaking_session_and_beta() {
         "claude-sonnet-4-6",
         &config(),
         &request_headers,
-        false,
+        &json!({"messages": [{"role": "user", "content": "ping"}]}),
     );
 
     assert_eq!(headers["Authorization"], "Bearer anthropic-access");
@@ -82,37 +82,135 @@ fn anthropic_headers_include_cloaking_session_and_beta() {
     assert_eq!(headers["X-Stainless-Timeout"], "120");
     assert!(headers["X-Claude-Code-Session-Id"].len() >= 32);
     assert!(headers["anthropic-beta"].contains("oauth-2025-04-20"));
-    assert!(headers["anthropic-beta"].contains("advanced-tool-use-2025-11-20"));
-    // Stainless fingerprint tracks the SDK bundled in Claude Code 2.1.261
+    // Advanced tool use gates deferred tools; a body without any must not
+    // claim it (audit: docs/research/claude-code-2.1.280-cloaking-audit.md).
+    assert!(!headers["anthropic-beta"].contains("advanced-tool-use-2025-11-20"));
+    // Stainless fingerprint tracks the SDK bundled in Claude Code 2.1.280
     // (a bun binary reporting node-compat v26).
     assert_eq!(headers["X-Stainless-Package-Version"], "0.112.1");
     assert_eq!(headers["X-Stainless-Runtime-Version"], "v26.3.0");
-    assert_eq!(headers["anthropic-client-platform"], "cli");
+    assert_eq!(headers["x-app"], "cli");
+    // Claude Code sets `anthropic-client-platform` only for the desktop app, so
+    // a first-party Messages request carries no platform header at all
+    // (2.1.261, 2.1.278 and 2.1.280 all read the same way).
+    assert!(!headers.contains_key("anthropic-client-platform"));
 }
 
 #[test]
-fn beta_header_switches_for_structured_and_haiku() {
-    assert!(build_beta_header("claude-sonnet-4-6", true).contains("structured-outputs-2025-12-15"));
+fn beta_header_follows_the_request_shape() {
+    let bare = RequestShape::of(&json!({"messages": []}));
+    // The whole set a bare non-haiku request carries, pinned: an accidental
+    // add or drop while editing the list fails here.
+    assert_eq!(
+        build_beta_header("claude-sonnet-4-6", bare),
+        "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+         thinking-token-count-2026-05-13,context-management-2025-06-27,\
+         prompt-caching-scope-2026-01-05"
+    );
+
+    // Each conditional flag travels with the field it gates.
+    let effort = RequestShape::of(&json!({"output_config": {"effort": "max"}}));
+    assert!(build_beta_header("claude-sonnet-4-6", effort).contains("effort-2025-11-24"));
+    assert!(!build_beta_header("claude-sonnet-4-6", effort).contains("structured-outputs"));
+
+    let task_budget = RequestShape::of(
+        &json!({"output_config": {"task_budget": {"type": "tokens", "total": 4096}}}),
+    );
+    assert!(
+        build_beta_header("claude-sonnet-4-6", task_budget).contains("task-budgets-2026-03-13")
+    );
+
+    let structured = RequestShape::of(&json!({"output_format": {"type": "json_schema"}}));
+    assert!(
+        build_beta_header("claude-sonnet-4-6", structured)
+            .contains("structured-outputs-2025-12-15")
+    );
+
+    let deferred =
+        RequestShape::of(&json!({"tools": [{"name": "mcp__x__y", "defer_loading": true}]}));
+    assert!(
+        build_beta_header("claude-sonnet-4-6", deferred).contains("advanced-tool-use-2025-11-20")
+    );
+
+    let searched = RequestShape::of(&json!({"tools": [{"type": "tool_search_tool_bm25"}]}));
+    assert!(
+        build_beta_header("claude-sonnet-4-6", searched).contains("advanced-tool-use-2025-11-20")
+    );
+
+    // A typed tool that is neither: neither flag may be claimed just because a tool
+    // carries a `type` tag, which is the shape every server tool has.
+    let server_tool = RequestShape::of(
+        &json!({"tools": [{"type": "web_search_20250305", "name": "web_search"}]}),
+    );
+    assert!(
+        !build_beta_header("claude-sonnet-4-6", server_tool)
+            .contains("advanced-tool-use-2025-11-20")
+    );
+    assert!(!build_beta_header("claude-sonnet-4-6", server_tool).contains("web-fetch-2025-09-10"));
+
+    // Native `web_fetch` server tool: the one flag the relay needs and Claude
+    // Code no longer sends (2.1.280 moved WebFetch client-side).
+    let swap =
+        RequestShape::of(&json!({"tools": [{"type": "web_fetch_20250910", "name": "web_fetch"}]}));
+    assert!(build_beta_header("claude-sonnet-4-6", swap).contains("web-fetch-2025-09-10"));
+    assert!(!build_beta_header("claude-sonnet-4-6", bare).contains("web-fetch-2025-09-10"));
+
     // Thinking text must reach the client: Claude Code asks the server to
     // redact it only because its own TUI hides thinking; a relay serving
     // pi/openclaw must not (verified: the flag empties `thinking` blocks
     // while still billing thinking_tokens).
-    assert!(!build_beta_header("claude-sonnet-4-6", false).contains("redact-thinking"));
-    assert!(!build_beta_header("claude-haiku-4-5-20251001", false).contains("redact-thinking"));
-    // Claude Code 2.1.261 sends thinking-token-count on thinking-capable models.
+    assert!(!build_beta_header("claude-sonnet-4-6", bare).contains("redact-thinking"));
+    assert!(!build_beta_header("claude-haiku-4-5-20251001", bare).contains("redact-thinking"));
+    // ...and on the harnesses' own shape, which redaction would silently break.
+    assert!(!build_beta_header("claude-sonnet-4-6", effort).contains("redact-thinking"));
+
+    // Claude Code sends thinking-token-count on thinking-capable models.
     assert!(
-        build_beta_header("claude-sonnet-4-6", false).contains("thinking-token-count-2026-05-13")
+        build_beta_header("claude-sonnet-4-6", bare).contains("thinking-token-count-2026-05-13")
     );
-    // The whole set, pinned: an accidental drop while editing the list fails here.
-    assert_eq!(
-        build_beta_header("claude-sonnet-4-6", false),
-        "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
-         thinking-token-count-2026-05-13,context-management-2025-06-27,\
-         prompt-caching-scope-2026-01-05,web-fetch-2025-09-10,\
-         advanced-tool-use-2025-11-20,effort-2025-11-24"
+
+    // The first-party flag is non-haiku only, and no flag the body did not ask
+    // for is sent.
+    assert!(!build_beta_header("claude-haiku-4-5-20251001", bare).contains("claude-code-20250219"));
+}
+
+#[test]
+fn mid_conversation_system_follows_the_model_generation() {
+    let bare = RequestShape::of(&json!({"messages": []}));
+    // Withheld from every model older than claude-opus-4-8, including the
+    // claude-3 family and the haiku line.
+    assert!(!build_beta_header("claude-sonnet-4-6", bare).contains("mid-conversation-system"));
+    assert!(!build_beta_header("claude-haiku-4-5", bare).contains("mid-conversation-system"));
+    assert!(
+        !build_beta_header("claude-3-5-haiku-20241022", bare).contains("mid-conversation-system")
     );
-    assert!(build_beta_header("claude-haiku-4-5-20251001", false).contains("claude-code-20250219"));
-    assert!(!build_beta_header("claude-haiku-4-5-20251001", false).contains("effort-2025-11-24"));
+    // Sent on claude-opus-4-8, and on a model the CLI does not know.
+    assert!(build_beta_header("claude-opus-4-8", bare).contains("mid-conversation-system"));
+    assert!(build_beta_header("claude-fable-5", bare).contains("mid-conversation-system"));
+    // A dated release names the same family, so it is compared as that family rather
+    // than as an id the list has never heard of; a 1M marker is not part of the name.
+    assert!(
+        !build_beta_header("claude-haiku-4-5-20251001", bare).contains("mid-conversation-system")
+    );
+    assert!(
+        !build_beta_header("claude-sonnet-4-6-20260101", bare).contains("mid-conversation-system")
+    );
+    assert!(build_beta_header("claude-opus-4-8[1m]", bare).contains("mid-conversation-system"));
+    // The marker must be stripped for the comparison to mean anything: with it left on,
+    // both of these are unknown ids and would be sent a beta their family does not get.
+    assert!(!build_beta_header("claude-sonnet-4-6[1m]", bare).contains("mid-conversation-system"));
+    assert!(!build_beta_header("claude-haiku-4-5[1M]", bare).contains("mid-conversation-system"));
+}
+
+#[test]
+fn claude_3_drops_the_thinking_and_context_betas() {
+    let bare = RequestShape::of(&json!({"messages": []}));
+    let legacy = build_beta_header("claude-3-5-haiku-20241022", bare);
+    assert_eq!(legacy, "oauth-2025-04-20,prompt-caching-scope-2026-01-05");
+    // A current haiku keeps them: only `claude-3-*` loses interleaved thinking.
+    let haiku = build_beta_header("claude-haiku-4-5-20251001", bare);
+    assert!(haiku.contains("interleaved-thinking-2025-05-14"));
+    assert!(!haiku.contains("claude-code-20250219"));
 }
 
 #[test]
@@ -135,12 +233,10 @@ fn apply_cloaking_injects_billing_prefix_and_metadata() {
     );
 
     let system = cloaked["system"].as_array().expect("system blocks");
-    assert!(
-        system[0]["text"]
-            .as_str()
-            .expect("billing text")
-            .contains("x-anthropic-billing-header")
-    );
+    let billing = system[0]["text"].as_str().expect("billing text");
+    assert!(billing.contains("x-anthropic-billing-header"));
+    // The first-party marker Claude Code appends to the version and entrypoint.
+    assert!(billing.contains("cch=00000;"));
     assert_eq!(
         system[1]["text"],
         "You are Claude Code, Anthropic's official CLI for Claude."

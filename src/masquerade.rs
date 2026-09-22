@@ -102,8 +102,11 @@ fn pseudo_for(name: &str, taken: &BTreeSet<String>) -> String {
 /// itself. Swap them for Anthropic's native server tools so the upstream runs them
 /// and folds the results into the turn; the name is kept (no client dispatch), so
 /// these are excluded from the `PascalCase` map. `web_fetch` also needs the
-/// `web-fetch-2025-09-10` beta on the request (see `build_beta_header`). Returns the
-/// native tool definition, or `None` for tools with no native equivalent.
+/// `web-fetch-2025-09-10` beta on the request (see `build_beta_header`), which is why
+/// `RequestShape` looks for this tool: Claude Code 2.1.280 dropped the server tool
+/// (`WebFetch` is a client tool there), so this swap is the only web-fetch
+/// implementation openclaw's requests have (ADR-0008). Returns the native tool
+/// definition, or `None` for tools with no native equivalent.
 fn native_replacement(name: &str) -> Option<Value> {
     match name {
         "web_search" => Some(serde_json::json!({
