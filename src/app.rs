@@ -302,7 +302,7 @@ impl UpstreamClient for HttpUpstreamClient {
                 model,
                 &request.config,
                 &request.request_headers,
-                false,
+                &body,
             );
             send_json(
                 client,
@@ -337,7 +337,7 @@ impl UpstreamClient for HttpUpstreamClient {
                 model,
                 &request.config,
                 &request.request_headers,
-                false,
+                &body,
             );
             send_stream(
                 client,
@@ -365,7 +365,7 @@ impl UpstreamClient for HttpUpstreamClient {
                 model,
                 &request.config,
                 &request.request_headers,
-                false,
+                &request.body,
             );
             send_json(
                 client,

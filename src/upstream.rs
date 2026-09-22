@@ -46,41 +46,163 @@ type Sessions = BTreeMap<String, (String, Instant, Duration)>;
 
 static SESSIONS: OnceLock<Mutex<Sessions>> = OnceLock::new();
 
-/// The beta set, based on what Claude Code 2.1.261 attaches to a first-party
-/// request (audit: docs/research/claude-code-2.1.261-cloaking-audit.md).
+/// The models Claude Code 2.1.280 orders oldest-first, used by its
+/// `or(model, "claude-opus-4-8")` generation test. A model id outside this list
+/// is not older than anything, which is how the CLI treats a model it has never
+/// heard of.
+const KNOWN_MODEL_ORDER: &[&str] = &[
+    "claude-opus-4-0",
+    "claude-sonnet-4-0",
+    "claude-opus-4-1",
+    "claude-sonnet-4-5",
+    "claude-haiku-4-5",
+    "claude-opus-4-5",
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+];
+
+/// The canonical model family an id belongs to: Claude Code compares generated ids, so a
+/// dated release (`claude-haiku-4-5-20251001`) and a 1M-context marker
+/// (`claude-sonnet-4-5[1m]`) both name the family the table lists rather than an id it
+/// has never heard of.
+fn canonical_model(model: &str) -> &str {
+    let model = model.trim();
+    let marker = model.len().checked_sub(4).and_then(|at| model.get(at..));
+    let model = match marker {
+        Some(tail) if tail.eq_ignore_ascii_case("[1m]") => &model[..model.len() - 4],
+        _ => model,
+    };
+    match model.rsplit_once('-') {
+        Some((family, date)) if date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()) => {
+            family
+        }
+        _ => model,
+    }
+}
+
+/// True for a model older than `newer`, matching Claude Code's generation test:
+/// every `claude-3-*` counts as older, and a model the list does not name is
+/// never older.
+fn older_than(model: &str, newer: &str) -> bool {
+    let model = canonical_model(model);
+    if model.contains("claude-3-") {
+        return true;
+    }
+    let index = KNOWN_MODEL_ORDER.iter().position(|known| *known == model);
+    let floor = KNOWN_MODEL_ORDER
+        .iter()
+        .position(|known| *known == newer)
+        .unwrap_or(KNOWN_MODEL_ORDER.len());
+    index.is_some_and(|index| index < floor)
+}
+
+/// What the request carries that a beta flag gates. Claude Code attaches each
+/// conditional beta to the shape it gates, so the relay does the same: a beta
+/// sent without its shape is a fingerprint a first-party client never produces
+/// (audit: docs/research/claude-code-2.1.280-cloaking-audit.md).
+///
+/// The flags are independent gates rather than states, so they stay separate
+/// booleans: one body can carry structured output and a task budget at once.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequestShape {
+    /// `output_format` or `output_config.format`: `structured-outputs-2025-12-15`.
+    structured: bool,
+    /// `output_config.effort`: `effort-2025-11-24`.
+    effort: bool,
+    /// `output_config.task_budget`: `task-budgets-2026-03-13`.
+    task_budget: bool,
+    /// A tool deferred behind tool search: `advanced-tool-use-2025-11-20`.
+    tool_search: bool,
+    /// A native `web_fetch` server tool: `web-fetch-2025-09-10`.
+    web_fetch: bool,
+}
+
+impl RequestShape {
+    /// Read the shape off the body that actually goes upstream, after masquerade
+    /// has swapped a client's tools for their native replacements.
+    #[must_use]
+    pub fn of(body: &Value) -> Self {
+        let output_config = body.get("output_config").and_then(Value::as_object);
+        let has_field = |key: &str| output_config.is_some_and(|config| config.contains_key(key));
+
+        let mut shape = Self {
+            structured: body.get("output_format").is_some() || has_field("format"),
+            effort: has_field("effort"),
+            task_budget: has_field("task_budget"),
+            ..Self::default()
+        };
+
+        let Some(tools) = body.get("tools").and_then(Value::as_array) else {
+            return shape;
+        };
+        for tool in tools {
+            match tool.get("type").and_then(Value::as_str) {
+                Some(kind) if kind.starts_with("web_fetch") => shape.web_fetch = true,
+                Some(kind) if kind.starts_with("tool_search_tool") => shape.tool_search = true,
+                _ => {
+                    shape.tool_search |=
+                        tool.get("defer_loading").and_then(Value::as_bool) == Some(true);
+                }
+            }
+        }
+        shape
+    }
+}
+
+/// The beta set a first-party Claude Code 2.1.280 request carries, derived from
+/// the request shape the same way the CLI derives it from its own request
+/// (audit: docs/research/claude-code-2.1.280-cloaking-audit.md).
 ///
 /// Deliberately absent: `redact-thinking-2026-02-12`. Claude Code sends it
 /// only because its own TUI hides thinking, and the server then empties
-/// every `thinking` block while still billing `thinking_tokens`. A relay
-/// serving pi/openclaw must let the text through. `web-fetch-2025-09-10`
-/// is kept for the native `web_fetch` server tool swap (masquerade) even
-/// though 2.1.261 no longer sends it.
+/// every `thinking` block while still billing `thinking_tokens`; a relay
+/// serving pi/openclaw must let the text through (ADR-0014).
+/// `web-fetch-2025-09-10` stays: 2.1.280 dropped the server tool (`WebFetch` is a client
+/// tool there) but the server-tool swap in `masquerade` still needs the beta to present
+/// openclaw's `web_fetch` upstream (ADR-0008), and it is only sent when that tool is on
+/// the request.
 #[must_use]
-pub fn build_beta_header(model: &str, structured: bool) -> String {
+pub fn build_beta_header(model: &str, shape: RequestShape) -> String {
     let is_haiku = model.contains("haiku");
-    let mut common = vec![
-        "oauth-2025-04-20",
-        "interleaved-thinking-2025-05-14",
-        "thinking-token-count-2026-05-13",
-        "context-management-2025-06-27",
-        "prompt-caching-scope-2026-01-05",
-        "web-fetch-2025-09-10",
-    ];
-    let extra = if structured {
-        vec!["structured-outputs-2025-12-15"]
-    } else if is_haiku {
-        vec!["claude-code-20250219"]
-    } else {
-        vec!["advanced-tool-use-2025-11-20", "effort-2025-11-24"]
-    };
-    if !is_haiku && !structured {
-        common.insert(0, "claude-code-20250219");
+    // Claude Code's model gates for a first-party provider: `claude-3-*` is the
+    // one family without interleaved thinking, `thinking_tokens` accounting, or
+    // API context management.
+    let is_legacy = model.contains("claude-3-");
+    let mut betas = Vec::with_capacity(10);
+    if !is_haiku {
+        betas.push("claude-code-20250219");
     }
-    common
-        .into_iter()
-        .chain(extra)
-        .collect::<Vec<_>>()
-        .join(",")
+    betas.push("oauth-2025-04-20");
+    if !is_legacy {
+        betas.push("interleaved-thinking-2025-05-14");
+        betas.push("thinking-token-count-2026-05-13");
+        betas.push("context-management-2025-06-27");
+    }
+    betas.push("prompt-caching-scope-2026-01-05");
+    // Sent for every model at or past claude-opus-4-8, and for a model the CLI
+    // does not know; withheld from the older ones it does.
+    if !older_than(model, "claude-opus-4-8") {
+        betas.push("mid-conversation-system-2026-04-07");
+    }
+    if shape.tool_search {
+        betas.push("advanced-tool-use-2025-11-20");
+    }
+    if shape.structured {
+        betas.push("structured-outputs-2025-12-15");
+    }
+    if shape.effort {
+        betas.push("effort-2025-11-24");
+    }
+    if shape.task_budget {
+        betas.push("task-budgets-2026-03-13");
+    }
+    if shape.web_fetch {
+        betas.push("web-fetch-2025-09-10");
+    }
+    betas.join(",")
 }
 
 #[must_use]
@@ -91,7 +213,7 @@ pub fn anthropic_headers(
     model: &str,
     config: &Config,
     request_headers: &BTreeMap<String, String>,
-    structured: bool,
+    body: &Value,
 ) -> BTreeMap<String, String> {
     let api_hash = sha256_hex(&extract_api_key(request_headers).unwrap_or_default());
     let mut headers = BTreeMap::from([
@@ -109,8 +231,8 @@ pub fn anthropic_headers(
             session_id(&api_hash),
         ),
         ("X-Stainless-Lang".to_string(), "js".to_string()),
-        // The SDK bundled in Claude Code 2.1.261; the binary runs on bun,
-        // whose node-compat `process.version` reports v26.
+        // The SDK bundled in Claude Code 2.1.280 (unchanged since 2.1.261); the
+        // binary runs on bun, whose node-compat `process.version` reports v26.
         (
             "X-Stainless-Package-Version".to_string(),
             "0.112.1".to_string(),
@@ -142,10 +264,6 @@ pub fn anthropic_headers(
         ("anthropic-version".to_string(), "2023-06-01".to_string()),
         ("x-app".to_string(), "cli".to_string()),
         (
-            "anthropic-client-platform".to_string(),
-            config.cloaking.entrypoint.clone(),
-        ),
-        (
             "x-client-request-id".to_string(),
             Uuid::new_v4().to_string(),
         ),
@@ -167,7 +285,7 @@ pub fn anthropic_headers(
     } else {
         headers.insert(
             "anthropic-beta".to_string(),
-            build_beta_header(model, structured),
+            build_beta_header(model, RequestShape::of(body)),
         );
     }
 
@@ -592,8 +710,13 @@ fn billing_header(messages: &[Value], version: &str, entrypoint: &str) -> String
         .map(|index| chars.get(index).copied().unwrap_or('0'))
         .collect::<String>();
     let fingerprint = &sha256_hex(&format!("{FINGERPRINT_SALT}{selected}{version}"))[..3];
+    // The trailing `cch` marker is what Claude Code writes when the base URL is
+    // its own (2.1.280 `JHn`): a constant, not a computed value, so it is copied
+    // verbatim. `cc_workload`, `cc_is_subagent`, `cc_prev_req`, `cc_prompt_id`
+    // and `cc_turn_origin` have no equivalent here and stay out.
     format!(
-        "x-anthropic-billing-header: cc_version={version}.{fingerprint}; cc_entrypoint={entrypoint};"
+        "x-anthropic-billing-header: cc_version={version}.{fingerprint}; \
+         cc_entrypoint={entrypoint}; cch=00000;"
     )
 }
 

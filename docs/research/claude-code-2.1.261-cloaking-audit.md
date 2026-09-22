@@ -4,6 +4,12 @@ Source: the published native binary `@anthropic-ai/claude-code-linux-x64@2.1.261
 (built 2026-09-04), `strings` + reading the beta registry (`me("name","header")`)
 and the per-request assembler `Vre(model)`.
 
+Superseded by `claude-code-2.1.280-cloaking-audit.md`, which reads the same code from the
+embedded module graph instead of `strings` and corrects three rows below:
+`advanced-tool-use-2025-11-20` and `effort-2025-11-24` are not unconditional in this build
+either (each travels with the shape it gates), and `anthropic-client-platform` is not sent
+on Messages requests.
+
 ## Beta flags a first-party request carries
 
 | flag | condition in 2.1.261 | relay |
