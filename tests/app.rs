@@ -5379,3 +5379,181 @@ async fn an_unreadable_peak_file_is_left_alone() {
         "an unreadable peak was overwritten"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Tool-name restoration (ARCHITECTURE: a masked tool name is restored before
+// the reply reaches the client)
+// ---------------------------------------------------------------------------
+
+/// An Anthropic upstream that calls the first tool it was offered, by the name it
+/// received, the way the real vendor answers a masked request.
+#[derive(Default)]
+struct ToolCallingUpstream {
+    offered: Mutex<Vec<String>>,
+}
+
+impl ToolCallingUpstream {
+    fn offered_name(&self, request: &UpstreamRequest) -> String {
+        let name = request.body["tools"][0]["name"]
+            .as_str()
+            .expect("a tool was offered")
+            .to_string();
+        self.offered
+            .lock()
+            .expect("offered lock")
+            .push(name.clone());
+        name
+    }
+}
+
+impl UpstreamClient for ToolCallingUpstream {
+    fn generic_chat(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("anthropic only")
+    }
+
+    fn generic_chat_stream(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        unreachable!("anthropic only")
+    }
+
+    fn anthropic_messages(
+        &self,
+        request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        let name = self.offered_name(&request);
+        Box::pin(async move {
+            Ok(UpstreamJsonResponse {
+                status: axum::http::StatusCode::OK,
+                body: json!({
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "tool_use", "id": "tu_1", "name": name, "input": {"cmd": "ls"}}],
+                    "stop_reason": "tool_use",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }),
+            })
+        })
+    }
+
+    fn anthropic_messages_stream(
+        &self,
+        request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        let name = self.offered_name(&request);
+        let start = format!(
+            "event: content_block_start\ndata: {}\n\n",
+            json!({"type": "content_block_start", "index": 0,
+                   "content_block": {"type": "tool_use", "id": "tu_1", "name": name, "input": {}}})
+        );
+        Box::pin(async move {
+            Ok(UpstreamSseResponse {
+                status: axum::http::StatusCode::OK,
+                body: Box::pin(futures_util::stream::iter([
+                    Ok(Bytes::from_static(
+                        b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+                    )),
+                    Ok(Bytes::from(start)),
+                    Ok(Bytes::from_static(
+                        b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                    )),
+                    Ok(Bytes::from_static(
+                        b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n",
+                    )),
+                    Ok(Bytes::from_static(
+                        b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                    )),
+                ])),
+            })
+        })
+    }
+
+    fn anthropic_count_tokens(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("anthropic messages only")
+    }
+
+    fn codex_responses(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        unreachable!("anthropic only")
+    }
+
+    fn codex_responses_stream(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+        unreachable!("anthropic only")
+    }
+
+    fn fetch_models(
+        &self,
+        _kind: ProviderKind,
+        _account: AvailableAccount,
+        _config: Arc<Config>,
+    ) -> ModelsFuture {
+        Box::pin(async { anyhow::bail!("no model catalog") })
+    }
+}
+
+/// The client offered `exec`; the vendor saw a masked name and called it; the client
+/// must get `exec` back, whole-body and streamed, or it cannot dispatch the call.
+#[tokio::test]
+async fn a_masked_tool_name_is_restored_before_the_reply_reaches_the_client() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_provider_token(tmp.path(), ProviderId::anthropic(), "anthropic@example.com");
+    let upstream = Arc::new(ToolCallingUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    let request = |stream: bool| {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "stream": stream,
+                    "tools": [{"name": "exec", "input_schema": {"type": "object"}}],
+                    "messages": [{"role": "user", "content": "run ls"}]
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+
+    let (status, body) = json_response(app.clone(), request(false)).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["content"][0]["name"], "exec", "{body}");
+
+    let response = app.oneshot(request(true)).await.expect("response");
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("stream body")
+        .to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains(r#""name":"exec""#),
+        "the streamed tool_use kept the masked name: {text}"
+    );
+
+    // The test means something only if the vendor saw a different name.
+    let offered = upstream.offered.lock().expect("offered lock").clone();
+    assert_eq!(offered.len(), 2);
+    for name in &offered {
+        assert_ne!(name, "exec", "the request reached the vendor unmasked");
+        assert!(!text.contains(&format!(r#""name":"{name}""#)), "{text}");
+    }
+}
