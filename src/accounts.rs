@@ -259,6 +259,7 @@ impl From<&AccountState> for PersistedUsage {
             reasoning_output_tokens: state.total_reasoning_output_tokens,
             models: state.models.clone(),
             days: state.days.clone(),
+            last_success_at: state.last_success_at.clone(),
         }
     }
 }
@@ -276,6 +277,9 @@ impl From<&AccountState> for PersistedUsage {
 fn usage_json(email: &str, usage: &PersistedUsage, cutoff: &str) -> serde_json::Map<String, Value> {
     let mut fields = serde_json::Map::new();
     fields.insert("email".to_string(), json!(email));
+    // A served success only, and persisted, so a record without a credential still
+    // says when it last served (last-ok).
+    fields.insert("lastSuccessAt".to_string(), json!(usage.last_success_at));
     fields.insert("totalRequests".to_string(), json!(usage.requests));
     fields.insert("totalSuccesses".to_string(), json!(usage.successes));
     fields.insert("totalFailures".to_string(), json!(usage.failures));
@@ -538,7 +542,6 @@ impl AccountManager {
             state.last_failure_kind = None;
             state.last_error = None;
             state.last_failure_at = None;
-            state.last_success_at = Some(refresh_at.clone());
             state.last_refresh_at = Some(refresh_at);
         }
         Ok(true)
@@ -719,7 +722,6 @@ impl AccountManager {
                 fields.insert("failureCount".to_string(), json!(state.failure_count));
                 fields.insert("lastError".to_string(), json!(state.last_error));
                 fields.insert("lastFailureAt".to_string(), json!(state.last_failure_at));
-                fields.insert("lastSuccessAt".to_string(), json!(state.last_success_at));
                 fields.insert("lastRefreshAt".to_string(), json!(state.last_refresh_at));
                 fields.insert("expiresAt".to_string(), json!(state.token.expires_at));
                 fields.insert("refreshing".to_string(), json!(false));
@@ -740,7 +742,6 @@ impl AccountManager {
             fields.insert("failureCount".to_string(), json!(0));
             fields.insert("lastError".to_string(), Value::Null);
             fields.insert("lastFailureAt".to_string(), Value::Null);
-            fields.insert("lastSuccessAt".to_string(), Value::Null);
             fields.insert("lastRefreshAt".to_string(), Value::Null);
             fields.insert("expiresAt".to_string(), json!(""));
             fields.insert("refreshing".to_string(), json!(false));
@@ -928,6 +929,7 @@ impl AccountManager {
                 state.total_reasoning_output_tokens = usage.reasoning_output_tokens;
                 state.models = usage.models.clone();
                 state.days = usage.days.clone();
+                state.last_success_at.clone_from(&usage.last_success_at);
                 reconcile_loaded_counters(&mut state);
             }
             self.order.push(email.clone());

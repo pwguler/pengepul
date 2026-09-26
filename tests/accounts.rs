@@ -1966,7 +1966,9 @@ async fn a_removed_credential_keeps_its_usage_record_in_the_payload() {
     assert_eq!(entry["cooldownUntil"], 0.0);
     assert_eq!(entry["failureCount"], 0);
     assert!(entry["lastError"].is_null());
-    assert!(entry["lastSuccessAt"].is_null());
+    // The one timestamp that is a record rather than liveness: when it last served
+    // is persisted with the counters (last-ok AC-3).
+    assert!(entry["lastSuccessAt"].is_string());
     assert!(entry["lastFailureAt"].is_null());
     assert!(entry["lastRefreshAt"].is_null());
     assert!(entry["planType"].is_null());
@@ -2123,4 +2125,141 @@ async fn a_removed_credentials_days_age_out_on_the_same_window() {
         days.get(&recent).is_some(),
         "the carry-through dropped a bucket inside the window: {days}"
     );
+}
+
+/// A Codex manager whose one account refreshes successfully, for the tests that need a
+/// Refresh to happen.
+fn refreshing_codex_manager(auth_dir: &Path) -> AccountManager {
+    let codex_dir = auth_dir.join("codex");
+    fs::create_dir_all(&codex_dir).expect("codex dir");
+    fs::write(
+        codex_dir.join("bob@example.com.json"),
+        json!({
+            "access_token": "old-access",
+            "refresh_token": "old-refresh",
+            "email": "bob@example.com",
+            "type": "codex",
+            "expired": "2030-01-01T00:00:00Z",
+            "account_uuid": "acct-codex"
+        })
+        .to_string(),
+    )
+    .expect("write token");
+    let mut manager = AccountManager::new(
+        auth_dir.to_path_buf(),
+        "codex".parse().unwrap(),
+        |_refresh_token| {
+            Box::pin(async {
+                Ok(TokenData {
+                    access_token: "new-access".to_string(),
+                    refresh_token: "new-refresh".to_string(),
+                    email: "bob@example.com".to_string(),
+                    expires_at: "2030-01-01T00:00:00Z".to_string(),
+                    account_uuid: "acct-codex".to_string(),
+                    provider: "codex".parse().unwrap(),
+                    id_token: None,
+                    last_refresh_at: None,
+                    plan_type: None,
+                })
+            })
+        },
+        RefreshPolicy::default(),
+    );
+    manager.load().expect("load");
+    manager
+}
+
+#[tokio::test]
+async fn last_ok_is_a_served_request_not_a_refresh() {
+    // last-ok AC-1: a Refresh proves the refresh token works, not that the account
+    // serves; only a served success moves the timestamp.
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = refreshing_codex_manager(tmp.path());
+
+    assert!(
+        manager
+            .refresh_account("bob@example.com")
+            .await
+            .expect("refresh")
+    );
+    let after_refresh = record(&mut manager, "bob@example.com");
+    assert!(
+        after_refresh["lastRefreshAt"].is_string(),
+        "the refresh has to have happened for this test to mean anything"
+    );
+    assert!(
+        after_refresh["lastSuccessAt"].is_null(),
+        "a refresh wrote last ok: {after_refresh}"
+    );
+
+    manager.record_success("bob@example.com", None, "gpt-5.6");
+    assert!(record(&mut manager, "bob@example.com")["lastSuccessAt"].is_string());
+}
+
+#[tokio::test]
+async fn last_ok_survives_a_restart() {
+    // last-ok AC-2: written with the counters, read back before the account serves.
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("a@example.com")).expect("save token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    manager.record_success("a@example.com", None, "deepseek-v4.1-flash");
+    let served = record(&mut manager, "a@example.com")["lastSuccessAt"].clone();
+    assert!(served.is_string());
+    assert_eq!(
+        persisted(&tmp.path().join("commandcode").join("usage.json"))["a@example.com"]["last_success_at"],
+        served
+    );
+
+    let mut restarted = never_refresh_manager(tmp.path().to_path_buf());
+    restarted.load().expect("load");
+
+    assert_eq!(
+        record(&mut restarted, "a@example.com")["lastSuccessAt"],
+        served
+    );
+}
+
+#[tokio::test]
+async fn a_removed_credential_keeps_its_last_ok() {
+    // last-ok AC-3: the record outlives the credential, and so does when it last served.
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("stays@example.com")).expect("save token");
+    let token_path = save_token(tmp.path(), &static_token("goes@example.com")).expect("save token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    manager.record_success("goes@example.com", None, "deepseek-v4.1-flash");
+    let served = record(&mut manager, "goes@example.com")["lastSuccessAt"].clone();
+    assert!(served.is_string());
+
+    fs::remove_file(&token_path).expect("remove the token");
+    let mut restarted = never_refresh_manager(tmp.path().to_path_buf());
+    restarted.load().expect("load");
+
+    assert_eq!(
+        record(&mut restarted, "goes@example.com")["lastSuccessAt"],
+        served
+    );
+}
+
+#[tokio::test]
+async fn a_usage_file_without_last_ok_loads_and_gains_it_on_success() {
+    // last-ok AC-4: files written before this change carry no field.
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("a@example.com")).expect("save token");
+    let usage_path = tmp.path().join("commandcode").join("usage.json");
+    fs::write(
+        &usage_path,
+        json!({"a@example.com": {"total_requests": 3, "total_successes": 3}}).to_string(),
+    )
+    .expect("write usage");
+
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    let loaded = record(&mut manager, "a@example.com");
+    assert_eq!(loaded["totalSuccesses"], 3, "the old file did not load");
+    assert!(loaded["lastSuccessAt"].is_null(), "{loaded}");
+
+    manager.record_success("a@example.com", None, "deepseek-v4.1-flash");
+    assert!(persisted(&usage_path)["a@example.com"]["last_success_at"].is_string());
 }

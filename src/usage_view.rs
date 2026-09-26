@@ -8,9 +8,20 @@ use serde_json::Value;
 
 use crate::render::{
     AMBER, ActionGlyph, BOLD, DIM, Fact, GREEN, INNER_WIDTH, Output, RED, fact_panel, fact_row,
-    format_count, format_exact, label_column, pad, paint, panel_row, share_bar, sparkline,
-    status_glyph, top_rule,
+    format_count, format_duration, format_exact, label_column, pad, paint, panel_row, share_bar,
+    sparkline, status_glyph, top_rule,
 };
+
+/// How long ago the account last served a request successfully (`3h5m`), or
+/// `None` when the payload holds no instant or one that does not parse.
+/// An instant ahead of `now` is clock skew and reads as `0s` (last-ok AC-7).
+pub(crate) fn last_ok_age(account: &Value, now: f64) -> Option<String> {
+    let at = account.get("lastSuccessAt").and_then(Value::as_str)?;
+    let at = chrono::DateTime::parse_from_rfc3339(at).ok()?;
+    #[allow(clippy::cast_precision_loss)]
+    let at = at.timestamp_millis() as f64 / 1000.0;
+    Some(format_duration(now - at))
+}
 
 /// `"on cooldown 4m12s"` while a cooldown lasts, `""` once it has cleared or
 /// was never set (`cooldownUntil` is an absolute unix timestamp).
@@ -78,6 +89,8 @@ pub(crate) fn print_accounts(payload: &Value, output: &mut Output, now: f64, ver
             if let Some(plan_type) = account.get("planType").and_then(Value::as_str) {
                 write!(line, " plan={plan_type}").expect("write to String cannot fail");
             }
+            let last_ok = last_ok_age(account, now).unwrap_or_else(|| "never".to_string());
+            write!(line, " last_ok={last_ok}").expect("write to String cannot fail");
             output.line(&line);
             let detail = format!(
                 "    requests {} ({} ok) {}",
@@ -342,7 +355,10 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64, ve
         );
         // One label column for every fact in the panel -- the per-account
         // token rows and the footer rollup align down the whole box.
-        let mut panel_facts: Vec<Fact> = accounts.iter().flat_map(account_detail_facts).collect();
+        let mut panel_facts: Vec<Fact> = accounts
+            .iter()
+            .flat_map(|account| account_detail_facts(account, now))
+            .collect();
         panel_facts.extend(
             accounts
                 .iter()
@@ -353,7 +369,7 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64, ve
         let column = label_column(&panel_facts);
         for account in accounts {
             output.line(&panel_row(&account_row(account, pool_total, now)));
-            for fact in account_detail_facts(account) {
+            for fact in account_detail_facts(account, now) {
                 output.line(&panel_row(&format!("  {}", fact_row(&fact, column))));
             }
             // AC-5: the models this account served, heaviest first.
@@ -866,15 +882,20 @@ fn reasoning_fact(reasoning: i64, output: i64, colour: &str) -> Fact {
 }
 
 /// The account's token block, on the same rows as every other scope (ADR-0024).
-pub(crate) fn account_detail_facts(account: &Value) -> Vec<Fact> {
-    token_block_facts(
+/// An account's block: when it last served (last-ok), then its token block.
+pub(crate) fn account_detail_facts(account: &Value, now: f64) -> Vec<Fact> {
+    let last_ok =
+        last_ok_age(account, now).map_or_else(|| "never".to_string(), |age| format!("{age} ago"));
+    let mut facts = vec![Fact::new("last ok", &paint(DIM, &last_ok))];
+    facts.extend(token_block_facts(
         i64_field(account, "totalInputTokens"),
         i64_field(account, "totalOutputTokens"),
         i64_field(account, "totalCacheReadInputTokens"),
         i64_field(account, "totalCacheCreationInputTokens"),
         i64_field(account, "totalReasoningOutputTokens"),
         DIM,
-    )
+    ));
+    facts
 }
 
 /// Footer rollup facts: requests and the pool's token block. The pool's carried load is not a

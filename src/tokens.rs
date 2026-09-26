@@ -269,6 +269,9 @@ pub(crate) struct PersistedUsage {
     /// Per-local-day traffic, keyed `YYYY-MM-DD`. Absent in files written
     /// before usage-trend: those load empty and start bucketing now.
     pub(crate) days: BTreeMap<String, DayUsage>,
+    /// When the account last served a request successfully, ISO-8601. Absent in
+    /// files written before last-ok: those load `None` until the next success.
+    pub(crate) last_success_at: Option<String>,
 }
 
 /// How many local days of buckets survive a write. Bounded on purpose: the
@@ -432,6 +435,10 @@ fn parse_persisted_usage(entry: &Value) -> Option<PersistedUsage> {
         reasoning_output_tokens: field("total_reasoning_output_tokens"),
         models: parse_persisted_models(object.get("models")),
         days: parse_persisted_days(object.get("days")),
+        last_success_at: object
+            .get("last_success_at")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 
@@ -553,6 +560,7 @@ pub(crate) fn save_usage(
                 "total_reasoning_output_tokens": usage.reasoning_output_tokens,
                 "models": models,
                 "days": days,
+                "last_success_at": usage.last_success_at,
             }),
         );
     }

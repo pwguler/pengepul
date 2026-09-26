@@ -92,8 +92,8 @@ in files.
   Accounts, or the admin payload.
 - **Usage view** (`usage_view.rs`) — the admin payload turned into the relay
   total block for `status` (one block: pool summary lines and the relay-wide
-  aggregate), pool panels with account rows, per-model lines and footers for
-  `accounts`, and the 30-day sparkline for `usage`, in both styles. Pure over
+  aggregate), pool panels with account rows and footers for `accounts` (per-model lines
+  under `--verbose`), and the 30-day sparkline for `usage`, in both styles. Pure over
   the payload and a `now` or a date the verb hands in.
 
 ## Seams

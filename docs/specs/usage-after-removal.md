@@ -57,8 +57,8 @@ disappears from `status`, from `usage` and from `accounts` at once.
 - `AccountManager::snapshots` merges both sets into one list, in account-key order. A
   record without a credential is emitted with the liveness defaults of an account that
   cannot serve: `available: false`, `cooldownUntil: 0`, `failureCount: 0`, null
-  `lastError`/`lastFailureAt`/`lastSuccessAt`/`lastRefreshAt`/`planType`, empty
-  `expiresAt`.
+  `lastError`/`lastFailureAt`/`lastRefreshAt`/`planType`, empty `expiresAt`, and the
+  `lastSuccessAt` the file holds (last-ok made it a persisted record, not liveness).
 - `GET /admin/accounts` counts that list rather than calling `account_count()` separately,
   so the header's `N accounts`, the per-pool lines and the rows a client prints cannot
   disagree about how many there are.

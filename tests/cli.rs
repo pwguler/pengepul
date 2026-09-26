@@ -977,10 +977,10 @@ fn accounts_detail_prints_usage_and_cooldown_per_account() {
     // Account header keeps its legacy shape; the cooldown account reads
     // "on cooldown" with remaining time, not "unavailable" (AC-6).
     assert!(stdout.contains("anthropic: 3 accounts\n"));
-    assert!(stdout.contains("  a@x.com available failures=0 plan=max\n"));
-    assert!(stdout.contains("  b@x.com on cooldown 3m10s failures=2 plan=pro\n"));
+    assert!(stdout.contains("  a@x.com available failures=0 plan=max last_ok=never\n"));
+    assert!(stdout.contains("  b@x.com on cooldown 3m10s failures=2 plan=pro last_ok=never\n"));
     // An unavailable snapshot with no future cooldownUntil keeps the old word.
-    assert!(stdout.contains("  c@x.com unavailable failures=5\n"));
+    assert!(stdout.contains("  c@x.com unavailable failures=5 last_ok=never\n"));
     // Detail line under each account: requests (ok) plus the token block,
     // in the same words and order as the panel (ADR-0024). reasoning prints
     // only when non-zero.
@@ -6123,4 +6123,111 @@ fn a_removed_keys_record_is_listed_by_accounts_as_usual() {
         "an account with no credential should read as unavailable, the word plain \
          prints for the same state: {visible}"
     );
+}
+
+/// last-ok: an ISO-8601 instant `seconds` from now (negative is the past).
+fn instant_from_now(seconds: i64) -> String {
+    (chrono::Utc::now() + chrono::Duration::seconds(seconds)).to_rfc3339()
+}
+
+/// last-ok: one pool whose accounts cover every shape `lastSuccessAt` takes.
+fn last_ok_pool() -> Value {
+    json!({
+        "providers": {
+            "anthropic": {
+                "account_count": 4,
+                "accounts": [
+                    // 3h5m10s ago renders `3h5m`, and cannot tick into another
+                    // minute in the time the test takes.
+                    {"email": "served@x.com", "available": true,
+                     "lastSuccessAt": instant_from_now(-11_110), "planType": "max"},
+                    {"email": "never@x.com", "available": true, "lastSuccessAt": null},
+                    {"email": "ahead@x.com", "available": true,
+                     "lastSuccessAt": instant_from_now(86_400)},
+                    {"email": "garbled@x.com", "available": true, "lastSuccessAt": "yesterday"}
+                ]
+            }
+        }
+    })
+}
+
+fn last_ok_lines(argv: &[&str], style: Style) -> Vec<String> {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        rich: style == Style::Rich,
+        accounts_payload: Some(last_ok_pool()),
+        ..FakeRuntime::default()
+    };
+    let outcome = run_style(argv, tmp.path(), &mut runtime, style);
+    strip_ansi(&outcome.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// last-ok AC-5, AC-7, AC-8: the first row of every account's block, rich, with
+/// and without --verbose.
+#[test]
+fn last_ok_is_the_first_row_of_the_rich_account_block() {
+    for argv in [&["accounts"][..], &["accounts", "-v"][..]] {
+        let lines = last_ok_lines(argv, Style::Rich);
+        let under = |email: &str| -> String {
+            let row = lines
+                .iter()
+                .position(|line| line.contains(email))
+                .unwrap_or_else(|| panic!("{email} missing: {lines:#?}"));
+            lines[row + 1]
+                .trim_matches(|c: char| c == '│' || c.is_whitespace())
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert_eq!(under("served@x.com"), "last ok 3h5m ago", "{argv:?}");
+        assert_eq!(under("never@x.com"), "last ok never", "{argv:?}");
+        assert_eq!(under("ahead@x.com"), "last ok 0s ago", "{argv:?}");
+        assert_eq!(under("garbled@x.com"), "last ok never", "{argv:?}");
+        // The row shares the block's label column: its value starts where
+        // `input`'s does.
+        let served = lines
+            .iter()
+            .position(|l| l.contains("served@x.com"))
+            .unwrap();
+        let value_at = |line: &str, label: &str| {
+            let rest = &line[line.find(label).unwrap() + label.len()..];
+            line.find(label).unwrap() + label.len() + (rest.len() - rest.trim_start().len())
+        };
+        assert_eq!(
+            value_at(&lines[served + 1], "last ok"),
+            value_at(&lines[served + 2], "input"),
+            "last ok off the label column:\n{}\n{}",
+            lines[served + 1],
+            lines[served + 2]
+        );
+    }
+}
+
+/// last-ok AC-6, AC-7, AC-8: plain appends it to the account line.
+#[test]
+fn last_ok_ends_the_plain_account_line() {
+    for argv in [&["accounts"][..], &["accounts", "-v"][..]] {
+        let lines = last_ok_lines(argv, Style::Plain);
+        let line = |email: &str| -> &str {
+            lines
+                .iter()
+                .find(|line| line.contains(email))
+                .unwrap_or_else(|| panic!("{email} missing: {lines:#?}"))
+        };
+        assert_eq!(
+            line("served@x.com"),
+            "  served@x.com available failures=0 plan=max last_ok=3h5m",
+            "{argv:?}"
+        );
+        assert!(line("never@x.com").ends_with(" last_ok=never"), "{argv:?}");
+        assert!(line("ahead@x.com").ends_with(" last_ok=0s"), "{argv:?}");
+        assert!(
+            line("garbled@x.com").ends_with(" last_ok=never"),
+            "{argv:?}"
+        );
+    }
 }

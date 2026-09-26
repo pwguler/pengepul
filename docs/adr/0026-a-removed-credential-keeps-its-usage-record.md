@@ -49,3 +49,5 @@ accounts sums these, and a reader that lists accounts lists them, with no second
   as the file holds it.
 - Retention reaches the record on the same write and the same cutoff as any account's daily
   buckets, and deleting `usage.json` remains the only reset.
+- `lastSuccessAt` is the exception to "no timestamps": last-ok persists it with the counters,
+  so a record without a credential reports when it last served.
