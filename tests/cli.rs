@@ -1377,45 +1377,24 @@ fn status_rich_is_one_64_wide_box() {
     }
 }
 
+/// status-is-health AC-4, AC-5: `usage`'s header counts the pools that hold
+/// accounts, so an empty pool counts in neither pools nor accounts. (`status`
+/// hiding empty pools is owned by `plain_status_says_what_each_pool_can_serve`.)
 #[test]
-fn status_hides_empty_pools() {
-    let tmp = tempdir().expect("tempdir");
-    write_config(tmp.path(), "0.0.0.0", 8318);
-    let mut runtime = FakeRuntime {
-        accounts_payload: Some(json!({
-            "providers": {
-                // Loaded accounts with no traffic (AC-3 second half).
-                "anthropic": {
-                    "account_count": 1,
-                    "accounts": [account(json!({
-                        "email": "a@x.com",
-                        "available": true
-                    }))]
-                },
-                // Empty pools: hidden from status entirely (AC-4), and
-                // excluded from the header's pool count.
-                "codex": {"account_count": 0, "accounts": []},
-                "commandcode": {"account_count": 0, "accounts": []}
-            }
-        })),
-        ..FakeRuntime::default()
-    };
-
-    let outcome = run(&["status"], tmp.path(), &mut runtime);
-
-    assert_eq!(outcome.code, 0);
-    // Empty pools are hidden, so the header counts only shown pools.
-    assert!(outcome.stdout.starts_with("status\n"), "{}", outcome.stdout);
-    assert!(
-        outcome
-            .stdout
-            .lines()
-            .any(|line| line.starts_with("anthropic") && line.ends_with("1 account, 1 available")),
-        "{}",
-        outcome.stdout
-    );
-    assert!(!outcome.stdout.contains("codex"));
-    assert!(!outcome.stdout.contains("commandcode"));
+fn usage_counts_only_pools_that_hold_accounts() {
+    let payload = json!({
+        "providers": {
+            "anthropic": {"account_count": 1, "accounts": [
+                {"email": "a@x.com", "available": true}
+            ]},
+            "codex": {"account_count": 0, "accounts": []},
+            "commandcode": {"account_count": 0, "accounts": []}
+        }
+    });
+    let plain = usage_run(payload.clone(), Style::Plain);
+    assert!(plain.starts_with("usage: 1 pool, 1 account\n"), "{plain}");
+    let rich = usage_run(payload, Style::Rich);
+    assert!(rich.starts_with("┌─ usage ─ 1 pool, 1 account ─"), "{rich}");
 }
 
 #[test]
@@ -3215,46 +3194,6 @@ fn usage_renders_a_thirty_day_sparkline() {
     for line in &lines {
         assert_eq!(line.chars().count(), 64, "off the fixed width: {line}");
     }
-}
-
-/// usage-trend AC-8: with no history the panel says so rather than
-/// drawing thirty flat bars that would read as thirty idle days.
-#[test]
-fn usage_says_so_when_no_history_exists() {
-    let tmp = tempdir().expect("tempdir");
-    write_config(tmp.path(), "127.0.0.1", 8317);
-    let mut runtime = FakeRuntime {
-        rich: true,
-        accounts_payload: Some(json!({
-            "providers": {
-                "anthropic": {
-                    "account_count": 1,
-                    "accounts": [account(json!({
-                        "email": "a@x.com",
-                        "available": true,
-                        "days": []
-                    }))]
-                }
-            }
-        })),
-        ..FakeRuntime::default()
-    };
-
-    let outcome = run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich);
-
-    assert_eq!(outcome.code, 0);
-    let visible = strip_ansi(&outcome.stdout);
-    assert!(
-        visible.contains("no usage recorded yet"),
-        "must not draw thirty idle bars: {visible}"
-    );
-    // Not `!contains("▁▁▁")`: this path returns before `sparkline` is
-    // called, so that assertion cannot fail. Pin the shape instead.
-    assert_eq!(fact_values(&visible, "tokens"), ["no usage recorded yet"]);
-    assert!(
-        !visible.contains('▁'),
-        "thirty idle bars were drawn: {visible}"
-    );
 }
 
 /// usage-trend AC-7: plain is one parseable line per day, no block
@@ -6382,10 +6321,21 @@ fn plain_usage_ends_with_the_one_block() {
 /// AC-9: nothing recorded yet.
 #[test]
 fn usage_with_no_history_is_still_one_box() {
-    let payload = json!({"providers": {"anthropic": {"account_count": 1, "accounts": [
-        {"email": "a@x.com", "available": true}
-    ]}}});
+    // No `days` at all, and an empty `days`: both are no history, and neither
+    // draws thirty flat bars that would read as thirty idle days (usage-trend AC-8).
+    for account in [
+        json!({"email": "a@x.com", "available": true}),
+        json!({"email": "a@x.com", "available": true, "days": []}),
+    ] {
+        usage_with_no_history_case(json!({"providers": {"anthropic": {
+            "account_count": 1, "accounts": [account]
+        }}}));
+    }
+}
+
+fn usage_with_no_history_case(payload: Value) {
     let text = usage_run(payload.clone(), Style::Rich);
+    assert!(!text.contains('▁'), "thirty idle bars were drawn: {text}");
     assert_eq!(text.matches('┌').count(), 1, "{text}");
     assert_eq!(fact_values(&text, "tokens"), ["no usage recorded yet"]);
     assert_eq!(fact_values(&text, "last 30 days"), ["0"]);
