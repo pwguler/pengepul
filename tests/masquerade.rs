@@ -1,6 +1,6 @@
 use std::fs;
 
-use pengepul::masquerade::{masquerade_request, restore_tool_name};
+use pengepul::masquerade::masquerade_request;
 use serde_json::{Value, json};
 
 fn fixture() -> Value {
@@ -67,11 +67,7 @@ fn tool_names_are_pascalcased_deterministically_and_bijectively() {
             continue;
         }
         assert_eq!(mapped, &pascal(orig), "{orig} must PascalCase to {mapped}");
-        assert_eq!(
-            &restore_tool_name(mapped, &rev1),
-            orig,
-            "reverse round-trips"
-        );
+        assert_eq!(&rev1[mapped], orig, "reverse round-trips");
     }
 
     // renamed names are unique (bijective)
@@ -113,7 +109,7 @@ fn assistant_tool_use_names_are_mapped_in_request_history() {
     let tu_name = out["messages"][1]["content"][0]["name"].as_str().unwrap();
     assert_ne!(tu_name, "exec", "history tool_use name must be masked");
     // and the masked name reverses back to exec
-    assert_eq!(restore_tool_name(tu_name, &rev), "exec");
+    assert_eq!(rev[tu_name], "exec");
     // tool_result (references id, not name) is untouched
     assert_eq!(out["messages"][2]["content"][0]["tool_use_id"], "tu_1");
 }

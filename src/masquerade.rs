@@ -400,16 +400,6 @@ pub fn masquerade_request(body: &Value) -> (Value, BTreeMap<String, String>) {
     (next, reverse)
 }
 
-/// Restore a `tool_use` name from the response to the openclaw tool name so
-/// openclaw dispatches it. Unknown names pass through unchanged.
-#[must_use]
-pub fn restore_tool_name(name: &str, reverse: &BTreeMap<String, String>) -> String {
-    reverse
-        .get(name)
-        .cloned()
-        .unwrap_or_else(|| name.to_string())
-}
-
 fn restore_block_name(block: &mut Value, reverse: &BTreeMap<String, String>) {
     if block.get("type").and_then(Value::as_str) == Some("tool_use")
         && let Some(name) = block.get("name").and_then(Value::as_str)

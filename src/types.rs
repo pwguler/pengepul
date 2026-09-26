@@ -2,10 +2,7 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProviderKind {
     Anthropic,
     Codex,
@@ -213,14 +210,6 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn provider_id_struct_round_trips_via_kind() {
-        let id = ProviderId::new(ProviderKind::Anthropic, "anthropic");
-        assert_eq!(id.kind, ProviderKind::Anthropic);
-        assert_eq!(&*id.id, "anthropic");
-        assert_eq!(id.to_string(), "anthropic");
-    }
-
-    #[test]
     fn provider_id_canonical_helpers_match_kind() {
         assert_eq!(ProviderId::anthropic().kind, ProviderKind::Anthropic);
         assert_eq!(&*ProviderId::anthropic().id, "anthropic");
@@ -235,35 +224,24 @@ mod tests {
         assert!(Arc::ptr_eq(&a.id, &b.id));
     }
 
+    /// Every kind's canonical id, the aliases it parses from, and the round trip
+    /// between them. "xai" is the configured-endpoint id for the console API, not
+    /// the OAuth provider, so it parses to no kind.
     #[test]
-    fn provider_kind_canonical_ids_match_serde_repr() {
-        assert_eq!(ProviderKind::Anthropic.canonical_id(), "anthropic");
-        assert_eq!(ProviderKind::Codex.canonical_id(), "codex");
-        assert_eq!(ProviderKind::Grok.canonical_id(), "grok");
-    }
-
-    #[test]
-    fn provider_kind_parses_from_str() {
-        assert_eq!(
-            "anthropic".parse::<ProviderKind>(),
-            Ok(ProviderKind::Anthropic)
-        );
-        assert_eq!(
-            "claude".parse::<ProviderKind>(),
-            Ok(ProviderKind::Anthropic)
-        );
-        assert_eq!("codex".parse::<ProviderKind>(), Ok(ProviderKind::Codex));
-        assert_eq!("grok".parse::<ProviderKind>(), Ok(ProviderKind::Grok));
-        // "xai" is the generic configured-endpoint id for the console API, not
-        // the OAuth provider.
-        assert!("xai".parse::<ProviderKind>().is_err());
-        assert!("nope".parse::<ProviderKind>().is_err());
-    }
-
-    #[test]
-    fn provider_kind_canonical_id_round_trips_through_from_str() {
-        for kind in [ProviderKind::Anthropic, ProviderKind::Codex] {
-            assert_eq!(kind.canonical_id().parse::<ProviderKind>(), Ok(kind));
+    fn provider_kinds_parse_from_their_canonical_ids_and_aliases() {
+        for (kind, canonical, aliases) in [
+            (ProviderKind::Anthropic, "anthropic", &["claude"][..]),
+            (ProviderKind::Codex, "codex", &[][..]),
+            (ProviderKind::Grok, "grok", &[][..]),
+        ] {
+            assert_eq!(kind.canonical_id(), canonical);
+            assert_eq!(canonical.parse::<ProviderKind>(), Ok(kind));
+            for alias in aliases {
+                assert_eq!(alias.parse::<ProviderKind>(), Ok(kind), "{alias}");
+            }
+        }
+        for unknown in ["xai", "nope"] {
+            assert!(unknown.parse::<ProviderKind>().is_err(), "{unknown}");
         }
     }
 
