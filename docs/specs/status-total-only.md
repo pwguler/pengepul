@@ -81,6 +81,10 @@ the total"*, then, choosing the shape: total **plus one line per pool**.
   pools, A accounts`) so plain and rich share one string; the rich box
   renders it as its panel header.
 
+- **The aggregate and the per-pool load left `status`.** status-is-health made
+  `status` health only: the relay header is `relay`, each pool row counts its
+  accounts by state, and the relay's figures are `usage`'s.
+
 ## Verification
 
 ```sh

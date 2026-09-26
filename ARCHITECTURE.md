@@ -226,15 +226,17 @@ in files.
   never captured, not the panel guessing one. The panel no longer names a
   remainder: a gap can now only come from restoring a pre-migration file,
   and it is silent by the operator's choice.
-- **One word, one scope.** Two verbs never print the same label for different
-  spans: `status` shows the relay's pools, `usage` names its `window` and its
-  `all time` separately, and neither claims the other's span. A row reports a
-  fact the panel does not already carry — it never restates another row or
-  narrates another verb — and no panel prints the relay's carried load as a
-  row, because it is `input + output`, which the token block carries. A
-  labelled total above its own breakdown is not a restatement: `input` is
-  `cached + uncached` on purpose, so the block reads as a whole without the
-  operator adding anything up (ADR-0024).
+- **One figure, one home.** `status` says whether the relay can serve and prints no
+  request or token figure; `usage` owns the relay's numbers, in one box whose window rows
+  (`tokens`, `last 30 days`) come first and whose every later row is all-time; `accounts`
+  owns the per-account detail. A row reports a fact the panel does not already carry — it
+  never restates another row or narrates another verb. A labelled total above its own
+  breakdown is not a restatement: `input` is `cached + uncached`, and `usage`'s `total` is
+  `input + output`, so a block reads as a whole without the operator adding anything up
+  (ADR-0024, status-is-health).
+- **The all-time peak outlives its buckets.** Daily buckets are trimmed at 90 days, so the
+  relay keeps its best day, every Pool summed, in `<auth-dir>/usage-peak.json`, raises it at
+  startup and whenever it builds the admin payload, and never lowers it.
 - **Every rich panel speaks one grammar.** Header is `<subject>` or
   `<subject> ─ <qualifier>`, never a colon, and a qualifier must add a
   fact the rows do not carry. Fact rows are `<label>  <value>` with the

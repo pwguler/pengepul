@@ -380,6 +380,51 @@ pub(crate) struct PersistedUsage {
     pub(crate) last_success_at: Option<String>,
 }
 
+/// The relay's best local day, every account of every Pool summed
+/// (status-is-health). Kept in its own file because the daily buckets it is
+/// computed from are trimmed at [`RETENTION_DAYS`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Peak {
+    pub(crate) date: String,
+    pub(crate) tokens: i64,
+}
+
+fn peak_path(auth_dir: &Path) -> PathBuf {
+    auth_dir.join("usage-peak.json")
+}
+
+/// The stored peak. A missing or unreadable file is no peak: the next
+/// retained day with traffic replaces it.
+pub(crate) fn load_peak(auth_dir: &Path) -> Option<Peak> {
+    let raw = fs::read_to_string(peak_path(auth_dir)).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    Some(Peak {
+        date: value.get("date")?.as_str()?.to_string(),
+        tokens: value.get("tokens")?.as_i64()?,
+    })
+}
+
+/// Write the peak, atomically and owner-only like every file beside it.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be written or moved into place.
+pub(crate) fn save_peak(auth_dir: &Path, peak: &Peak) -> Result<()> {
+    fs::create_dir_all(auth_dir)
+        .with_context(|| format!("failed to create {}", auth_dir.display()))?;
+    let path = peak_path(auth_dir);
+    let temp = path.with_extension("json.tmp");
+    fs::write(
+        &temp,
+        serde_json::to_string_pretty(&json!({"date": peak.date, "tokens": peak.tokens}))?,
+    )
+    .with_context(|| format!("failed to write {}", temp.display()))?;
+    fs::rename(&temp, &path)
+        .with_context(|| format!("failed to move {} into place", temp.display()))?;
+    set_mode(&path, 0o600)?;
+    Ok(())
+}
+
 /// How many local days of buckets survive a write. Bounded on purpose: the
 /// file is rewritten after every outcome, and days x accounts grows without
 /// one (usage-trend AC-4).

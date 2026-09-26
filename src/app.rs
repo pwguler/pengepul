@@ -36,6 +36,7 @@ use crate::streaming::{
     drain_complete_sse_events, finish_chat_stream, finish_sse_events, responses_sse_to_anthropic,
     responses_sse_to_chat, responses_sse_to_payload, sse,
 };
+use crate::tokens::{Peak, load_peak, save_peak};
 use crate::translate::{
     anthropic_to_chat_request, anthropic_to_openai, anthropic_to_responses,
     anthropic_to_responses_request, chat_to_anthropic_message, chat_to_responses_message,
@@ -580,6 +581,15 @@ pub fn create_app_with_upstream(config: Config, upstream: Arc<dyn UpstreamClient
     }
     let body_limit = config.body_limit;
     let account_managers = build_account_managers(&config);
+    // Startup is one of the two moments the peak moves: a relay restarted after
+    // a long idle spell records its best retained day before the buckets age out.
+    let snapshots: Vec<Value> = account_managers
+        .pools()
+        .iter()
+        .filter_map(|(_, manager)| manager.try_lock().ok().map(|manager| manager.snapshots()))
+        .flatten()
+        .collect();
+    record_peak(&config.auth_dir, &snapshots);
     let config = Arc::new(config);
     let cloaking = Arc::new(StdRwLock::new(Cloaking::new(
         &config,
@@ -902,32 +912,71 @@ async fn admin_accounts(State(state): State<AppState>, headers: HeaderMap) -> Re
         return error.into_response();
     }
 
-    let anthropic = state.account_managers.anthropic.lock().await;
-    let codex = state.account_managers.codex.lock().await;
-    let grok = state.account_managers.grok.lock().await;
-    let mut providers = serde_json::Map::from_iter([
-        (
-            ProviderId::anthropic().to_string(),
-            provider_entry(&anthropic.snapshots()),
-        ),
-        (
-            ProviderId::codex().to_string(),
-            provider_entry(&codex.snapshots()),
-        ),
-        (
-            ProviderId::grok().to_string(),
-            provider_entry(&grok.snapshots()),
-        ),
-    ]);
-    drop(anthropic);
-    drop(codex);
-    drop(grok);
-    for (id, manager) in &state.account_managers.generic {
-        let manager = manager.lock().await;
-        providers.insert(id.clone(), provider_entry(&manager.snapshots()));
+    let mut pools = Vec::new();
+    for (provider, manager) in state.account_managers.pools() {
+        pools.push((provider, manager.lock().await.snapshots()));
     }
+    let peak = record_peak(
+        &state.config.auth_dir,
+        &pools
+            .iter()
+            .flat_map(|(_, snapshots)| snapshots.iter().cloned())
+            .collect::<Vec<_>>(),
+    );
+    let providers: serde_json::Map<String, Value> = pools
+        .iter()
+        .map(|(provider, snapshots)| (provider.to_string(), provider_entry(snapshots)))
+        .collect();
 
-    Json(json!({"providers": providers, "generated_at": now_iso()})).into_response()
+    Json(json!({
+        "providers": providers,
+        "peak": peak.map(|peak| json!({"date": peak.date, "tokens": peak.tokens})),
+        "generated_at": now_iso()
+    }))
+    .into_response()
+}
+
+/// The relay's all-time peak: the stored one, raised to the best day the
+/// snapshots still retain, every account of every Pool summed. Written only
+/// when raised, so the file never goes down (status-is-health AC-8). A write
+/// that fails is logged: losing it costs a figure, never a request.
+fn record_peak(auth_dir: &std::path::Path, snapshots: &[Value]) -> Option<Peak> {
+    let mut days: BTreeMap<String, i64> = BTreeMap::new();
+    for day in snapshots
+        .iter()
+        .filter_map(|account| account.get("days").and_then(Value::as_array))
+        .flatten()
+    {
+        let Some(date) = day.get("date").and_then(Value::as_str) else {
+            continue;
+        };
+        let field = |key: &str| day.get(key).and_then(Value::as_i64).unwrap_or(0);
+        *days.entry(date.to_string()).or_default() += field("inputTokens")
+            + field("outputTokens")
+            + field("cacheReadInputTokens")
+            + field("cacheCreationInputTokens");
+    }
+    let best = days
+        .into_iter()
+        .filter(|(_, tokens)| *tokens > 0)
+        .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)))
+        .map(|(date, tokens)| Peak { date, tokens });
+    let stored = load_peak(auth_dir);
+    match (stored, best) {
+        (Some(stored), Some(best)) if best.tokens > stored.tokens => {
+            if let Err(error) = save_peak(auth_dir, &best) {
+                tracing::warn!(?error, "failed to record the relay's peak day");
+            }
+            Some(best)
+        }
+        (None, Some(best)) => {
+            if let Err(error) = save_peak(auth_dir, &best) {
+                tracing::warn!(?error, "failed to record the relay's peak day");
+            }
+            Some(best)
+        }
+        (stored, _) => stored,
+    }
 }
 
 /// One provider's entry in the payload: its accounts, and how many there are.

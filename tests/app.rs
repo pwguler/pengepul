@@ -5263,3 +5263,102 @@ async fn admin_toggle_refuses_a_record_without_a_credential() {
         "{message}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// status-is-health AC-8: the relay's all-time peak
+// ---------------------------------------------------------------------------
+
+fn today_minus(days: i64) -> String {
+    (chrono::Local::now() - chrono::Duration::days(days))
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+/// Two groq keys whose usage.json holds one shared day: the relay's peak is the
+/// day summed across accounts, not either account's own best.
+fn relay_with_days(auth_dir: &std::path::Path, a: i64, b: i64) -> axum::Router {
+    save_token(auth_dir, &groq_key("key-1")).expect("save");
+    save_token(auth_dir, &groq_key("key-2")).expect("save");
+    let day = today_minus(3);
+    let entry = |tokens: i64| {
+        json!({"total_requests": 1, "total_successes": 1, "total_input_tokens": tokens,
+               "days": {day.clone(): {"requests": 1, "successes": 1, "input_tokens": tokens}}})
+    };
+    std::fs::write(
+        auth_dir.join("groq").join("usage.json"),
+        json!({"key-1": entry(a), "key-2": entry(b)}).to_string(),
+    )
+    .expect("usage");
+    create_app_with_upstream(
+        config_with_groq(auth_dir.to_path_buf()),
+        Arc::new(GenericUpstream::default()),
+    )
+}
+
+async fn payload(app: axum::Router) -> Value {
+    let (status, body) = json_response(
+        app,
+        axum::http::Request::builder()
+            .uri("/admin/accounts")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    body
+}
+
+fn stored_peak(auth_dir: &std::path::Path) -> Value {
+    serde_json::from_str(
+        &std::fs::read_to_string(auth_dir.join("usage-peak.json")).expect("usage-peak.json"),
+    )
+    .expect("parse")
+}
+
+#[tokio::test]
+async fn the_relay_records_its_best_day_at_startup_and_reports_it() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = relay_with_days(tmp.path(), 700, 300);
+
+    // Written before any request: startup is one of the two moments it updates.
+    assert_eq!(
+        stored_peak(tmp.path()),
+        json!({"date": today_minus(3), "tokens": 1_000})
+    );
+    assert_eq!(
+        payload(app).await["peak"],
+        json!({"date": today_minus(3), "tokens": 1_000})
+    );
+}
+
+#[tokio::test]
+async fn a_stored_peak_outlives_its_buckets_and_is_never_lowered() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // A day older than the retained buckets, and higher than any of them.
+    std::fs::write(
+        tmp.path().join("usage-peak.json"),
+        json!({"date": "2025-01-01", "tokens": 5_000}).to_string(),
+    )
+    .expect("stored");
+    let app = relay_with_days(tmp.path(), 700, 300);
+
+    assert_eq!(
+        payload(app).await["peak"],
+        json!({"date": "2025-01-01", "tokens": 5_000})
+    );
+    assert_eq!(stored_peak(tmp.path())["tokens"], 5_000, "lowered on disk");
+}
+
+#[tokio::test]
+async fn a_relay_with_no_traffic_reports_no_peak() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &groq_key("key-1")).expect("save");
+    let app = create_app_with_upstream(
+        config_with_groq(tmp.path().to_path_buf()),
+        Arc::new(GenericUpstream::default()),
+    );
+
+    assert!(payload(app).await["peak"].is_null());
+    assert!(!tmp.path().join("usage-peak.json").exists());
+}

@@ -61,8 +61,9 @@ Considered and rejected:
   relay prices nothing and a raw write total is one more token count.
 - **`status` and `usage` can no longer be checked against each other.** ARCHITECTURE's "One
   word, one scope" leaned on both printing the all-time carried figure from one sum, so the
-  two could not drift. `usage` still prints `all time`; `status` prints it nowhere, and its
-  pool rows carry per-pool load instead.
+  two could not drift. `status` prints no figure at all since status-is-health; `usage` owns
+  the relay's numbers and prints the carried load as `total`, a labelled total above its own
+  breakdown.
 - **ARCHITECTURE's restatement rule is amended.** "A row never restates another row" was why
   the panel printed parts and no totals. A labelled total above its own breakdown is not a
   restatement, and that carve-out is what admits `Input`.

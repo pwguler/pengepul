@@ -255,6 +255,12 @@ before.
   synthesised as zero rather than skipped. Without this the line would
   compress an idle week into nothing and misreport the shape.
 
+- **`window` is `last 30 days`, `all time` is `total`, and `peak` is all-time.**
+  status-is-health merged the trend into one box with the relay's figures; the
+  header no longer names the window, the window row does, and every row after it
+  is all-time. `peak` is the relay's best day of every retained bucket or the
+  stored `usage-peak.json`, not the window's.
+
 ## Verification
 
 ```sh

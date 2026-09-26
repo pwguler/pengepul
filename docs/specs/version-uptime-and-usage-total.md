@@ -81,6 +81,12 @@ The numbers are the relay's lifetime totals, the same figures `status` prints â€
 - AC-10: `accounts` output is byte-identical to before, and the existing `status` and
   `usage` assertions pass unedited apart from the two inserted lines and the appended block.
 
+## Revisions
+
+- **One box, and no copy in `status`.** status-is-health folded the relay total into
+  `usage`'s single box under the header `usage â”€ P pools, A accounts`, and removed the
+  aggregate from `status`, so the two verbs no longer print the same block.
+
 ## Verification
 
 ```sh

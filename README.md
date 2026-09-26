@@ -165,10 +165,10 @@ pengepul serve # start the relay (the default with no subcommand)
 pengepul login --provider anthropic # authorize an account in a browser (--provider codex for Codex)
 pengepul login --provider groq --key $KEY # save a static key for a configured provider
 pengepul login --provider groq --base-url $URL --key $KEY # register a new OpenAI-compatible provider and save its key
-pengepul status # health of the running relay
+pengepul status # health of the running relay: build, uptime, what each pool can serve
 pengepul accounts # loaded accounts (-v per model, --reload re-reads from disk)
 pengepul accounts disable|enable <id> # take an account out of its pool, or put it back and clear its cooldown
-pengepul usage # the last 30 days of tokens, as a sparkline
+pengepul usage # the relay's numbers: 30-day trend, all-time peak, total, requests, tokens
 pengepul update # install the most recent release (--check only reports)
 pengepul config path|show|api-key # show the config path, contents, or a key
 pengepul service install|start|stop|restart|status|uninstall|logs # manage the user service (systemd on Linux, launchd on macOS)
