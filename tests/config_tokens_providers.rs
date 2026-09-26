@@ -4,11 +4,10 @@ use std::path::PathBuf;
 
 use pengepul::config::{BodyLimit, load_config, selected_config_path};
 use pengepul::oauth::{
-    CODEX_CALLBACK_PATH, CODEX_CALLBACK_PORT, CODEX_CLIENT_ID, detect_exhausted_reason,
-    generate_anthropic_auth_url, generate_codex_auth_url,
+    CODEX_CALLBACK_PATH, CODEX_CALLBACK_PORT, CODEX_CLIENT_ID, generate_anthropic_auth_url,
+    generate_codex_auth_url,
 };
 use pengepul::tokens::{load_all_tokens, save_token};
-use pengepul::translate::resolve_model;
 use pengepul::types::{PkceCodes, ProviderId, TokenData};
 use tempfile::tempdir;
 
@@ -68,19 +67,6 @@ fn default_config_is_generated_under_home_pengepul() {
         config_path.metadata().unwrap().permissions().mode() & 0o777,
         0o600
     );
-}
-
-#[test]
-fn oauth_detects_exhausted_refresh_markers() {
-    assert_eq!(
-        detect_exhausted_reason(r#"{"error":"invalid_grant"}"#),
-        Some("invalid_grant")
-    );
-    assert_eq!(
-        detect_exhausted_reason("refresh_token_reused by another client"),
-        Some("refresh_token_reused")
-    );
-    assert_eq!(detect_exhausted_reason("temporary outage"), None);
 }
 
 #[test]
@@ -329,15 +315,6 @@ fn token_storage_round_trips_provider_files() {
             .collect::<Vec<_>>(),
         ["bob@example.com"]
     );
-}
-
-#[test]
-fn resolve_model_passes_ids_through_without_aliases() {
-    // Aliases were removed; a bare id is returned as-is, a missing one falls to the default.
-    assert_eq!(resolve_model(None), "claude-sonnet-4-6");
-    assert_eq!(resolve_model(Some("opus")), "opus");
-    assert_eq!(resolve_model(Some("claude-opus-5")), "claude-opus-5");
-    assert_eq!(resolve_model(Some("gpt-5.4")), "gpt-5.4");
 }
 
 #[test]

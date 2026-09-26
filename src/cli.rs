@@ -998,7 +998,7 @@ pub fn release_asset() -> Result<&'static str> {
 /// Tags carry a leading `v`. A tag that does not parse is treated as newer, so a
 /// release naming scheme change still prompts an update rather than going silent.
 #[must_use]
-pub fn tag_is_newer(tag: &str, current: &str) -> bool {
+fn tag_is_newer(tag: &str, current: &str) -> bool {
     fn parts(value: &str) -> Option<(u64, u64, u64)> {
         let mut it = value.trim_start_matches('v').split('.');
         Some((
@@ -1497,7 +1497,22 @@ fn unix_now() -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ModelChoice, matching_choices};
+    use super::{ModelChoice, matching_choices, tag_is_newer};
+
+    #[test]
+    fn tag_is_newer_compares_versions_numerically() {
+        assert!(tag_is_newer("v0.2.0", "0.1.0"));
+        assert!(tag_is_newer("v0.1.1", "0.1.0"));
+        assert!(tag_is_newer("v1.0.0", "0.9.9"));
+        // 10 > 9 numerically, though "v0.10.0" sorts before "v0.9.0" as a string
+        assert!(tag_is_newer("v0.10.0", "0.9.0"));
+
+        assert!(!tag_is_newer("v0.1.0", "0.1.0"));
+        assert!(!tag_is_newer("v0.1.0", "0.2.0"));
+
+        // an unparseable tag prompts rather than silently never updating
+        assert!(tag_is_newer("nightly", "0.1.0"));
+    }
 
     fn rows(ids: &[&str]) -> Vec<ModelChoice> {
         ids.iter()

@@ -4,7 +4,7 @@ const ANTHROPIC_WEB_SEARCH_TOOL_TYPE: &str = "web_search_20250305";
 const ANTHROPIC_WEB_SEARCH_TOOL_TYPES: [&str; 1] = [ANTHROPIC_WEB_SEARCH_TOOL_TYPE];
 
 #[must_use]
-pub fn resolve_model(model: Option<&str>) -> String {
+fn resolve_model(model: Option<&str>) -> String {
     model.unwrap_or("claude-sonnet-4-6").to_string()
 }
 

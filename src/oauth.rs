@@ -40,7 +40,7 @@ pub const GROK_REFERRER: &str = "grok-build";
 pub const GROK_TOKEN_TTL_SECONDS: u64 = 21_600;
 
 #[must_use]
-pub fn detect_exhausted_reason(body: &str) -> Option<&'static str> {
+fn detect_exhausted_reason(body: &str) -> Option<&'static str> {
     let body = body.to_ascii_lowercase();
     [
         "refresh_token_reused",
@@ -513,6 +513,19 @@ fn required_string(data: &Value, field: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oauth_detects_exhausted_refresh_markers() {
+        assert_eq!(
+            detect_exhausted_reason(r#"{"error":"invalid_grant"}"#),
+            Some("invalid_grant")
+        );
+        assert_eq!(
+            detect_exhausted_reason("refresh_token_reused by another client"),
+            Some("refresh_token_reused")
+        );
+        assert_eq!(detect_exhausted_reason("temporary outage"), None);
+    }
 
     fn content_type(req: &reqwest::Request) -> String {
         req.headers()

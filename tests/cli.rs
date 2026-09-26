@@ -1218,21 +1218,6 @@ fn login_for_an_unconfigured_provider_lists_the_configured_ones() {
 }
 
 #[test]
-fn tag_is_newer_compares_versions_numerically() {
-    assert!(pengepul::cli::tag_is_newer("v0.2.0", "0.1.0"));
-    assert!(pengepul::cli::tag_is_newer("v0.1.1", "0.1.0"));
-    assert!(pengepul::cli::tag_is_newer("v1.0.0", "0.9.9"));
-    // 10 > 9 numerically, though "v0.10.0" sorts before "v0.9.0" as a string
-    assert!(pengepul::cli::tag_is_newer("v0.10.0", "0.9.0"));
-
-    assert!(!pengepul::cli::tag_is_newer("v0.1.0", "0.1.0"));
-    assert!(!pengepul::cli::tag_is_newer("v0.1.0", "0.2.0"));
-
-    // an unparseable tag prompts rather than silently never updating
-    assert!(pengepul::cli::tag_is_newer("nightly", "0.1.0"));
-}
-
-#[test]
 fn update_check_reports_without_installing() {
     let tmp = tempdir().expect("tempdir");
     let mut runtime = FakeRuntime {
