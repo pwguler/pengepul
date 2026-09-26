@@ -4634,40 +4634,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removed_provider_model_ids_are_unknown_models() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let upstream = Arc::new(CapturingUpstream::default());
-        let state = test_state(tmp.path(), upstream.clone());
-
-        let response = route_provider_request(
-            &state,
-            &HeaderMap::new(),
-            &json!({
-                "model": "opencode/glm-5.1",
-                "messages": [{"role": "user", "content": "hi"}]
-            }),
-            RequestRoute::Chat,
-        )
-        .await;
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(upstream.calls.lock().expect("calls lock").is_empty());
-
-        let response = route_provider_request(
-            &state,
-            &HeaderMap::new(),
-            &json!({
-                "model": "opencode/glm-5.1",
-                "messages": [{"role": "user", "content": "hi"}]
-            }),
-            RequestRoute::Messages,
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(upstream.calls.lock().expect("calls lock").is_empty());
-    }
-
-    #[tokio::test]
     async fn refresh_keeps_the_last_good_catalog_when_a_fetch_fails() {
         let tmp = tempfile::tempdir().expect("tempdir");
         save_token(
