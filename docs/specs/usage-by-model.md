@@ -126,6 +126,9 @@ model at accounting time but throws it away.
   is a sum of lines already on screen, and `status` already carries the
   pool-level totals. Models now appear once, under the account that
   served them. `pool_model_rows` is gone with it.
+- **Behind `--verbose`.** accounts-verbose moved the per-model lines, rich
+  and plain, behind `accounts --verbose` (`-v`). Every criterion above
+  holds for that view; the default view stops at the account scope.
 
 ## Verification
 

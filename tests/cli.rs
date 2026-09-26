@@ -775,7 +775,7 @@ fn accounts_renders_the_token_block_at_every_scope() {
         ..FakeRuntime::default()
     };
 
-    let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+    let outcome = run_style(&["accounts", "-v"], tmp.path(), &mut runtime, Style::Rich);
 
     assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
@@ -1929,7 +1929,7 @@ fn accounts_breaks_usage_down_per_model_on_a_tty() {
         ..FakeRuntime::default()
     };
 
-    let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+    let outcome = run_style(&["accounts", "-v"], tmp.path(), &mut runtime, Style::Rich);
 
     assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
@@ -2061,7 +2061,7 @@ fn accounts_lists_models_in_plain_output() {
         ..FakeRuntime::default()
     };
 
-    let outcome = run(&["accounts"], tmp.path(), &mut runtime);
+    let outcome = run(&["accounts", "--verbose"], tmp.path(), &mut runtime);
 
     assert_eq!(outcome.code, 0);
     assert!(outcome.stdout.contains("claude-fable-5-1"));
@@ -2078,6 +2078,115 @@ fn accounts_lists_models_in_plain_output() {
     );
     // AC-6 (revised): no pool aggregate in plain either.
     assert!(!outcome.stdout.contains("by model"));
+}
+
+/// accounts-verbose AC-6: the two flags compose.
+#[test]
+fn accounts_reload_composes_with_verbose() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        accounts_payload: Some(two_model_pool()),
+        ..FakeRuntime::default()
+    };
+
+    let outcome = run(&["accounts", "--reload", "-v"], tmp.path(), &mut runtime);
+
+    assert_eq!(
+        runtime.calls,
+        [
+            "reload:http://127.0.0.1:8317:sk-test",
+            "accounts:http://127.0.0.1:8317:sk-test"
+        ]
+    );
+    assert!(outcome.stdout.contains("reloaded accounts"));
+    assert!(
+        outcome.stdout.contains("claude-fable-5-1"),
+        "{}",
+        outcome.stdout
+    );
+}
+
+/// accounts-verbose: the lines `accounts` prints for `argv`, visible text only.
+fn accounts_lines(argv: &[&str], style: Style) -> Vec<String> {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        rich: style == Style::Rich,
+        accounts_payload: Some(two_model_pool()),
+        ..FakeRuntime::default()
+    };
+    let outcome = run_style(argv, tmp.path(), &mut runtime, style);
+    strip_ansi(&outcome.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// accounts-verbose AC-1, AC-2, AC-4: without the flag no model line is
+/// printed, and every other line is printed exactly as the verbose view
+/// prints it, in the same order.
+#[test]
+fn accounts_hides_models_without_verbose() {
+    for style in [Style::Rich, Style::Plain] {
+        let default = accounts_lines(&["accounts"], style);
+        let verbose = accounts_lines(&["accounts", "--verbose"], style);
+
+        for line in &default {
+            assert!(
+                !line.contains("claude-fable-5-1") && !line.contains("claude-sonnet-4-5"),
+                "{style:?}: a model line without --verbose: {line}"
+            );
+        }
+        // The default view is the verbose view with lines removed, never
+        // reworded: walk the verbose lines, keeping the ones the default
+        // printed, and require they are all of it.
+        let mut kept = default.iter().peekable();
+        let mut removed = Vec::new();
+        for line in &verbose {
+            if kept.peek() == Some(&line) {
+                kept.next();
+            } else {
+                removed.push(line.clone());
+            }
+        }
+        assert!(
+            kept.peek().is_none(),
+            "{style:?}: the default printed a line the verbose view does not: {default:#?}"
+        );
+        // What went is the model scope only: headlines, and the rows indented
+        // under them.
+        let model_indent = match style {
+            Style::Rich => "│     ",
+            Style::Plain => "      ",
+        };
+        assert!(!removed.is_empty(), "{style:?}: nothing was hidden");
+        for line in &removed {
+            assert!(
+                line.contains("claude-fable-5-1")
+                    || line.contains("claude-sonnet-4-5")
+                    || line.starts_with(model_indent),
+                "{style:?}: hid a line outside the model scope: {line}"
+            );
+        }
+    }
+}
+
+/// accounts-verbose AC-3: `-v` is `--verbose`.
+#[test]
+fn accounts_v_is_verbose() {
+    for style in [Style::Rich, Style::Plain] {
+        assert_eq!(
+            accounts_lines(&["accounts", "-v"], style),
+            accounts_lines(&["accounts", "--verbose"], style),
+        );
+        assert!(
+            accounts_lines(&["accounts", "-v"], style)
+                .iter()
+                .any(|line| line.contains("claude-fable-5-1")),
+            "{style:?}: -v printed no model"
+        );
+    }
 }
 
 /// usage-by-model AC-5: an account with no per-model history prints no
@@ -2156,7 +2265,7 @@ fn accounts_keeps_long_model_names_distinguishable() {
         ..FakeRuntime::default()
     };
 
-    let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+    let outcome = run_style(&["accounts", "-v"], tmp.path(), &mut runtime, Style::Rich);
 
     assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
@@ -2223,7 +2332,12 @@ fn accounts_fits_the_model_column_to_the_names_present() {
         accounts_payload: Some(payload(json!([model("claude-opus-5")]))),
         ..FakeRuntime::default()
     };
-    let short = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+    let short = run_style(
+        &["accounts", "--verbose"],
+        tmp.path(),
+        &mut runtime,
+        Style::Rich,
+    );
     let short_visible = strip_ansi(&short.stdout);
     assert!(
         short_visible.contains("claude-opus-5  5 ok"),
@@ -2239,7 +2353,12 @@ fn accounts_fits_the_model_column_to_the_names_present() {
         ]))),
         ..FakeRuntime::default()
     };
-    let long = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+    let long = run_style(
+        &["accounts", "--verbose"],
+        tmp.path(),
+        &mut runtime,
+        Style::Rich,
+    );
     let long_visible = strip_ansi(&long.stdout);
     assert!(long_visible.contains("deepseek-v4-flash-vision-exp"));
     assert!(
@@ -2287,7 +2406,7 @@ fn accounts_never_amputates_counts_for_an_overlong_model_name() {
         ..FakeRuntime::default()
     };
 
-    let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+    let outcome = run_style(&["accounts", "-v"], tmp.path(), &mut runtime, Style::Rich);
 
     assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
@@ -2380,7 +2499,7 @@ fn accounts_shares_one_model_column_across_a_pool() {
         ..FakeRuntime::default()
     };
 
-    let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
+    let outcome = run_style(&["accounts", "-v"], tmp.path(), &mut runtime, Style::Rich);
 
     assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
@@ -4545,6 +4664,24 @@ fn a_failed_token_save_registers_nothing() {
         !written.contains("openrouter"),
         "the provider was registered despite a failed token save: {written}"
     );
+}
+
+/// accounts-verbose AC-5: help is the one place the hidden models are named,
+/// so the flag's doc text is what is asserted, not clap's flag list.
+#[test]
+fn accounts_help_documents_verbose() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime = FakeRuntime::default();
+
+    let outcome = run(&["help", "accounts"], tmp.path(), &mut runtime);
+
+    let line = outcome
+        .stdout
+        .lines()
+        .find(|line| line.contains("--verbose"))
+        .unwrap_or_else(|| panic!("no --verbose in help: {}", outcome.stdout));
+    assert!(line.contains("-v,"), "no short flag: {line}");
+    assert!(line.contains("per-model breakdown"), "undocumented: {line}");
 }
 
 /// AC-12: the flag documents what it does and what it needs.

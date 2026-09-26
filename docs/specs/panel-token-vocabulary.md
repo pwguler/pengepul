@@ -30,7 +30,8 @@ on `cached` that is the read share of the prompt, and no cache write anywhere in
 
 - AC-1: Every scope that reports a subject prints the block in order — `input`, `cached`,
   `uncached`, `output` — with `reasoning` after `output` when non-zero: the relay block in
-  `status`, and the pool, account and model blocks in `accounts` (ADR-0024).
+  `status`, and the pool, account and model blocks in `accounts` (ADR-0024); the model block under
+  `--verbose` since accounts-verbose.
   `tests/cli.rs::accounts_renders_the_token_block_at_every_scope` asserts the exact label
   sequence at the account, model and footer scopes, and
   `tests/cli.rs::status_renders_panels_on_a_tty` asserts the relay's own block.

@@ -135,6 +135,8 @@ built by hand rather than by `fact_panel`.
   above argued the split was forced by byte stability; it was not, and the
   owner asked for the two to match. Rich prints `● unavailable` now, and
   `unavailable` remains barred from naming a **Cooldown**.
+- **Model rows print under `--verbose` only.** AC-7's model rows keep their
+  shape; accounts-verbose moved them behind `accounts --verbose`.
 
 ## Verification
 

@@ -284,6 +284,9 @@ enum Command {
         command_config: Option<PathBuf>,
         #[arg(long)]
         reload: bool,
+        /// show each account's per-model breakdown
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// show the last 30 days of token usage
     Usage {
@@ -423,10 +426,12 @@ pub fn run_with_env(
         Some(Command::Accounts {
             command_config,
             reload,
+            verbose,
         }) => {
             accounts(
                 root_env.with_override(command_config.as_deref()),
                 reload,
+                verbose,
                 runtime,
                 &mut output,
                 style,
@@ -618,6 +623,7 @@ fn status(
 fn accounts(
     env: CommandEnv<'_>,
     reload: bool,
+    verbose: bool,
     runtime: &mut impl CliRuntime,
     output: &mut Output,
     style: Style,
@@ -632,8 +638,8 @@ fn accounts(
     let accounts = runtime.accounts(&base_url, &api_key)?;
     let now = unix_now();
     match style {
-        Style::Plain => print_accounts(&accounts, output, now),
-        Style::Rich => print_pool_rich(&accounts, output, now),
+        Style::Plain => print_accounts(&accounts, output, now, verbose),
+        Style::Rich => print_pool_rich(&accounts, output, now, verbose),
     }
     Ok(())
 }

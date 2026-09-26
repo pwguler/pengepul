@@ -36,7 +36,8 @@ pub(crate) fn cooldown_label(now: f64, cooldown_until: f64) -> String {
     }
 }
 
-pub(crate) fn print_accounts(payload: &Value, output: &mut Output, now: f64) {
+/// `verbose` adds each account's per-model lines (accounts-verbose).
+pub(crate) fn print_accounts(payload: &Value, output: &mut Output, now: f64, verbose: bool) {
     for (provider_id, provider) in providers(payload) {
         let count = provider
             .get("account_count")
@@ -92,6 +93,9 @@ pub(crate) fn print_accounts(payload: &Value, output: &mut Output, now: f64) {
             );
             output.line(&detail);
             // AC-7: the same per-model breakdown, plain.
+            if !verbose {
+                continue;
+            }
             for row in model_rows(account) {
                 output.line(&format!(
                     "    {} {} ok {}",
@@ -292,7 +296,9 @@ pub(crate) fn model_rows(account: &Value) -> Vec<ModelRow> {
 /// The rich pool view behind `accounts`: one panel per provider with rows,
 /// per-account token lines and a footer rollup. Pure over the payload and
 /// the clock value handed to it: the renderer reads no clock.
-pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64) {
+/// `verbose` adds each account's per-model breakdown under its block
+/// (accounts-verbose); without it the view stops at the account scope.
+pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64, verbose: bool) {
     for (provider_id, provider) in providers(payload) {
         let accounts = provider
             .get("accounts")
@@ -351,6 +357,9 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64) {
                 output.line(&panel_row(&format!("  {}", fact_row(&fact, column))));
             }
             // AC-5: the models this account served, heaviest first.
+            if !verbose {
+                continue;
+            }
             for row in model_rows(account) {
                 output.line(&panel_row(&format!("  {}", row.headline(width))));
                 for fact in row.facts() {
@@ -1256,7 +1265,7 @@ mod tests {
             }
         });
         let mut output = Output::default();
-        print_pool_rich(&payload, &mut output, 1_000_000.0);
+        print_pool_rich(&payload, &mut output, 1_000_000.0, true);
         for line in output.stdout.lines() {
             assert_eq!(
                 strip_ansi(line).chars().count(),
@@ -1285,7 +1294,7 @@ mod tests {
             }
         });
         let mut output = Output::default();
-        print_pool_rich(&payload, &mut output, 1_000_000.0);
+        print_pool_rich(&payload, &mut output, 1_000_000.0, false);
         for line in output.stdout.lines() {
             assert_eq!(
                 strip_ansi(line).chars().count(),

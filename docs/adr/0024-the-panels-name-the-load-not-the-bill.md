@@ -69,3 +69,6 @@ Considered and rejected:
 - **Plain output's byte stability is given up on purpose.** It was frozen so scripts could
   parse it; it now prints the same four words on one line per subject. The old `in` / `cache`
   labels and the `1h write` suffix are gone.
+- **The model block prints under `accounts --verbose` only** (accounts-verbose). The block's
+  rows and order are unchanged; the model scope as a whole moved behind the flag, because at
+  every model an account ever served it was most of the view.

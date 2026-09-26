@@ -166,7 +166,7 @@ pengepul login --provider anthropic # authorize an account in a browser (--provi
 pengepul login --provider groq --key $KEY # save a static key for a configured provider
 pengepul login --provider groq --base-url $URL --key $KEY # register a new OpenAI-compatible provider and save its key
 pengepul status # health of the running relay
-pengepul accounts # loaded accounts (--reload re-reads from disk)
+pengepul accounts # loaded accounts (-v per model, --reload re-reads from disk)
 pengepul usage # the last 30 days of tokens, as a sparkline
 pengepul update # install the most recent release (--check only reports)
 pengepul config path|show|api-key # show the config path, contents, or a key
