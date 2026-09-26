@@ -69,9 +69,12 @@ Considered and rejected:
 - **ARCHITECTURE's restatement rule is amended.** "A row never restates another row" was why
   the panel printed parts and no totals. A labelled total above its own breakdown is not a
   restatement, and that carve-out is what admits `Input`.
-- **Plain output's byte stability is given up on purpose.** It was frozen so scripts could
-  parse it; it now prints the same four words on one line per subject. The old `in` / `cache`
-  labels and the `1h write` suffix are gone.
+- **Plain output is a line contract, not a byte one.** It was frozen byte for byte so scripts
+  could parse it; it now prints the same four words on one line per subject, and the old
+  `in` / `cache` labels and the `1h write` suffix are gone. What a script may rely on is its
+  words, labels, one fact per line, and line order; column spacing and padding may change
+  without notice, and tests compare plain output field by field, whitespace normalised. A
+  change to a word, a label or the line order is a breaking change and is released as one.
 - **The model block prints under `accounts --verbose` only** (accounts-verbose). The block's
   rows and order are unchanged; the model scope as a whole moved behind the flag, because at
   every model an account ever served it was most of the view.

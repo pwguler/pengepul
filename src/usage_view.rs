@@ -602,8 +602,8 @@ fn relay_header_rich(name: &str, totals: &RelayTotals) -> String {
 
 /// Where the relay is and whether it answered: the facts `status` shows
 /// above its numbers. Kept structured rather than pre-formatted so plain
-/// can join `url` and `server` on one line (its bytes are load-bearing
-/// for scripts) while rich gives each its own labelled row.
+/// can join `url` and `server` on one line (a line a script reads, ADR-0024)
+/// while rich gives each its own labelled row.
 pub(crate) struct Connection {
     pub(crate) config: String,
     pub(crate) url: String,

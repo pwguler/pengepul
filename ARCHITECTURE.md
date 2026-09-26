@@ -250,7 +250,8 @@ in files.
   indented breakdown beneath it, one level per scope: the token block does,
   under the account, that account's models, and the pool's own rollup. Plain
   output does not follow the panel language — it prints the same vocabulary,
-  one line per subject (ADR-0024).
+  one line per subject, and is a line contract: words, labels, one fact per
+  line and line order hold, column spacing does not (ADR-0024).
 - **Cloaking follows Claude Code except where fidelity breaks the client.**
   The beta set is audited against the current CLI binary, but
   `redact-thinking` is never sent (it empties thinking text pengepul's clients

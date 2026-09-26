@@ -387,6 +387,16 @@ fn status_reports_health_and_account_counts() {
     assert_eq!(runtime.accounts_api_key.as_deref(), Some("sk-test"));
 }
 
+/// Plain output as the lines a script reads: each line's fields, joined by one
+/// space. Plain is a line contract — its words, labels, one fact per line and
+/// line order — not a byte one, so column spacing is normalised away (ADR-0024).
+fn plain_lines(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect()
+}
+
 /// Strip ANSI escape sequences, leaving the visible text — assertions about
 /// layout run on this, assertions about color run on the raw bytes.
 fn strip_ansi(text: &str) -> String {
@@ -551,9 +561,7 @@ fn status_rolls_up_pool_health_per_provider() {
     let usage = run(&["usage"], tmp.path(), &mut runtime);
     assert!(!outcome.stdout.contains("requests"), "{}", outcome.stdout);
     assert!(
-        usage
-            .stdout
-            .contains("requests 1,204  (1,198 ok, 6 failed)"),
+        plain_lines(&usage.stdout).contains(&"requests 1,204 (1,198 ok, 6 failed)".to_string()),
         "{}",
         usage.stdout
     );
@@ -1188,147 +1196,6 @@ fn login_for_an_unconfigured_provider_lists_the_configured_ones() {
     assert!(runtime.login_provider.is_none());
 }
 
-#[test]
-fn update_check_reports_without_installing() {
-    let tmp = tempdir().expect("tempdir");
-    let mut runtime = FakeRuntime {
-        latest_tag: Some("v99.0.0".to_string()),
-        ..FakeRuntime::default()
-    };
-
-    let outcome = run(&["update", "--check"], tmp.path(), &mut runtime);
-
-    assert!(outcome.stdout.contains("v99.0.0"), "{}", outcome.stdout);
-    assert!(runtime.installed.is_none(), "--check must not install");
-}
-
-#[test]
-fn update_installs_when_a_newer_release_exists() {
-    let tmp = tempdir().expect("tempdir");
-    let mut runtime = FakeRuntime {
-        latest_tag: Some("v99.0.0".to_string()),
-        ..FakeRuntime::default()
-    };
-
-    run(&["update"], tmp.path(), &mut runtime);
-
-    let (tag, asset) = runtime.installed.expect("must install");
-    assert_eq!(tag, "v99.0.0");
-    assert!(asset.ends_with(".tar.gz"), "asset was {asset}");
-}
-
-#[test]
-fn update_is_a_noop_when_already_current() {
-    let tmp = tempdir().expect("tempdir");
-    let mut runtime = FakeRuntime {
-        latest_tag: Some("v0.0.1".to_string()),
-        ..FakeRuntime::default()
-    };
-
-    let outcome = run(&["update"], tmp.path(), &mut runtime);
-
-    assert!(outcome.stdout.contains("latest"), "{}", outcome.stdout);
-    assert!(runtime.installed.is_none(), "must not reinstall");
-}
-
-#[test]
-fn status_plain_ends_with_its_pool_rows() {
-    let tmp = tempdir().expect("tempdir");
-    write_config(tmp.path(), "0.0.0.0", 8318);
-    let mut runtime = FakeRuntime {
-        accounts_payload: Some(json!({
-            "providers": {
-                "anthropic": {
-                    "account_count": 1,
-                    "accounts": [json!({
-                        "email": "a@x.com",
-                        "available": true,
-                        "totalRequests": 640,
-                        "totalInputTokens": 33,
-                        "totalOutputTokens": 120,
-                        "totalCacheReadInputTokens": 7,
-                        "totalCacheCreationInputTokens": 0
-                    })]
-                },
-                "commandcode": {
-                    "account_count": 1,
-                    "accounts": [json!({
-                        "email": "k@x.com",
-                        "available": true,
-                        "totalRequests": 10,
-                        "totalInputTokens": 10,
-                        "totalOutputTokens": 5
-                    })]
-                }
-            }
-        })),
-        ..FakeRuntime::default()
-    };
-
-    let outcome = run(&["status"], tmp.path(), &mut runtime);
-
-    // status-is-health AC-1, AC-2: the block opens with the relay header and
-    // ends on its pool rows; the relay's numbers are `usage`'s.
-    assert!(
-        outcome.stdout.starts_with("status\nconfig "),
-        "{}",
-        outcome.stdout
-    );
-    assert!(!outcome.stdout.contains("requests"), "{}", outcome.stdout);
-    assert!(!outcome.stdout.contains("input"), "{}", outcome.stdout);
-    let last = outcome.stdout.trim_end().lines().last().expect("a line");
-    assert!(last.starts_with("commandcode"), "{last}");
-    assert!(last.ends_with("1 account, 1 available"), "{last}");
-}
-
-#[test]
-fn status_rich_is_one_64_wide_box() {
-    let tmp = tempdir().expect("tempdir");
-    write_config(tmp.path(), "0.0.0.0", 8318);
-    let mut runtime = FakeRuntime {
-        rich: true,
-        accounts_payload: Some(json!({
-            "providers": {
-                "anthropic": {
-                    "account_count": 1,
-                    "accounts": [json!({
-                        "email": "a@x.com",
-                        "available": true,
-                        "totalRequests": 640,
-                        "totalInputTokens": 33,
-                        "totalOutputTokens": 120
-                    })]
-                }
-            }
-        })),
-        ..FakeRuntime::default()
-    };
-
-    let outcome = run_style(&["status"], tmp.path(), &mut runtime, Style::Rich);
-
-    let visible = strip_ansi(&outcome.stdout);
-    // AC-2: a single 64-wide box panel headed by the relay total.
-    let lines: Vec<&str> = visible.lines().collect();
-    let top = lines
-        .iter()
-        .position(|line| line.starts_with('┌'))
-        .expect("panel top");
-    assert!(lines[top].starts_with("┌─ status ───"), "{}", lines[top]);
-    assert_eq!(lines[top].chars().count(), 64, "top rule: {}", lines[top]);
-    let bottom = lines
-        .iter()
-        .rposition(|line| line.starts_with('└'))
-        .expect("panel bottom");
-    assert_eq!(bottom, lines.len() - 1, "panel closes the output");
-    // status-is-health AC-1: no request or token row.
-    for label in ["requests", "input", "uncached", "output", "total"] {
-        assert!(
-            !visible.contains(&format!("│ {label} ")),
-            "{label}: {visible}"
-        );
-    }
-}
-
 /// status-is-health AC-4, AC-5: `usage`'s header counts the pools that hold
 /// accounts, so an empty pool counts in neither pools nor accounts. (`status`
 /// hiding empty pools is owned by `plain_status_says_what_each_pool_can_serve`.)
@@ -1676,27 +1543,50 @@ fn action_panels_hold_the_width_and_paint_the_glyph() {
     assert!(strip_ansi(&update.stdout).contains("v99.0.0"));
 }
 
+/// `update` in plain: what each case prints, and whether it installed. A newer tag
+/// installs unless `--check` asks only to report; the current release installs
+/// nothing.
 #[test]
-fn update_plain_bytes_are_pinned() {
-    let tmp = tempdir().expect("tempdir");
-    let mut runtime = FakeRuntime {
-        latest_tag: Some("v99.0.0".to_string()),
-        ..FakeRuntime::default()
-    };
-
-    let check = run(&["update", "--check"], tmp.path(), &mut runtime);
-    assert_eq!(
-        check.stdout,
-        format!(
-            "pengepul v99.0.0 is available (running {}); run `pengepul update` to install it\n",
-            env!("CARGO_PKG_VERSION")
-        )
-    );
-    let install = run(&["update"], tmp.path(), &mut runtime);
-    assert_eq!(
-        install.stdout,
-        "updated to v99.0.0 at /usr/local/bin/pengepul\n"
-    );
+fn update_reports_and_installs_by_the_latest_tag() {
+    let running = env!("CARGO_PKG_VERSION");
+    for (argv, latest, said, installs) in [
+        (
+            &["update", "--check"][..],
+            "v99.0.0",
+            format!(
+                "pengepul v99.0.0 is available (running {running}); run `pengepul update` to install it"
+            ),
+            false,
+        ),
+        (
+            &["update"][..],
+            "v99.0.0",
+            "updated to v99.0.0 at /usr/local/bin/pengepul".to_string(),
+            true,
+        ),
+        (
+            &["update"][..],
+            "v0.0.1",
+            format!("pengepul {running} is the latest release"),
+            false,
+        ),
+    ] {
+        let tmp = tempdir().expect("tempdir");
+        let mut runtime = FakeRuntime {
+            latest_tag: Some(latest.to_string()),
+            ..FakeRuntime::default()
+        };
+        let outcome = run(argv, tmp.path(), &mut runtime);
+        assert_eq!(plain_lines(&outcome.stdout), [said], "{argv:?} {latest}");
+        match (&runtime.installed, installs) {
+            (Some((tag, asset)), true) => {
+                assert_eq!(tag, latest);
+                assert!(asset.ends_with(".tar.gz"), "asset was {asset}");
+            }
+            (None, false) => {}
+            (installed, _) => panic!("{argv:?} {latest}: installed {installed:?}"),
+        }
+    }
 }
 
 #[test]
@@ -5610,7 +5500,7 @@ fn a_removed_keys_record_is_counted_by_status_and_usage() {
     let usage = run(&["usage"], tmp.path(), &mut runtime);
     assert_eq!(usage.code, 0);
     assert!(
-        usage.stdout.contains("requests 107  (107 ok, 0 failed)\n"),
+        plain_lines(&usage.stdout).contains(&"requests 107 (107 ok, 0 failed)".to_string()),
         "{}",
         usage.stdout
     );
@@ -6033,6 +5923,11 @@ fn plain_status_says_what_each_pool_can_serve() {
     for word in ["requests", "input", "cached", "output", " req"] {
         assert!(!text.contains(word), "status printed {word:?}: {text}");
     }
+    // The pool rows end the output: nothing follows the last one.
+    assert!(
+        lines.last().is_some_and(|line| line.starts_with("groq")),
+        "{text}"
+    );
 }
 
 /// status-is-health AC-1, AC-2, AC-3, rich.
@@ -6082,6 +5977,11 @@ fn rich_status_is_one_health_box() {
         "amber cooldown: {raw:?}"
     );
     assert!(raw.contains("\x1b[2m1 disabled"), "dim disabled: {raw:?}");
+    // The box closes the output.
+    assert!(
+        text.trim_end().ends_with('┘'),
+        "something follows the box: {text}"
+    );
     for line in text.lines() {
         assert_eq!(line.chars().count(), 64, "off the fixed width: {line}");
     }
@@ -6205,7 +6105,7 @@ fn usage_peak_prefers_the_relays_stored_peak() {
 #[test]
 fn plain_usage_ends_with_the_one_block() {
     let text = usage_run(usage_payload(None), Style::Plain);
-    let lines: Vec<&str> = text.lines().collect();
+    let lines = plain_lines(&text);
     // The header opens the output, as the box header does in rich.
     assert_eq!(lines[0], "usage: 2 pools, 2 accounts", "{text}");
     let tail = &lines[lines.len() - 5..];
@@ -6215,7 +6115,7 @@ fn plain_usage_ends_with_the_one_block() {
             "last_30_days 5.5K",
             &format!("peak 45.0K {}", date_back(60)),
             "total 101.5K",
-            "requests 13  (11 ok, 2 failed)",
+            "requests 13 (11 ok, 2 failed)",
             "input 81.0K cached 30.0K (37%) uncached 51.0K output 20.5K",
         ],
         "{text}"
