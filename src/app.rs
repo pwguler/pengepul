@@ -954,6 +954,62 @@ async fn admin_enable(State(state): State<AppState>, headers: HeaderMap, body: B
     admin_toggle(&state, &headers, &body, Toggle::Enable).await
 }
 
+/// The one Pool an admin request's account belongs to: the Pool it names, or the
+/// only Pool holding the id (disable-an-account AC-6).
+async fn resolve_pool<'a>(
+    state: &'a AppState,
+    account: &str,
+    named: Option<&str>,
+) -> Result<(ProviderId, &'a tokio::sync::Mutex<AccountManager>), AppError> {
+    let pools = state.account_managers.pools();
+    if let Some(named) = named
+        && !pools
+            .iter()
+            .any(|(provider, _)| provider.to_string() == named)
+    {
+        // A mistyped `--provider` is the operator's error to fix, not the account's.
+        let known = pools
+            .iter()
+            .map(|(provider, _)| provider.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(AppError::simple(
+            StatusCode::NOT_FOUND,
+            format!("no pool {named}; pools: {known}"),
+        ));
+    }
+    let mut holders = Vec::new();
+    for (provider, manager) in pools {
+        if named.is_some_and(|named| named != provider.to_string()) {
+            continue;
+        }
+        if manager.lock().await.holds(account) {
+            holders.push((provider, manager));
+        }
+    }
+    match holders.len() {
+        0 => Err(AppError::simple(
+            StatusCode::NOT_FOUND,
+            format!(
+                "no account {account} in {}; `pengepul accounts` lists them",
+                named.unwrap_or("any pool")
+            ),
+        )),
+        1 => Ok(holders.remove(0)),
+        _ => {
+            let holding = holders
+                .iter()
+                .map(|(provider, _)| provider.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(AppError::simple(
+                StatusCode::CONFLICT,
+                format!("{account} is in more than one pool ({holding}); name one with --provider"),
+            ))
+        }
+    }
+}
+
 /// Disable or enable one account, found by id across every Pool, or in the one
 /// Pool the body names (disable-an-account AC-6, AC-14). The Pool's lock is held
 /// for the rename, which is what keeps a Refresh from writing the credential back
@@ -980,38 +1036,9 @@ async fn admin_toggle(
         .into_response();
     };
     let named = request.get("provider").and_then(Value::as_str);
-
-    let mut holders = Vec::new();
-    for (provider, manager) in state.account_managers.pools() {
-        if named.is_some_and(|named| named != provider.to_string()) {
-            continue;
-        }
-        if manager.lock().await.holds(account) {
-            holders.push((provider, manager));
-        }
-    }
-    let (provider, manager) = match holders.len() {
-        0 => {
-            let scope = named.map_or_else(String::new, |named| format!(" in {named}"));
-            return AppError::simple(
-                StatusCode::NOT_FOUND,
-                format!("no account {account}{scope}"),
-            )
-            .into_response();
-        }
-        1 => holders.remove(0),
-        _ => {
-            let pools = holders
-                .iter()
-                .map(|(provider, _)| provider.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            return AppError::simple(
-                StatusCode::CONFLICT,
-                format!("{account} is in more than one pool ({pools}); name one with --provider"),
-            )
-            .into_response();
-        }
+    let (provider, manager) = match resolve_pool(state, account, named).await {
+        Ok(pool) => pool,
+        Err(error) => return error.into_response(),
     };
 
     let result = {
@@ -1023,23 +1050,34 @@ async fn admin_toggle(
     };
     match result {
         Ok(outcome) => {
+            let needs_login = matches!(
+                outcome,
+                ToggleOutcome::NeedsLogin
+                    | ToggleOutcome::Enabled { needs_login: true }
+                    | ToggleOutcome::CooldownCleared { needs_login: true }
+            );
             let mut body = json!({
                 "account": account,
                 "provider": provider.to_string(),
                 "outcome": outcome.as_str(),
+                "needs_login": needs_login,
+                "login": login_command(&provider),
             });
             if let ToggleOutcome::Disabled { enabled_left } = outcome {
                 body["enabled_left"] = json!(enabled_left);
             }
             Json(body).into_response()
         }
-        Err(ToggleError::NotFound) => {
-            AppError::simple(StatusCode::NOT_FOUND, format!("no account {account}")).into_response()
-        }
+        Err(ToggleError::NotFound) => AppError::simple(
+            StatusCode::NOT_FOUND,
+            format!("no account {account} in {provider}; `pengepul accounts` lists them"),
+        )
+        .into_response(),
         Err(ToggleError::NoCredential) => AppError::simple(
             StatusCode::CONFLICT,
             format!(
-                "{account}'s credential is gone; run `pengepul login --provider {provider}` to bring it back"
+                "{account}'s credential is gone; run `{}` to bring it back",
+                login_command(&provider)
             ),
         )
         .into_response(),
@@ -1048,6 +1086,16 @@ async fn admin_toggle(
             format!("failed to rename {account}'s credential: {error:#}"),
         )
         .into_response(),
+    }
+}
+
+/// The login that restores an account of this Provider: a configured Provider
+/// holds static keys, which `login` takes only with `--key`.
+fn login_command(provider: &ProviderId) -> String {
+    if provider.kind == ProviderKind::Generic {
+        format!("pengepul login --provider {provider} --key <key>")
+    } else {
+        format!("pengepul login --provider {provider}")
     }
 }
 

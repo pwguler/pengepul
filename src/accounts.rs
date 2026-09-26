@@ -100,12 +100,17 @@ pub enum ToggleOutcome {
         enabled_left: usize,
     },
     AlreadyDisabled,
-    /// A Disabled account put back in the Pool.
-    Enabled,
+    /// A Disabled account put back in the Pool. `needs_login` when it is in
+    /// Reauth, which the rename does not repair.
+    Enabled {
+        needs_login: bool,
+    },
     /// An account on Cooldown made selectable now, its failure streak reset.
-    CooldownCleared,
-    /// The Cooldown is cleared, but the account is in Reauth: only a login
-    /// makes it serve again.
+    CooldownCleared {
+        needs_login: bool,
+    },
+    /// An account in Reauth with no Cooldown to clear (a Pool of one earns
+    /// none, ADR-0027): only a login makes it serve again.
     NeedsLogin,
     AlreadyAvailable,
 }
@@ -116,8 +121,8 @@ impl ToggleOutcome {
         match self {
             Self::Disabled { .. } => "disabled",
             Self::AlreadyDisabled => "already_disabled",
-            Self::Enabled => "enabled",
-            Self::CooldownCleared => "cooldown_cleared",
+            Self::Enabled { .. } => "enabled",
+            Self::CooldownCleared { .. } => "cooldown_cleared",
             Self::NeedsLogin => "needs_login",
             Self::AlreadyAvailable => "already_available",
         }
@@ -646,26 +651,31 @@ impl AccountManager {
                 return Err(ToggleError::NoCredential);
             }
             self.join_rotation(email);
+            let mut needs_login = false;
             if let Some(state) = self.accounts.get_mut(email) {
                 state.cooldown_until = 0.0;
                 state.failure_count = 0;
+                needs_login = state.reauth;
             }
-            return Ok(ToggleOutcome::Enabled);
+            return Ok(ToggleOutcome::Enabled { needs_login });
         }
         let on_cooldown = state.cooldown_until > unix_now();
-        let reauth = state.reauth;
-        if !on_cooldown && !reauth {
-            return Ok(ToggleOutcome::AlreadyAvailable);
+        let needs_login = state.reauth;
+        if !on_cooldown {
+            // Nothing to clear. A Reauth with no Cooldown is a Pool of one
+            // (ADR-0027), and saying "cleared" there would claim an act that
+            // did not happen.
+            return Ok(if needs_login {
+                ToggleOutcome::NeedsLogin
+            } else {
+                ToggleOutcome::AlreadyAvailable
+            });
         }
         if let Some(state) = self.accounts.get_mut(email) {
             state.cooldown_until = 0.0;
             state.failure_count = 0;
         }
-        Ok(if reauth {
-            ToggleOutcome::NeedsLogin
-        } else {
-            ToggleOutcome::CooldownCleared
-        })
+        Ok(ToggleOutcome::CooldownCleared { needs_login })
     }
 
     fn missing(&self, email: &str) -> ToggleError {

@@ -339,7 +339,8 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
-    /// show loaded provider accounts
+    /// show loaded provider accounts, or disable or enable one
+    #[command(args_conflicts_with_subcommands = true)]
     Accounts {
         #[arg(long = "config")]
         command_config: Option<PathBuf>,
@@ -724,14 +725,21 @@ fn toggle_account(
     let config = env.load()?;
     let answer = runtime.toggle_account(&base_url(&config), &first_api_key(&config)?, request)?;
     let text = |key: &str| answer.get(key).and_then(Value::as_str).unwrap_or_default();
-    let (account, provider) = (text("account"), text("provider"));
+    let (account, provider, login) = (text("account"), text("provider"), text("login"));
+    // The relay names the login, because only it knows whether the Pool takes a
+    // static key.
+    let owed = if answer.get("needs_login").and_then(Value::as_bool) == Some(true) {
+        format!("; it still needs `{login}`")
+    } else {
+        String::new()
+    };
     let said = match text("outcome") {
         "disabled" => format!("disabled {account} ({provider})"),
-        "enabled" => format!("enabled {account} ({provider})"),
-        "cooldown_cleared" => format!("cleared {account}'s cooldown ({provider})"),
-        "needs_login" => format!(
-            "cleared {account}'s cooldown ({provider}); it still needs `pengepul login --provider {provider}`"
-        ),
+        "enabled" => format!("enabled {account} ({provider}){owed}"),
+        "cooldown_cleared" => format!("cleared {account}'s cooldown ({provider}){owed}"),
+        "needs_login" => {
+            format!("{account} needs `{login}` ({provider}); enable cannot restore it")
+        }
         "already_available" => format!("{account} is already available ({provider})"),
         "already_disabled" => format!("{account} is already disabled ({provider})"),
         other => bail!("the relay answered an unknown outcome {other:?}"),

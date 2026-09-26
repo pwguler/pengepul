@@ -43,11 +43,11 @@ The state an account enters when its refresh token is itself rejected, where not
 _Avoid_: refresh exhausted, invalid_grant, dead token
 
 **Cooldown**:
-A period during which an account is passed over by rotation, entered on failure and cleared by the next success or by reloading accounts after a fresh login. A Pool that holds one account earns none: a Cooldown hands the next request to a sibling, and with no sibling it would only withhold the account the Pool has (ADR-0027).
+A period during which an account is passed over by rotation, entered on failure and cleared by the next success, by reloading accounts after a fresh login, or by the operator's `pengepul accounts enable`. A Pool that holds one account earns none: a Cooldown hands the next request to a sibling, and with no sibling it would only withhold the account the Pool has (ADR-0027).
 _Avoid_: backoff, lockout, unavailable, cooling down
 
 **Disabled**:
-An Account the operator has taken out of its Pool, held out of Rotation and Failover until the operator enables it again; no success, no reload and no passage of time clears it. Its credential is intact and renamed `<account>.json.disabled` beside the others, which is the whole of the state: it survives restarts, and a fresh `pengepul login` for the account clears it. It is counted and listed like any other Account, printed `disabled`. A Pool whose only enabled Account sits beside Disabled ones is a Pool of one for Cooldown purposes (ADR-0027).
+An Account the operator has taken out of its Pool, held out of Rotation and Failover until the operator enables it again; no success and no passage of time clears it. Its credential is intact and renamed `<account>.json.disabled` beside the others, which is the whole of the state: it survives restarts, and it ends when the operator runs `pengepul accounts enable`, logs the account in afresh, or renames the file back by hand and reloads. It is counted and listed like any other Account, printed `disabled`. A Pool whose only enabled Account sits beside Disabled ones is a Pool of one for Cooldown purposes (ADR-0027).
 _Avoid_: dead, paused, parked, retired, off
 
 **Rotation**:

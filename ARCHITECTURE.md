@@ -172,8 +172,8 @@ in files.
 - **Every route authenticates before it parses a body.** `/health` is the only
   unauthenticated route.
 - **One Account holds exactly one credential**, on disk at `0600` and never
-  elsewhere. **Cooldown** clears only on success, a completed Refresh, or a
-  reload that sees a changed credential.
+  elsewhere. **Cooldown** clears only on success, a completed Refresh, a
+  reload that sees a changed credential, or the operator's `accounts enable`.
 - **The Provider registry is the `config.yaml` `providers:` section**, read at
   startup; there is no database and nothing on the serving path writes it.
   One CLI verb does: `login --base-url` registers a new Provider, and only

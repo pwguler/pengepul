@@ -5097,7 +5097,14 @@ async fn admin_disable_and_enable_toggle_an_account() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         body,
-        json!({"account": "key-1", "provider": "groq", "outcome": "disabled", "enabled_left": 1})
+        json!({
+            "account": "key-1",
+            "provider": "groq",
+            "outcome": "disabled",
+            "enabled_left": 1,
+            "needs_login": false,
+            "login": "pengepul login --provider groq --key <key>"
+        })
     );
     assert_eq!(listed(app.clone(), "groq", "key-1").await["disabled"], true);
 
@@ -5191,18 +5198,30 @@ async fn admin_toggle_resolves_the_provider_from_the_id() {
     );
 
     let (status, body) = toggle(
-        app,
+        app.clone(),
         "disable",
         json!({"account": "nobody"}),
         Some("sk-test"),
     )
     .await;
     assert_eq!(status, 404, "{body}");
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .expect("message")
-            .contains("nobody")
+    assert_eq!(
+        body["error"]["message"],
+        "no account nobody in any pool; `pengepul accounts` lists them"
+    );
+
+    // A mistyped pool is blamed, not the account.
+    let (status, body) = toggle(
+        app,
+        "disable",
+        json!({"account": "shared", "provider": "gorq"}),
+        Some("sk-test"),
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(
+        body["error"]["message"],
+        "no pool gorq; pools: anthropic, codex, grok, cerebras, groq"
     );
 }
 
@@ -5239,7 +5258,8 @@ async fn admin_toggle_refuses_a_record_without_a_credential() {
     assert_eq!(status, 409, "{body}");
     let message = body["error"]["message"].as_str().expect("message");
     assert!(
-        message.contains("pengepul login --provider groq"),
+        // groq holds static keys: the login that restores one needs `--key`.
+        message.contains("pengepul login --provider groq --key <key>"),
         "{message}"
     );
 }

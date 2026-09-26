@@ -2337,7 +2337,7 @@ async fn enable_puts_a_disabled_account_back_in_rotation() {
 
     assert_eq!(
         manager.enable("a@example.com").expect("enable"),
-        ToggleOutcome::Enabled
+        ToggleOutcome::Enabled { needs_login: false }
     );
 
     assert!(pool_dir(tmp.path()).join("a@example.com.json").exists());
@@ -2366,7 +2366,7 @@ async fn enable_clears_a_cooldown_and_the_streak() {
 
     assert_eq!(
         manager.enable("a@example.com").expect("enable"),
-        ToggleOutcome::CooldownCleared
+        ToggleOutcome::CooldownCleared { needs_login: false }
     );
 
     let a = record(&mut manager, "a@example.com");
@@ -2415,9 +2415,40 @@ async fn enable_cannot_repair_a_reauth() {
 
     assert_eq!(
         manager.enable("a@example.com").expect("enable"),
-        ToggleOutcome::NeedsLogin
+        ToggleOutcome::CooldownCleared { needs_login: true }
     );
     assert_eq!(record(&mut manager, "a@example.com")["available"], true);
+}
+
+#[tokio::test]
+async fn enabling_a_disabled_reauth_account_still_owes_a_login() {
+    // AC-5: the rename back does not repair the refresh token.
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = pool_of_two(tmp.path());
+    manager.record_refresh_exhausted("a@example.com", "invalid_grant");
+    manager.disable("a@example.com").expect("disable");
+
+    assert_eq!(
+        manager.enable("a@example.com").expect("enable"),
+        ToggleOutcome::Enabled { needs_login: true }
+    );
+}
+
+#[tokio::test]
+async fn a_lone_reauth_account_has_no_cooldown_to_clear() {
+    // AC-5 with ADR-0027: a Pool of one earns no Cooldown, so there is nothing to
+    // clear, and the outcome must not claim otherwise.
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("a@example.com")).expect("save a");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    manager.record_refresh_exhausted("a@example.com", "invalid_grant");
+    assert_eq!(record(&mut manager, "a@example.com")["cooldownUntil"], 0.0);
+
+    assert_eq!(
+        manager.enable("a@example.com").expect("enable"),
+        ToggleOutcome::NeedsLogin
+    );
 }
 
 #[tokio::test]

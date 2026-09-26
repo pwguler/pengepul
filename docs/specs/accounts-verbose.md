@@ -12,11 +12,12 @@ moves behind a flag.
 
 ## Non-goals
 
-- **No change to what `--verbose` prints.** Its bytes are the pre-change `accounts` output,
-  in both styles.
-- **No change to the account row, the account block, the pool header or the pool footer.**
-- **No change to `status`, `usage`, `GET /admin/accounts` or `usage.json`.** The payload still
-  carries `models`.
+- **`--verbose` adds only the model scope.** Every line it prints outside the model headlines
+  and model blocks is a line the default view prints, in the same order.
+- **No change to the model headline or the model block,** which print as the model scope
+  printed before this change.
+- **No change to `status`, `usage`, `GET /admin/accounts` or `usage.json` from this spec.** The
+  payload still carries `models`.
 - **No hint in the output that models are hidden.** `pengepul help accounts` documents the flag;
   nothing else does.
 - **No short flag other than `-v`, and no other detail hung on it.**
@@ -28,11 +29,10 @@ moves behind a flag.
 - AC-2: `pengepul accounts` in plain style prints no model line and no indented model token
   line for the same payload.
 - AC-3: `pengepul accounts --verbose` and `pengepul accounts -v` print every model headline and
-  model block in both styles, and the model tests that predate this spec pass unchanged except
-  for the flag added to their argv.
-- AC-4: Without the flag, every account row, account block, pool header and pool footer is
-  printed exactly as with it: the default output is the verbose output with the model lines
-  removed.
+  model block in both styles, and the model tests that predate this spec pass with the flag
+  added to their argv.
+- AC-4: The default output is the verbose output with the model lines removed: every account
+  row, account block, pool header and pool footer prints the same with and without the flag.
 - AC-5: `pengepul help accounts` lists `-v, --verbose` with a description naming the per-model
   breakdown.
 - AC-6: `--verbose` combines with `--reload`.

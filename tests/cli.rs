@@ -6281,7 +6281,13 @@ fn toggle_run(
 }
 
 fn answer(outcome: &str) -> Value {
-    json!({"account": "key-1", "provider": "groq", "outcome": outcome})
+    json!({
+        "account": "key-1",
+        "provider": "groq",
+        "outcome": outcome,
+        "needs_login": false,
+        "login": "pengepul login --provider groq --key <key>"
+    })
 }
 
 #[test]
@@ -6318,18 +6324,61 @@ fn disabling_the_last_enabled_account_warns() {
 #[test]
 fn accounts_enable_names_every_outcome() {
     // AC-2, AC-3, AC-4, AC-5
-    for (outcome, said) in [
-        ("enabled", "enabled key-1 (groq)\n"),
-        ("cooldown_cleared", "cleared key-1's cooldown (groq)\n"),
+    let login = "`pengepul login --provider groq --key <key>`";
+    for (outcome, needs_login, said) in [
+        ("enabled", false, "enabled key-1 (groq)\n".to_string()),
+        (
+            "enabled",
+            true,
+            format!("enabled key-1 (groq); it still needs {login}\n"),
+        ),
+        (
+            "cooldown_cleared",
+            false,
+            "cleared key-1's cooldown (groq)\n".to_string(),
+        ),
+        (
+            "cooldown_cleared",
+            true,
+            format!("cleared key-1's cooldown (groq); it still needs {login}\n"),
+        ),
         (
             "needs_login",
-            "cleared key-1's cooldown (groq); it still needs `pengepul login --provider groq`\n",
+            true,
+            format!("key-1 needs {login} (groq); enable cannot restore it\n"),
         ),
-        ("already_available", "key-1 is already available (groq)\n"),
-        ("already_disabled", "key-1 is already disabled (groq)\n"),
+        (
+            "already_available",
+            false,
+            "key-1 is already available (groq)\n".to_string(),
+        ),
+        (
+            "already_disabled",
+            false,
+            "key-1 is already disabled (groq)\n".to_string(),
+        ),
     ] {
-        let (_, run) = toggle_run(&["accounts", "enable", "key-1"], Ok(answer(outcome)));
-        assert_eq!(run.expect(outcome).stdout, said, "{outcome}");
+        let mut body = answer(outcome);
+        body["needs_login"] = json!(needs_login);
+        let (_, run) = toggle_run(&["accounts", "enable", "key-1"], Ok(body));
+        assert_eq!(run.expect(outcome).stdout, said, "{outcome} {needs_login}");
+    }
+}
+
+#[test]
+fn accounts_list_flags_do_not_ride_on_a_toggle() {
+    // `--reload` and `-v` mean nothing to disable/enable; accepting them silently
+    // would let an operator believe a reload happened.
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    for argv in [
+        &["accounts", "--reload", "disable", "key-1"][..],
+        &["accounts", "-v", "enable", "key-1"][..],
+    ] {
+        let mut runtime = FakeRuntime::default();
+        let message = run_err(argv, tmp.path(), &mut runtime);
+        assert!(message.contains("cannot be used"), "{argv:?}: {message}");
+        assert!(runtime.calls.is_empty(), "{argv:?} reached the relay");
     }
 }
 

@@ -902,8 +902,8 @@ fn reasoning_fact(reasoning: i64, output: i64, colour: &str) -> Fact {
     )
 }
 
-/// The account's token block, on the same rows as every other scope (ADR-0024).
-/// An account's block: when it last served (last-ok), then its token block.
+/// An account's block: when it last served (last-ok), then its token block on
+/// the same rows as every other scope (ADR-0024).
 pub(crate) fn account_detail_facts(account: &Value, now: f64) -> Vec<Fact> {
     let last_ok =
         last_ok_age(account, now).map_or_else(|| "never".to_string(), |age| format!("{age} ago"));
