@@ -19,7 +19,9 @@ use futures_util::{Stream, StreamExt, TryStreamExt};
 use serde_json::{Value, json};
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::accounts::{AccountManager, RefreshPolicy, RefreshPolicyKind};
+use crate::accounts::{
+    AccountManager, RefreshPolicy, RefreshPolicyKind, ToggleError, ToggleOutcome,
+};
 use crate::cloaking_versions::{CliVersions, codex_release, effective, npm_latest};
 use crate::config::{BodyLimit, Config};
 use crate::masquerade::{masquerade_request, restore_tool_use_names};
@@ -137,6 +139,23 @@ struct AccountManagers {
     codex: tokio::sync::Mutex<AccountManager>,
     grok: tokio::sync::Mutex<AccountManager>,
     generic: BTreeMap<String, tokio::sync::Mutex<AccountManager>>,
+}
+
+impl AccountManagers {
+    /// Every Pool with the Provider it serves, built-ins first.
+    fn pools(&self) -> Vec<(ProviderId, &tokio::sync::Mutex<AccountManager>)> {
+        let mut pools = vec![
+            (ProviderId::anthropic(), &self.anthropic),
+            (ProviderId::codex(), &self.codex),
+            (ProviderId::grok(), &self.grok),
+        ];
+        pools.extend(
+            self.generic
+                .iter()
+                .map(|(id, manager)| (ProviderId::generic(id.as_str()), manager)),
+        );
+        pools
+    }
 }
 
 #[derive(Clone)]
@@ -598,6 +617,8 @@ pub fn create_app_with_upstream(config: Config, upstream: Arc<dyn UpstreamClient
         .route("/health", get(health))
         .route("/admin/accounts", get(admin_accounts))
         .route("/admin/reload", post(admin_reload))
+        .route("/admin/accounts/disable", post(admin_disable))
+        .route("/admin/accounts/enable", post(admin_enable))
         .nest("/v1", api.clone())
         .nest("/v1/v1", api)
         .with_state(state)
@@ -917,6 +938,117 @@ async fn admin_accounts(State(state): State<AppState>, headers: HeaderMap) -> Re
 /// exists to prevent (usage-after-removal).
 fn provider_entry(accounts: &[Value]) -> Value {
     json!({"account_count": accounts.len(), "accounts": accounts})
+}
+
+#[derive(Clone, Copy)]
+enum Toggle {
+    Disable,
+    Enable,
+}
+
+async fn admin_disable(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    admin_toggle(&state, &headers, &body, Toggle::Disable).await
+}
+
+async fn admin_enable(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    admin_toggle(&state, &headers, &body, Toggle::Enable).await
+}
+
+/// Disable or enable one account, found by id across every Pool, or in the one
+/// Pool the body names (disable-an-account AC-6, AC-14). The Pool's lock is held
+/// for the rename, which is what keeps a Refresh from writing the credential back
+/// under it (AC-13).
+async fn admin_toggle(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &[u8],
+    toggle: Toggle,
+) -> Response {
+    if let Err(error) = require_api_key(state, headers, false) {
+        return error.into_response();
+    }
+    let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    let Some(account) = request
+        .get("account")
+        .and_then(Value::as_str)
+        .filter(|account| !account.is_empty())
+    else {
+        return AppError::simple(
+            StatusCode::BAD_REQUEST,
+            "the body must be JSON naming an `account`",
+        )
+        .into_response();
+    };
+    let named = request.get("provider").and_then(Value::as_str);
+
+    let mut holders = Vec::new();
+    for (provider, manager) in state.account_managers.pools() {
+        if named.is_some_and(|named| named != provider.to_string()) {
+            continue;
+        }
+        if manager.lock().await.holds(account) {
+            holders.push((provider, manager));
+        }
+    }
+    let (provider, manager) = match holders.len() {
+        0 => {
+            let scope = named.map_or_else(String::new, |named| format!(" in {named}"));
+            return AppError::simple(
+                StatusCode::NOT_FOUND,
+                format!("no account {account}{scope}"),
+            )
+            .into_response();
+        }
+        1 => holders.remove(0),
+        _ => {
+            let pools = holders
+                .iter()
+                .map(|(provider, _)| provider.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return AppError::simple(
+                StatusCode::CONFLICT,
+                format!("{account} is in more than one pool ({pools}); name one with --provider"),
+            )
+            .into_response();
+        }
+    };
+
+    let result = {
+        let mut manager = manager.lock().await;
+        match toggle {
+            Toggle::Disable => manager.disable(account),
+            Toggle::Enable => manager.enable(account),
+        }
+    };
+    match result {
+        Ok(outcome) => {
+            let mut body = json!({
+                "account": account,
+                "provider": provider.to_string(),
+                "outcome": outcome.as_str(),
+            });
+            if let ToggleOutcome::Disabled { enabled_left } = outcome {
+                body["enabled_left"] = json!(enabled_left);
+            }
+            Json(body).into_response()
+        }
+        Err(ToggleError::NotFound) => {
+            AppError::simple(StatusCode::NOT_FOUND, format!("no account {account}")).into_response()
+        }
+        Err(ToggleError::NoCredential) => AppError::simple(
+            StatusCode::CONFLICT,
+            format!(
+                "{account}'s credential is gone; run `pengepul login --provider {provider}` to bring it back"
+            ),
+        )
+        .into_response(),
+        Err(ToggleError::Io(error)) => AppError::simple(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to rename {account}'s credential: {error:#}"),
+        )
+        .into_response(),
+    }
 }
 
 async fn admin_reload(State(state): State<AppState>, headers: HeaderMap) -> Response {

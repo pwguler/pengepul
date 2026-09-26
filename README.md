@@ -167,6 +167,7 @@ pengepul login --provider groq --key $KEY # save a static key for a configured p
 pengepul login --provider groq --base-url $URL --key $KEY # register a new OpenAI-compatible provider and save its key
 pengepul status # health of the running relay
 pengepul accounts # loaded accounts (-v per model, --reload re-reads from disk)
+pengepul accounts disable|enable <id> # take an account out of its pool, or put it back and clear its cooldown
 pengepul usage # the last 30 days of tokens, as a sparkline
 pengepul update # install the most recent release (--check only reports)
 pengepul config path|show|api-key # show the config path, contents, or a key
@@ -181,7 +182,8 @@ Run `pengepul <command> --help` for flags. The service is user-scoped, so
 
 Routes: `POST /v1/messages`, `POST /v1/chat/completions`, `POST /v1/responses`,
 `POST /v1/messages/count_tokens`, `GET /v1/models`, `GET /admin/accounts`,
-`POST /admin/reload`, and `GET /health` (unauthenticated). Every route but `/health` needs
+`POST /admin/reload`, `POST /admin/accounts/disable`, `POST /admin/accounts/enable`, and
+`GET /health` (unauthenticated). Every route but `/health` needs
 the local API key, sent as `Authorization: Bearer <key>` or `x-api-key: <key>`.
 
 pengepul writes `~/.pengepul/config.yaml` when missing, with a fresh `sk-local-…` key. The

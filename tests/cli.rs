@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use pengepul::cli::{
-    CliRuntime, LaunchPlan, ModelChoice, RunOutcome, ServiceInstallRequest, Style, run_with_env,
+    AccountToggle, CliRuntime, LaunchPlan, ModelChoice, RunOutcome, ServiceInstallRequest, Style,
+    run_with_env,
 };
 use pengepul::config::Config;
 use pengepul::types::ProviderId;
@@ -44,6 +45,9 @@ struct FakeRuntime {
     picks: Option<usize>,
     offered: Option<Vec<ModelChoice>>,
     picker_harness: Option<String>,
+    /// What the relay answers `accounts disable|enable`: a body, or the
+    /// message of a refusal.
+    toggle_answer: Option<Result<Value, String>>,
 }
 
 impl CliRuntime for FakeRuntime {
@@ -134,6 +138,28 @@ impl CliRuntime for FakeRuntime {
     fn reload_accounts(&mut self, base_url: &str, api_key: &str) -> Result<Value> {
         self.calls.push(format!("reload:{base_url}:{api_key}"));
         Ok(json!({"reloaded": {"anthropic": {"added": [], "updated": [], "unchanged": []}}}))
+    }
+
+    fn toggle_account(
+        &mut self,
+        base_url: &str,
+        api_key: &str,
+        request: &AccountToggle,
+    ) -> Result<Value> {
+        self.calls.push(format!(
+            "toggle:{base_url}:{api_key}:{}:{}:{}",
+            request.action,
+            request.account,
+            request.provider.as_deref().unwrap_or("-")
+        ));
+        match self
+            .toggle_answer
+            .clone()
+            .expect("the test sets a toggle answer")
+        {
+            Ok(body) => Ok(body),
+            Err(message) => Err(anyhow::anyhow!(message)),
+        }
     }
 
     fn install_service(&mut self, request: ServiceInstallRequest) -> Result<PathBuf> {
@@ -6229,5 +6255,146 @@ fn last_ok_ends_the_plain_account_line() {
             line("garbled@x.com").ends_with(" last_ok=never"),
             "{argv:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// disable-an-account: the verbs
+// ---------------------------------------------------------------------------
+
+fn toggle_run(
+    argv: &[&str],
+    answer: Result<Value, String>,
+) -> (FakeRuntime, Result<RunOutcome, String>) {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        toggle_answer: Some(answer),
+        ..FakeRuntime::default()
+    };
+    let outcome = match run_with_env(argv, tmp.path(), tmp.path(), &mut runtime, Style::Plain) {
+        Ok(outcome) if outcome.code == 0 => Ok(outcome),
+        Ok(outcome) => Err(outcome.stderr),
+        Err(error) => Err(format!("{error:#}")),
+    };
+    (runtime, outcome)
+}
+
+fn answer(outcome: &str) -> Value {
+    json!({"account": "key-1", "provider": "groq", "outcome": outcome})
+}
+
+#[test]
+fn accounts_disable_asks_the_relay_and_says_what_it_did() {
+    // AC-1, AC-14
+    let mut body = answer("disabled");
+    body["enabled_left"] = json!(1);
+    let (runtime, outcome) = toggle_run(&["accounts", "disable", "key-1"], Ok(body));
+    let outcome = outcome.expect("disable");
+
+    assert_eq!(
+        runtime.calls,
+        ["toggle:http://127.0.0.1:8317:sk-test:disable:key-1:-"]
+    );
+    assert_eq!(outcome.stdout, "disabled key-1 (groq)\n");
+    assert_eq!(outcome.stderr, "", "no warning while an account is left");
+}
+
+#[test]
+fn disabling_the_last_enabled_account_warns() {
+    // AC-7
+    let mut body = answer("disabled");
+    body["enabled_left"] = json!(0);
+    let (_, outcome) = toggle_run(&["accounts", "disable", "key-1"], Ok(body));
+    let outcome = outcome.expect("disable succeeds");
+
+    assert_eq!(outcome.stdout, "disabled key-1 (groq)\n");
+    assert_eq!(
+        outcome.stderr,
+        "warning: groq has no enabled account; its requests fail until one is enabled\n"
+    );
+}
+
+#[test]
+fn accounts_enable_names_every_outcome() {
+    // AC-2, AC-3, AC-4, AC-5
+    for (outcome, said) in [
+        ("enabled", "enabled key-1 (groq)\n"),
+        ("cooldown_cleared", "cleared key-1's cooldown (groq)\n"),
+        (
+            "needs_login",
+            "cleared key-1's cooldown (groq); it still needs `pengepul login --provider groq`\n",
+        ),
+        ("already_available", "key-1 is already available (groq)\n"),
+        ("already_disabled", "key-1 is already disabled (groq)\n"),
+    ] {
+        let (_, run) = toggle_run(&["accounts", "enable", "key-1"], Ok(answer(outcome)));
+        assert_eq!(run.expect(outcome).stdout, said, "{outcome}");
+    }
+}
+
+#[test]
+fn accounts_toggle_passes_the_named_provider() {
+    // AC-6
+    let (runtime, outcome) = toggle_run(
+        &["accounts", "enable", "shared", "--provider", "groq"],
+        Ok(answer("enabled")),
+    );
+    outcome.expect("enable");
+    assert_eq!(
+        runtime.calls,
+        ["toggle:http://127.0.0.1:8317:sk-test:enable:shared:groq"]
+    );
+}
+
+#[test]
+fn accounts_toggle_fails_with_the_relays_refusal() {
+    // AC-5, AC-6: the relay's message reaches the operator, and the exit is non-zero.
+    let refusal = "shared is in more than one pool (cerebras, groq); name one with --provider";
+    let (_, outcome) = toggle_run(&["accounts", "disable", "shared"], Err(refusal.to_string()));
+    let message = outcome.expect_err("a refusal exits non-zero");
+    assert!(message.contains(refusal), "{message}");
+}
+
+/// disable-an-account AC-11: the row names the state in both styles, and the
+/// Pool's available count leaves it out.
+#[test]
+fn a_disabled_account_reads_disabled() {
+    let payload = json!({
+        "providers": {
+            "groq": {
+                "account_count": 2,
+                "accounts": [
+                    {"email": "key-1", "available": false, "disabled": true,
+                     "cooldownUntil": 0.0, "failureCount": 0},
+                    {"email": "key-2", "available": true, "disabled": false,
+                     "cooldownUntil": 0.0, "failureCount": 0}
+                ]
+            }
+        }
+    });
+    for style in [Style::Plain, Style::Rich] {
+        let tmp = tempdir().expect("tempdir");
+        write_config(tmp.path(), "127.0.0.1", 8317);
+        let mut runtime = FakeRuntime {
+            rich: style == Style::Rich,
+            accounts_payload: Some(payload.clone()),
+            ..FakeRuntime::default()
+        };
+        let visible = strip_ansi(&run_style(&["accounts"], tmp.path(), &mut runtime, style).stdout);
+        let row = visible
+            .lines()
+            .find(|line| line.contains("key-1"))
+            .unwrap_or_else(|| panic!("key-1 missing: {visible}"));
+        match style {
+            Style::Plain => {
+                assert!(row.starts_with("  key-1 disabled failures=0"), "{row}");
+                assert!(visible.contains("groq: 2 accounts"), "{visible}");
+            }
+            Style::Rich => {
+                assert!(row.contains("● disabled"), "{row}");
+                assert!(visible.contains("2 accounts, 1 available"), "{visible}");
+            }
+        }
     }
 }

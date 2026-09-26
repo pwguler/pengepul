@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -33,6 +34,16 @@ pub struct ServiceInstallRequest {
     pub port: Option<u16>,
     pub start: bool,
     pub enable: bool,
+}
+
+/// One `accounts disable|enable` request to the relay (disable-an-account).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountToggle {
+    /// `disable` or `enable`: the admin route it posts to.
+    pub action: &'static str,
+    pub account: String,
+    /// The Pool, when the operator named one.
+    pub provider: Option<String>,
 }
 
 /// The process `launch` becomes: the harness binary, its arguments, and the
@@ -105,6 +116,19 @@ pub trait CliRuntime {
     ///
     /// Returns an error if the admin request fails.
     fn reload_accounts(&mut self, base_url: &str, api_key: &str) -> Result<Value>;
+
+    /// Disable or enable one account on the running relay.
+    ///
+    /// # Errors
+    ///
+    /// Returns the relay's own message when it refuses, or an error if the
+    /// request fails.
+    fn toggle_account(
+        &mut self,
+        base_url: &str,
+        api_key: &str,
+        request: &AccountToggle,
+    ) -> Result<Value>;
 
     /// Install the user service.
     ///
@@ -230,6 +254,43 @@ struct Args {
 }
 
 #[derive(Debug, Subcommand)]
+enum AccountsCommand {
+    /// take an account out of its pool until it is enabled
+    Disable {
+        /// the account's email or key label
+        account: String,
+        /// the pool, when the id is in more than one
+        #[arg(long)]
+        provider: Option<String>,
+    },
+    /// put a disabled account back in its pool, or clear its cooldown
+    Enable {
+        /// the account's email or key label
+        account: String,
+        /// the pool, when the id is in more than one
+        #[arg(long)]
+        provider: Option<String>,
+    },
+}
+
+impl From<AccountsCommand> for AccountToggle {
+    fn from(command: AccountsCommand) -> Self {
+        match command {
+            AccountsCommand::Disable { account, provider } => Self {
+                action: "disable",
+                account,
+                provider,
+            },
+            AccountsCommand::Enable { account, provider } => Self {
+                action: "enable",
+                account,
+                provider,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
 enum Command {
     /// start the API relay
     Serve {
@@ -287,6 +348,8 @@ enum Command {
         /// show each account's per-model breakdown
         #[arg(short, long)]
         verbose: bool,
+        #[command(subcommand)]
+        action: Option<AccountsCommand>,
     },
     /// show the last 30 days of token usage
     Usage {
@@ -427,9 +490,11 @@ pub fn run_with_env(
             command_config,
             reload,
             verbose,
+            action,
         }) => {
             accounts(
                 root_env.with_override(command_config.as_deref()),
+                action,
                 reload,
                 verbose,
                 runtime,
@@ -622,12 +687,16 @@ fn status(
 
 fn accounts(
     env: CommandEnv<'_>,
+    action: Option<AccountsCommand>,
     reload: bool,
     verbose: bool,
     runtime: &mut impl CliRuntime,
     output: &mut Output,
     style: Style,
 ) -> Result<()> {
+    if let Some(action) = action {
+        return toggle_account(env, &action.into(), runtime, output);
+    }
     let config = env.load()?;
     let base_url = base_url(&config);
     let api_key = first_api_key(&config)?;
@@ -640,6 +709,40 @@ fn accounts(
     match style {
         Style::Plain => print_accounts(&accounts, output, now, verbose),
         Style::Rich => print_pool_rich(&accounts, output, now, verbose),
+    }
+    Ok(())
+}
+
+/// `accounts disable|enable`: the relay renames the credential and answers
+/// with what it did; this says it in one line (disable-an-account).
+fn toggle_account(
+    env: CommandEnv<'_>,
+    request: &AccountToggle,
+    runtime: &mut impl CliRuntime,
+    output: &mut Output,
+) -> Result<()> {
+    let config = env.load()?;
+    let answer = runtime.toggle_account(&base_url(&config), &first_api_key(&config)?, request)?;
+    let text = |key: &str| answer.get(key).and_then(Value::as_str).unwrap_or_default();
+    let (account, provider) = (text("account"), text("provider"));
+    let said = match text("outcome") {
+        "disabled" => format!("disabled {account} ({provider})"),
+        "enabled" => format!("enabled {account} ({provider})"),
+        "cooldown_cleared" => format!("cleared {account}'s cooldown ({provider})"),
+        "needs_login" => format!(
+            "cleared {account}'s cooldown ({provider}); it still needs `pengepul login --provider {provider}`"
+        ),
+        "already_available" => format!("{account} is already available ({provider})"),
+        "already_disabled" => format!("{account} is already disabled ({provider})"),
+        other => bail!("the relay answered an unknown outcome {other:?}"),
+    };
+    output.line(&said);
+    if answer.get("enabled_left").and_then(Value::as_u64) == Some(0) {
+        writeln!(
+            output.stderr,
+            "warning: {provider} has no enabled account; its requests fail until one is enabled"
+        )
+        .expect("write to String cannot fail");
     }
     Ok(())
 }

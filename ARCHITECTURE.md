@@ -190,6 +190,13 @@ in files.
   view that counts or lists accounts, where it reads as an account that cannot
   serve: no Cooldown, no failure, `available: false`. Rotation never hands it out,
   and re-adding the same key resumes its counters.
+- **Disabled is a file name, not a flag.** `accounts disable` renames the credential
+  `<id>.json.disabled`; the loader reads both names, so the state survives a restart with no
+  second store to drift from the directory, and a reload mirrors whatever the operator renamed
+  by hand. A Disabled account stays in the manager's map, so an outcome in flight is still
+  booked, but never in the rotation order, which is what Rotation, affinity, Failover's budget
+  and the pool-of-one rule (ADR-0027) all read. `save_token` removes the twin, so a login
+  enables.
 - **A counter counts outcomes, never attempts.** Every recorder settles
   through one private seam (`AccountState::settle`), which increments
   `requests` in the same call that increments `successes` or `failures`,

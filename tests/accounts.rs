@@ -2,7 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use pengepul::accounts::{AccountManager, RefreshPolicy, RefreshPolicyKind};
+use pengepul::accounts::{
+    AccountManager, RefreshPolicy, RefreshPolicyKind, ToggleError, ToggleOutcome,
+};
 use pengepul::tokens::save_token;
 use pengepul::types::{ProviderId, RefreshTokenExhaustedError, TokenData, UsageData};
 use serde_json::{Value, json};
@@ -2262,4 +2264,336 @@ async fn a_usage_file_without_last_ok_loads_and_gains_it_on_success() {
 
     manager.record_success("a@example.com", None, "deepseek-v4.1-flash");
     assert!(persisted(&usage_path)["a@example.com"]["last_success_at"].is_string());
+}
+
+// ---------------------------------------------------------------------------
+// disable-an-account
+// ---------------------------------------------------------------------------
+
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs_f64()
+}
+
+/// A commandcode Pool of `a@example.com` and `b@example.com`, loaded.
+fn pool_of_two(auth_dir: &Path) -> AccountManager {
+    save_token(auth_dir, &static_token("a@example.com")).expect("save a");
+    save_token(auth_dir, &static_token("b@example.com")).expect("save b");
+    let mut manager = never_refresh_manager(auth_dir.to_path_buf());
+    manager.load().expect("load");
+    manager
+}
+
+fn pool_dir(auth_dir: &Path) -> PathBuf {
+    auth_dir.join("commandcode")
+}
+
+/// The emails Rotation hands out over `turns` requests.
+fn served(manager: &mut AccountManager, turns: usize) -> Vec<String> {
+    (0..turns)
+        .filter_map(|_| manager.next_account())
+        .map(|account| account.token.email)
+        .collect()
+}
+
+#[tokio::test]
+async fn disable_renames_the_credential_and_rotation_skips_it() {
+    // AC-1, AC-11
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = pool_of_two(tmp.path());
+    manager.record_success("a@example.com", None, "deepseek-v4.1-flash");
+
+    assert_eq!(
+        manager.disable("a@example.com").expect("disable"),
+        ToggleOutcome::Disabled { enabled_left: 1 }
+    );
+
+    assert!(!pool_dir(tmp.path()).join("a@example.com.json").exists());
+    assert!(
+        pool_dir(tmp.path())
+            .join("a@example.com.json.disabled")
+            .exists()
+    );
+    assert_eq!(served(&mut manager, 4), ["b@example.com"; 4]);
+    let a = record(&mut manager, "a@example.com");
+    assert_eq!(a["disabled"], true);
+    assert_eq!(a["available"], false);
+    assert_eq!(
+        a["totalSuccesses"], 1,
+        "a disabled account keeps its counters"
+    );
+    assert!(a["lastSuccessAt"].is_string());
+    assert_eq!(record(&mut manager, "b@example.com")["disabled"], false);
+}
+
+#[tokio::test]
+async fn enable_puts_a_disabled_account_back_in_rotation() {
+    // AC-2
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = pool_of_two(tmp.path());
+    manager.disable("a@example.com").expect("disable");
+
+    assert_eq!(
+        manager.enable("a@example.com").expect("enable"),
+        ToggleOutcome::Enabled
+    );
+
+    assert!(pool_dir(tmp.path()).join("a@example.com.json").exists());
+    assert!(
+        !pool_dir(tmp.path())
+            .join("a@example.com.json.disabled")
+            .exists()
+    );
+    let mut turns = served(&mut manager, 4);
+    turns.sort();
+    turns.dedup();
+    assert_eq!(turns, ["a@example.com", "b@example.com"]);
+    assert_eq!(record(&mut manager, "a@example.com")["disabled"], false);
+}
+
+#[tokio::test]
+async fn enable_clears_a_cooldown_and_the_streak() {
+    // AC-3
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = pool_of_two(tmp.path());
+    manager.record_success("a@example.com", None, "deepseek-v4.1-flash");
+    for _ in 0..4 {
+        manager.record_failure("a@example.com", "network", None);
+    }
+    assert_eq!(record(&mut manager, "a@example.com")["available"], false);
+
+    assert_eq!(
+        manager.enable("a@example.com").expect("enable"),
+        ToggleOutcome::CooldownCleared
+    );
+
+    let a = record(&mut manager, "a@example.com");
+    assert_eq!(a["available"], true);
+    assert_eq!(a["cooldownUntil"], 0.0);
+    assert!(served(&mut manager, 2).contains(&"a@example.com".to_string()));
+    // The streak is reset: the next failure earns the base second, not 16.
+    manager.record_failure("a@example.com", "network", None);
+    let remaining = record(&mut manager, "a@example.com")["cooldownUntil"]
+        .as_f64()
+        .expect("cooldownUntil")
+        - unix_now();
+    assert!(remaining <= 1.0, "streak survived enable: {remaining}s");
+}
+
+#[tokio::test]
+async fn toggling_into_the_state_already_held_touches_nothing() {
+    // AC-4
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = pool_of_two(tmp.path());
+
+    assert_eq!(
+        manager.enable("a@example.com").expect("enable"),
+        ToggleOutcome::AlreadyAvailable
+    );
+    manager.disable("a@example.com").expect("disable");
+    assert_eq!(
+        manager.disable("a@example.com").expect("disable again"),
+        ToggleOutcome::AlreadyDisabled
+    );
+    assert!(
+        pool_dir(tmp.path())
+            .join("a@example.com.json.disabled")
+            .exists()
+    );
+    assert!(!pool_dir(tmp.path()).join("a@example.com.json").exists());
+}
+
+#[tokio::test]
+async fn enable_cannot_repair_a_reauth() {
+    // AC-5: the cooldown clears, and the outcome says a login is still owed.
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = pool_of_two(tmp.path());
+    manager.record_refresh_exhausted("a@example.com", "invalid_grant");
+    assert_eq!(record(&mut manager, "a@example.com")["available"], false);
+
+    assert_eq!(
+        manager.enable("a@example.com").expect("enable"),
+        ToggleOutcome::NeedsLogin
+    );
+    assert_eq!(record(&mut manager, "a@example.com")["available"], true);
+}
+
+#[tokio::test]
+async fn a_record_without_a_credential_cannot_be_toggled() {
+    // AC-5
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = pool_of_two(tmp.path());
+    manager.record_success("a@example.com", None, "deepseek-v4.1-flash");
+    fs::remove_file(pool_dir(tmp.path()).join("a@example.com.json")).expect("remove");
+    let mut manager = {
+        drop(manager);
+        let mut restarted = never_refresh_manager(tmp.path().to_path_buf());
+        restarted.load().expect("load");
+        restarted
+    };
+
+    assert!(manager.holds("a@example.com"));
+    assert!(matches!(
+        manager.enable("a@example.com"),
+        Err(ToggleError::NoCredential)
+    ));
+    assert!(matches!(
+        manager.disable("a@example.com"),
+        Err(ToggleError::NoCredential)
+    ));
+    assert!(!manager.holds("nobody@example.com"));
+    assert!(matches!(
+        manager.disable("nobody@example.com"),
+        Err(ToggleError::NotFound)
+    ));
+}
+
+#[tokio::test]
+async fn disabling_the_last_enabled_account_reports_none_left() {
+    // AC-7
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = pool_of_two(tmp.path());
+    manager.disable("a@example.com").expect("disable a");
+
+    assert_eq!(
+        manager.disable("b@example.com").expect("disable b"),
+        ToggleOutcome::Disabled { enabled_left: 0 }
+    );
+    assert!(manager.next_account().is_none());
+    assert_eq!(manager.account_count(), 0, "the serving count");
+    assert_eq!(manager.snapshots().len(), 2, "both still listed");
+}
+
+#[tokio::test]
+async fn disabled_survives_a_restart() {
+    // AC-8
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = pool_of_two(tmp.path());
+    manager.disable("a@example.com").expect("disable");
+    drop(manager);
+
+    let mut restarted = never_refresh_manager(tmp.path().to_path_buf());
+    restarted.load().expect("load");
+
+    assert_eq!(record(&mut restarted, "a@example.com")["disabled"], true);
+    assert_eq!(served(&mut restarted, 4), ["b@example.com"; 4]);
+}
+
+#[tokio::test]
+async fn a_fresh_login_enables_a_disabled_account() {
+    // AC-9: login writes `<id>.json` through save_token, which drops the twin.
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = pool_of_two(tmp.path());
+    manager.disable("a@example.com").expect("disable");
+
+    save_token(tmp.path(), &static_token("a@example.com")).expect("login");
+
+    assert!(
+        !pool_dir(tmp.path())
+            .join("a@example.com.json.disabled")
+            .exists()
+    );
+    manager.reload().expect("reload");
+    assert_eq!(record(&mut manager, "a@example.com")["disabled"], false);
+    let mut turns = served(&mut manager, 4);
+    turns.sort();
+    turns.dedup();
+    assert_eq!(turns, ["a@example.com", "b@example.com"]);
+}
+
+#[tokio::test]
+async fn reload_reconciles_the_pool_with_its_directory() {
+    // AC-10
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("c@example.com")).expect("save c");
+    let mut manager = pool_of_two(tmp.path());
+    manager.record_success("b@example.com", None, "deepseek-v4.1-flash");
+    let dir = pool_dir(tmp.path());
+
+    // By hand: a is renamed to disabled, b's credential is deleted outright.
+    fs::rename(
+        dir.join("a@example.com.json"),
+        dir.join("a@example.com.json.disabled"),
+    )
+    .expect("rename a");
+    fs::remove_file(dir.join("b@example.com.json")).expect("remove b");
+    manager.reload().expect("reload");
+
+    assert_eq!(record(&mut manager, "a@example.com")["disabled"], true);
+    let b = record(&mut manager, "b@example.com");
+    assert_eq!(b["disabled"], false, "a removed credential is not Disabled");
+    assert_eq!(b["available"], false);
+    assert_eq!(
+        b["totalSuccesses"], 1,
+        "the removed record kept its counters"
+    );
+    assert_eq!(served(&mut manager, 4), ["c@example.com"; 4]);
+    assert!(matches!(
+        manager.enable("b@example.com"),
+        Err(ToggleError::NoCredential)
+    ));
+    // The record is carried in the file, not only in memory.
+    manager.record_success("c@example.com", None, "deepseek-v4.1-flash");
+    assert_eq!(
+        persisted(&dir.join("usage.json"))["b@example.com"]["total_successes"],
+        1
+    );
+}
+
+#[tokio::test]
+async fn one_enabled_account_beside_disabled_ones_earns_no_cooldown() {
+    // AC-12 (ADR-0027)
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = pool_of_two(tmp.path());
+    manager.disable("b@example.com").expect("disable b");
+
+    manager.record_failure("a@example.com", "network", None);
+
+    assert_eq!(record(&mut manager, "a@example.com")["cooldownUntil"], 0.0);
+    assert_eq!(served(&mut manager, 1), ["a@example.com"]);
+}
+
+#[tokio::test]
+async fn a_refresh_cannot_recreate_a_disabled_credential() {
+    // AC-13
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = refreshing_codex_manager(tmp.path());
+    manager.disable("bob@example.com").expect("disable");
+
+    let _ = manager.refresh_account("bob@example.com").await;
+
+    let dir = tmp.path().join("codex");
+    assert!(
+        !dir.join("bob@example.com.json").exists(),
+        "refresh re-enabled it"
+    );
+    assert!(dir.join("bob@example.com.json.disabled").exists());
+}
+
+#[tokio::test]
+async fn a_request_in_flight_on_a_disabled_account_is_still_counted() {
+    // AC-1: in flight completes, and its outcome is booked.
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = pool_of_two(tmp.path());
+    let held = manager.account_for("conversation").expect_account();
+    manager.disable(&held).expect("disable");
+
+    manager.record_success(&held, None, "deepseek-v4.1-flash");
+
+    assert_eq!(record(&mut manager, &held)["totalSuccesses"], 1);
+    // And the conversation's affinity falls through to the sibling.
+    let next = manager.account_for("conversation").expect_account();
+    assert_ne!(next, held);
+}
+
+trait ExpectAccount {
+    fn expect_account(self) -> String;
+}
+
+impl ExpectAccount for pengepul::accounts::AccountResult {
+    fn expect_account(self) -> String {
+        self.account.expect("an account").token.email
+    }
 }

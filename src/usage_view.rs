@@ -64,7 +64,9 @@ pub(crate) fn print_accounts(payload: &Value, output: &mut Output, now: f64, ver
                 .get("failureCount")
                 .and_then(Value::as_i64)
                 .unwrap_or(0);
-            let state = if account
+            let state = if is_disabled(account) {
+                "disabled".to_string()
+            } else if account
                 .get("available")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
@@ -187,6 +189,14 @@ pub(crate) fn ok_cell(ok: i64) -> String {
         format!("{} ok", format_count(ok))
     };
     pad(&text, OK_WIDTH)
+}
+
+/// Whether the operator took the account out of its Pool (disable-an-account).
+fn is_disabled(account: &Value) -> bool {
+    account
+        .get("disabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 pub(crate) fn glyph(available: bool, on_cooldown: bool) -> String {
@@ -718,8 +728,13 @@ pub(crate) fn account_row(account: &Value, pool_total: i64, now: f64) -> String 
         .and_then(Value::as_f64)
         .unwrap_or(0.0);
     let raw_cooldown = cooldown_label(now, until);
-    let on_cooldown = !is_available && !raw_cooldown.is_empty();
-    let label = if is_available {
+    let disabled = is_disabled(account);
+    let on_cooldown = !is_available && !disabled && !raw_cooldown.is_empty();
+    let label = if disabled {
+        // The operator's hold outranks whatever cooldown it sits beside: it
+        // is what keeps the account out (disable-an-account AC-11).
+        "disabled".to_string()
+    } else if is_available {
         "available".to_string()
     } else if on_cooldown {
         // The glyph already says the condition; the row drops the plain
@@ -736,7 +751,9 @@ pub(crate) fn account_row(account: &Value, pool_total: i64, now: f64) -> String 
         // this state.
         "unavailable".to_string()
     };
-    let state_color = if is_available {
+    let state_color = if disabled {
+        DIM
+    } else if is_available {
         GREEN
     } else if on_cooldown {
         AMBER
@@ -746,7 +763,11 @@ pub(crate) fn account_row(account: &Value, pool_total: i64, now: f64) -> String 
     let ok = i64_field(account, "totalSuccesses");
     let state_span = format!(
         "{} {}",
-        glyph(is_available, on_cooldown),
+        if disabled {
+            paint(DIM, "●")
+        } else {
+            glyph(is_available, on_cooldown)
+        },
         paint(state_color, &pad(&label, STATE_SPAN_WIDTH - 2))
     );
     let ok_text = ok_cell(ok);

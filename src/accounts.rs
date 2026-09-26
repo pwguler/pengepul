@@ -7,8 +7,9 @@ use anyhow::Result;
 use serde_json::{Value, json};
 
 use crate::tokens::{
-    DayUsage, ModelUsage, PersistedUsage, RETENTION_DAYS, load_all_tokens, load_usage, save_token,
-    save_usage, trim_days, usage_file_unreadable, usage_path,
+    DayUsage, ModelUsage, PersistedUsage, RETENTION_DAYS, load_all_tokens, load_disabled_tokens,
+    load_usage, save_token, save_usage, set_credential_disabled, trim_days, usage_file_unreadable,
+    usage_path,
 };
 use crate::types::{
     AvailableAccount, ProviderId, ProviderKind, RefreshTokenExhaustedError, TokenData, UsageData,
@@ -91,6 +92,60 @@ impl AffinityOutcome {
     }
 }
 
+/// What `disable` or `enable` did to an account (disable-an-account).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToggleOutcome {
+    /// Taken out of the Pool; `enabled_left` accounts still serve it.
+    Disabled {
+        enabled_left: usize,
+    },
+    AlreadyDisabled,
+    /// A Disabled account put back in the Pool.
+    Enabled,
+    /// An account on Cooldown made selectable now, its failure streak reset.
+    CooldownCleared,
+    /// The Cooldown is cleared, but the account is in Reauth: only a login
+    /// makes it serve again.
+    NeedsLogin,
+    AlreadyAvailable,
+}
+
+impl ToggleOutcome {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled { .. } => "disabled",
+            Self::AlreadyDisabled => "already_disabled",
+            Self::Enabled => "enabled",
+            Self::CooldownCleared => "cooldown_cleared",
+            Self::NeedsLogin => "needs_login",
+            Self::AlreadyAvailable => "already_available",
+        }
+    }
+}
+
+/// Why `disable` or `enable` could not act.
+#[derive(Debug)]
+pub enum ToggleError {
+    /// No account of this Pool, with or without a credential, has the id.
+    NotFound,
+    /// The account's record is kept but its credential is gone (ADR-0026):
+    /// there is no file to rename, and only a login brings one back.
+    NoCredential,
+    /// The rename itself failed.
+    Io(anyhow::Error),
+}
+
+impl std::fmt::Display for ToggleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "no such account"),
+            Self::NoCredential => write!(f, "the account's credential is gone"),
+            Self::Io(error) => write!(f, "{error:#}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AccountResult {
     pub account: Option<AvailableAccount>,
@@ -118,6 +173,12 @@ struct AccountState {
     last_failure_at: Option<String>,
     last_success_at: Option<String>,
     last_refresh_at: Option<String>,
+    /// Held out of the Pool by the operator; the credential is on disk as
+    /// `<id>.json.disabled`. A Disabled account is in `accounts`, so an
+    /// outcome in flight is still booked, but never in `order`.
+    disabled: bool,
+    /// The refresh token was rejected: nothing but a login restores it.
+    reauth: bool,
     total_requests: i64,
     total_successes: i64,
     total_failures: i64,
@@ -171,6 +232,8 @@ impl AccountState {
             last_failure_at: None,
             last_success_at: None,
             last_refresh_at,
+            disabled: false,
+            reauth: false,
             total_requests: 0,
             total_successes: 0,
             total_failures: 0,
@@ -391,7 +454,8 @@ impl AccountManager {
 
     #[must_use]
     pub fn account_count(&self) -> usize {
-        self.accounts.len()
+        // The serving count: a Disabled account is listed, never handed a request.
+        self.order.len()
     }
 
     /// Whether a Cooldown has a sibling to send the next request to.
@@ -416,6 +480,12 @@ impl AccountManager {
         self.persisted_usage = load_usage(&self.auth_dir, &self.provider);
         for token in load_all_tokens(&self.auth_dir, Some(&self.provider))? {
             self.upsert_loaded_token(token);
+        }
+        for token in load_disabled_tokens(&self.auth_dir, &self.provider)? {
+            // An account with both files is enabled: the `.json` is the newer act.
+            if !self.accounts.contains_key(&token.email) {
+                self.upsert_disabled_token(token);
+            }
         }
         // `total_successes` is a policy input, not only a counter: it decides whether an
         // account earns the never-succeeded cooldown ceiling (ADR-0020). So a usage file
@@ -451,7 +521,49 @@ impl AccountManager {
         let mut added = Vec::new();
         let mut updated = Vec::new();
         let mut unchanged = Vec::new();
-        for token in load_all_tokens(&self.auth_dir, Some(&self.provider))? {
+        let enabled = load_all_tokens(&self.auth_dir, Some(&self.provider))?;
+        let disabled = load_disabled_tokens(&self.auth_dir, &self.provider)?;
+        // Reload mirrors the directory: an account whose credential is on disk under
+        // neither name leaves the Pool as the removed-credential record ADR-0026
+        // describes, exactly as a restart would leave it (disable-an-account AC-10).
+        let gone: Vec<String> = self
+            .accounts
+            .keys()
+            .filter(|email| {
+                !enabled.iter().any(|token| &token.email == *email)
+                    && !disabled.iter().any(|token| &token.email == *email)
+            })
+            .cloned()
+            .collect();
+        for email in gone {
+            self.leave_rotation(&email);
+            if let Some(state) = self.accounts.remove(&email) {
+                self.persisted_usage
+                    .insert(email, PersistedUsage::from(&state));
+            }
+        }
+        for token in disabled {
+            if enabled.iter().any(|held| held.email == token.email) {
+                continue;
+            }
+            match self.accounts.get_mut(&token.email) {
+                Some(state) if !state.disabled => {
+                    state.disabled = true;
+                    let email = token.email.clone();
+                    self.leave_rotation(&email);
+                }
+                Some(_) => {}
+                None => self.upsert_disabled_token(token),
+            }
+        }
+        for token in enabled {
+            if self
+                .accounts
+                .get(&token.email)
+                .is_some_and(|state| state.disabled)
+            {
+                self.join_rotation(&token.email);
+            }
             let Some(existing) = self.accounts.get_mut(&token.email) else {
                 added.push(token.email.clone());
                 self.upsert_loaded_token(token);
@@ -470,12 +582,123 @@ impl AccountManager {
             existing.last_failure_kind = None;
             existing.last_error = None;
             existing.last_failure_at = None;
+            existing.reauth = false;
         }
         Ok(json!({
             "added": added,
             "updated": updated,
             "unchanged": unchanged
         }))
+    }
+
+    /// Whether this Pool has a record for the account, with or without a
+    /// credential.
+    #[must_use]
+    pub fn holds(&self, email: &str) -> bool {
+        self.accounts.contains_key(email) || self.persisted_usage.contains_key(email)
+    }
+
+    /// Take an account out of the Pool: its credential is renamed
+    /// `<id>.json.disabled`, and Rotation, affinity and Failover pass it over
+    /// until [`Self::enable`] (disable-an-account).
+    ///
+    /// # Errors
+    ///
+    /// [`ToggleError::NotFound`] for an id the Pool has no record of,
+    /// [`ToggleError::NoCredential`] for a record whose credential is gone, and
+    /// [`ToggleError::Io`] when the rename fails.
+    pub fn disable(&mut self, email: &str) -> Result<ToggleOutcome, ToggleError> {
+        let Some(state) = self.accounts.get(email) else {
+            return Err(self.missing(email));
+        };
+        if state.disabled {
+            return Ok(ToggleOutcome::AlreadyDisabled);
+        }
+        if !set_credential_disabled(&self.auth_dir, &self.provider, email, true)
+            .map_err(ToggleError::Io)?
+        {
+            return Err(ToggleError::NoCredential);
+        }
+        if let Some(state) = self.accounts.get_mut(email) {
+            state.disabled = true;
+        }
+        self.leave_rotation(email);
+        Ok(ToggleOutcome::Disabled {
+            enabled_left: self.order.len(),
+        })
+    }
+
+    /// Make an account serve on the next request: a Disabled one is renamed
+    /// back into the Pool, and one on Cooldown has it cleared with its failure
+    /// streak (disable-an-account).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::disable`].
+    pub fn enable(&mut self, email: &str) -> Result<ToggleOutcome, ToggleError> {
+        let Some(state) = self.accounts.get(email) else {
+            return Err(self.missing(email));
+        };
+        if state.disabled {
+            if !set_credential_disabled(&self.auth_dir, &self.provider, email, false)
+                .map_err(ToggleError::Io)?
+            {
+                return Err(ToggleError::NoCredential);
+            }
+            self.join_rotation(email);
+            if let Some(state) = self.accounts.get_mut(email) {
+                state.cooldown_until = 0.0;
+                state.failure_count = 0;
+            }
+            return Ok(ToggleOutcome::Enabled);
+        }
+        let on_cooldown = state.cooldown_until > unix_now();
+        let reauth = state.reauth;
+        if !on_cooldown && !reauth {
+            return Ok(ToggleOutcome::AlreadyAvailable);
+        }
+        if let Some(state) = self.accounts.get_mut(email) {
+            state.cooldown_until = 0.0;
+            state.failure_count = 0;
+        }
+        Ok(if reauth {
+            ToggleOutcome::NeedsLogin
+        } else {
+            ToggleOutcome::CooldownCleared
+        })
+    }
+
+    fn missing(&self, email: &str) -> ToggleError {
+        if self.persisted_usage.contains_key(email) {
+            ToggleError::NoCredential
+        } else {
+            ToggleError::NotFound
+        }
+    }
+
+    /// Drop an account from the rotation order, keeping Rotation's place: the
+    /// account after the one used last is still next.
+    fn leave_rotation(&mut self, email: &str) {
+        let Some(index) = self.order.iter().position(|held| held == email) else {
+            return;
+        };
+        self.order.remove(index);
+        self.last_used_index = match self.last_used_index {
+            Some(last) if last >= index => last.checked_sub(1),
+            other => other,
+        };
+        if self.order.is_empty() {
+            self.last_used_index = None;
+        }
+    }
+
+    fn join_rotation(&mut self, email: &str) {
+        if let Some(state) = self.accounts.get_mut(email) {
+            state.disabled = false;
+        }
+        if !self.order.iter().any(|held| held == email) {
+            self.order.push(email.to_string());
+        }
     }
 
     /// Refresh an account when its configured refresh policy says it is due.
@@ -503,6 +726,12 @@ impl AccountManager {
         let Some(state) = self.accounts.get(email) else {
             return Ok(false);
         };
+        // A refresh saves `<id>.json`, which would enable a Disabled account behind
+        // the operator's back. A request already in flight holds its token and
+        // needs nothing written (disable-an-account AC-13).
+        if state.disabled {
+            return Ok(true);
+        }
         let old_token = state.token.clone();
         let refreshed = match (self.refresh)(old_token.refresh_token.clone()).await {
             Ok(token) => token,
@@ -542,6 +771,7 @@ impl AccountManager {
             state.last_failure_kind = None;
             state.last_error = None;
             state.last_failure_at = None;
+            state.reauth = false;
             state.last_refresh_at = Some(refresh_at);
         }
         Ok(true)
@@ -556,6 +786,7 @@ impl AccountManager {
         state.last_failure_kind = None;
         state.last_error = None;
         state.last_failure_at = None;
+        state.reauth = false;
         state.last_success_at = Some(now_iso());
         let day = state.settle(true);
         // Keyed by the upstream model name: what the provider billed, not
@@ -674,6 +905,7 @@ impl AccountManager {
         let _ = state.settle(false);
         state.last_failure_kind = Some("auth".to_string());
         state.last_failure_at = Some(now_iso());
+        state.reauth = true;
         state.last_error = Some(format!(
             "refresh token {reason}; re-run login for {}",
             self.provider
@@ -710,7 +942,11 @@ impl AccountManager {
                 let cooldown_remaining = (state.cooldown_until - now).max(0.0);
                 let mut fields =
                     usage_json(&state.token.email, &PersistedUsage::from(state), &cutoff);
-                fields.insert("available".to_string(), json!(cooldown_remaining == 0.0));
+                fields.insert(
+                    "available".to_string(),
+                    json!(cooldown_remaining == 0.0 && !state.disabled),
+                );
+                fields.insert("disabled".to_string(), json!(state.disabled));
                 fields.insert(
                     "cooldownUntil".to_string(),
                     json!(if cooldown_remaining == 0.0 {
@@ -738,6 +974,7 @@ impl AccountManager {
             // to wait out) and no failure to report (nothing has been attempted since
             // its credential went away).
             fields.insert("available".to_string(), json!(false));
+            fields.insert("disabled".to_string(), json!(false));
             fields.insert("cooldownUntil".to_string(), json!(0.0));
             fields.insert("failureCount".to_string(), json!(0));
             fields.insert("lastError".to_string(), Value::Null);
@@ -769,6 +1006,7 @@ impl AccountManager {
         if let Some(email) = self.affinity.get(affinity)
             && let Some(state) = self.accounts.get(email)
             && state.cooldown_until <= now
+            && !state.disabled
         {
             let account = self.available_account(state);
             if let Some(index) = self.order.iter().position(|held| held == email) {
@@ -906,6 +1144,17 @@ impl AccountManager {
         // Write failures are swallowed: losing an increment of
         // observability must never fail the request that produced it.
         let _ = save_usage(&self.auth_dir, &self.provider, &usage);
+    }
+
+    /// Load a Disabled account: listed and counted like any other, never in
+    /// the rotation order.
+    fn upsert_disabled_token(&mut self, token: TokenData) {
+        let email = token.email.clone();
+        self.upsert_loaded_token(token);
+        if let Some(state) = self.accounts.get_mut(&email) {
+            state.disabled = true;
+        }
+        self.leave_rotation(&email);
     }
 
     fn upsert_loaded_token(&mut self, token: TokenData) {

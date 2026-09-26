@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use crate::app::create_app;
-use crate::cli::{CliRuntime, LaunchPlan, ModelChoice, ServiceInstallRequest};
+use crate::cli::{AccountToggle, CliRuntime, LaunchPlan, ModelChoice, ServiceInstallRequest};
 use crate::config::{Config, DebugMode};
 use crate::oauth::{
     ANTHROPIC_REDIRECT_URI, CODEX_CALLBACK_PATH, CODEX_CALLBACK_PORT, GROK_CALLBACK_PATH,
@@ -104,6 +104,24 @@ impl CliRuntime for RealRuntime {
             base_url,
             "/admin/reload",
             Some(api_key),
+        ))
+    }
+
+    fn toggle_account(
+        &mut self,
+        base_url: &str,
+        api_key: &str,
+        request: &AccountToggle,
+    ) -> Result<Value> {
+        let mut body = serde_json::json!({"account": request.account});
+        if let Some(provider) = &request.provider {
+            body["provider"] = Value::String(provider.clone());
+        }
+        self.runtime.block_on(post_admin(
+            base_url,
+            &format!("/admin/accounts/{}", request.action),
+            api_key,
+            &body,
         ))
     }
 
@@ -343,6 +361,37 @@ async fn request_json(
         );
     }
     serde_json::from_slice(&body).with_context(|| format!("{url} returned invalid JSON"))
+}
+
+/// POST a JSON body to an admin route. A refusal is reported by the relay's own
+/// message, which is written for the operator, rather than as a raw response.
+async fn post_admin(base_url: &str, path: &str, api_key: &str, body: &Value) -> Result<Value> {
+    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+    let response = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(api_key)
+        .json(body)
+        .send()
+        .await
+        .with_context(|| format!("failed to request {url}"))?;
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .with_context(|| format!("failed to read response from {url}"))?;
+    if !status.is_success() {
+        let message = serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .and_then(|answer| answer["error"]["message"].as_str().map(str::to_string))
+            .unwrap_or_else(|| {
+                format!(
+                    "{url} returned {status}: {}",
+                    String::from_utf8_lossy(&bytes)
+                )
+            });
+        bail!(message);
+    }
+    serde_json::from_slice(&bytes).with_context(|| format!("{url} returned invalid JSON"))
 }
 
 fn server_bind_addr(config: &Config) -> String {

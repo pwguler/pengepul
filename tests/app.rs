@@ -5002,6 +5002,8 @@ async fn admin_accounts_lists_a_record_whose_credential_is_gone() {
             "available",
             "cooldownUntil",
             "days",
+            // disable-an-account AC-11
+            "disabled",
             "email",
             "expiresAt",
             "failureCount",
@@ -5029,5 +5031,215 @@ async fn admin_accounts_lists_a_record_whose_credential_is_gone() {
     assert_eq!(
         gone_keys, live_keys,
         "a record without a credential carries a different shape"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// disable-an-account AC-6, AC-14
+// ---------------------------------------------------------------------------
+
+fn groq_key(id: &str) -> TokenData {
+    TokenData {
+        email: id.to_string(),
+        access_token: format!("gsk-{id}"),
+        ..groq_key_token()
+    }
+}
+
+async fn toggle(app: axum::Router, action: &str, body: Value, key: Option<&str>) -> (u16, Value) {
+    let mut request = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/admin/accounts/{action}"))
+        .header("content-type", "application/json");
+    if let Some(key) = key {
+        request = request.header("authorization", format!("Bearer {key}"));
+    }
+    json_response(app, request.body(Body::from(body.to_string())).unwrap()).await
+}
+
+async fn listed(app: axum::Router, provider: &str, id: &str) -> Value {
+    let (status, accounts) = json_response(
+        app,
+        axum::http::Request::builder()
+            .uri("/admin/accounts")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    accounts["providers"][provider]["accounts"]
+        .as_array()
+        .expect("accounts")
+        .iter()
+        .find(|account| account["email"] == id)
+        .cloned()
+        .unwrap_or_else(|| panic!("{id} not listed under {provider}: {accounts}"))
+}
+
+#[tokio::test]
+async fn admin_disable_and_enable_toggle_an_account() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &groq_key("key-1")).expect("save");
+    save_token(tmp.path(), &groq_key("key-2")).expect("save");
+    let app = create_app_with_upstream(
+        config_with_groq(tmp.path().to_path_buf()),
+        Arc::new(GenericUpstream::default()),
+    );
+
+    let (status, body) = toggle(
+        app.clone(),
+        "disable",
+        json!({"account": "key-1"}),
+        Some("sk-test"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body,
+        json!({"account": "key-1", "provider": "groq", "outcome": "disabled", "enabled_left": 1})
+    );
+    assert_eq!(listed(app.clone(), "groq", "key-1").await["disabled"], true);
+
+    let (status, body) = toggle(
+        app.clone(),
+        "enable",
+        json!({"account": "key-1"}),
+        Some("sk-test"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["outcome"], "enabled");
+    assert_eq!(listed(app, "groq", "key-1").await["disabled"], false);
+}
+
+#[tokio::test]
+async fn admin_toggle_needs_the_local_api_key() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &groq_key("key-1")).expect("save");
+    let app = create_app_with_upstream(
+        config_with_groq(tmp.path().to_path_buf()),
+        Arc::new(GenericUpstream::default()),
+    );
+
+    let (status, _) = toggle(app.clone(), "disable", json!({"account": "key-1"}), None).await;
+    assert_eq!(status, 401);
+    let (status, _) = toggle(
+        app.clone(),
+        "disable",
+        json!({"account": "key-1"}),
+        Some("wrong"),
+    )
+    .await;
+    assert_eq!(status, 403, "the relay's answer to a wrong key");
+    assert_eq!(listed(app, "groq", "key-1").await["disabled"], false);
+}
+
+#[tokio::test]
+async fn admin_toggle_resolves_the_provider_from_the_id() {
+    // AC-6: inferred when one Pool holds the id, refused naming both when two do.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &groq_key("shared")).expect("save groq");
+    save_token(tmp.path(), &groq_key("key-2")).expect("save groq");
+    let mut cfg = config_with_groq(tmp.path().to_path_buf());
+    cfg.providers.insert(
+        "cerebras".to_string(),
+        pengepul::config::ConfiguredProvider {
+            base_url: "https://cerebras.example/v1".to_string(),
+        },
+    );
+    save_token(
+        tmp.path(),
+        &TokenData {
+            provider: ProviderId::generic("cerebras"),
+            ..groq_key("shared")
+        },
+    )
+    .expect("save cerebras");
+    let app = create_app_with_upstream(cfg, Arc::new(GenericUpstream::default()));
+
+    let (status, body) = toggle(
+        app.clone(),
+        "disable",
+        json!({"account": "shared"}),
+        Some("sk-test"),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("cerebras") && message.contains("groq") && message.contains("--provider"),
+        "{message}"
+    );
+
+    let (status, body) = toggle(
+        app.clone(),
+        "disable",
+        json!({"account": "shared", "provider": "groq"}),
+        Some("sk-test"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["provider"], "groq");
+    assert_eq!(
+        listed(app.clone(), "groq", "shared").await["disabled"],
+        true
+    );
+    assert_eq!(
+        listed(app.clone(), "cerebras", "shared").await["disabled"],
+        false
+    );
+
+    let (status, body) = toggle(
+        app,
+        "disable",
+        json!({"account": "nobody"}),
+        Some("sk-test"),
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("nobody")
+    );
+}
+
+#[tokio::test]
+async fn admin_toggle_refuses_a_record_without_a_credential() {
+    // AC-5
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let gone = save_token(tmp.path(), &groq_key("key-1")).expect("save");
+    save_token(tmp.path(), &groq_key("key-2")).expect("save");
+    let app = create_app_with_upstream(
+        config_with_groq(tmp.path().to_path_buf()),
+        Arc::new(GenericUpstream::default()),
+    );
+    // Give the record something to carry, then take the credential away.
+    std::fs::write(
+        tmp.path().join("groq").join("usage.json"),
+        json!({"key-1": {"total_requests": 1, "total_successes": 1}}).to_string(),
+    )
+    .expect("usage");
+    std::fs::remove_file(gone).expect("remove");
+    let (status, _) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/admin/reload")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let (status, body) = toggle(app, "enable", json!({"account": "key-1"}), Some("sk-test")).await;
+    assert_eq!(status, 409, "{body}");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("pengepul login --provider groq"),
+        "{message}"
     );
 }

@@ -45,7 +45,149 @@ pub fn save_token(auth_dir: &Path, token: &TokenData) -> Result<PathBuf> {
     fs::write(&path, serde_json::to_string_pretty(&stored)?)
         .with_context(|| format!("failed to write {}", path.display()))?;
     set_mode(&path, 0o600)?;
+    // A fresh credential for a Disabled account enables it: logging in is the
+    // operator asking to use the account, and a twin left behind would disable
+    // it again at the next reload (disable-an-account AC-9).
+    for (twin, held) in read_credentials(&provider_dir, Credential::Disabled, None)? {
+        if held.email == token.email {
+            fs::remove_file(&twin)
+                .with_context(|| format!("failed to remove {}", twin.display()))?;
+        }
+    }
     Ok(path)
+}
+
+/// Which credential files a read selects: `<id>.json`, or a Disabled
+/// account's `<id>.json.disabled` (disable-an-account).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Credential {
+    Enabled,
+    Disabled,
+}
+
+impl Credential {
+    fn selects(self, path: &Path) -> bool {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        match self {
+            // usage.json is per-provider state written by AccountManager, not
+            // a credential; scanning it would log a spurious warning on every
+            // startup.
+            Self::Enabled => {
+                path.extension().is_some_and(|ext| ext == "json") && name != "usage.json"
+            }
+            Self::Disabled => name.ends_with(".json.disabled"),
+        }
+    }
+}
+
+/// Every readable credential of one kind in one provider directory, with the
+/// path it was read from, in path order. An unreadable file is skipped with a
+/// warning, never fatal.
+fn read_credentials(
+    provider_dir: &Path,
+    kind: Credential,
+    provider: Option<&ProviderId>,
+) -> Result<Vec<(PathBuf, TokenData)>> {
+    if !provider_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let dir_id = provider_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut paths = fs::read_dir(provider_dir)
+        .with_context(|| format!("failed to read {}", provider_dir.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to read {}", provider_dir.display()))?
+        .into_iter()
+        .map(|entry| entry.path())
+        .filter(|path| kind.selects(path))
+        .collect::<Vec<_>>();
+    paths.sort();
+
+    let mut tokens = Vec::new();
+    for path in paths {
+        let stored = match fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))
+            .and_then(|text| {
+                serde_json::from_str::<StoredToken>(&text)
+                    .with_context(|| format!("failed to parse {}", path.display()))
+            }) {
+            Ok(stored) => stored,
+            Err(error) => {
+                tracing::warn!(?error, path = %path.display(), "skipping unreadable token file");
+                continue;
+            }
+        };
+        let token = storage_to_token(stored, &dir_id);
+        if provider.is_none_or(|p| {
+            token.provider.kind == p.kind && token.provider.id.as_ref() == p.id.as_ref()
+        }) {
+            tokens.push((path, token));
+        }
+    }
+    Ok(tokens)
+}
+
+/// Load the credentials of one provider's Disabled accounts.
+///
+/// # Errors
+///
+/// Returns an error when the provider directory exists but cannot be read.
+pub fn load_disabled_tokens(auth_dir: &Path, provider: &ProviderId) -> Result<Vec<TokenData>> {
+    Ok(read_credentials(
+        &auth_dir.join(provider.storage_dir()),
+        Credential::Disabled,
+        Some(provider),
+    )?
+    .into_iter()
+    .map(|(_, token)| token)
+    .collect())
+}
+
+/// Rename an account's credential into the state asked for: `<file>.json` to
+/// `<file>.json.disabled` to disable it, and back to enable it. The file is
+/// found by the account it holds, not by its name, because a credential may
+/// carry a name `save_token` would not give it. Returns whether a file was
+/// renamed: `false` means no credential of the other state holds the account.
+///
+/// # Errors
+///
+/// Returns an error when the directory cannot be read or the rename fails.
+pub fn set_credential_disabled(
+    auth_dir: &Path,
+    provider: &ProviderId,
+    email: &str,
+    disabled: bool,
+) -> Result<bool> {
+    let provider_dir = auth_dir.join(provider.storage_dir());
+    let from = if disabled {
+        Credential::Enabled
+    } else {
+        Credential::Disabled
+    };
+    let Some((path, _)) = read_credentials(&provider_dir, from, Some(provider))?
+        .into_iter()
+        .find(|(_, token)| token.email == email)
+    else {
+        return Ok(false);
+    };
+    let name = path.to_string_lossy();
+    let target = if disabled {
+        PathBuf::from(format!("{name}.disabled"))
+    } else {
+        PathBuf::from(name.trim_end_matches(".disabled"))
+    };
+    fs::rename(&path, &target).with_context(|| {
+        format!(
+            "failed to rename {} to {}",
+            path.display(),
+            target.display()
+        )
+    })?;
+    Ok(true)
 }
 
 /// Load all readable provider token files from an auth directory.
@@ -73,47 +215,11 @@ pub fn load_all_tokens(auth_dir: &Path, provider: Option<&ProviderId>) -> Result
 
     let mut tokens = Vec::new();
     for provider_dir in scan_dirs {
-        if !provider_dir.exists() {
-            continue;
-        }
-        let dir_id = provider_dir
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let mut paths = fs::read_dir(&provider_dir)
-            .with_context(|| format!("failed to read {}", provider_dir.display()))?
-            .collect::<Result<Vec<_>, _>>()
-            .with_context(|| format!("failed to read {}", provider_dir.display()))?
-            .into_iter()
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
-            // usage.json is per-provider state written by AccountManager,
-            // not a credential; scanning it would log a spurious warning
-            // on every startup.
-            .filter(|path| path.file_name().is_none_or(|name| name != "usage.json"))
-            .collect::<Vec<_>>();
-        paths.sort();
-
-        for path in paths {
-            let stored = match fs::read_to_string(&path)
-                .with_context(|| format!("failed to read {}", path.display()))
-                .and_then(|text| {
-                    serde_json::from_str::<StoredToken>(&text)
-                        .with_context(|| format!("failed to parse {}", path.display()))
-                }) {
-                Ok(stored) => stored,
-                Err(error) => {
-                    tracing::warn!(?error, path = %path.display(), "skipping unreadable token file");
-                    continue;
-                }
-            };
-            let token = storage_to_token(stored, &dir_id);
-            if provider.is_none_or(|p| {
-                token.provider.kind == p.kind && token.provider.id.as_ref() == p.id.as_ref()
-            }) {
-                tokens.push(token);
-            }
-        }
+        tokens.extend(
+            read_credentials(&provider_dir, Credential::Enabled, provider)?
+                .into_iter()
+                .map(|(_, token)| token),
+        );
     }
     Ok(tokens)
 }
