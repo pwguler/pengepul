@@ -46,8 +46,12 @@ _Avoid_: refresh exhausted, invalid_grant, dead token
 A period during which an account is passed over by rotation, entered on failure and cleared by the next success or by reloading accounts after a fresh login. A Pool that holds one account earns none: a Cooldown hands the next request to a sibling, and with no sibling it would only withhold the account the Pool has (ADR-0027).
 _Avoid_: backoff, lockout, unavailable, cooling down
 
+**Disabled**:
+An Account the operator has taken out of its Pool, held out of Rotation and Failover until the operator enables it again; no success, no reload and no passage of time clears it. Its credential is intact and renamed `<account>.json.disabled` beside the others, which is the whole of the state: it survives restarts, and a fresh `pengepul login` for the account clears it. It is counted and listed like any other Account, printed `disabled`. A Pool whose only enabled Account sits beside Disabled ones is a Pool of one for Cooldown purposes (ADR-0027).
+_Avoid_: dead, paused, parked, retired, off
+
 **Rotation**:
-The policy by which each request is handed the account after the one used last, skipping accounts on cooldown. It prefers the account that already holds a conversation's cached prefix, and falls back to the next account whenever that one is on **Cooldown** — availability outranks cache locality (ADR-0017). The preference is keyed by the session a harness names — a session header, or the `prompt_cache_key` its body carries — or by a hash of the request's cacheable prefix when it names none.
+The policy by which each request is handed the account after the one used last, skipping accounts on cooldown and Disabled ones. It prefers the account that already holds a conversation's cached prefix, and falls back to the next account whenever that one is on **Cooldown** — availability outranks cache locality (ADR-0017). The preference is keyed by the session a harness names — a session header, or the `prompt_cache_key` its body carries — or by a hash of the request's cacheable prefix when it names none.
 _Avoid_: round-robin, load balancing, sticky windows, account selection
 
 **Failover**:
