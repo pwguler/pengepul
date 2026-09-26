@@ -124,14 +124,27 @@ jobs:
           else
             link="https://github.com/${GITHUB_REPOSITORY}/commits/${GITHUB_REF_NAME}"
           fi
+          # Release notes come from the annotated tag's body (everything after
+          # its subject line). checkout can leave the tag lightweight, so the
+          # annotated object is fetched explicitly; a lightweight tag has no
+          # body of its own and contributes nothing.
+          git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          body=""
+          if [ "$(git cat-file -t "refs/tags/${GITHUB_REF_NAME}")" = "tag" ]; then
+            body="$(git tag -l --format='%(contents:body)' "${GITHUB_REF_NAME}")"
+          fi
+          notes="**Full Changelog**: ${link}"
+          if [ -n "${body//[[:space:]]/}" ]; then
+            notes="${body}"$'\n\n'"${notes}"
+          fi
           # The title is set explicitly: with none, the release has no name
           # and the page renders the tag followed by the commit subject.
-          notes="**Full Changelog**: ${link}"
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # A re-run keeps the existing notes: they may have been written
+            # by hand after the release was published.
             gh release edit "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" \
-              --title "$GITHUB_REF_NAME" \
-              --notes "${notes}"
+              --title "$GITHUB_REF_NAME"
             gh release upload "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" \
               --clobber \
