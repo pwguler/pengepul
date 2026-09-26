@@ -747,31 +747,6 @@ fn aggregate_facts(totals: &RelayTotals) -> Vec<Fact> {
     facts
 }
 
-/// `usage`'s relay total, plain: the header and the aggregate lines, with no blank line
-/// before them — the views stack panels without a gap, and the header is what marks the
-/// change of scope. The trend above covers 30 days; these figures do not, which is why it
-/// keeps the wording `status` uses.
-pub(crate) fn print_usage_total_plain(payload: &Value, output: &mut Output) {
-    let totals = RelayTotals::from_payload(payload, 0.0);
-    output.line(&relay_header("relay total", &totals));
-    for line in aggregate_lines(&totals) {
-        output.line(&line);
-    }
-}
-
-/// `usage`'s relay total, rich: the same content as one panel below the trend panel, with
-/// the aggregate rows only — no `config`, no `url`, no per-pool line, because where-and-which
-/// facts are `status`'s and per-pool detail is `accounts`'.
-pub(crate) fn print_usage_total_rich(payload: &Value, output: &mut Output) {
-    let totals = RelayTotals::from_payload(payload, 0.0);
-    for line in fact_panel(
-        &relay_header_rich("relay total", &totals),
-        &aggregate_facts(&totals),
-    ) {
-        output.line(&line);
-    }
-}
-
 /// The relay-wide rollup, plain: requests, tokens, reasoning when non-zero,
 /// and the carried-load total.
 fn aggregate_lines(totals: &RelayTotals) -> Vec<String> {
@@ -1045,7 +1020,6 @@ const TREND_DAYS: usize = 30;
 
 /// One day of relay-wide traffic: every account of every pool, summed.
 pub(crate) struct TrendDay {
-    date: String,
     tokens: i64,
     /// Whether the relay held a bucket for this day. Carried rather than
     /// re-derived from `tokens > 0`: a day whose every request failed is
@@ -1059,6 +1033,30 @@ pub(crate) struct TrendDay {
 /// has one column per calendar day rather than one per recorded day.
 /// Pure over the payload and the date handed in (AC-9, AC-10).
 pub(crate) fn trend_days(payload: &Value, today: &str) -> Vec<TrendDay> {
+    let totals = day_totals(payload);
+    let window: Vec<TrendDay> = window_dates(today, TREND_DAYS)
+        .into_iter()
+        .map(|date| {
+            let tokens = totals.get(&date).copied().unwrap_or(0);
+            let recorded = totals.contains_key(&date);
+            TrendDay { tokens, recorded }
+        })
+        .collect();
+    // Emptiness is judged over the *window*, not over every bucket the
+    // file holds: a relay whose only traffic predates the window would
+    // otherwise render 30 flat bars, the shape AC-8 exists to prevent.
+    // A day is history because it was *recorded*, not because it spent
+    // tokens — a day of failures is history, and plain prints it, so rich
+    // must not call it empty.
+    if !window.iter().any(|day| day.recorded) {
+        return Vec::new();
+    }
+    window
+}
+
+/// Every retained day's relay-wide tokens, every account of every Pool summed,
+/// keyed by date. A day present with zero was recorded; a missing day was not.
+fn day_totals(payload: &Value) -> std::collections::BTreeMap<String, i64> {
     let mut totals: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
     for (_provider_id, provider) in providers(payload) {
         let accounts = provider
@@ -1084,28 +1082,53 @@ pub(crate) fn trend_days(payload: &Value, today: &str) -> Vec<TrendDay> {
             }
         }
     }
-    let window: Vec<TrendDay> = window_dates(today, TREND_DAYS)
+    totals
+}
+
+/// The relay's best day of all time: the peak the relay stores, or a better
+/// retained day the payload carries, inside the 30-day window or not
+/// (status-is-health AC-7). `None` when neither holds a day with traffic.
+fn all_time_peak(payload: &Value) -> Option<(String, i64)> {
+    let stored = payload.get("peak").and_then(|peak| {
+        Some((
+            peak.get("date")?.as_str()?.to_string(),
+            peak.get("tokens")?.as_i64()?,
+        ))
+    });
+    day_totals(payload)
         .into_iter()
-        .map(|date| {
-            let tokens = totals.get(&date).copied().unwrap_or(0);
-            let recorded = totals.contains_key(&date);
-            TrendDay {
-                date,
-                tokens,
-                recorded,
-            }
-        })
-        .collect();
-    // Emptiness is judged over the *window*, not over every bucket the
-    // file holds: a relay whose only traffic predates the window would
-    // otherwise render 30 flat bars, the shape AC-8 exists to prevent.
-    // A day is history because it was *recorded*, not because it spent
-    // tokens — a day of failures is history, and plain prints it, so rich
-    // must not call it empty.
-    if !window.iter().any(|day| day.recorded) {
-        return Vec::new();
+        .chain(stored)
+        .filter(|(_, tokens)| *tokens > 0)
+        .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)))
+}
+
+/// The figures `usage` prints after its sparkline, shared by both styles.
+struct UsageFigures {
+    days: Vec<TrendDay>,
+    last_30_days: i64,
+    peak: Option<(String, i64)>,
+    /// `input + output`: the labelled total above its own breakdown
+    /// (ADR-0024). Never below the window it contains.
+    total: i64,
+    totals: RelayTotals,
+}
+
+impl UsageFigures {
+    fn from_payload(payload: &Value, today: &str) -> Self {
+        let days = trend_days(payload, today);
+        let last_30_days = days.iter().map(|day| day.tokens).sum();
+        let totals = RelayTotals::from_payload(payload, 0.0);
+        let pool = &totals.totals;
+        let total = carried_tokens(pool.input, pool.output, pool.cache_read, pool.cache_write)
+            .max(last_30_days);
+        Self {
+            days,
+            last_30_days,
+            peak: all_time_peak(payload),
+            total,
+            totals,
+        }
     }
-    window
 }
 
 /// The `count` calendar dates ending at `today`, oldest first. Date math
@@ -1125,62 +1148,67 @@ fn window_dates(today: &str, count: usize) -> Vec<String> {
         .collect()
 }
 
-/// The `Style::Rich` trend: one panel, four rows (AC-5).
-pub(crate) fn print_trend_rich(payload: &Value, output: &mut Output, today: &str) {
-    let days = trend_days(payload, today);
-    if days.is_empty() {
-        // AC-8: thirty flat bars would read as thirty idle days.
-        for line in fact_panel(
-            "usage ─ last 30 days",
-            &[Fact::new("tokens", &paint(DIM, "no usage recorded yet"))],
-        ) {
-            output.line(&line);
-        }
-        return;
-    }
-    let values: Vec<i64> = days.iter().map(|day| day.tokens).collect();
-    let peak = days
-        .iter()
-        .max_by_key(|day| day.tokens)
-        .expect("non-empty window");
-    let total: i64 = values.iter().sum();
-    // The all-time figure comes from the same sum `status` prints, over the
-    // same payload, so the two verbs cannot drift and the window is
-    // visibly a subset rather than a competing total.
-    let all_time: i64 = providers(payload)
-        .into_iter()
-        .flat_map(|(_provider_id, provider)| {
-            provider
-                .get("accounts")
-                .and_then(Value::as_array)
-                .map_or(&[][..], Vec::as_slice)
-        })
-        .map(account_tokens)
-        .sum();
-    // The window is a subset of all time by construction. A payload whose
-    // cumulative counters are missing or lag its buckets would otherwise
-    // print a total smaller than the subset inside it.
-    let all_time = all_time.max(total);
-    let facts = vec![
-        Fact::new("tokens", &sparkline(&values)),
-        // Figures, not sentences: the peak row carries its count and its day, and the
-        // window row carries its total. The panel header already says the window is the
-        // last 30 days, so words explaining either would be the only prose in the box.
+/// `usage`, rich: one box. The sparkline and `last 30 days` cover the window;
+/// every row after them is all-time (status-is-health AC-4).
+pub(crate) fn print_usage_rich(payload: &Value, output: &mut Output, today: &str) {
+    let figures = UsageFigures::from_payload(payload, today);
+    let tokens = if figures.days.is_empty() {
+        // Thirty flat bars would read as thirty idle days (usage-trend AC-8).
+        paint(DIM, "no usage recorded yet")
+    } else {
+        sparkline(
+            &figures
+                .days
+                .iter()
+                .map(|day| day.tokens)
+                .collect::<Vec<_>>(),
+        )
+    };
+    let mut facts = vec![
+        Fact::new("tokens", &tokens),
         Fact::new(
-            "peak",
-            &format!("{}  {}", paint(BOLD, &format_count(peak.tokens)), peak.date),
+            "last 30 days",
+            &paint(BOLD, &format_count(figures.last_30_days)),
         ),
-        Fact::new("window", &paint(BOLD, &format_count(total))),
-        Fact::new("all time", &paint(BOLD, &format_count(all_time))),
     ];
-    for line in fact_panel("usage ─ last 30 days", &facts) {
+    if let Some((date, tokens)) = &figures.peak {
+        facts.push(Fact::new(
+            "peak",
+            &format!("{}  {date}", paint(BOLD, &format_count(*tokens))),
+        ));
+    }
+    facts.push(Fact::new(
+        "total",
+        &paint(BOLD, &format_count(figures.total)),
+    ));
+    facts.extend(aggregate_facts(&figures.totals));
+    for line in fact_panel(&relay_header_rich("usage", &figures.totals), &facts) {
+        output.line(&line);
+    }
+}
+
+/// `usage`, plain: the daily rows, then the box's facts in the box's order,
+/// one per line (status-is-health AC-5).
+pub(crate) fn print_usage_plain(payload: &Value, output: &mut Output, today: &str) {
+    print_trend_plain(payload, output, today);
+    let figures = UsageFigures::from_payload(payload, today);
+    output.line(&relay_header("usage", &figures.totals));
+    output.line(&format!(
+        "last_30_days {}",
+        format_count(figures.last_30_days)
+    ));
+    if let Some((date, tokens)) = &figures.peak {
+        output.line(&format!("peak {} {date}", format_count(*tokens)));
+    }
+    output.line(&format!("total {}", format_count(figures.total)));
+    for line in aggregate_lines(&figures.totals) {
         output.line(&line);
     }
 }
 
 /// The `Style::Plain` trend: one parseable row per recorded day, oldest
 /// first, no block characters (AC-7).
-pub(crate) fn print_trend_plain(payload: &Value, output: &mut Output, today: &str) {
+fn print_trend_plain(payload: &Value, output: &mut Output, today: &str) {
     let mut rows: std::collections::BTreeMap<String, (i64, i64, i64, i64, i64)> =
         std::collections::BTreeMap::new();
     for (_provider_id, provider) in providers(payload) {

@@ -3124,19 +3124,6 @@ fn a_control_character_cannot_split_a_panel_row() {
     }
 }
 
-/// usage-trend AC-5/AC-6/AC-9: one panel, a 30-character sparkline of
-/// relay-wide daily tokens, a peak row naming its day, and a total.
-/// The inner rows of the first box in `text` — the trend panel in `usage`, whose row count
-/// these tests pin. `version-uptime-and-usage-total` appends a second panel below it, so the
-/// subject has to be named rather than counted as the whole output.
-fn first_panel_rows(text: &str) -> usize {
-    text.lines()
-        .skip_while(|line| !line.starts_with('\u{250c}'))
-        .skip(1)
-        .take_while(|line| !line.starts_with('\u{2514}'))
-        .count()
-}
-
 #[test]
 fn usage_renders_a_thirty_day_sparkline() {
     let tmp = tempdir().expect("tempdir");
@@ -3195,22 +3182,20 @@ fn usage_renders_a_thirty_day_sparkline() {
     assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
     let lines: Vec<&str> = visible.lines().collect();
+    // status-is-health AC-4: the window rows lead the one box.
     assert_eq!(
-        first_panel_rows(&visible),
-        4,
-        "four rows in the trend box: {visible}"
-    );
-    // all time contains the window, never the other way round.
-    assert!(
-        lines[4].contains("50.0K"),
-        "all time sums both pools: {}",
-        lines[4]
+        fact_values(&visible, "total"),
+        ["50.0K"],
+        "total sums both pools"
     );
     assert!(
         !visible.contains("what status"),
         "a row reports a fact, it does not footnote another verb: {visible}"
     );
-    assert!(lines[0].contains("usage ─ last 30 days"), "{visible}");
+    assert!(
+        lines[0].contains("usage ─ 2 pools, 2 accounts"),
+        "{visible}"
+    );
     // AC-6: one character per day, oldest left, no blanks.
     let spark_row = lines[1];
     assert!(spark_row.contains("│ tokens"), "{visible}");
@@ -3220,27 +3205,27 @@ fn usage_renders_a_thirty_day_sparkline() {
         .collect();
     assert_eq!(spark.chars().count(), 30, "one bar per day: {spark_row}");
     assert!(spark.ends_with('▁'), "today is idle here: {spark_row}");
-    // AC-9: the later day is the peak, and both pools sum into the earlier one.
-    assert!(lines[2].contains("peak"), "{visible}");
-    assert!(lines[2].contains("9.0K"), "peak value: {}", lines[2]);
-    assert!(lines[2].contains(&peak_day), "peak date: {}", lines[2]);
-    assert!(lines[3].contains("window"), "{visible}");
+    // AC-9: both pools sum into the window, and the later day is the peak.
+    assert!(lines[2].contains("last 30 days"), "{visible}");
     assert!(
-        lines[3].contains("11.0K"),
-        "window sums pools: {}",
-        lines[3]
+        lines[2].contains("11.0K"),
+        "the window sums pools: {}",
+        lines[2]
     );
+    assert!(lines[3].contains("peak"), "{visible}");
+    assert!(lines[3].contains("9.0K"), "peak value: {}", lines[3]);
+    assert!(lines[3].contains(&peak_day), "peak date: {}", lines[3]);
     // The panel states figures, not sentences: the peak row keeps its date and drops the
     // word joining them, and the window row is a total rather than a phrase about days.
     assert!(
-        !lines[2].contains(" on "),
+        !lines[3].contains(" on "),
         "the peak row carries a word it does not need: {}",
-        lines[2]
+        lines[3]
     );
     assert!(
-        !lines[3].contains("across") && !lines[3].contains("recorded"),
+        !lines[2].contains("across") && !lines[2].contains("recorded"),
         "the window row is prose, not a figure: {}",
-        lines[3]
+        lines[2]
     );
     for line in &lines {
         assert_eq!(line.chars().count(), 64, "off the fixed width: {line}");
@@ -3280,10 +3265,10 @@ fn usage_says_so_when_no_history_exists() {
     );
     // Not `!contains("▁▁▁")`: this path returns before `sparkline` is
     // called, so that assertion cannot fail. Pin the shape instead.
-    assert_eq!(
-        first_panel_rows(&visible),
-        1,
-        "one row in a box, no bars: {visible}"
+    assert_eq!(fact_values(&visible, "tokens"), ["no usage recorded yet"]);
+    assert!(
+        !visible.contains('▁'),
+        "thirty idle bars were drawn: {visible}"
     );
 }
 
@@ -3381,8 +3366,9 @@ fn usage_says_how_much_history_it_actually_has() {
     // the header says which window is drawn and the bars show what is in it.
     let window = visible
         .lines()
-        .find(|line| line.contains("window"))
-        .expect("window row");
+        .find(|line| line.contains("last 30 days"))
+        .expect("last 30 days row");
+    let window = window.split("last 30 days").nth(1).unwrap_or_default();
     for word in ["day", "days", "across", "recorded"] {
         assert!(
             !window.contains(word),
@@ -3399,175 +3385,12 @@ fn usage_says_how_much_history_it_actually_has() {
         !visible.contains("no usage recorded yet"),
         "history exists and the panel denies it: {visible}"
     );
-    assert_eq!(
-        first_panel_rows(&visible),
-        4,
-        "four rows whatever the history: {visible}"
-    );
+    // The shape does not depend on how much history there is: one box, and
+    // the window rows present whatever the history.
+    assert_eq!(visible.matches('┌').count(), 1, "one box: {visible}");
+    assert_eq!(fact_values(&visible, "last 30 days").len(), 1, "{visible}");
     for line in visible.lines() {
         assert_eq!(line.chars().count(), 64, "off the fixed width: {line}");
-    }
-}
-
-/// version-uptime-and-usage-total AC-5: `usage` plain keeps one line per day and then,
-/// after a blank line, prints the relay total — the same header and the same aggregate lines
-/// `status` prints for the same payload. Before this, `usage` had no relay-wide numbers at all.
-#[test]
-fn usage_plain_ends_with_the_relay_total_block() {
-    let tmp = tempdir().expect("tempdir");
-    write_config(tmp.path(), "127.0.0.1", 8317);
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let mut runtime = FakeRuntime {
-        rich: false,
-        accounts_payload: Some(json!({
-            "providers": {
-                "anthropic": {
-                    "account_count": 1,
-                    "accounts": [account(json!({
-                        "email": "a@x.com",
-                        "available": true,
-                        "totalRequests": 20,
-                        "totalSuccesses": 18,
-                        "totalFailures": 2,
-                        "totalInputTokens": 700_000,
-                        "totalOutputTokens": 900_000,
-                        "totalCacheReadInputTokens": 289_000_000,
-                        "days": [{
-                            "date": today,
-                            "requests": 20,
-                            "successes": 18,
-                            "failures": 2,
-                            "inputTokens": 700_000,
-                            "outputTokens": 900_000,
-                            "cacheCreationInputTokens": 0,
-                            "cacheReadInputTokens": 289_000_000,
-                            "reasoningOutputTokens": 0
-                        }]
-                    }))]
-                }
-            }
-        })),
-        ..FakeRuntime::default()
-    };
-
-    let out = run_style(&["usage"], tmp.path(), &mut runtime, Style::Plain).stdout;
-    let lines: Vec<&str> = out.lines().collect();
-
-    // The trend is untouched and still first.
-    assert!(
-        lines.iter().any(|line| line.starts_with(&today)),
-        "the per-day line moved or vanished: {out}"
-    );
-    // Then the relay total: header, requests, tokens.
-    let header = lines
-        .iter()
-        .position(|line| line.starts_with("relay total: 1 pool, 1 account"))
-        .unwrap_or_else(|| panic!("no relay total header in: {out}"));
-    // The block follows the trend directly: the views stack without a blank line, and the
-    // `relay total` wording is what separates lifetime figures from the window above.
-    assert!(
-        lines[header - 1].starts_with(&today),
-        "the block did not follow the trend's last day line: {out}"
-    );
-    assert!(
-        lines[header + 1].starts_with("requests 20  (18 ok, 2 failed)"),
-        "the requests line is not the relay rollup: {out}"
-    );
-    let tokens = lines[header + 2];
-    assert!(
-        tokens.starts_with("input ") && tokens.contains("cached ") && tokens.contains("output "),
-        "the token line is missing or wrong: {tokens:?}"
-    );
-    assert_eq!(
-        lines.len(),
-        header + 3,
-        "the block must end the output: {out}"
-    );
-}
-
-/// AC-6: rich `usage` stays one trend panel and gains a second, the relay total, below it —
-/// aggregate rows only, so no pool appears in it. AC-7: the figures are the same rollup
-/// `status` takes, not a second computation.
-#[test]
-fn usage_rich_prints_the_relay_total_panel_below_the_trend() {
-    let tmp = tempdir().expect("tempdir");
-    write_config(tmp.path(), "127.0.0.1", 8317);
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let payload = json!({
-        "providers": {
-            "anthropic": {
-                "account_count": 1,
-                "accounts": [account(json!({
-                    "email": "a@x.com",
-                    "available": true,
-                    "totalRequests": 20,
-                    "totalSuccesses": 18,
-                    "totalFailures": 2,
-                    "totalInputTokens": 700_000,
-                    "totalOutputTokens": 900_000,
-                    "totalCacheReadInputTokens": 289_000_000,
-                    "days": [{
-                        "date": today,
-                        "requests": 20,
-                        "successes": 18,
-                        "failures": 2,
-                        "inputTokens": 700_000,
-                        "outputTokens": 900_000,
-                        "cacheCreationInputTokens": 0,
-                        "cacheReadInputTokens": 289_000_000,
-                        "reasoningOutputTokens": 0
-                    }]
-                }))]
-            }
-        }
-    });
-    let mut runtime = FakeRuntime {
-        rich: true,
-        accounts_payload: Some(payload.clone()),
-        ..FakeRuntime::default()
-    };
-
-    let out = strip_ansi(&run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich).stdout);
-    let lines: Vec<&str> = out.lines().collect();
-
-    let trend = lines
-        .iter()
-        .position(|line| line.contains("usage ─ last 30 days"))
-        .expect("the trend panel is missing");
-    let total = lines
-        .iter()
-        .position(|line| line.contains("relay total ─ 1 pool, 1 account"))
-        .unwrap_or_else(|| panic!("no relay total panel in: {out}"));
-    assert!(total > trend, "the block must sit below the trend: {out}");
-
-    // AC-6: the block is a panel of its own, with the aggregate rows and no pool row.
-    let body = &lines[total..];
-    assert!(
-        body.iter().any(|line| line
-            .trim_start_matches('│')
-            .trim_start()
-            .starts_with("requests")),
-        "no requests row in the block: {body:?}"
-    );
-    for word in ["input", "cached", "uncached", "output"] {
-        assert!(
-            body.iter().any(|line| line.contains(word)),
-            "the {word} row is missing from the block: {body:?}"
-        );
-    }
-    assert!(
-        !body
-            .iter()
-            .any(|line| line.contains("anthropic") && line.contains("req")),
-        "the block repeats the per-pool detail: {body:?}"
-    );
-    // Every line of the box is the panel width, borders included.
-    for line in body.iter().take_while(|line| !line.starts_with('└')) {
-        assert_eq!(
-            line.chars().count(),
-            64,
-            "a block line is not 64 columns: {line:?}"
-        );
     }
 }
 
@@ -3923,8 +3746,8 @@ fn usage_all_time_is_the_payload_carried_load_exactly() {
     // sum would be 488, and a rounded one would carry a scale suffix.
     let all_time = usage
         .lines()
-        .find(|line| line.contains("all time"))
-        .expect("all time row");
+        .find(|line| line.contains("total"))
+        .expect("total row");
     assert!(all_time.contains("710"), "all time: {all_time}");
     assert!(
         !all_time.contains('K') && !all_time.contains('M'),
@@ -3933,8 +3756,8 @@ fn usage_all_time_is_the_payload_carried_load_exactly() {
     // And the window is its own, smaller figure: 10 + 20 + 30 = 60.
     let window = usage
         .lines()
-        .find(|line| line.contains("window"))
-        .expect("window row");
+        .find(|line| line.contains("last 30 days"))
+        .expect("last 30 days row");
     assert!(window.contains("60"), "window: {window}");
 }
 
@@ -3977,12 +3800,12 @@ fn all_time_is_never_smaller_than_the_window_it_contains() {
     let visible = strip_ansi(&run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich).stdout);
     let window = visible
         .lines()
-        .find(|line| line.contains("window"))
-        .expect("window row");
+        .find(|line| line.contains("last 30 days"))
+        .expect("last 30 days row");
     let all_time = visible
         .lines()
-        .find(|line| line.contains("all time"))
-        .expect("all time row");
+        .find(|line| line.contains("total"))
+        .expect("total row");
     assert!(window.contains("500"), "window: {window}");
     assert!(
         all_time.contains("500"),
@@ -4115,8 +3938,8 @@ fn a_day_of_failures_is_one_day_recorded_not_zero() {
     let visible = strip_ansi(&run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich).stdout);
     let window = visible
         .lines()
-        .find(|line| line.contains("window"))
-        .expect("window row");
+        .find(|line| line.contains("last 30 days"))
+        .expect("last 30 days row");
     // The day carries failures and no tokens. It is still a day of history: the panel draws
     // the window and states its total rather than falling back to "no usage recorded yet".
     assert!(
@@ -4127,11 +3950,12 @@ fn a_day_of_failures_is_one_day_recorded_not_zero() {
         window.chars().any(|c| c.is_ascii_digit()),
         "the window row carries no total: {window}"
     );
-    let peak = visible
-        .lines()
-        .find(|line| line.contains("peak"))
-        .expect("peak row");
-    assert!(peak.contains(&today), "peak names the recorded day: {peak}");
+    // A day with no tokens is history, not a peak (status-is-health AC-7).
+    assert!(
+        fact_values(&visible, "peak").is_empty(),
+        "a zero day was named the peak: {visible}"
+    );
+    let _ = &today;
 }
 
 /// AC-1: `--base-url` mendaftarkan provider baru dan menyimpan keynya
@@ -6430,4 +6254,162 @@ fn rich_status_is_one_health_box() {
     for line in text.lines() {
         assert_eq!(line.chars().count(), 64, "off the fixed width: {line}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// status-is-health: usage is one box
+// ---------------------------------------------------------------------------
+
+fn date_back(days: i64) -> String {
+    (chrono::Local::now() - chrono::Duration::days(days))
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+fn usage_day(date: &str, input: i64, output: i64) -> Value {
+    json!({"date": date, "requests": 1, "successes": 1, "failures": 0,
+           "inputTokens": input, "outputTokens": output,
+           "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0, "reasoningOutputTokens": 0})
+}
+
+/// Two pools, one day in the window and one 60 days back that outweighs it.
+fn usage_payload(peak: Option<Value>) -> Value {
+    let mut payload = json!({
+        "providers": {
+            "anthropic": {"account_count": 1, "accounts": [{
+                "email": "a@x.com", "available": true,
+                "totalRequests": 12, "totalSuccesses": 10, "totalFailures": 2,
+                "totalInputTokens": 50_000, "totalOutputTokens": 20_000,
+                "totalCacheReadInputTokens": 30_000, "totalCacheCreationInputTokens": 0,
+                "days": [usage_day(&date_back(2), 3_000, 1_000), usage_day(&date_back(60), 40_000, 5_000)]
+            }]},
+            "groq": {"account_count": 1, "accounts": [{
+                "email": "key-1", "available": true,
+                "totalRequests": 1, "totalSuccesses": 1,
+                "totalInputTokens": 1_000, "totalOutputTokens": 500,
+                "days": [usage_day(&date_back(2), 1_000, 500)]
+            }]}
+        }
+    });
+    if let Some(peak) = peak {
+        payload["peak"] = peak;
+    }
+    payload
+}
+
+fn usage_run(payload: Value, style: Style) -> String {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        rich: style == Style::Rich,
+        accounts_payload: Some(payload),
+        ..FakeRuntime::default()
+    };
+    strip_ansi(&run_style(&["usage"], tmp.path(), &mut runtime, style).stdout)
+}
+
+/// AC-4, AC-6, AC-7: one box, the rows in order, all-time peak beyond the window.
+#[test]
+fn usage_is_one_box_of_window_then_all_time_rows() {
+    let text = usage_run(usage_payload(None), Style::Rich);
+
+    assert_eq!(text.matches('┌').count(), 1, "one box: {text}");
+    assert!(text.starts_with("┌─ usage ─ 2 pools, 2 accounts"), "{text}");
+    let labels: Vec<String> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("│ "))
+        .map(|body| body.split("  ").next().unwrap_or("").trim().to_string())
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            "tokens",
+            "last 30 days",
+            "peak",
+            "total",
+            "requests",
+            "input",
+            "cached",
+            "uncached",
+            "output"
+        ],
+        "{text}"
+    );
+    // The window holds one day: 3,000 + 1,000 on one pool, 1,000 + 500 on the other.
+    assert_eq!(fact_values(&text, "last 30 days"), ["5.5K"]);
+    // The best retained day is 60 days back, outside the window.
+    assert_eq!(
+        fact_values(&text, "peak"),
+        [format!("45.0K  {}", date_back(60))]
+    );
+    // total = input + output: (51,000 + 30,000 read) + 20,500.
+    assert_eq!(fact_values(&text, "total"), ["101.5K"]);
+    assert_eq!(fact_values(&text, "input"), ["81.0K"]);
+    assert_eq!(fact_values(&text, "output"), ["20.5K"]);
+    for gone in ["window", "all time"] {
+        assert!(fact_values(&text, gone).is_empty(), "{gone}: {text}");
+    }
+    for line in text.lines() {
+        assert_eq!(line.chars().count(), 64, "off the fixed width: {line}");
+    }
+}
+
+/// AC-7, AC-8: a stored peak whose day is no longer retained still wins.
+#[test]
+fn usage_peak_prefers_the_relays_stored_peak() {
+    let stored = json!({"date": "2026-01-02", "tokens": 9_000_000});
+    let text = usage_run(usage_payload(Some(stored)), Style::Rich);
+    assert_eq!(fact_values(&text, "peak"), ["9.0M  2026-01-02"]);
+
+    // A stored peak below a retained day loses to it.
+    let low = json!({"date": "2026-01-02", "tokens": 10});
+    let text = usage_run(usage_payload(Some(low)), Style::Rich);
+    assert_eq!(
+        fact_values(&text, "peak"),
+        [format!("45.0K  {}", date_back(60))]
+    );
+}
+
+/// AC-5: plain follows the daily rows with the same facts, in the same order.
+#[test]
+fn plain_usage_ends_with_the_one_block() {
+    let text = usage_run(usage_payload(None), Style::Plain);
+    let lines: Vec<&str> = text.lines().collect();
+    let tail = &lines[lines.len() - 6..];
+    assert_eq!(
+        tail,
+        [
+            "usage: 2 pools, 2 accounts",
+            "last_30_days 5.5K",
+            &format!("peak 45.0K {}", date_back(60)),
+            "total 101.5K",
+            "requests 13  (11 ok, 2 failed)",
+            "input 81.0K cached 30.0K (37%) uncached 51.0K output 20.5K",
+        ],
+        "{text}"
+    );
+    // The daily rows lead, and only days inside the window are listed.
+    assert!(lines[0].starts_with(&date_back(2)), "{text}");
+    assert!(!text.contains(&format!("{} ", date_back(60))), "{text}");
+}
+
+/// AC-9: nothing recorded yet.
+#[test]
+fn usage_with_no_history_is_still_one_box() {
+    let payload = json!({"providers": {"anthropic": {"account_count": 1, "accounts": [
+        {"email": "a@x.com", "available": true}
+    ]}}});
+    let text = usage_run(payload.clone(), Style::Rich);
+    assert_eq!(text.matches('┌').count(), 1, "{text}");
+    assert_eq!(fact_values(&text, "tokens"), ["no usage recorded yet"]);
+    assert_eq!(fact_values(&text, "last 30 days"), ["0"]);
+    assert_eq!(fact_values(&text, "total"), ["0"]);
+    assert!(fact_values(&text, "peak").is_empty(), "{text}");
+
+    let plain = usage_run(payload, Style::Plain);
+    assert!(!plain.contains("peak"), "{plain}");
+    assert!(
+        plain.starts_with("usage: 1 pool, 1 account\nlast_30_days 0\ntotal 0\n"),
+        "{plain}"
+    );
 }
