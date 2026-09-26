@@ -12,7 +12,6 @@ pub const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 pub const ANTHROPIC_REDIRECT_URI: &str = "http://localhost:54545/callback";
 pub const ANTHROPIC_SCOPE: &str = "org:create_api_key user:profile user:inference";
 
-pub const CODEX_ISSUER: &str = "https://auth.openai.com";
 pub const CODEX_AUTH_URL: &str = "https://auth.openai.com/oauth/authorize";
 pub const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const CODEX_CALLBACK_PORT: u16 = 1455;
@@ -23,7 +22,6 @@ pub const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 pub const ANTHROPIC_TOKEN_URL: &str = "https://api.anthropic.com/v1/oauth/token";
 pub const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
-pub const GROK_ISSUER: &str = "https://auth.x.ai";
 pub const GROK_AUTH_URL: &str = "https://auth.x.ai/oauth2/authorize";
 pub const GROK_TOKEN_URL: &str = "https://auth.x.ai/oauth2/token";
 pub const GROK_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";

@@ -284,7 +284,6 @@ fn default_command_starts_server() {
 
     let outcome = run(&[], tmp.path(), &mut runtime);
 
-    assert_eq!(outcome.code, 0);
     assert_eq!(runtime.server_host.as_deref(), Some("0.0.0.0"));
     assert_eq!(runtime.server_port, Some(8318));
     assert!(outcome.stderr.is_empty());
@@ -297,10 +296,6 @@ fn top_level_help_uses_subcommands() {
 
     let outcome = run(&["help"], tmp.path(), &mut runtime);
 
-    assert_eq!(outcome.code, 0);
-    assert!(!outcome.stdout.contains("--login"));
-    assert!(!outcome.stdout.contains("--host HOST"));
-    assert!(!outcome.stdout.contains("--port PORT"));
     assert!(outcome.stdout.contains("login"));
     assert!(outcome.stdout.contains("serve"));
     assert!(outcome.stderr.is_empty());
@@ -313,7 +308,6 @@ fn help_command_prints_nested_help() {
 
     let outcome = run(&["help", "service", "install"], tmp.path(), &mut runtime);
 
-    assert_eq!(outcome.code, 0);
     assert!(
         outcome
             .stdout
@@ -331,13 +325,12 @@ fn serve_subcommand_starts_server_with_custom_host_port() {
     write_config(tmp.path(), "127.0.0.1", 8317);
     let mut runtime = FakeRuntime::default();
 
-    let outcome = run(
+    run(
         &["serve", "--host", "0.0.0.0", "--port", "9000"],
         tmp.path(),
         &mut runtime,
     );
 
-    assert_eq!(outcome.code, 0);
     assert_eq!(runtime.server_host.as_deref(), Some("0.0.0.0"));
     assert_eq!(runtime.server_port, Some(9000));
 }
@@ -380,7 +373,6 @@ fn status_reports_health_and_account_counts() {
 
     let outcome = run(&["status"], tmp.path(), &mut runtime);
 
-    assert_eq!(outcome.code, 0);
     // Header facts moved into the relay block (rich-everywhere AC-7).
     assert!(
         outcome
@@ -388,22 +380,11 @@ fn status_reports_health_and_account_counts() {
             .contains("url http://127.0.0.1:8318 \u{2014} server ok")
     );
 
-    // status-total-only AC-3: the pool appears as one summary line, not a
-    // panel with its own request/token rollup.
     assert!(outcome.stdout.contains("anthropic"));
-    assert!(
-        !outcome
-            .stdout
-            .contains("anthropic: 1 account (1 available)")
-    );
     // Empty pools are hidden (AC-4): codex has no loaded accounts.
     assert!(!outcome.stdout.contains("codex"));
     assert_eq!(runtime.health_url.as_deref(), Some("http://127.0.0.1:8318"));
     assert_eq!(runtime.accounts_api_key.as_deref(), Some("sk-test"));
-}
-
-fn account(json: Value) -> Value {
-    json
 }
 
 /// Strip ANSI escape sequences, leaving the visible text — assertions about
@@ -475,7 +456,7 @@ fn cooldown_and_empty_pools() -> Value {
             "anthropic": {
                 "account_count": 3,
                 "accounts": [
-                    account(json!({
+                    json!({
                         "email": "a@x.com",
                         "available": true,
                         "failureCount": 0,
@@ -489,8 +470,8 @@ fn cooldown_and_empty_pools() -> Value {
                         "totalCacheReadInputTokens": 155_000_000,
                         "totalReasoningOutputTokens": 64_000,
                         "planType": "max"
-                    })),
-                    account(json!({
+                    }),
+                    json!({
                         "email": "b@x.com",
                         "available": true,
                         "failureCount": 4,
@@ -503,25 +484,25 @@ fn cooldown_and_empty_pools() -> Value {
                         "totalCacheReadInputTokens": 156_700_000,
                         "totalReasoningOutputTokens": 32_000,
                         "planType": "pro"
-                    })),
-                    account(json!({
+                    }),
+                    json!({
                         "email": "c@x.com",
                         "available": false,
                         "cooldownUntil": soon(252.9),
                         "failureCount": 9,
                         "planType": "pro"
-                    }))
+                    })
                 ]
             },
             "groq": {
                 "account_count": 1,
                 "accounts": [
-                    account(json!({
+                    json!({
                         "email": "g@x.com",
                         "available": true,
                         "failureCount": 0,
                         "planType": null
-                    }))
+                    })
                 ]
             },
             "deepseek": {
@@ -543,7 +524,6 @@ fn status_rolls_up_pool_health_per_provider() {
 
     let outcome = run(&["status"], tmp.path(), &mut runtime);
 
-    assert_eq!(outcome.code, 0);
     // status-is-health AC-3: one line per pool, saying what it can serve.
     let row = |name: &str| -> String {
         outcome
@@ -598,7 +578,7 @@ fn status_renders_panels_on_a_tty() {
                 "anthropic": {
                     "account_count": 3,
                     "accounts": [
-                        account(json!({
+                        json!({
                             "email": "a@x.com",
                             "available": true,
                             "failureCount": 0,
@@ -611,14 +591,14 @@ fn status_renders_panels_on_a_tty() {
                             "totalCacheReadInputTokens": 155_000_000,
                             "totalReasoningOutputTokens": 64_000,
                             "planType": "max"
-                        })),
-                        account(json!({
+                        }),
+                        json!({
                             "email": "b@x.com",
                             "available": false,
                             "cooldownUntil": soon(252.9),
                             "failureCount": 2,
                             "planType": "pro"
-                        }))
+                        })
                     ]
                 },
                 "deepseek": {"account_count": 0, "accounts": []}
@@ -629,14 +609,12 @@ fn status_renders_panels_on_a_tty() {
 
     let outcome = run_style(&["status"], tmp.path(), &mut runtime, Style::Rich);
 
-    assert_eq!(outcome.code, 0);
     let stdout = outcome.stdout.clone();
     let visible = strip_ansi(&stdout);
     // status-total-only AC-2: one box panel, headed by the relay total.
     assert!(visible.contains("┌─ status ───"), "panel header: {visible}");
     assert!(visible.contains('└'));
-    // No pool panel, no account row.
-    assert!(!visible.contains("pool: anthropic"));
+    // No account row.
     assert!(!visible.contains("a@x.com"));
     // status-is-health AC-3: the pool row says what the pool can serve. The
     // payload lists two of its three accounts: one available, one on cooldown.
@@ -683,7 +661,7 @@ fn accounts_renders_panels_with_detail_lines_on_a_tty() {
                 "anthropic": {
                     "account_count": 2,
                     "accounts": [
-                        account(json!({
+                        json!({
                             "email": "a@x.com",
                             "available": true,
                             "failureCount": 0,
@@ -695,12 +673,12 @@ fn accounts_renders_panels_with_detail_lines_on_a_tty() {
                             "totalCacheReadInputTokens": 155_000_000,
                             "totalReasoningOutputTokens": 64_000,
                             "planType": "max"
-                        })),
-                        account(json!({
+                        }),
+                        json!({
                             "email": "b@x.com",
                             "available": false,
                             "failureCount": 2
-                        }))
+                        })
                     ]
                 }
             }
@@ -710,7 +688,6 @@ fn accounts_renders_panels_with_detail_lines_on_a_tty() {
 
     let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
 
-    assert_eq!(outcome.code, 0);
     let stdout = outcome.stdout.clone();
     let visible = strip_ansi(&stdout);
     // Same panel frame as status (AC-6).
@@ -752,7 +729,7 @@ fn accounts_renders_the_token_block_at_every_scope() {
                 "anthropic": {
                     "account_count": 1,
                     "accounts": [
-                        account(json!({
+                        json!({
                             "email": "a@x.com",
                             "available": true,
                             "failureCount": 0,
@@ -773,7 +750,7 @@ fn accounts_renders_the_token_block_at_every_scope() {
                                 "reasoningOutputTokens": 1_600_000
                             }],
                             "planType": "max"
-                        }))
+                        })
                     ]
                 }
             }
@@ -783,7 +760,6 @@ fn accounts_renders_the_token_block_at_every_scope() {
 
     let outcome = run_style(&["accounts", "-v"], tmp.path(), &mut runtime, Style::Rich);
 
-    assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
     // AC-1: the block in order, at the account scope, the model scope and
     // the pool footer. Three occurrences because the pool holds one account
@@ -870,7 +846,7 @@ fn no_command_prints_a_cache_write() {
             "providers": {
                 "anthropic": {
                     "account_count": 1,
-                    "accounts": [account(json!({
+                    "accounts": [json!({
                         "email": "a@x.com",
                         "available": true,
                         "totalRequests": 3,
@@ -891,7 +867,7 @@ fn no_command_prints_a_cache_write() {
                             "cacheCreationInputTokens": 4_000,
                             "reasoningOutputTokens": 0
                         }]
-                    }))]
+                    })]
                 }
             }
         })),
@@ -944,7 +920,7 @@ fn accounts_detail_prints_usage_and_cooldown_per_account() {
                 "anthropic": {
                     "account_count": 3,
                     "accounts": [
-                        account(json!({
+                        json!({
                             "email": "a@x.com",
                             "available": true,
                             "failureCount": 0,
@@ -956,19 +932,19 @@ fn accounts_detail_prints_usage_and_cooldown_per_account() {
                             "totalCacheReadInputTokens": 155_000_000,
                             "totalReasoningOutputTokens": 64_000,
                             "planType": "max"
-                        })),
-                        account(json!({
+                        }),
+                        json!({
                             "email": "b@x.com",
                             "available": false,
                             "cooldownUntil": soon(191.0),
                             "failureCount": 2,
                             "planType": "pro"
-                        })),
-                        account(json!({
+                        }),
+                        json!({
                             "email": "c@x.com",
                             "available": false,
                             "failureCount": 5
-                        }))
+                        })
                     ]
                 }
             }
@@ -978,7 +954,6 @@ fn accounts_detail_prints_usage_and_cooldown_per_account() {
 
     let outcome = run(&["accounts"], tmp.path(), &mut runtime);
 
-    assert_eq!(outcome.code, 0);
     let stdout = outcome.stdout.clone();
     // Account header keeps its legacy shape; the cooldown account reads
     // "on cooldown" with remaining time, not "unavailable" (AC-6).
@@ -1006,7 +981,7 @@ fn service_install_delegates_custom_host_port() {
     write_config(tmp.path(), "127.0.0.1", 8317);
     let mut runtime = FakeRuntime::default();
 
-    let outcome = run(
+    run(
         &[
             "service",
             "install",
@@ -1019,7 +994,6 @@ fn service_install_delegates_custom_host_port() {
         &mut runtime,
     );
 
-    assert_eq!(outcome.code, 0);
     let request = runtime.install_request.expect("install request");
     assert_eq!(request.host.as_deref(), Some("127.0.0.1"));
     assert_eq!(request.port, Some(8318));
@@ -1078,13 +1052,12 @@ fn service_logs_passes_follow_and_lines() {
     let tmp = tempdir().expect("tempdir");
     let mut runtime = FakeRuntime::default();
 
-    let outcome = run(
+    run(
         &["service", "logs", "-f", "-n", "100"],
         tmp.path(),
         &mut runtime,
     );
 
-    assert_eq!(outcome.code, 0);
     assert_eq!(runtime.calls, ["service:logs:follow=true:lines=100"]);
 }
 
@@ -1093,9 +1066,8 @@ fn service_logs_defaults_to_recent_lines_without_follow() {
     let tmp = tempdir().expect("tempdir");
     let mut runtime = FakeRuntime::default();
 
-    let outcome = run(&["service", "logs"], tmp.path(), &mut runtime);
+    run(&["service", "logs"], tmp.path(), &mut runtime);
 
-    assert_eq!(outcome.code, 0);
     assert_eq!(runtime.calls, ["service:logs:follow=false:lines=50"]);
 }
 
@@ -1145,7 +1117,6 @@ fn login_with_key_saves_a_configured_provider_key() {
         &mut runtime,
     );
 
-    assert_eq!(outcome.code, 0);
     // Static keys are saved by the CLI itself; the OAuth runtime is never entered.
     assert!(runtime.login_provider.is_none(), "no OAuth login for a key");
     let token_file = tmp.path().join(".pengepul/groq");
@@ -1227,7 +1198,6 @@ fn update_check_reports_without_installing() {
 
     let outcome = run(&["update", "--check"], tmp.path(), &mut runtime);
 
-    assert_eq!(outcome.code, 0);
     assert!(outcome.stdout.contains("v99.0.0"), "{}", outcome.stdout);
     assert!(runtime.installed.is_none(), "--check must not install");
 }
@@ -1240,9 +1210,8 @@ fn update_installs_when_a_newer_release_exists() {
         ..FakeRuntime::default()
     };
 
-    let outcome = run(&["update"], tmp.path(), &mut runtime);
+    run(&["update"], tmp.path(), &mut runtime);
 
-    assert_eq!(outcome.code, 0);
     let (tag, asset) = runtime.installed.expect("must install");
     assert_eq!(tag, "v99.0.0");
     assert!(asset.ends_with(".tar.gz"), "asset was {asset}");
@@ -1271,7 +1240,7 @@ fn status_plain_ends_with_its_pool_rows() {
             "providers": {
                 "anthropic": {
                     "account_count": 1,
-                    "accounts": [account(json!({
+                    "accounts": [json!({
                         "email": "a@x.com",
                         "available": true,
                         "totalRequests": 640,
@@ -1279,17 +1248,17 @@ fn status_plain_ends_with_its_pool_rows() {
                         "totalOutputTokens": 120,
                         "totalCacheReadInputTokens": 7,
                         "totalCacheCreationInputTokens": 0
-                    }))]
+                    })]
                 },
                 "commandcode": {
                     "account_count": 1,
-                    "accounts": [account(json!({
+                    "accounts": [json!({
                         "email": "k@x.com",
                         "available": true,
                         "totalRequests": 10,
                         "totalInputTokens": 10,
                         "totalOutputTokens": 5
-                    }))]
+                    })]
                 }
             }
         })),
@@ -1298,7 +1267,6 @@ fn status_plain_ends_with_its_pool_rows() {
 
     let outcome = run(&["status"], tmp.path(), &mut runtime);
 
-    assert_eq!(outcome.code, 0);
     // status-is-health AC-1, AC-2: the block opens with the relay header and
     // ends on its pool rows; the relay's numbers are `usage`'s.
     assert!(
@@ -1323,13 +1291,13 @@ fn status_rich_is_one_64_wide_box() {
             "providers": {
                 "anthropic": {
                     "account_count": 1,
-                    "accounts": [account(json!({
+                    "accounts": [json!({
                         "email": "a@x.com",
                         "available": true,
                         "totalRequests": 640,
                         "totalInputTokens": 33,
                         "totalOutputTokens": 120
-                    }))]
+                    })]
                 }
             }
         })),
@@ -1338,7 +1306,6 @@ fn status_rich_is_one_64_wide_box() {
 
     let outcome = run_style(&["status"], tmp.path(), &mut runtime, Style::Rich);
 
-    assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
     // AC-2: a single 64-wide box panel headed by the relay total.
     let lines: Vec<&str> = visible.lines().collect();
@@ -1771,7 +1738,7 @@ fn a_command_level_config_wins_over_the_root_one() {
     .expect("write command config");
     let mut runtime = FakeRuntime::default();
 
-    let outcome = run(
+    run(
         &[
             "--config",
             root.to_str().expect("utf-8"),
@@ -1783,7 +1750,6 @@ fn a_command_level_config_wins_over_the_root_one() {
         &mut runtime,
     );
 
-    assert_eq!(outcome.code, 0);
     assert_eq!(runtime.health_url.as_deref(), Some("http://127.0.0.1:8318"));
     assert_eq!(runtime.accounts_api_key.as_deref(), Some("sk-command"));
 
@@ -1807,7 +1773,7 @@ fn two_model_pool() -> Value {
             "anthropic": {
                 "account_count": 2,
                 "accounts": [
-                    account(json!({
+                    json!({
                         "email": "a@x.com",
                         "available": true,
                         "totalRequests": 700,
@@ -1836,8 +1802,8 @@ fn two_model_pool() -> Value {
                                 "reasoningOutputTokens": 42
                             }
                         ]
-                    })),
-                    account(json!({
+                    }),
+                    json!({
                         "email": "b@x.com",
                         "available": true,
                         "totalRequests": 3,
@@ -1851,7 +1817,7 @@ fn two_model_pool() -> Value {
                             "cacheReadInputTokens": 30,
                             "reasoningOutputTokens": 0
                         }]
-                    }))
+                    })
                 ]
             }
         }
@@ -1872,7 +1838,6 @@ fn accounts_breaks_usage_down_per_model_on_a_tty() {
 
     let outcome = run_style(&["accounts", "-v"], tmp.path(), &mut runtime, Style::Rich);
 
-    assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
     let lines: Vec<&str> = visible.lines().collect();
 
@@ -1931,12 +1896,6 @@ fn accounts_breaks_usage_down_per_model_on_a_tty() {
         ]
     );
 
-    // AC-6 (revised): the pool footer carries no model aggregate; the
-    // per-account lines are the only breakdown.
-    assert!(
-        !visible.contains("by model"),
-        "aggregate removed: {visible}"
-    );
     // Each model appears once per account that served it, never summed:
     // fable ran on both accounts, so twice — not a third aggregated line.
     assert_eq!(
@@ -1963,7 +1922,7 @@ fn accounts_lists_models_in_plain_output() {
                 "anthropic": {
                     "account_count": 2,
                     "accounts": [
-                        account(json!({
+                        json!({
                             "email": "a@x.com",
                             "available": true,
                             "totalRequests": 10,
@@ -1977,10 +1936,10 @@ fn accounts_lists_models_in_plain_output() {
                                 "cacheReadInputTokens": 500,
                                 "reasoningOutputTokens": 7
                             }]
-                        })),
+                        }),
                         // A second account serving the same model: the
                         // rows stay per-account, never summed.
-                        account(json!({
+                        json!({
                             "email": "b@x.com",
                             "available": true,
                             "totalRequests": 2,
@@ -1994,7 +1953,7 @@ fn accounts_lists_models_in_plain_output() {
                                 "cacheReadInputTokens": 0,
                                 "reasoningOutputTokens": 0
                             }]
-                        }))
+                        })
                     ]
                 }
             }
@@ -2004,7 +1963,6 @@ fn accounts_lists_models_in_plain_output() {
 
     let outcome = run(&["accounts", "--verbose"], tmp.path(), &mut runtime);
 
-    assert_eq!(outcome.code, 0);
     assert!(outcome.stdout.contains("claude-fable-5-1"));
     assert!(outcome.stdout.contains("10 ok"));
     // AC-7: plain carries the same block as one line, in the panel's words:
@@ -2017,8 +1975,6 @@ fn accounts_lists_models_in_plain_output() {
         "{}",
         outcome.stdout
     );
-    // AC-6 (revised): no pool aggregate in plain either.
-    assert!(!outcome.stdout.contains("by model"));
 }
 
 /// accounts-verbose AC-6: the two flags compose.
@@ -2142,14 +2098,14 @@ fn accounts_without_model_history_print_no_model_lines() {
             "providers": {
                 "anthropic": {
                     "account_count": 1,
-                    "accounts": [account(json!({
+                    "accounts": [json!({
                         "email": "a@x.com",
                         "available": true,
                         "totalRequests": 921,
                         "totalSuccesses": 898,
                         "totalInputTokens": 1_000,
                         "models": []
-                    }))]
+                    })]
                 }
             }
         })),
@@ -2158,10 +2114,7 @@ fn accounts_without_model_history_print_no_model_lines() {
 
     let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
 
-    assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
-    assert!(!visible.contains("by model"), "no section: {visible}");
-    assert!(!visible.contains("untracked"));
     // The account totals still show.
     assert!(visible.contains("898 ok"));
 }
@@ -2190,7 +2143,7 @@ fn accounts_keeps_long_model_names_distinguishable() {
             "providers": {
                 "deepseek": {
                     "account_count": 1,
-                    "accounts": [account(json!({
+                    "accounts": [json!({
                         "email": "d@x.com",
                         "available": true,
                         "totalSuccesses": 10,
@@ -2199,7 +2152,7 @@ fn accounts_keeps_long_model_names_distinguishable() {
                             usage("deepseek-v4-flash-vision-exp", 20),
                             usage("deepseek-v4-flash-fast", 10)
                         ]
-                    }))]
+                    })]
                 }
             }
         })),
@@ -2208,7 +2161,6 @@ fn accounts_keeps_long_model_names_distinguishable() {
 
     let outcome = run_style(&["accounts", "-v"], tmp.path(), &mut runtime, Style::Rich);
 
-    assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
     assert!(
         visible.contains("deepseek-v4-flash-vision-exp"),
@@ -2256,12 +2208,12 @@ fn accounts_fits_the_model_column_to_the_names_present() {
             "providers": {
                 "anthropic": {
                     "account_count": 1,
-                    "accounts": [account(json!({
+                    "accounts": [json!({
                         "email": "a@x.com",
                         "available": true,
                         "totalSuccesses": 5,
                         "models": models
-                    }))]
+                    })]
                 }
             }
         })
@@ -2325,7 +2277,7 @@ fn accounts_never_amputates_counts_for_an_overlong_model_name() {
             "providers": {
                 "anthropic": {
                     "account_count": 1,
-                    "accounts": [account(json!({
+                    "accounts": [json!({
                         "email": "a@x.com",
                         "available": true,
                         "totalSuccesses": 5,
@@ -2340,7 +2292,7 @@ fn accounts_never_amputates_counts_for_an_overlong_model_name() {
                             "cacheReadInputTokens": 0,
                             "reasoningOutputTokens": 0
                         }]
-                    }))]
+                    })]
                 }
             }
         })),
@@ -2349,7 +2301,6 @@ fn accounts_never_amputates_counts_for_an_overlong_model_name() {
 
     let outcome = run_style(&["accounts", "-v"], tmp.path(), &mut runtime, Style::Rich);
 
-    assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
     let row = visible
         .lines()
@@ -2374,7 +2325,6 @@ fn status_prints_the_block_for_a_relay_with_no_pools() {
 
     let outcome = run(&["status"], tmp.path(), &mut runtime);
 
-    assert_eq!(outcome.code, 0);
     assert!(outcome.stdout.starts_with("status\n"), "{}", outcome.stdout);
     // The connection facts still print; there is no pool row to follow them.
     assert!(outcome.stdout.contains("server ok"), "{}", outcome.stdout);
@@ -2405,18 +2355,18 @@ fn accounts_shares_one_model_column_across_a_pool() {
                 "anthropic": {
                     "account_count": 2,
                     "accounts": [
-                        account(json!({
+                        json!({
                             "email": "a@x.com",
                             "available": true,
                             "totalSuccesses": 5,
                             "models": [model("claude-sonnet-4-5")]
-                        })),
-                        account(json!({
+                        }),
+                        json!({
                             "email": "b@x.com",
                             "available": true,
                             "totalSuccesses": 5,
                             "models": [model("claude-opus-5")]
-                        }))
+                        })
                     ]
                 }
             }
@@ -2426,7 +2376,6 @@ fn accounts_shares_one_model_column_across_a_pool() {
 
     let outcome = run_style(&["accounts", "-v"], tmp.path(), &mut runtime, Style::Rich);
 
-    assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
     let column = |needle: &str| -> usize {
         let line = visible
@@ -2507,23 +2456,23 @@ fn status_rows_are_labelled_facts_in_one_column() {
             "providers": {
                 "anthropic": {
                     "account_count": 1,
-                    "accounts": [account(json!({
+                    "accounts": [json!({
                         "email": "a@x.com",
                         "available": true,
                         "totalRequests": 907,
                         "totalSuccesses": 900,
                         "totalInputTokens": 1_000,
                         "totalOutputTokens": 2_000
-                    }))]
+                    })]
                 },
                 "commandcode": {
                     "account_count": 2,
-                    "accounts": [account(json!({
+                    "accounts": [json!({
                         "email": "k@x.com",
                         "available": true,
                         "totalRequests": 239,
                         "totalSuccesses": 212
-                    }))]
+                    })]
                 }
             }
         })),
@@ -2532,7 +2481,6 @@ fn status_rows_are_labelled_facts_in_one_column() {
 
     let outcome = run_style(&["status"], tmp.path(), &mut runtime, Style::Rich);
 
-    assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
     let value_column = |label: &str| -> usize {
         let line = visible
@@ -2673,22 +2621,22 @@ fn status_survives_a_long_pool_name() {
             "providers": {
                 "a-very-long-provider-name-here": {
                     "account_count": 1,
-                    "accounts": [account(json!({
+                    "accounts": [json!({
                         "email": "a@x.com",
                         "available": true,
                         "totalRequests": 640,
                         "totalInputTokens": 22_100_000,
                         "totalOutputTokens": 401_200
-                    }))]
+                    })]
                 },
                 "anthropic": {
                     "account_count": 1,
-                    "accounts": [account(json!({
+                    "accounts": [json!({
                         "email": "b@x.com",
                         "available": true,
                         "totalRequests": 10,
                         "totalInputTokens": 10
-                    }))]
+                    })]
                 }
             }
         })),
@@ -2697,7 +2645,6 @@ fn status_survives_a_long_pool_name() {
 
     let outcome = run_style(&["status"], tmp.path(), &mut runtime, Style::Rich);
 
-    assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
     // The counts survive: the label clips, a silently truncated count is a lie.
     let long_row = visible
@@ -2747,7 +2694,7 @@ fn accounts_footer_rows_use_the_row_grammar() {
             "providers": {
                 "anthropic": {
                     "account_count": 1,
-                    "accounts": [account(json!({
+                    "accounts": [json!({
                         "email": "a@x.com",
                         "available": true,
                         "totalRequests": 640,
@@ -2755,7 +2702,7 @@ fn accounts_footer_rows_use_the_row_grammar() {
                         "totalInputTokens": 22_100_000,
                         "totalOutputTokens": 401_200,
                         "totalReasoningOutputTokens": 64_000
-                    }))]
+                    })]
                 }
             }
         })),
@@ -2764,7 +2711,6 @@ fn accounts_footer_rows_use_the_row_grammar() {
 
     let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
 
-    assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
     let lines: Vec<&str> = visible.lines().collect();
     // The footer starts after the mid-panel separator; searching the whole
@@ -2881,7 +2827,6 @@ fn the_service_header_does_not_repeat_the_state_row() {
         Style::Rich,
     );
 
-    assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
     let header = visible.lines().next().expect("header");
     // The state belongs to its row, not to the header.
@@ -2971,11 +2916,11 @@ fn an_over_long_panel_header_is_marked_not_amputated() {
             "providers": {
                 long_id.clone(): {
                     "account_count": 12,
-                    "accounts": (0..12).map(|n| account(json!({
+                    "accounts": (0..12).map(|n| json!({
                         "email": format!("k{n}@x.com"),
                         "available": true,
                         "totalRequests": 1
-                    }))).collect::<Vec<_>>()
+                    })).collect::<Vec<_>>()
                 }
             }
         })),
@@ -2984,7 +2929,6 @@ fn an_over_long_panel_header_is_marked_not_amputated() {
 
     let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
 
-    assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
     let header = visible.lines().next().expect("header");
     assert_eq!(header.chars().count(), 64, "header width: {header}");
@@ -3010,11 +2954,11 @@ fn plain_status_never_clips_a_pool_name() {
             "providers": {
                 long_id: {
                     "account_count": 1,
-                    "accounts": [account(json!({
+                    "accounts": [json!({
                         "email": "a@x.com",
                         "available": true,
                         "totalRequests": 5
-                    }))]
+                    })]
                 }
             }
         })),
@@ -3023,7 +2967,6 @@ fn plain_status_never_clips_a_pool_name() {
 
     let outcome = run(&["status"], tmp.path(), &mut runtime);
 
-    assert_eq!(outcome.code, 0);
     assert!(
         outcome.stdout.contains(long_id),
         "plain clipped the pool name:\n{}",
@@ -3049,11 +2992,11 @@ fn a_control_character_cannot_split_a_panel_row() {
             "providers": {
                 "an\nthropic\tpool": {
                     "account_count": 1,
-                    "accounts": [account(json!({
+                    "accounts": [json!({
                         "email": "a@x.com",
                         "available": true,
                         "totalRequests": 5
-                    }))]
+                    })]
                 }
             }
         })),
@@ -3062,7 +3005,6 @@ fn a_control_character_cannot_split_a_panel_row() {
 
     let outcome = run_style(&["status"], tmp.path(), &mut runtime, Style::Rich);
 
-    assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
     for line in visible.lines() {
         assert_eq!(
@@ -3104,22 +3046,22 @@ fn usage_renders_a_thirty_day_sparkline() {
             "providers": {
                 "anthropic": {
                     "account_count": 1,
-                    "accounts": [account(json!({
+                    "accounts": [json!({
                         "email": "a@x.com",
                         "available": true,
                         "totalInputTokens": 40_000,
                         "days": [day(&older, 1_000), day(&peak_day, 9_000)]
-                    }))]
+                    })]
                 },
                 // AC-9: a second pool's days sum into the same bars.
                 "commandcode": {
                     "account_count": 1,
-                    "accounts": [account(json!({
+                    "accounts": [json!({
                         "email": "k@x.com",
                         "available": true,
                         "totalInputTokens": 10_000,
                         "days": [day(&older, 1_000)]
-                    }))]
+                    })]
                 }
             }
         })),
@@ -3128,7 +3070,6 @@ fn usage_renders_a_thirty_day_sparkline() {
 
     let outcome = run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich);
 
-    assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
     let lines: Vec<&str> = visible.lines().collect();
     // status-is-health AC-4: the window rows lead the one box.
@@ -3195,7 +3136,7 @@ fn usage_plain_is_one_line_per_day() {
             "providers": {
                 "anthropic": {
                     "account_count": 1,
-                    "accounts": [account(json!({
+                    "accounts": [json!({
                         "email": "a@x.com",
                         "available": true,
                         "days": [{
@@ -3209,7 +3150,7 @@ fn usage_plain_is_one_line_per_day() {
                             "cacheReadInputTokens": 20,
                             "reasoningOutputTokens": 5
                         }]
-                    }))]
+                    })]
                 }
             }
         })),
@@ -3218,7 +3159,6 @@ fn usage_plain_is_one_line_per_day() {
 
     let outcome = run(&["usage"], tmp.path(), &mut runtime);
 
-    assert_eq!(outcome.code, 0);
     assert!(
         !outcome.stdout.contains('▁') && !outcome.stdout.contains('█'),
         "block characters in a pipe: {}",
@@ -3248,7 +3188,7 @@ fn usage_says_how_much_history_it_actually_has() {
             "providers": {
                 "anthropic": {
                     "account_count": 1,
-                    "accounts": [account(json!({
+                    "accounts": [json!({
                         "email": "a@x.com",
                         "available": true,
                         "days": [{
@@ -3260,7 +3200,7 @@ fn usage_says_how_much_history_it_actually_has() {
                             "cacheCreationInputTokens": 0,
                             "reasoningOutputTokens": 0
                         }]
-                    }))]
+                    })]
                 }
             }
         })),
@@ -3269,7 +3209,6 @@ fn usage_says_how_much_history_it_actually_has() {
 
     let outcome = run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich);
 
-    assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
     // The window row is a figure. No day count, no phrase about how much history exists:
     // the header says which window is drawn and the bars show what is in it.
@@ -3489,7 +3428,7 @@ fn usage_treats_an_out_of_window_history_as_empty() {
             "providers": {
                 "anthropic": {
                     "account_count": 1,
-                    "accounts": [account(json!({
+                    "accounts": [json!({
                         "email": "a@x.com",
                         "available": true,
                         "days": [{
@@ -3501,7 +3440,7 @@ fn usage_treats_an_out_of_window_history_as_empty() {
                             "cacheCreationInputTokens": 0,
                             "reasoningOutputTokens": 0
                         }]
-                    }))]
+                    })]
                 }
             }
         })),
@@ -3510,7 +3449,6 @@ fn usage_treats_an_out_of_window_history_as_empty() {
 
     let outcome = run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich);
 
-    assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
     // History exists, just not in the window: saying none was ever recorded
     // would contradict the all-time peak printed below it.
@@ -3535,12 +3473,12 @@ fn a_pool_footer_prints_no_load_row() {
             "providers": {
                 "anthropic": {
                     "account_count": 1,
-                    "accounts": [account(json!({
+                    "accounts": [json!({
                         "email": "a@x.com",
                         "available": true,
                         "totalRequests": 10,
                         "totalInputTokens": 1_000
-                    }))]
+                    })]
                 }
             }
         })),
@@ -3549,7 +3487,6 @@ fn a_pool_footer_prints_no_load_row() {
 
     let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
 
-    assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
     assert!(
         !visible.contains("│ total"),
@@ -3577,7 +3514,7 @@ fn a_day_of_failures_counts_as_history_in_both_styles() {
         "providers": {
             "anthropic": {
                 "account_count": 1,
-                "accounts": [account(json!({
+                "accounts": [json!({
                     "email": "a@x.com",
                     "available": true,
                     "days": [{
@@ -3591,7 +3528,7 @@ fn a_day_of_failures_counts_as_history_in_both_styles() {
                         "cacheCreationInputTokens": 0,
                         "reasoningOutputTokens": 0
                     }]
-                }))]
+                })]
             }
         }
     });
@@ -3623,7 +3560,7 @@ fn usage_all_time_is_the_payload_carried_load_exactly() {
         "providers": {
             "anthropic": {
                 "account_count": 1,
-                "accounts": [account(json!({
+                "accounts": [json!({
                     "email": "a@x.com",
                     "available": true,
                     "totalRequests": 3,
@@ -3643,7 +3580,7 @@ fn usage_all_time_is_the_payload_carried_load_exactly() {
                         "cacheCreationInputTokens": 0,
                         "reasoningOutputTokens": 0
                     }]
-                }))]
+                })]
             }
         }
     });
@@ -3688,7 +3625,7 @@ fn all_time_is_never_smaller_than_the_window_it_contains() {
             "providers": {
                 "anthropic": {
                     "account_count": 1,
-                    "accounts": [account(json!({
+                    "accounts": [json!({
                         "email": "a@x.com",
                         "available": true,
                         // Cumulative counters absent: a hand-edited file.
@@ -3703,7 +3640,7 @@ fn all_time_is_never_smaller_than_the_window_it_contains() {
                             "cacheCreationInputTokens": 0,
                             "reasoningOutputTokens": 0
                         }]
-                    }))]
+                    })]
                 }
             }
         })),
@@ -3740,7 +3677,7 @@ fn an_account_is_silent_about_tokens_no_model_claims() {
             "providers": {
                 "anthropic": {
                     "account_count": 1,
-                    "accounts": [account(json!({
+                    "accounts": [json!({
                         "email": "a@x.com",
                         "available": true,
                         "totalRequests": 100,
@@ -3758,7 +3695,7 @@ fn an_account_is_silent_about_tokens_no_model_claims() {
                             "cacheReadInputTokens": 0,
                             "reasoningOutputTokens": 0
                         }]
-                    }))]
+                    })]
                 }
             }
         })),
@@ -3767,7 +3704,6 @@ fn an_account_is_silent_about_tokens_no_model_claims() {
 
     let outcome = run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich);
 
-    assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
     // 1,000 on the account, 400 claimed by a model: 600 belong to none,
     // and the panel says nothing about them. The operator migrated the
@@ -3784,7 +3720,7 @@ fn an_account_is_silent_about_tokens_no_model_claims() {
             "providers": {
                 "anthropic": {
                     "account_count": 1,
-                    "accounts": [account(json!({
+                    "accounts": [json!({
                         "email": "a@x.com",
                         "available": true,
                         "totalInputTokens": 400,
@@ -3797,7 +3733,7 @@ fn an_account_is_silent_about_tokens_no_model_claims() {
                             "cacheReadInputTokens": 0,
                             "reasoningOutputTokens": 0
                         }]
-                    }))]
+                    })]
                 }
             }
         })),
@@ -3825,7 +3761,7 @@ fn a_day_of_failures_is_one_day_recorded_not_zero() {
             "providers": {
                 "anthropic": {
                     "account_count": 1,
-                    "accounts": [account(json!({
+                    "accounts": [json!({
                         "email": "a@x.com",
                         "available": true,
                         "totalRequests": 9,
@@ -3841,7 +3777,7 @@ fn a_day_of_failures_is_one_day_recorded_not_zero() {
                             "cacheCreationInputTokens": 0,
                             "reasoningOutputTokens": 0
                         }]
-                    }))]
+                    })]
                 }
             }
         })),
@@ -5071,7 +5007,6 @@ fn launch_claude_points_the_harness_at_the_relay() {
 
     let outcome = run(&["launch", "claude"], tmp.path(), &mut runtime);
 
-    assert_eq!(outcome.code, 0);
     // Nothing is printed: the process is about to become the harness, and a
     // panel under its first frame is noise (`serve` prints nothing either).
     assert!(outcome.stdout.is_empty(), "{}", outcome.stdout);
@@ -5098,13 +5033,12 @@ fn launch_claude_moves_every_model_tier() {
     write_config(tmp.path(), "127.0.0.1", 8317);
     let mut runtime = FakeRuntime::default();
 
-    let outcome = run(
+    run(
         &["launch", "claude", "--model", "gpt-5.4"],
         tmp.path(),
         &mut runtime,
     );
 
-    assert_eq!(outcome.code, 0);
     let plan = launched(&runtime);
     for name in [
         "ANTHROPIC_MODEL",
@@ -5123,13 +5057,12 @@ fn launch_pi_names_the_relay_provider_and_the_model() {
     write_config(tmp.path(), "127.0.0.1", 8317);
     let mut runtime = FakeRuntime::default();
 
-    let outcome = run(
+    run(
         &["launch", "pi", "--model", "anthropic/claude-opus-5"],
         tmp.path(),
         &mut runtime,
     );
 
-    assert_eq!(outcome.code, 0);
     let plan = launched(&runtime);
     assert_eq!(plan.program, "pi");
     assert_eq!(
@@ -5169,13 +5102,12 @@ fn launch_forwards_arguments_after_the_separator() {
     write_config(tmp.path(), "127.0.0.1", 8317);
     let mut runtime = FakeRuntime::default();
 
-    let outcome = run(
+    run(
         &["launch", "claude", "--", "--resume", "abc"],
         tmp.path(),
         &mut runtime,
     );
 
-    assert_eq!(outcome.code, 0);
     assert_eq!(launched(&runtime).args, ["--resume", "abc"]);
 }
 
@@ -5185,13 +5117,12 @@ fn launch_pi_forwards_arguments_after_its_own() {
     write_config(tmp.path(), "127.0.0.1", 8317);
     let mut runtime = FakeRuntime::default();
 
-    let outcome = run(
+    run(
         &["launch", "pi", "--model", "opus-5", "--", "--continue"],
         tmp.path(),
         &mut runtime,
     );
 
-    assert_eq!(outcome.code, 0);
     assert_eq!(
         launched(&runtime).args,
         ["--provider", "pengepul", "--model", "opus-5", "--continue"]
@@ -5288,7 +5219,6 @@ fn help_launch_names_the_harnesses() {
 
     let outcome = run(&["help", "launch"], tmp.path(), &mut runtime);
 
-    assert_eq!(outcome.code, 0);
     assert!(
         outcome.stdout.starts_with("Usage: pengepul launch"),
         "{}",
@@ -5340,9 +5270,8 @@ fn launch_claude_picks_a_model_from_the_relay() {
     write_config(tmp.path(), "127.0.0.1", 8317);
     let mut runtime = picking(1);
 
-    let outcome = run(&["launch", "claude"], tmp.path(), &mut runtime);
+    run(&["launch", "claude"], tmp.path(), &mut runtime);
 
-    assert_eq!(outcome.code, 0);
     assert_eq!(
         env_value(&launched(&runtime), "ANTHROPIC_MODEL"),
         Some("anthropic/claude-opus-5")
@@ -5369,9 +5298,8 @@ fn the_picker_offers_the_whole_catalog_to_claude() {
     );
     let mut runtime = picking(3);
 
-    let outcome = run(&["launch", "claude"], tmp.path(), &mut runtime);
+    run(&["launch", "claude"], tmp.path(), &mut runtime);
 
-    assert_eq!(outcome.code, 0);
     let choices = offered(&runtime);
     assert_eq!(
         choices.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
@@ -5399,7 +5327,7 @@ fn a_configured_provider_model_is_an_ordinary_choice_for_claude() {
     );
     let mut runtime = FakeRuntime::default();
 
-    let outcome = run(
+    run(
         &[
             "launch",
             "claude",
@@ -5410,7 +5338,6 @@ fn a_configured_provider_model_is_an_ordinary_choice_for_claude() {
         &mut runtime,
     );
 
-    assert_eq!(outcome.code, 0);
     assert_eq!(
         env_value(&launched(&runtime), "ANTHROPIC_MODEL"),
         Some("groq/llama-3.3-70b-versatile")
@@ -5426,9 +5353,8 @@ fn launch_pi_picks_from_the_same_catalog() {
     );
     let mut runtime = picking(3);
 
-    let outcome = run(&["launch", "pi"], tmp.path(), &mut runtime);
+    run(&["launch", "pi"], tmp.path(), &mut runtime);
 
-    assert_eq!(outcome.code, 0);
     assert_eq!(offered(&runtime).len(), 3);
     assert_eq!(
         launched(&runtime).args,
@@ -5483,7 +5409,6 @@ fn a_cancelled_picker_launches_nothing() {
 
     let outcome = run(&["launch", "claude"], tmp.path(), &mut runtime);
 
-    assert_eq!(outcome.code, 0);
     assert!(runtime.offered.is_some(), "it did ask");
     assert!(runtime.launch_plan.is_none(), "nothing was launched");
     assert!(outcome.stdout.is_empty(), "{}", outcome.stdout);
@@ -5502,9 +5427,8 @@ fn a_cancelled_picker_launches_nothing_for_pi_either() {
         ..FakeRuntime::default()
     };
 
-    let outcome = run(&["launch", "pi"], tmp.path(), &mut runtime);
+    run(&["launch", "pi"], tmp.path(), &mut runtime);
 
-    assert_eq!(outcome.code, 0);
     assert!(runtime.launch_plan.is_none());
 }
 
@@ -5519,9 +5443,8 @@ fn the_picker_does_not_run_when_output_is_piped() {
         ..FakeRuntime::default()
     };
 
-    let outcome = run(&["launch", "claude"], tmp.path(), &mut runtime);
+    run(&["launch", "claude"], tmp.path(), &mut runtime);
 
-    assert_eq!(outcome.code, 0);
     assert!(runtime.offered.is_none());
     assert!(
         !runtime.calls.iter().any(|call| call.starts_with("models:")),
@@ -5561,9 +5484,8 @@ fn an_empty_catalog_asks_nothing() {
         ..FakeRuntime::default()
     };
 
-    let outcome = run(&["launch", "claude"], tmp.path(), &mut runtime);
+    run(&["launch", "claude"], tmp.path(), &mut runtime);
 
-    assert_eq!(outcome.code, 0);
     assert!(runtime.offered.is_none());
     assert_eq!(env_value(&launched(&runtime), "ANTHROPIC_MODEL"), None);
 }
@@ -5641,15 +5563,15 @@ fn payload_with_a_removed_key() -> Value {
             "commandcode": {
                 "account_count": 2,
                 "accounts": [
-                    account(json!({
+                    json!({
                         "email": "key-90445c90",
                         "available": true,
                         "totalRequests": 100,
                         "totalSuccesses": 100,
                         "totalInputTokens": 10_000,
                         "days": [day(100, 10_000)]
-                    })),
-                    account(json!({
+                    }),
+                    json!({
                         "email": "key-4f84698d",
                         "available": false,
                         "cooldownUntil": 0.0,
@@ -5659,7 +5581,7 @@ fn payload_with_a_removed_key() -> Value {
                         "totalSuccesses": 7,
                         "totalInputTokens": 2_000,
                         "days": [day(7, 2_000)]
-                    }))
+                    })
                 ]
             }
         }

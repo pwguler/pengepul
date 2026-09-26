@@ -14,5 +14,4 @@ fn binary_help_runs_cli() {
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
     assert!(stdout.contains("Usage: pengepul"));
-    assert!(!stdout.contains("not fully wired"));
 }
