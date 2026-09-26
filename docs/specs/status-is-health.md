@@ -11,7 +11,7 @@ and *"peak (all time) and all should be all time as well except last 30 days"*.
 
 ## Shape
 
-**`status`** is one box headed `relay`: `config`, `url`, `server`,
+**`status`** is one box headed `status`: `config`, `url`, `server`,
 `version`, `uptime`, then one row per Pool naming what it can serve:
 `2 accounts, 1 available, 1 on cooldown`. `available` always prints; `on cooldown`, `disabled`
 and `unavailable` print only when non-zero, in the words the account rows use. No request or
@@ -51,7 +51,8 @@ unreadable one is left in place and never overwritten.
 ## Acceptance criteria
 
 - AC-1: `status` prints no `requests` row and no token row, in either style.
-- AC-2: `status` rich is one box headed `relay`; plain's first line is `relay`. The pool rows
+- AC-2: `status` rich is one box headed `status`; plain's first line is `status`, the verb's
+  own name, as `usage`'s box is headed `usage`. The pool rows
   carry each pool and its account count, so the header names only the subject.
 - AC-3: Each non-empty Pool has one `status` row, which rich wraps between counts onto an
   unlabelled continuation line when it is wider than the value cell: `N account(s), N available`, then

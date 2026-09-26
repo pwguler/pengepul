@@ -91,8 +91,8 @@ in files.
   number formats, and the `Style` (rich on a color TTY, plain otherwise)
   that `main.rs` decides once at the edge. Knows nothing of Pools,
   Accounts, or the admin payload.
-- **Usage view** (`usage_view.rs`) — the admin payload turned into the `relay`
-  health block for `status` (connection facts and one row per pool counting its
+- **Usage view** (`usage_view.rs`) — the admin payload turned into the `status`
+  health block (connection facts and one row per pool counting its
   accounts by state), pool panels with account rows and footers for `accounts`
   (per-model lines under `--verbose`), and `usage`'s one box (the 30-day sparkline and
   window total, then the all-time peak, total, requests and token block), in both

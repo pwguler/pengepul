@@ -1,5 +1,5 @@
 //! The `status`/`accounts`/`usage` views: the admin payload turned into pool
-//! panels, account rows, footers, the `relay` health block and the `usage`
+//! panels, account rows, footers, the `status` health block and the `usage`
 //! box, in both styles. Pure over the payload and a `now` handed in by the
 //! caller.
 
@@ -578,8 +578,8 @@ impl RelayTotals {
     }
 }
 
-/// `<name>: P pools, A accounts` with singular forms where due: `relay` for
-/// `status`, `usage` for `usage`.
+/// `<name>: P pools, A accounts` with singular forms where due; `usage`'s
+/// header.
 pub(crate) fn relay_header(name: &str, totals: &RelayTotals) -> String {
     format!(
         "{name}: {} {}, {} {}",
@@ -619,7 +619,7 @@ pub(crate) struct Connection {
     pub(crate) stale: bool,
 }
 
-/// `status`, plain: the `relay` header, the connection facts, then one line
+/// `status`, plain: the `status` header, the connection facts, then one line
 /// per pool saying what it can serve (status-is-health).
 pub(crate) fn print_relay_total_plain(
     payload: &Value,
@@ -630,7 +630,7 @@ pub(crate) fn print_relay_total_plain(
     let totals = RelayTotals::from_payload(payload, now);
     // The pool rows carry each pool and its account count; the header only
     // names the subject (status-is-health AC-2).
-    output.line("relay");
+    output.line("status");
     output.line(&format!("config {}", connection.config));
     output.line(&format!(
         "url {} \u{2014} server {}",
@@ -693,7 +693,7 @@ pub(crate) fn print_relay_total_rich(
             facts.push(Fact::new(label, &value));
         }
     }
-    for line in fact_panel("relay", &facts) {
+    for line in fact_panel("status", &facts) {
         output.line(&line);
     }
 }
