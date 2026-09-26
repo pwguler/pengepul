@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::render::{
     AMBER, ActionGlyph, BOLD, DIM, Fact, GREEN, INNER_WIDTH, Output, RED, fact_panel, fact_row,
     format_count, format_duration, format_exact, label_column, pad, paint, panel_row, share_bar,
-    sparkline, status_glyph, top_rule,
+    sparkline, status_glyph, strip_ansi, top_rule,
 };
 
 /// How long ago the account last served a request successfully (`3h5m`), or
@@ -260,7 +260,7 @@ impl ModelRow {
             pad(&self.name, width),
             ok_cell(self.successes),
             format_count(self.tokens()),
-            tokens = POOL_TOKENS_WIDTH
+            tokens = MODEL_TOKENS_WIDTH
         )
     }
 }
@@ -271,6 +271,9 @@ impl ModelRow {
 /// clamps here, so a longer id clips rather than breaking the box — the
 /// plain branch prints names un-clipped.
 const MODEL_NAME_WIDTH: usize = 38;
+
+/// The model headline's right-aligned token cell.
+const MODEL_TOKENS_WIDTH: usize = 9;
 
 /// The name column for one account's rows: the longest name present plus
 /// a space of air before the ok cell, capped at `MODEL_NAME_WIDTH`.
@@ -413,44 +416,64 @@ pub(crate) struct RelayTotals {
     lines: Vec<PoolLine>,
 }
 
-/// One pool's summary row in the relay block: what `status` shows now that
-/// the per-pool panels are gone.
+/// One pool's row in `status`: what it can serve (status-is-health AC-3).
+/// The counts partition the pool's accounts, one state each, by the same rule
+/// the account row names its state with.
 pub(crate) struct PoolLine {
     name: String,
     accounts: i64,
-    requests: i64,
-    tokens: i64,
+    available: i64,
+    on_cooldown: i64,
+    disabled: i64,
+    unavailable: i64,
 }
 
-/// The pool line's column budget inside the 60 inner columns: name 18 +
-/// accounts 12 + requests 11 + tokens 9, single spaces between (53), the
-/// rest is slack. The name cell is a *minimum*, not a clamp: plain output
-/// is the surface a script parses and the one that can be trusted for a
-/// full provider key (usage-by-model AC-7), so a long name widens its row
-/// rather than losing characters to an ellipsis a parser would read as
-/// part of the id. Short names still align down the block. The rich
-/// branch carries the name as a fact label, where it does clip.
-const POOL_NAME_WIDTH: usize = 18;
-const POOL_ACCOUNTS_WIDTH: usize = 12;
-const POOL_REQUESTS_WIDTH: usize = 11;
-const POOL_TOKENS_WIDTH: usize = 9;
+/// One account's state, as its row names it: Disabled outranks everything, a
+/// live Cooldown outranks the leftover `unavailable`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AccountState {
+    Available,
+    OnCooldown,
+    Disabled,
+    Unavailable,
+}
+
+fn account_state(account: &Value, now: f64) -> AccountState {
+    if is_disabled(account) {
+        return AccountState::Disabled;
+    }
+    if account
+        .get("available")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return AccountState::Available;
+    }
+    let until = account
+        .get("cooldownUntil")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    if cooldown_label(now, until).is_empty() {
+        AccountState::Unavailable
+    } else {
+        AccountState::OnCooldown
+    }
+}
 
 impl PoolLine {
-    /// `anthropic     3 accounts    1,204 req    143.4M` — the plain
-    /// branch's row, where the pool name leads the line.
-    fn render(&self) -> String {
-        format!(
-            "{:<width$} {}",
-            self.name,
-            self.render_value(),
-            width = POOL_NAME_WIDTH
-        )
+    /// `2 accounts, 1 available, 1 on cooldown`: `available` always, every
+    /// other state only when an account is in it. `rich` paints each count in
+    /// its account-row colour.
+    fn render_value(&self, rich: bool) -> String {
+        self.parts(rich).join(", ")
     }
 
-    /// The same row without its name: rich carries the name as the fact
-    /// label, so the value starts at the accounts count.
-    fn render_value(&self) -> String {
-        let accounts = format!(
+    /// The row's counts, one per state, in print order.
+    fn parts(&self, rich: bool) -> Vec<String> {
+        let paint_if = |colour: &str, text: String| {
+            if rich { paint(colour, &text) } else { text }
+        };
+        let mut parts = vec![format!(
             "{} {}",
             self.accounts,
             if self.accounts == 1 {
@@ -458,25 +481,55 @@ impl PoolLine {
             } else {
                 "accounts"
             }
-        );
-        let requests = format!("{} req", format_exact(self.requests));
-        let requests = if requests.chars().count() <= POOL_REQUESTS_WIDTH {
-            requests
-        } else {
-            format!("{} req", format_count(self.requests))
-        };
-        format!(
-            "{} {} {:>width$}",
-            pad(&accounts, POOL_ACCOUNTS_WIDTH),
-            pad(&requests, POOL_REQUESTS_WIDTH),
-            format_count(self.tokens),
-            width = POOL_TOKENS_WIDTH
-        )
+        )];
+        parts.push(paint_if(
+            if self.available == 0 { RED } else { GREEN },
+            format!("{} available", self.available),
+        ));
+        for (count, word, colour) in [
+            (self.on_cooldown, "on cooldown", AMBER),
+            (self.disabled, "disabled", DIM),
+            (self.unavailable, "unavailable", RED),
+        ] {
+            if count > 0 {
+                parts.push(paint_if(colour, format!("{count} {word}")));
+            }
+        }
+        parts
+    }
+
+    /// The rich row as box lines of at most `budget` visible columns, broken
+    /// between counts: a count is never cut, and a line that continues ends
+    /// on its comma. A Pool with accounts in every state is wider than the
+    /// value cell, and a clipped count would be a wrong one.
+    fn wrapped(&self, budget: usize) -> Vec<String> {
+        let mut lines: Vec<String> = Vec::new();
+        let mut line = String::new();
+        for part in self.parts(true) {
+            let joined = if line.is_empty() {
+                part.clone()
+            } else {
+                format!("{line}, {part}")
+            };
+            if !line.is_empty() && strip_ansi(&joined).chars().count() + 1 > budget {
+                lines.push(format!("{line},"));
+                line = part;
+            } else {
+                line = joined;
+            }
+        }
+        lines.push(line);
+        lines
     }
 }
 
+/// The plain pool row's name cell: a minimum, never a clamp, so a long
+/// provider key widens its row rather than losing characters to an ellipsis a
+/// parser would read as part of the id (usage-by-model AC-7).
+const POOL_NAME_WIDTH: usize = 18;
+
 impl RelayTotals {
-    fn from_payload(payload: &Value) -> Self {
+    fn from_payload(payload: &Value, now: f64) -> Self {
         let mut totals = Self::default();
         for (provider_id, provider) in providers(payload) {
             let accounts = provider
@@ -502,15 +555,19 @@ impl RelayTotals {
                     .get("account_count")
                     .and_then(Value::as_i64)
                     .unwrap_or(0),
-                requests: 0,
-                tokens: 0,
+                available: 0,
+                on_cooldown: 0,
+                disabled: 0,
+                unavailable: 0,
             };
             for account in accounts {
-                let requests = i64_field(account, "totalRequests");
-                let tokens = account_tokens(account);
                 totals.totals.add(account);
-                pool.requests += requests;
-                pool.tokens += tokens;
+                match account_state(account, now) {
+                    AccountState::Available => pool.available += 1,
+                    AccountState::OnCooldown => pool.on_cooldown += 1,
+                    AccountState::Disabled => pool.disabled += 1,
+                    AccountState::Unavailable => pool.unavailable += 1,
+                }
             }
             if !accounts.is_empty() {
                 totals.lines.push(pool);
@@ -520,10 +577,11 @@ impl RelayTotals {
     }
 }
 
-/// `relay total: P pools, A accounts` with singular forms where due.
-pub(crate) fn relay_header(totals: &RelayTotals) -> String {
+/// `<name>: P pools, A accounts` with singular forms where due: `relay` for
+/// `status`, `usage` for `usage`.
+pub(crate) fn relay_header(name: &str, totals: &RelayTotals) -> String {
     format!(
-        "relay total: {} {}, {} {}",
+        "{name}: {} {}, {} {}",
         totals.pools,
         if totals.pools == 1 { "pool" } else { "pools" },
         totals.accounts,
@@ -537,8 +595,8 @@ pub(crate) fn relay_header(totals: &RelayTotals) -> String {
 
 /// The same facts as the box panel's header, where the separator is the
 /// panel's own rule rather than a colon.
-fn relay_header_rich(totals: &RelayTotals) -> String {
-    relay_header(totals).replacen(": ", " ─ ", 1)
+fn relay_header_rich(name: &str, totals: &RelayTotals) -> String {
+    relay_header(name, totals).replacen(": ", " ─ ", 1)
 }
 
 /// Where the relay is and whether it answered: the facts `status` shows
@@ -566,9 +624,10 @@ pub(crate) fn print_relay_total_plain(
     payload: &Value,
     output: &mut Output,
     connection: &Connection,
+    now: f64,
 ) {
-    let totals = RelayTotals::from_payload(payload);
-    output.line(&relay_header(&totals));
+    let totals = RelayTotals::from_payload(payload, now);
+    output.line(&relay_header("relay", &totals));
     output.line(&format!("config {}", connection.config));
     output.line(&format!(
         "url {} \u{2014} server {}",
@@ -579,10 +638,12 @@ pub(crate) fn print_relay_total_plain(
         output.line(&format!("uptime {uptime}"));
     }
     for pool in &totals.lines {
-        output.line(pool.render().trim_end());
-    }
-    for line in aggregate_lines(&totals) {
-        output.line(&line);
+        output.line(&format!(
+            "{:<width$} {}",
+            pool.name,
+            pool.render_value(false),
+            width = POOL_NAME_WIDTH
+        ));
     }
 }
 
@@ -592,8 +653,9 @@ pub(crate) fn print_relay_total_rich(
     payload: &Value,
     output: &mut Output,
     connection: &Connection,
+    now: f64,
 ) {
-    let totals = RelayTotals::from_payload(payload);
+    let totals = RelayTotals::from_payload(payload, now);
     // The glyph marks a state, never a plain fact: `server` earns one,
     // `config` and `url` do not.
     let health = if connection.server == "ok" {
@@ -613,11 +675,22 @@ pub(crate) fn print_relay_total_rich(
     if let Some(uptime) = &connection.uptime {
         facts.push(Fact::new("uptime", uptime));
     }
+    // The pool names join the label column first, so the width left for a
+    // pool's counts is known before they are laid out.
+    let names: Vec<Fact> = totals
+        .lines
+        .iter()
+        .map(|line| Fact::new(&line.name, ""))
+        .chain(facts.iter().map(|fact| Fact::new(&fact.label, "")))
+        .collect();
+    let budget = INNER_WIDTH.saturating_sub(label_column(&names));
     for line in &totals.lines {
-        facts.push(Fact::new(&line.name, &line.render_value()));
+        for (index, value) in line.wrapped(budget).into_iter().enumerate() {
+            let label = if index == 0 { line.name.as_str() } else { "" };
+            facts.push(Fact::new(label, &value));
+        }
     }
-    facts.extend(aggregate_facts(&totals));
-    for line in fact_panel(&relay_header_rich(&totals), &facts) {
+    for line in fact_panel(&relay_header_rich("relay", &totals), &facts) {
         output.line(&line);
     }
 }
@@ -679,8 +752,8 @@ fn aggregate_facts(totals: &RelayTotals) -> Vec<Fact> {
 /// change of scope. The trend above covers 30 days; these figures do not, which is why it
 /// keeps the wording `status` uses.
 pub(crate) fn print_usage_total_plain(payload: &Value, output: &mut Output) {
-    let totals = RelayTotals::from_payload(payload);
-    output.line(&relay_header(&totals));
+    let totals = RelayTotals::from_payload(payload, 0.0);
+    output.line(&relay_header("relay total", &totals));
     for line in aggregate_lines(&totals) {
         output.line(&line);
     }
@@ -690,8 +763,11 @@ pub(crate) fn print_usage_total_plain(payload: &Value, output: &mut Output) {
 /// the aggregate rows only — no `config`, no `url`, no per-pool line, because where-and-which
 /// facts are `status`'s and per-pool detail is `accounts`'.
 pub(crate) fn print_usage_total_rich(payload: &Value, output: &mut Output) {
-    let totals = RelayTotals::from_payload(payload);
-    for line in fact_panel(&relay_header_rich(&totals), &aggregate_facts(&totals)) {
+    let totals = RelayTotals::from_payload(payload, 0.0);
+    for line in fact_panel(
+        &relay_header_rich("relay total", &totals),
+        &aggregate_facts(&totals),
+    ) {
         output.line(&line);
     }
 }
@@ -1165,7 +1241,7 @@ mod tests {
             }]
         }}});
 
-        let lines = super::aggregate_lines(&super::RelayTotals::from_payload(&payload));
+        let lines = super::aggregate_lines(&super::RelayTotals::from_payload(&payload, 0.0));
         for line in &lines {
             assert!(!line.contains("1h write"), "{lines:?}");
             assert!(!line.contains("7216"), "{lines:?}");

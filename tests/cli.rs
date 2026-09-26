@@ -533,7 +533,7 @@ fn cooldown_and_empty_pools() -> Value {
 }
 
 #[test]
-fn status_rolls_up_pool_health_and_token_totals_per_provider() {
+fn status_rolls_up_pool_health_per_provider() {
     let tmp = tempdir().expect("tempdir");
     write_config(tmp.path(), "0.0.0.0", 8318);
     let mut runtime = FakeRuntime {
@@ -544,56 +544,47 @@ fn status_rolls_up_pool_health_and_token_totals_per_provider() {
     let outcome = run(&["status"], tmp.path(), &mut runtime);
 
     assert_eq!(outcome.code, 0);
-    // status-total-only AC-3: one line per pool — name, accounts, requests,
-    // tokens — and no per-pool request/token rollup lines.
-    assert!(
+    // status-is-health AC-3: one line per pool, saying what it can serve.
+    let row = |name: &str| -> String {
         outcome
             .stdout
-            .contains("anthropic          3 accounts   1,204 req      370.1M"),
-        "pool line missing:\n{}",
-        outcome.stdout
+            .lines()
+            .find(|line| line.starts_with(name))
+            .unwrap_or_else(|| panic!("{name} row missing:\n{}", outcome.stdout))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    assert_eq!(
+        row("anthropic"),
+        "anthropic 3 accounts, 2 available, 1 on cooldown"
     );
-    assert!(outcome.stdout.contains("groq               1 account"));
-    // AC-1: the aggregate is relay-wide, printed once.
+    assert_eq!(row("groq"), "groq 1 account, 1 available");
+    // An empty pool is hidden entirely, and no account row survives.
+    assert!(!outcome.stdout.contains("deepseek"));
+    assert!(!outcome.stdout.contains("a@x.com"));
+    assert!(outcome.stdout.starts_with("relay: 2 pools, 4 accounts"));
+
+    // The relay's figures moved to `usage`, byte for byte: 45.2M uncached +
+    // 12.4M written + 311.7M read is a 369.3M prompt, 84% of it served from
+    // cache; 96.0K of the 812.3K generated were reasoning. No 1h write figure.
+    let usage = run(&["usage"], tmp.path(), &mut runtime);
+    assert!(!outcome.stdout.contains("requests"), "{}", outcome.stdout);
     assert!(
-        outcome
+        usage
             .stdout
-            .contains("requests 1,204  (1,198 ok, 6 failed)")
+            .contains("requests 1,204  (1,198 ok, 6 failed)"),
+        "{}",
+        usage.stdout
     );
-    // AC-7: the relay's token block as one line, in the panel's words and
-    // order. 45.2M uncached + 12.4M written + 311.7M read is a 369.3M
-    // prompt, 84% of it served from cache; 96.0K of the 812.3K generated
-    // were reasoning.
     assert!(
-        outcome.stdout.contains(
+        usage.stdout.contains(
             "input 369.3M cached 311.7M (84%) uncached 57.6M output 812.3K reasoning 96.0K (12%)\n"
         ),
         "{}",
-        outcome.stdout
+        usage.stdout
     );
-    // AC-5: a pool that wrote 7.2M at the 1h retention prints no figure for
-    // it, and AC-6: the relay's carried load is on its pool lines, not a
-    // `total` row.
-    assert!(!outcome.stdout.contains("1h write"), "{}", outcome.stdout);
-    assert!(
-        !outcome
-            .stdout
-            .lines()
-            .any(|line| line.starts_with("total ")),
-        "{}",
-        outcome.stdout
-    );
-    // AC-4: an empty pool is hidden entirely.
-    assert!(!outcome.stdout.contains("deepseek"));
-    // AC-1: no per-account row survives in status.
-    assert!(!outcome.stdout.contains("a@x.com"));
-    assert!(!outcome.stdout.contains("on cooldown"));
-    // AC-1: the block opens the output; nothing precedes the header.
-    assert!(
-        outcome
-            .stdout
-            .starts_with("relay total: 2 pools, 4 accounts")
-    );
+    assert!(!usage.stdout.contains("1h write"), "{}", usage.stdout);
 }
 
 #[test]
@@ -642,43 +633,38 @@ fn status_renders_panels_on_a_tty() {
     let stdout = outcome.stdout.clone();
     let visible = strip_ansi(&stdout);
     // status-total-only AC-2: one box panel, headed by the relay total.
-    assert!(stdout.contains("\x1b[1m"));
     assert!(
-        visible.contains("┌─ relay total ─ 1 pool, 3 accounts"),
+        visible.contains("┌─ relay ─ 1 pool, 3 accounts"),
         "panel header: {visible}"
     );
     assert!(visible.contains('└'));
-    // AC-1: no pool panel, no account row survives.
+    // No pool panel, no account row.
     assert!(!visible.contains("pool: anthropic"));
     assert!(!visible.contains("a@x.com"));
-    // AC-3: the pool summary row carries name, accounts, requests and the
-    // right-aligned token cell. Asserted against the row itself: the
-    // header also contains "3 accounts", so a panel-wide `contains` would
-    // pass even if the row printed nothing but the name.
-    let pool_row = visible
-        .lines()
-        .find(|line| line.contains("│ anthropic"))
-        .expect("pool row");
-    assert!(pool_row.contains("3 accounts"), "pool row: {pool_row}");
-    assert!(pool_row.contains("640 req"), "pool row: {pool_row}");
-    assert!(pool_row.contains("183.5M"), "token cell: {pool_row}");
-    // AC-4: the empty pool is omitted from lines and from the header count.
+    // status-is-health AC-3: the pool row says what the pool can serve. The
+    // payload lists two of its three accounts: one available, one on cooldown.
+    assert_eq!(
+        fact_values(&visible, "anthropic"),
+        ["3 accounts, 1 available, 1 on cooldown"]
+    );
+    // The empty pool is omitted from rows and from the header count.
     assert!(!visible.contains("deepseek"));
-    // AC-1: the relay's own token block, on the same rows as a pool's would
-    // be. a@x.com's 22.1M uncached + 6.0M written + 155.0M read is a 183.1M
-    // prompt, 85% of it served from cache.
-    assert_eq!(fact_values(&visible, "input"), ["183.1M"]);
-    assert_eq!(fact_values(&visible, "cached"), ["155.0M (85%)"]);
-    assert_eq!(fact_values(&visible, "uncached"), ["28.1M"]);
-    assert_eq!(fact_values(&visible, "output"), ["401.2K"]);
-    assert_eq!(fact_values(&visible, "reasoning"), ["64.0K (16%)"]);
-    // AC-5: the account wrote 7.2M at the 1h retention, and no command prints
-    // it. AC-6: the relay's carried load is not a `total` row either.
-    assert!(!visible.contains("1h write"), "{visible}");
-    assert!(!visible.contains("│ total"), "{visible}");
-    assert!(!visible.contains("│ tokens"), "{visible}");
-    // AC-2: every line is exactly the 64-column box width. `<= 64` would
-    // hold for any renderer at all, since panel_row clips to 64.
+    // AC-1: no request or token row.
+    for label in [
+        "requests",
+        "input",
+        "cached",
+        "uncached",
+        "output",
+        "reasoning",
+        "total",
+    ] {
+        assert!(
+            fact_values(&visible, label).is_empty(),
+            "{label}: {visible}"
+        );
+    }
+    // Every line is exactly the 64-column box width, in exactly one panel.
     for line in visible.lines() {
         assert_eq!(line.chars().count(), 64, "off the fixed width: {line}");
     }
@@ -687,9 +673,6 @@ fn status_renders_panels_on_a_tty() {
         .filter(|line| line.starts_with('┌') || line.starts_with('└'))
         .collect();
     assert_eq!(borders.len(), 2, "exactly one panel: {visible}");
-    for border in borders {
-        assert_eq!(border.chars().count(), 64, "border width: {border}");
-    }
 }
 
 #[test]
@@ -1298,7 +1281,7 @@ fn update_is_a_noop_when_already_current() {
 }
 
 #[test]
-fn status_ends_with_relay_total_block_in_plain() {
+fn status_plain_ends_with_its_pool_rows() {
     let tmp = tempdir().expect("tempdir");
     write_config(tmp.path(), "0.0.0.0", 8318);
     let mut runtime = FakeRuntime {
@@ -1334,38 +1317,22 @@ fn status_ends_with_relay_total_block_in_plain() {
     let outcome = run(&["status"], tmp.path(), &mut runtime);
 
     assert_eq!(outcome.code, 0);
-    // AC-1: the block is the whole output — header, connection, pool lines,
-    // aggregate.
+    // status-is-health AC-1, AC-2: the block opens with the relay header and
+    // ends on its pool rows; the relay's numbers are `usage`'s.
     assert!(
-        outcome
-            .stdout
-            .starts_with("relay total: 2 pools, 2 accounts\n")
-    );
-    assert!(outcome.stdout.contains("requests 650  (0 ok, 0 failed)\n"));
-    // ADR-0024: the relay's block is one line, in the panel's words — a 50
-    // prompt (33 + 7 + 10 uncached, 7 of it served from cache) with 125
-    // generated. Carried load is `input + output`, 175.
-    assert!(
-        outcome
-            .stdout
-            .contains("input 50 cached 7 (14%) uncached 43 output 125\n"),
+        outcome.stdout.starts_with("relay: 2 pools, 2 accounts\n"),
         "{}",
         outcome.stdout
     );
-    // AC-3: one line per pool.
-    assert!(outcome.stdout.contains("anthropic"));
-    assert!(outcome.stdout.contains("commandcode"));
-    // The block is last: nothing after the token line.
-    assert!(
-        outcome
-            .stdout
-            .trim_end()
-            .ends_with("input 50 cached 7 (14%) uncached 43 output 125")
-    );
+    assert!(!outcome.stdout.contains("requests"), "{}", outcome.stdout);
+    assert!(!outcome.stdout.contains("input"), "{}", outcome.stdout);
+    let last = outcome.stdout.trim_end().lines().last().expect("a line");
+    assert!(last.starts_with("commandcode"), "{last}");
+    assert!(last.ends_with("1 account, 1 available"), "{last}");
 }
 
 #[test]
-fn status_relay_total_block_in_rich_has_64_wide_rule() {
+fn status_rich_is_one_64_wide_box() {
     let tmp = tempdir().expect("tempdir");
     write_config(tmp.path(), "0.0.0.0", 8318);
     let mut runtime = FakeRuntime {
@@ -1397,26 +1364,28 @@ fn status_relay_total_block_in_rich_has_64_wide_rule() {
         .iter()
         .position(|line| line.starts_with('┌'))
         .expect("panel top");
-    assert!(lines[top].contains("relay total ─ 1 pool, 1 account"));
+    assert!(
+        lines[top].contains("relay ─ 1 pool, 1 account"),
+        "{}",
+        lines[top]
+    );
     assert_eq!(lines[top].chars().count(), 64, "top rule: {}", lines[top]);
     let bottom = lines
         .iter()
         .rposition(|line| line.starts_with('└'))
         .expect("panel bottom");
     assert_eq!(bottom, lines.len() - 1, "panel closes the output");
-    assert!(visible.contains("│ requests"));
-    assert!(visible.contains("640"));
-    // AC-1: the block's rows, and AC-6: no relay-wide `total` row — the
-    // relay's load is `input + output`, 33 + 120.
-    assert!(visible.contains("│ input"));
-    assert!(visible.contains("│ uncached"));
-    assert!(visible.contains("│ output"));
-    assert!(visible.contains("153"));
-    assert!(!visible.contains("│ total"));
+    // status-is-health AC-1: no request or token row.
+    for label in ["requests", "input", "uncached", "output", "total"] {
+        assert!(
+            !visible.contains(&format!("│ {label} ")),
+            "{label}: {visible}"
+        );
+    }
 }
 
 #[test]
-fn status_relay_total_covers_empty_pools_and_zero_relay() {
+fn status_hides_empty_pools() {
     let tmp = tempdir().expect("tempdir");
     write_config(tmp.path(), "0.0.0.0", 8318);
     let mut runtime = FakeRuntime {
@@ -1442,24 +1411,17 @@ fn status_relay_total_covers_empty_pools_and_zero_relay() {
     let outcome = run(&["status"], tmp.path(), &mut runtime);
 
     assert_eq!(outcome.code, 0);
-    // AC-6: block prints even at a zero relay; empty pools are hidden, so
-    // the header counts only shown pools.
-    assert!(outcome.stdout.contains("relay total: 1 pool, 1 account\n"));
-    assert!(outcome.stdout.contains("requests 0  (0 ok, 0 failed)\n"));
-    // AC-6: the block prints at a zero relay too, and the relay's carried load
-    // is left to be `input + output` rather than repeated as a `total` row.
+    // Empty pools are hidden, so the header counts only shown pools.
     assert!(
-        outcome
-            .stdout
-            .contains("input 0 cached 0 uncached 0 output 0\n"),
+        outcome.stdout.contains("relay: 1 pool, 1 account\n"),
         "{}",
         outcome.stdout
     );
     assert!(
-        !outcome
+        outcome
             .stdout
             .lines()
-            .any(|line| line.starts_with("total ")),
+            .any(|line| line.starts_with("anthropic") && line.ends_with("1 account, 1 available")),
         "{}",
         outcome.stdout
     );
@@ -1692,7 +1654,7 @@ fn status_moves_the_header_facts_into_the_relay_block() {
     );
     assert!(!visible[..first_panel].contains("url:"));
     assert!(!visible[..first_panel].contains("server:"));
-    assert!(visible.contains("relay total"));
+    assert!(visible.contains("┌─ relay ─"));
     assert!(visible.contains("│ server"));
     assert!(visible.contains("│ url"));
     assert!(visible.contains("http://127.0.0.1:8318"));
@@ -1700,7 +1662,7 @@ fn status_moves_the_header_facts_into_the_relay_block() {
     // Plain: same facts, same place.
     let plain = run(&["status"], tmp.path(), &mut runtime);
     let body = plain.stdout;
-    assert!(body.starts_with("relay total:"));
+    assert!(body.starts_with("relay:"));
     assert!(body.contains("url http://127.0.0.1:8318 \u{2014} server ok"));
 }
 
@@ -2461,25 +2423,13 @@ fn status_prints_the_block_for_a_relay_with_no_pools() {
 
     assert_eq!(outcome.code, 0);
     assert!(
-        outcome
-            .stdout
-            .starts_with("relay total: 0 pools, 0 accounts")
-    );
-    assert!(outcome.stdout.contains("requests 0  (0 ok, 0 failed)"));
-    assert!(
-        outcome
-            .stdout
-            .contains("input 0 cached 0 uncached 0 output 0")
-    );
-    // AC-6: no `total` row, so nothing follows the token line.
-    assert!(
-        !outcome
-            .stdout
-            .lines()
-            .any(|line| line.starts_with("total ")),
+        outcome.stdout.starts_with("relay: 0 pools, 0 accounts"),
         "{}",
         outcome.stdout
     );
+    // The connection facts still print; there is no pool row to follow them.
+    assert!(outcome.stdout.contains("server ok"), "{}", outcome.stdout);
+    assert!(!outcome.stdout.contains("requests"), "{}", outcome.stdout);
 }
 
 /// usage-by-model AC-8: one name column per panel, not per account — the
@@ -2649,9 +2599,7 @@ fn status_rows_are_labelled_facts_in_one_column() {
     };
 
     // AC-3: the facts status reports, each on a labelled row.
-    for label in [
-        "config", "url", "server", "requests", "input", "cached", "uncached", "output",
-    ] {
+    for label in ["config", "url", "server"] {
         assert!(
             visible.contains(&format!("│ {label}")),
             "missing labelled row {label:?}:\n{visible}"
@@ -2661,7 +2609,7 @@ fn status_rows_are_labelled_facts_in_one_column() {
     assert!(visible.contains("│ anthropic"));
     assert!(visible.contains("│ commandcode"));
     // AC-9: every value starts in the same column.
-    let columns: Vec<usize> = ["config", "url", "server", "anthropic", "requests", "input"]
+    let columns: Vec<usize> = ["config", "url", "server", "anthropic", "commandcode"]
         .into_iter()
         .map(value_column)
         .collect();
@@ -2802,14 +2750,14 @@ fn status_survives_a_long_pool_name() {
 
     assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
-    // The token figure survives: a silently truncated number is a lie.
+    // The counts survive: the label clips, a silently truncated count is a lie.
     let long_row = visible
         .lines()
         .find(|line| line.contains("a-very-long"))
         .expect("long pool row");
     assert!(
-        long_row.contains("22.5M"),
-        "token figure amputated: {long_row}"
+        long_row.contains("1 account, 1 available"),
+        "counts amputated: {long_row}"
     );
     // AC-9: every value starts in the same column, long label included.
     // Measured in visible columns, not bytes — the clip ellipsis is one
@@ -3461,70 +3409,6 @@ fn usage_says_how_much_history_it_actually_has() {
     }
 }
 
-/// ADR-0024 removed `status`'s relay-wide `total` row, so the two verbs no longer print the same
-/// figure as a fact. They still agree where both print it: `status`'s pool row carries the whole
-/// relay's load, and `usage` calls the same sum `all time`.
-#[test]
-fn usage_all_time_equals_the_status_pool_row() {
-    let tmp = tempdir().expect("tempdir");
-    write_config(tmp.path(), "127.0.0.1", 8317);
-    let payload = json!({
-        "providers": {
-            "anthropic": {
-                "account_count": 1,
-                "accounts": [account(json!({
-                    "email": "a@x.com",
-                    "available": true,
-                    "totalRequests": 1_345,
-                    "totalInputTokens": 700_000,
-                    "totalOutputTokens": 900_000,
-                    "totalCacheReadInputTokens": 289_000_000,
-                    "totalCacheCreationInputTokens": 636_984,
-                    "days": [{
-                        "date": chrono::Local::now().format("%Y-%m-%d").to_string(),
-                        "requests": 7,
-                        "inputTokens": 25,
-                        "outputTokens": 278,
-                        "cacheReadInputTokens": 2_980_150,
-                        "cacheCreationInputTokens": 0,
-                        "reasoningOutputTokens": 0
-                    }]
-                }))]
-            }
-        }
-    });
-    let mut runtime = FakeRuntime {
-        rich: true,
-        accounts_payload: Some(payload.clone()),
-        ..FakeRuntime::default()
-    };
-
-    let usage = strip_ansi(&run_style(&["usage"], tmp.path(), &mut runtime, Style::Rich).stdout);
-    let status = strip_ansi(&run_style(&["status"], tmp.path(), &mut runtime, Style::Rich).stdout);
-
-    let load = status
-        .lines()
-        .find(|line| line.contains("│ anthropic"))
-        .expect("status pool row")
-        .trim_end_matches(['│', ' '])
-        .split_whitespace()
-        .next_back()
-        .expect("pool row load")
-        .to_string();
-    // The same figure, labelled `all time`, inside `usage`.
-    let all_time = usage
-        .lines()
-        .find(|line| line.contains("all time"))
-        .expect("usage all-time row");
-    assert!(
-        all_time.contains(&load),
-        "usage all-time {all_time:?} must carry the pool row's load {load:?}"
-    );
-    // And the window is visibly a subset, not a competing total.
-    assert!(usage.contains("window"), "{usage}");
-    assert!(!usage.contains("│ total"), "one word, one scope: {usage}");
-}
-
 /// version-uptime-and-usage-total AC-5: `usage` plain keeps one line per day and then,
 /// after a blank line, prints the relay total — the same header and the same aggregate lines
 /// `status` prints for the same payload. Before this, `usage` had no relay-wide numbers at all.
@@ -3685,23 +3569,6 @@ fn usage_rich_prints_the_relay_total_panel_below_the_trend() {
             "a block line is not 64 columns: {line:?}"
         );
     }
-
-    // AC-7: the same rollup `status` prints, by the same path.
-    let status = strip_ansi(&run_style(&["status"], tmp.path(), &mut runtime, Style::Rich).stdout);
-    // The two panels align their label columns to their own widest label, so the raw bytes
-    // differ by padding. The figures are what must agree.
-    let requests = |text: &str| {
-        let line = text
-            .lines()
-            .find(|line| line.contains("requests"))
-            .expect("requests row");
-        line.split_whitespace().collect::<Vec<_>>().join(" ")
-    };
-    assert_eq!(
-        requests(&out),
-        requests(&status),
-        "usage and status disagree about the relay rollup"
-    );
 }
 
 /// version-uptime-and-usage-total AC-1: `status` names the build and how long the service
@@ -6077,23 +5944,21 @@ fn a_removed_keys_record_is_counted_by_status_and_usage() {
     let status = run(&["status"], tmp.path(), &mut runtime);
     assert_eq!(status.code, 0);
     assert!(
-        status
-            .stdout
-            .starts_with("relay total: 1 pool, 2 accounts\n"),
-        "{}",
-        status.stdout
-    );
-    // Both records are in the aggregate, and the count matches the list.
-    assert!(
-        status.stdout.contains("requests 107  (107 ok, 0 failed)\n"),
+        status.stdout.starts_with("relay: 1 pool, 2 accounts\n"),
         "{}",
         status.stdout
     );
 
-    // The trend is per recorded day, so one day carries both records' traffic.
+    // The trend is per recorded day, so one day carries both records' traffic,
+    // and both records are in the aggregate `usage` owns.
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let usage = run(&["usage"], tmp.path(), &mut runtime);
     assert_eq!(usage.code, 0);
+    assert!(
+        usage.stdout.contains("requests 107  (107 ok, 0 failed)\n"),
+        "{}",
+        usage.stdout
+    );
     assert!(
         usage.stdout.contains(&format!("{today} 107 12000 0 0 0")),
         "{}",
@@ -6445,5 +6310,124 @@ fn a_disabled_account_reads_disabled() {
                 assert!(visible.contains("2 accounts, 1 available"), "{visible}");
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// status-is-health
+// ---------------------------------------------------------------------------
+
+/// One Pool in every state an account can be in, beside a healthy one.
+fn every_state_pool() -> Value {
+    json!({
+        "providers": {
+            "anthropic": {
+                "account_count": 5,
+                "accounts": [
+                    {"email": "ok@x.com", "available": true, "totalRequests": 900,
+                     "totalSuccesses": 890, "totalFailures": 10, "totalInputTokens": 5_000},
+                    {"email": "ok2@x.com", "available": true},
+                    {"email": "cool@x.com", "available": false, "cooldownUntil": soon(252.9)},
+                    {"email": "off@x.com", "available": false, "disabled": true},
+                    {"email": "gone@x.com", "available": false, "cooldownUntil": 0.0}
+                ]
+            },
+            "groq": {
+                "account_count": 1,
+                "accounts": [{"email": "key-1", "available": false, "cooldownUntil": soon(60.0)}]
+            },
+            "deepseek": {"account_count": 0, "accounts": []}
+        }
+    })
+}
+
+fn status_text(style: Style) -> (String, String) {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        rich: style == Style::Rich,
+        accounts_payload: Some(every_state_pool()),
+        ..FakeRuntime::default()
+    };
+    let raw = run_style(&["status"], tmp.path(), &mut runtime, style).stdout;
+    (strip_ansi(&raw), raw)
+}
+
+/// status-is-health AC-1, AC-2, AC-3, plain.
+#[test]
+fn plain_status_says_what_each_pool_can_serve() {
+    let (text, _) = status_text(Style::Plain);
+    let lines: Vec<&str> = text.lines().collect();
+
+    assert_eq!(lines[0], "relay: 2 pools, 6 accounts", "{text}");
+    let pool = |name: &str| -> String {
+        lines
+            .iter()
+            .find(|line| line.starts_with(name))
+            .unwrap_or_else(|| panic!("{name} row missing: {text}"))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    assert_eq!(
+        pool("anthropic"),
+        "anthropic 5 accounts, 2 available, 1 on cooldown, 1 disabled, 1 unavailable"
+    );
+    assert_eq!(pool("groq"), "groq 1 account, 0 available, 1 on cooldown");
+    assert!(!text.contains("deepseek"), "{text}");
+    for word in ["requests", "input", "cached", "output", " req"] {
+        assert!(!text.contains(word), "status printed {word:?}: {text}");
+    }
+}
+
+/// status-is-health AC-1, AC-2, AC-3, rich.
+#[test]
+fn rich_status_is_one_health_box() {
+    let (text, raw) = status_text(Style::Rich);
+
+    assert!(text.starts_with("┌─ relay ─ 2 pools, 6 accounts"), "{text}");
+    assert_eq!(text.matches('┌').count(), 1, "one box: {text}");
+    // Every state at once is wider than the value cell: the row wraps between
+    // counts onto an unlabelled continuation row, never clipping one.
+    let lines: Vec<&str> = text.lines().collect();
+    let row = lines
+        .iter()
+        .position(|line| line.starts_with("│ anthropic"))
+        .expect("anthropic row");
+    let value = |line: &str| {
+        line.trim_matches(|c: char| c == '│' || c.is_whitespace())
+            .to_string()
+    };
+    let first = value(lines[row]);
+    let second = value(lines[row + 1]);
+    assert!(!text.contains('…'), "a count was clipped: {text}");
+    assert_eq!(
+        format!("{} {second}", first.trim_start_matches("anthropic").trim()),
+        "5 accounts, 2 available, 1 on cooldown, 1 disabled, 1 unavailable"
+    );
+    assert_eq!(
+        fact_values(&text, "groq"),
+        ["1 account, 0 available, 1 on cooldown"]
+    );
+    for label in ["requests", "input", "cached", "uncached", "output", "total"] {
+        assert!(
+            fact_values(&text, label).is_empty(),
+            "status printed {label}: {text}"
+        );
+    }
+    // The counts carry the account rows' colours: a Pool with nothing to serve
+    // reads red.
+    assert!(
+        raw.contains("\x1b[32m2 available"),
+        "green available: {raw:?}"
+    );
+    assert!(raw.contains("\x1b[31m0 available"), "red zero: {raw:?}");
+    assert!(
+        raw.contains("\x1b[33m1 on cooldown"),
+        "amber cooldown: {raw:?}"
+    );
+    assert!(raw.contains("\x1b[2m1 disabled"), "dim disabled: {raw:?}");
+    for line in text.lines() {
+        assert_eq!(line.chars().count(), 64, "off the fixed width: {line}");
     }
 }
