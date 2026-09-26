@@ -1335,7 +1335,7 @@ mod settle_tests {
 
     /// AC-5: every bucket balances, whatever the order of outcomes.
     #[test]
-    fn concurrent_outcomes_each_count_their_own_request() {
+    fn outcomes_each_count_their_own_request() {
         let mut state = state();
         state.settle(true);
         state.settle(false);
