@@ -11,7 +11,7 @@ and *"peak (all time) and all should be all time as well except last 30 days"*.
 
 ## Shape
 
-**`status`** is one box headed `relay ─ P pools, A accounts`: `config`, `url`, `server`,
+**`status`** is one box headed `relay`: `config`, `url`, `server`,
 `version`, `uptime`, then one row per Pool naming what it can serve:
 `2 accounts, 1 available, 1 on cooldown`. `available` always prints; `on cooldown`, `disabled`
 and `unavailable` print only when non-zero, in the words the account rows use. No request or
@@ -36,7 +36,8 @@ buckets are kept 90 days, so the relay persists its best day in `<auth-dir>/usag
 and reports it in the admin payload as `peak: {date, tokens}`. The stored day is replaced
 whenever the retained buckets hold a better one, at startup and each time the payload is built.
 A day stays the peak on record only if the relay starts or the payload is built at least once
-while that day is still inside the 90-day retention.
+while that day is still inside the 90-day retention. Only a missing file means no peak: an
+unreadable one is left in place and never overwritten.
 
 ## Non-goals
 
@@ -50,9 +51,10 @@ while that day is still inside the 90-day retention.
 ## Acceptance criteria
 
 - AC-1: `status` prints no `requests` row and no token row, in either style.
-- AC-2: `status` rich is one box headed `relay ─ P pools, A accounts`; plain's first line is
-  `relay: P pools, A accounts`.
-- AC-3: Each non-empty Pool has one `status` row: `N account(s), N available`, then
+- AC-2: `status` rich is one box headed `relay`; plain's first line is `relay`. The pool rows
+  carry each pool and its account count, so the header names only the subject.
+- AC-3: Each non-empty Pool has one `status` row, which rich wraps between counts onto an
+  unlabelled continuation line when it is wider than the value cell: `N account(s), N available`, then
   `, N on cooldown`, `, N disabled`, `, N unavailable` for each non-zero count. The counts
   partition the Pool's accounts. Rich paints the available count green, or red at zero,
   `on cooldown` amber and `disabled` dim. Empty Pools print no row.
@@ -60,7 +62,7 @@ while that day is still inside the 90-day retention.
   `tokens`, `last 30 days`, `peak`, `total`, `requests`, `input`, `cached`, `uncached`,
   `output`, then `reasoning` when non-zero, in that order, on one label column. No `window` or
   `all time` row and no second box.
-- AC-5: `usage` plain prints the daily rows, then `usage: P pools, A accounts`,
+- AC-5: `usage` plain prints `usage: P pools, A accounts`, the daily rows, then
   `last_30_days <n>`, `peak <n> <date>`, `total <n>`, `requests …` and the token line.
 - AC-6: `total` equals `input + output` as printed by the token block's source counters, and
   is never less than `last 30 days`.
@@ -70,7 +72,8 @@ while that day is still inside the 90-day retention.
   above the stored one, never lowers it, and reports it as the payload's `peak`. A stored peak
   whose day is no longer retained is still reported.
 - AC-9: A relay with no recorded day prints `tokens  no usage recorded yet` and zero figures in
-  the one box, and no `peak` row.
+  the one box, and no `peak` row. A relay whose history is all older than the window prints
+  `tokens  none in the last 30 days` above its all-time rows.
 
 ## Verification
 

@@ -1,6 +1,7 @@
-//! The `status`/`accounts` view: the admin payload turned into pool
-//! panels, account rows, footers and the relay total block, in both
-//! styles. Pure over the payload and a `now` handed in by the caller.
+//! The `status`/`accounts`/`usage` views: the admin payload turned into pool
+//! panels, account rows, footers, the `relay` health block and the `usage`
+//! box, in both styles. Pure over the payload and a `now` handed in by the
+//! caller.
 
 use std::fmt::Write as _;
 
@@ -335,7 +336,7 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64, ve
             .and_then(Value::as_i64)
             .unwrap_or(0);
         let suffix = if count == 1 { "account" } else { "accounts" };
-        // An empty pool says nothing the relay total block doesn't; skip it.
+        // An empty pool has no account to show; skip it.
         if accounts.is_empty() {
             continue;
         }
@@ -618,8 +619,8 @@ pub(crate) struct Connection {
     pub(crate) stale: bool,
 }
 
-/// The `Style::Plain` relay block: header, connection, one line per pool,
-/// then the relay-wide aggregate. This is the whole of `status` now.
+/// `status`, plain: the `relay` header, the connection facts, then one line
+/// per pool saying what it can serve (status-is-health).
 pub(crate) fn print_relay_total_plain(
     payload: &Value,
     output: &mut Output,
@@ -627,7 +628,9 @@ pub(crate) fn print_relay_total_plain(
     now: f64,
 ) {
     let totals = RelayTotals::from_payload(payload, now);
-    output.line(&relay_header("relay", &totals));
+    // The pool rows carry each pool and its account count; the header only
+    // names the subject (status-is-health AC-2).
+    output.line("relay");
     output.line(&format!("config {}", connection.config));
     output.line(&format!(
         "url {} \u{2014} server {}",
@@ -690,7 +693,7 @@ pub(crate) fn print_relay_total_rich(
             facts.push(Fact::new(label, &value));
         }
     }
-    for line in fact_panel(&relay_header_rich("relay", &totals), &facts) {
+    for line in fact_panel("relay", &facts) {
         output.line(&line);
     }
 }
@@ -722,9 +725,7 @@ fn version_value(connection: &Connection) -> String {
 }
 
 /// The relay-wide rollup, rich: the requests breakdown, then the token block in the
-/// vocabulary ADR-0024 settled. One function because two verbs print it — `status` inside
-/// its connection panel, `usage` under the trend — and the whole point of the second copy is
-/// that the figures cannot drift from the first.
+/// vocabulary ADR-0024 settled. `usage` is the one verb that prints it.
 fn aggregate_facts(totals: &RelayTotals) -> Vec<Fact> {
     let pool = &totals.totals;
     let mut facts = vec![Fact::new(
@@ -1007,9 +1008,9 @@ pub(crate) fn account_tokens(account: &Value) -> i64 {
 /// What "carried load" means, in one place: input, output and both cache
 /// directions. Reasoning is excluded — it is already inside output. Every
 /// figure derived from it resolves through here — the share bars, the model
-/// headlines and `usage`'s all-time row — so they cannot disagree about what
-/// they are summing (AC-11). No panel prints it as a row: it is `input +
-/// output`, two rows the token block carries (ADR-0024).
+/// headlines and `usage`'s `total` — so they cannot disagree about what they
+/// are summing (AC-11). `usage` prints it as `total`, a labelled total above
+/// the `input` and `output` rows it sums (ADR-0024); no other panel does.
 pub(crate) fn carried_tokens(input: i64, output: i64, cache_read: i64, cache_write: i64) -> i64 {
     input + output + cache_read + cache_write
 }
@@ -1154,7 +1155,16 @@ pub(crate) fn print_usage_rich(payload: &Value, output: &mut Output, today: &str
     let figures = UsageFigures::from_payload(payload, today);
     let tokens = if figures.days.is_empty() {
         // Thirty flat bars would read as thirty idle days (usage-trend AC-8).
-        paint(DIM, "no usage recorded yet")
+        // History older than the window is still history: the peak below it
+        // may name one of its days.
+        paint(
+            DIM,
+            if figures.peak.is_some() || figures.totals.totals.requests > 0 {
+                "none in the last 30 days"
+            } else {
+                "no usage recorded yet"
+            },
+        )
     } else {
         sparkline(
             &figures
@@ -1190,9 +1200,9 @@ pub(crate) fn print_usage_rich(payload: &Value, output: &mut Output, today: &str
 /// `usage`, plain: the daily rows, then the box's facts in the box's order,
 /// one per line (status-is-health AC-5).
 pub(crate) fn print_usage_plain(payload: &Value, output: &mut Output, today: &str) {
-    print_trend_plain(payload, output, today);
     let figures = UsageFigures::from_payload(payload, today);
     output.line(&relay_header("usage", &figures.totals));
+    print_trend_plain(payload, output, today);
     output.line(&format!(
         "last_30_days {}",
         format_count(figures.last_30_days)

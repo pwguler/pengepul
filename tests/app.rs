@@ -5362,3 +5362,20 @@ async fn a_relay_with_no_traffic_reports_no_peak() {
     assert!(payload(app).await["peak"].is_null());
     assert!(!tmp.path().join("usage-peak.json").exists());
 }
+
+#[tokio::test]
+async fn an_unreadable_peak_file_is_left_alone() {
+    // AC-8: only a missing file means "no peak". A file that cannot be parsed may hold
+    // a day the buckets no longer retain, so it is never overwritten with a lower one.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("usage-peak.json"), "{not json").expect("garbled");
+    let app = relay_with_days(tmp.path(), 700, 300);
+
+    let _ = payload(app).await;
+
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("usage-peak.json")).expect("read"),
+        "{not json",
+        "an unreadable peak was overwritten"
+    );
+}

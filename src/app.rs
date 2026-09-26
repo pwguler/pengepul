@@ -961,23 +961,37 @@ fn record_peak(auth_dir: &std::path::Path, snapshots: &[Value]) -> Option<Peak> 
         .filter(|(_, tokens)| *tokens > 0)
         .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)))
         .map(|(date, tokens)| Peak { date, tokens });
-    let stored = load_peak(auth_dir);
+    // One reader-writer at a time: two payloads built at once must not both read
+    // the old peak and land their writes in the wrong order.
+    let _guard = PEAK_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let stored = match load_peak(auth_dir) {
+        Ok(stored) => stored,
+        Err(error) => {
+            // Unreadable is not absent: leave the file for the operator and report
+            // only what the buckets hold.
+            tracing::warn!(
+                ?error,
+                "the relay's peak file is unreadable; leaving it in place"
+            );
+            return best;
+        }
+    };
     match (stored, best) {
-        (Some(stored), Some(best)) if best.tokens > stored.tokens => {
+        (Some(stored), Some(best)) if best.tokens <= stored.tokens => Some(stored),
+        (stored, None) => stored,
+        (_, Some(best)) => {
             if let Err(error) = save_peak(auth_dir, &best) {
                 tracing::warn!(?error, "failed to record the relay's peak day");
             }
             Some(best)
         }
-        (None, Some(best)) => {
-            if let Err(error) = save_peak(auth_dir, &best) {
-                tracing::warn!(?error, "failed to record the relay's peak day");
-            }
-            Some(best)
-        }
-        (stored, _) => stored,
     }
 }
+
+/// Serializes the peak's read-compare-write across concurrent payload builds.
+static PEAK_LOCK: StdMutex<()> = StdMutex::new(());
 
 /// One provider's entry in the payload: its accounts, and how many there are.
 ///

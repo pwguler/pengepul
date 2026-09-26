@@ -389,19 +389,41 @@ pub(crate) struct Peak {
     pub(crate) tokens: i64,
 }
 
+static PEAK_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn peak_path(auth_dir: &Path) -> PathBuf {
     auth_dir.join("usage-peak.json")
 }
 
-/// The stored peak. A missing or unreadable file is no peak: the next
-/// retained day with traffic replaces it.
-pub(crate) fn load_peak(auth_dir: &Path) -> Option<Peak> {
-    let raw = fs::read_to_string(peak_path(auth_dir)).ok()?;
-    let value: Value = serde_json::from_str(&raw).ok()?;
-    Some(Peak {
-        date: value.get("date")?.as_str()?.to_string(),
-        tokens: value.get("tokens")?.as_i64()?,
-    })
+/// The stored peak: `Ok(None)` only when there is no file. A file that
+/// cannot be read or parsed is an error, never "no peak", because it may hold
+/// a day the buckets no longer retain and replacing it would lower the peak.
+///
+/// # Errors
+///
+/// Returns an error when the file exists but cannot be read or parsed.
+pub(crate) fn load_peak(auth_dir: &Path) -> Result<Option<Peak>> {
+    let path = peak_path(auth_dir);
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let value: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let field = |key: &str| value.get(key).cloned();
+    match (
+        field("date").as_ref().and_then(Value::as_str),
+        field("tokens").as_ref().and_then(Value::as_i64),
+    ) {
+        (Some(date), Some(tokens)) => Ok(Some(Peak {
+            date: date.to_string(),
+            tokens,
+        })),
+        _ => anyhow::bail!("{} holds no date and tokens", path.display()),
+    }
 }
 
 /// Write the peak, atomically and owner-only like every file beside it.
@@ -413,7 +435,12 @@ pub(crate) fn save_peak(auth_dir: &Path, peak: &Peak) -> Result<()> {
     fs::create_dir_all(auth_dir)
         .with_context(|| format!("failed to create {}", auth_dir.display()))?;
     let path = peak_path(auth_dir);
-    let temp = path.with_extension("json.tmp");
+    // One temp file per write: two writers never rename each other's file.
+    let temp = path.with_extension(format!(
+        "json.{}.{}.tmp",
+        std::process::id(),
+        PEAK_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     fs::write(
         &temp,
         serde_json::to_string_pretty(&json!({"date": peak.date, "tokens": peak.tokens}))?,

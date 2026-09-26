@@ -22,7 +22,8 @@ and a write is disclosed as an annotation: `Uncached: 141 (100 written to cache)
 ## Decision
 
 A panel's token block prints four rows, in this order, at every scope it reports a subject
-for — the relay block in `status`, and the pool, account and model blocks in `accounts`:
+for — the relay block (in `status` when this was decided, in `usage` since status-is-health),
+and the pool, account and model blocks in `accounts`:
 
 - **Input** — the whole prompt the upstream saw, `cached + uncached`.
 - **Cached** — the cache read, carrying its share of Input.
@@ -33,7 +34,8 @@ for — the relay block in `status`, and the pool, account and model blocks in `
 The share on `Cached` is `read / input`, the hit rate. The cache write and its 1h share are
 not printed by any command: they stay recorded, and readable from `GET /admin/accounts` and
 `usage.json`. The `total` and `pool` fact rows are removed, because `input + output` is the
-carried load and both are printed.
+carried load and both are printed. (status-is-health brought `total` back in `usage` only, as a
+labelled total directly above the rows it sums, which the restatement rule below admits.)
 
 Considered and rejected:
 
@@ -61,7 +63,7 @@ Considered and rejected:
   relay prices nothing and a raw write total is one more token count.
 - **`status` and `usage` can no longer be checked against each other.** ARCHITECTURE's "One
   word, one scope" leaned on both printing the all-time carried figure from one sum, so the
-  two could not drift. `status` prints no figure at all since status-is-health; `usage` owns
+  two could not drift. `status` prints no request or token figure since status-is-health; `usage` owns
   the relay's numbers and prints the carried load as `total`, a labelled total above its own
   breakdown.
 - **ARCHITECTURE's restatement rule is amended.** "A row never restates another row" was why

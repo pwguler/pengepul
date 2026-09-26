@@ -563,7 +563,7 @@ fn status_rolls_up_pool_health_per_provider() {
     // An empty pool is hidden entirely, and no account row survives.
     assert!(!outcome.stdout.contains("deepseek"));
     assert!(!outcome.stdout.contains("a@x.com"));
-    assert!(outcome.stdout.starts_with("relay: 2 pools, 4 accounts"));
+    assert!(outcome.stdout.starts_with("relay\n"));
 
     // The relay's figures moved to `usage`, byte for byte: 45.2M uncached +
     // 12.4M written + 311.7M read is a 369.3M prompt, 84% of it served from
@@ -633,10 +633,7 @@ fn status_renders_panels_on_a_tty() {
     let stdout = outcome.stdout.clone();
     let visible = strip_ansi(&stdout);
     // status-total-only AC-2: one box panel, headed by the relay total.
-    assert!(
-        visible.contains("┌─ relay ─ 1 pool, 3 accounts"),
-        "panel header: {visible}"
-    );
+    assert!(visible.contains("┌─ relay ───"), "panel header: {visible}");
     assert!(visible.contains('└'));
     // No pool panel, no account row.
     assert!(!visible.contains("pool: anthropic"));
@@ -1320,7 +1317,7 @@ fn status_plain_ends_with_its_pool_rows() {
     // status-is-health AC-1, AC-2: the block opens with the relay header and
     // ends on its pool rows; the relay's numbers are `usage`'s.
     assert!(
-        outcome.stdout.starts_with("relay: 2 pools, 2 accounts\n"),
+        outcome.stdout.starts_with("relay\nconfig "),
         "{}",
         outcome.stdout
     );
@@ -1364,11 +1361,7 @@ fn status_rich_is_one_64_wide_box() {
         .iter()
         .position(|line| line.starts_with('┌'))
         .expect("panel top");
-    assert!(
-        lines[top].contains("relay ─ 1 pool, 1 account"),
-        "{}",
-        lines[top]
-    );
+    assert!(lines[top].starts_with("┌─ relay ───"), "{}", lines[top]);
     assert_eq!(lines[top].chars().count(), 64, "top rule: {}", lines[top]);
     let bottom = lines
         .iter()
@@ -1412,11 +1405,7 @@ fn status_hides_empty_pools() {
 
     assert_eq!(outcome.code, 0);
     // Empty pools are hidden, so the header counts only shown pools.
-    assert!(
-        outcome.stdout.contains("relay: 1 pool, 1 account\n"),
-        "{}",
-        outcome.stdout
-    );
+    assert!(outcome.stdout.starts_with("relay\n"), "{}", outcome.stdout);
     assert!(
         outcome
             .stdout
@@ -1662,7 +1651,7 @@ fn status_moves_the_header_facts_into_the_relay_block() {
     // Plain: same facts, same place.
     let plain = run(&["status"], tmp.path(), &mut runtime);
     let body = plain.stdout;
-    assert!(body.starts_with("relay:"));
+    assert!(body.starts_with("relay\n"));
     assert!(body.contains("url http://127.0.0.1:8318 \u{2014} server ok"));
 }
 
@@ -2422,11 +2411,7 @@ fn status_prints_the_block_for_a_relay_with_no_pools() {
     let outcome = run(&["status"], tmp.path(), &mut runtime);
 
     assert_eq!(outcome.code, 0);
-    assert!(
-        outcome.stdout.starts_with("relay: 0 pools, 0 accounts"),
-        "{}",
-        outcome.stdout
-    );
+    assert!(outcome.stdout.starts_with("relay\n"), "{}", outcome.stdout);
     // The connection facts still print; there is no pool row to follow them.
     assert!(outcome.stdout.contains("server ok"), "{}", outcome.stdout);
     assert!(!outcome.stdout.contains("requests"), "{}", outcome.stdout);
@@ -3603,10 +3588,14 @@ fn usage_treats_an_out_of_window_history_as_empty() {
 
     assert_eq!(outcome.code, 0);
     let visible = strip_ansi(&outcome.stdout);
-    assert!(
-        visible.contains("no usage recorded yet"),
+    // History exists, just not in the window: saying none was ever recorded
+    // would contradict the all-time peak printed below it.
+    assert_eq!(
+        fact_values(&visible, "tokens"),
+        ["none in the last 30 days"],
         "30 flat bars for out-of-window history: {visible}"
     );
+    assert_eq!(fact_values(&visible, "peak").len(), 1, "{visible}");
 }
 
 /// ADR-0024: a pool footer carries no load row. The pool's carried load is `input + output`,
@@ -5767,11 +5756,7 @@ fn a_removed_keys_record_is_counted_by_status_and_usage() {
 
     let status = run(&["status"], tmp.path(), &mut runtime);
     assert_eq!(status.code, 0);
-    assert!(
-        status.stdout.starts_with("relay: 1 pool, 2 accounts\n"),
-        "{}",
-        status.stdout
-    );
+    assert!(status.stdout.starts_with("relay\n"), "{}", status.stdout);
 
     // The trend is per recorded day, so one day carries both records' traffic,
     // and both records are in the aggregate `usage` owns.
@@ -6183,7 +6168,7 @@ fn plain_status_says_what_each_pool_can_serve() {
     let (text, _) = status_text(Style::Plain);
     let lines: Vec<&str> = text.lines().collect();
 
-    assert_eq!(lines[0], "relay: 2 pools, 6 accounts", "{text}");
+    assert_eq!(lines[0], "relay", "{text}");
     let pool = |name: &str| -> String {
         lines
             .iter()
@@ -6209,7 +6194,7 @@ fn plain_status_says_what_each_pool_can_serve() {
 fn rich_status_is_one_health_box() {
     let (text, raw) = status_text(Style::Rich);
 
-    assert!(text.starts_with("┌─ relay ─ 2 pools, 6 accounts"), "{text}");
+    assert!(text.starts_with("┌─ relay ───"), "{text}");
     assert_eq!(text.matches('┌').count(), 1, "one box: {text}");
     // Every state at once is wider than the value cell: the row wraps between
     // counts onto an unlabelled continuation row, never clipping one.
@@ -6375,11 +6360,12 @@ fn usage_peak_prefers_the_relays_stored_peak() {
 fn plain_usage_ends_with_the_one_block() {
     let text = usage_run(usage_payload(None), Style::Plain);
     let lines: Vec<&str> = text.lines().collect();
-    let tail = &lines[lines.len() - 6..];
+    // The header opens the output, as the box header does in rich.
+    assert_eq!(lines[0], "usage: 2 pools, 2 accounts", "{text}");
+    let tail = &lines[lines.len() - 5..];
     assert_eq!(
         tail,
         [
-            "usage: 2 pools, 2 accounts",
             "last_30_days 5.5K",
             &format!("peak 45.0K {}", date_back(60)),
             "total 101.5K",
@@ -6388,8 +6374,8 @@ fn plain_usage_ends_with_the_one_block() {
         ],
         "{text}"
     );
-    // The daily rows lead, and only days inside the window are listed.
-    assert!(lines[0].starts_with(&date_back(2)), "{text}");
+    // The daily rows follow the header, and only days inside the window are listed.
+    assert!(lines[1].starts_with(&date_back(2)), "{text}");
     assert!(!text.contains(&format!("{} ", date_back(60))), "{text}");
 }
 
