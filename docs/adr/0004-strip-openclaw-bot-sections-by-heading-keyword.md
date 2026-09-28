@@ -2,7 +2,9 @@
 
 Status: Accepted (amended by ADR-0005 — the keyword set is narrowed to the two
 sections that actually trip; the categories named below are no longer stripped.
-Amended again by ADR-0009 — one heading is matched exactly, alongside the keywords)
+Amended again by ADR-0009 — one heading is matched exactly, alongside the keywords.
+Amended again by ADR-0028 — the transform runs on every dialect that reaches
+anthropic, not on the Messages route only)
 
 ## Context
 

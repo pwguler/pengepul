@@ -539,12 +539,14 @@ pub fn anthropic_sse_to_chat(
                     &json!({"reasoning_content": delta.get("thinking").and_then(Value::as_str).unwrap_or("")}),
                 )],
                 Some("input_json_delta") => {
+                    // Only a block that opened a client tool call streams its input.
+                    // A server tool's block never opened one, so its input (the
+                    // query it runs upstream) has no call to extend.
                     let block_index = int_field(data, "index");
-                    let tool_index = state
-                        .tool_block_indexes
-                        .get(&block_index)
-                        .copied()
-                        .unwrap_or(block_index);
+                    let Some(tool_index) = state.tool_block_indexes.get(&block_index).copied()
+                    else {
+                        return Vec::new();
+                    };
                     vec![chat_delta(
                         state,
                         &json!({

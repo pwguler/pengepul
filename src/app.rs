@@ -1857,15 +1857,15 @@ async fn route_anthropic_request(
     client_wants_stream: bool,
 ) -> Response {
     let body = upstream_request_body(ProviderKind::Anthropic, route, body, model);
-    // Masquerade openclaw's own tool names and bot-persona system prompt as a
-    // first-party Claude Code request so the subscription billing classifier does
-    // not reject it. Only the Messages route carries these; the reverse map
-    // restores tool_use names in the response.
-    let (body, tool_reverse) = if matches!(route, RequestRoute::Messages) {
+    // The Cloaking sanitizer rewrites a harness's tool names and bot-persona
+    // system prompt so the Classifier reads the request as first-party Claude
+    // Code. Every route reaches here as Messages, translated ones included. The
+    // Classifier reads the body, not the client's dialect, so no route skips the
+    // sanitizer (ADR-0028). The reverse map restores tool_use names in the
+    // response.
+    let (body, tool_reverse) = {
         let (masked, reverse) = masquerade_request(&body);
         (masked, Arc::new(reverse))
-    } else {
-        (body, Arc::new(BTreeMap::new()))
     };
     if client_wants_stream {
         return match state
@@ -2775,12 +2775,15 @@ fn json_upstream_response(
     if !response.status.is_success() {
         return (response.status, Json(response.body)).into_response();
     }
-    // The Messages route restores the tool names the sanitizer renamed;
-    // every other pair is the matrix and nothing else.
-    let mut body = Translation::between(provider.kind, route).response(response.body, model);
-    if provider.kind == ProviderKind::Anthropic && matches!(route, RequestRoute::Messages) {
+    // The sanitizer renamed tool names on the request, so the upstream's reply
+    // carries the masked ones too. Restore them while the body is still in the
+    // Messages dialect: translation moves each name into the client's shape
+    // (`tool_calls[].function.name` in Chat), where the restore cannot read it.
+    let mut body = response.body;
+    if provider.kind == ProviderKind::Anthropic {
         restore_tool_use_names(&mut body, tool_reverse);
     }
+    let body = Translation::between(provider.kind, route).response(body, model);
     (response.status, Json(body)).into_response()
 }
 
@@ -3219,13 +3222,21 @@ fn transform_sse_event(
                 vec![sse(&data, passthrough_event(event))]
             },
         ),
+        // Masked names are restored before the conversion: it moves each one into
+        // the client's shape, where `restore_tool_use_names` cannot find it.
         (ProviderKind::Anthropic, RequestRoute::Chat) => parsed.map_or_else(
             |_| Vec::new(),
-            |data| anthropic_sse_to_chat(event, &data, chat_state),
+            |mut data| {
+                restore_tool_use_names(&mut data, tool_reverse);
+                anthropic_sse_to_chat(event, &data, chat_state)
+            },
         ),
         (ProviderKind::Anthropic, RequestRoute::Responses) => parsed.map_or_else(
             |_| Vec::new(),
-            |data| anthropic_sse_to_responses(event, &data, responses_state, model),
+            |mut data| {
+                restore_tool_use_names(&mut data, tool_reverse);
+                anthropic_sse_to_responses(event, &data, responses_state, model)
+            },
         ),
         (ProviderKind::Codex, RequestRoute::Chat) => parsed.map_or_else(
             |_| Vec::new(),

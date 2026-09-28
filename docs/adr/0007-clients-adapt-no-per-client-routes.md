@@ -1,6 +1,7 @@
 # 7. Clients adapt to pengepul's routes; do not add per-client endpoints
 
-Status: Accepted
+Status: Accepted (amended by ADR-0028 — the transform runs on every dialect that
+reaches anthropic; the route rule stands)
 
 ## Context
 

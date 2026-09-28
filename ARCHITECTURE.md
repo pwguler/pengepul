@@ -127,16 +127,17 @@ in files.
   anthropic's own endpoint. Two losses in that translation are deliberate:
   anthropic server tools are dropped, and thinking blocks do not travel back
   upstream.
-- **Cloaking runs in two layers.** The sanitizer (`masquerade_request`) runs on
-  the `/messages` route only; the vendor-identity inject (`apply_cloaking`) runs
-  inside the Upstream client for anthropic on every dialect. A Chat- or
-  Responses-shaped request to an anthropic model therefore gets the identity
-  headers but not the sanitizer — a known gap. codex is header-only; a configured
-  OpenAI-compatible endpoint is never Cloaked; `count_tokens` gets identifying
-  headers but no body Cloaking.
+- **Cloaking runs in two layers, on every dialect that reaches anthropic.** The
+  sanitizer (`masquerade_request`) runs on the request after it is translated
+  into Messages. A Chat- or Responses-shaped request is sanitized like a native
+  one, because the Classifier reads the body, not the client's dialect
+  (ADR-0028, amending ADR-0002, ADR-0004 and ADR-0007). The vendor-identity
+  inject (`apply_cloaking`) runs inside the Upstream client. codex is
+  header-only; a configured OpenAI-compatible endpoint is never Cloaked;
+  `count_tokens` gets identifying headers but no body Cloaking.
 - **Tool-name rewrites are bijective within a request and restored before the
-  reply reaches the client**, on the Messages route where the sanitizer applied
-  them.
+  reply reaches the client**, on the upstream's Messages-shaped reply, before
+  translation moves each name into the client's dialect.
 - **Nothing observes the Classifier.** Every table entry is bisected offline
   against live traffic; an under-strip surfaces only as an upstream 400 with no
   log line, so the rules bias toward failing loud over deleting operator content.

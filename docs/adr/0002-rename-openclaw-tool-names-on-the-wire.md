@@ -1,7 +1,9 @@
 # 2. Rename openclaw's tool names on the wire, reverse them on the way back
 
 Status: Accepted (amended by ADR-0005 — multi-word tool names are now also renamed
-in the prompt prose, not only the tool listing)
+in the prompt prose, not only the tool listing. Amended again by ADR-0028 — the
+rename runs on every dialect that reaches anthropic, and each reply path restores
+the names before translation)
 
 ## Context
 

@@ -5390,10 +5390,12 @@ async fn an_unreadable_peak_file_is_left_alone() {
 #[derive(Default)]
 struct ToolCallingUpstream {
     offered: Mutex<Vec<String>>,
+    calls: Mutex<Vec<UpstreamRequest>>,
 }
 
 impl ToolCallingUpstream {
     fn offered_name(&self, request: &UpstreamRequest) -> String {
+        self.calls.lock().expect("calls lock").push(request.clone());
         let name = request.body["tools"][0]["name"]
             .as_str()
             .expect("a tool was offered")
@@ -5555,5 +5557,154 @@ async fn a_masked_tool_name_is_restored_before_the_reply_reaches_the_client() {
     for name in &offered {
         assert_ne!(name, "exec", "the request reached the vendor unmasked");
         assert!(!text.contains(&format!(r#""name":"{name}""#)), "{text}");
+    }
+}
+
+/// A Chat client reaches the same sanitizer a Messages client does: the Classifier
+/// reads the prompt body, not the dialect the client spoke. So a `snake_case`
+/// harness on `/v1/chat/completions` is masked on the way out, and its tool names
+/// come back restored in the Chat shape, where each name sits under `tool_calls`.
+#[tokio::test]
+async fn a_chat_request_is_masked_and_its_tool_names_restored() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_provider_token(tmp.path(), ProviderId::anthropic(), "anthropic@example.com");
+    let upstream = Arc::new(ToolCallingUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    let request = |stream: bool| {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "stream": stream,
+                    "tools": [{
+                        "type": "function",
+                        "function": {"name": "read_file", "parameters": {"type": "object"}}
+                    }],
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "House rules.\n\n## Inbound Context (trusted metadata)\nEnvelope framing the classifier reads as a bridge marker.\n"
+                        },
+                        {"role": "user", "content": "read it"}
+                    ]
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+
+    let (status, body) = json_response(app.clone(), request(false)).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "read_file",
+        "{body}"
+    );
+
+    let response = app.oneshot(request(true)).await.expect("response");
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("stream body")
+        .to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains(r#""name":"read_file""#),
+        "the streamed call kept the masked name: {text}"
+    );
+    assert!(
+        !text.contains(r#""name":"ReadFile""#),
+        "the masked name reached the client: {text}"
+    );
+
+    // The masking means something only if the vendor saw the other shape.
+    let calls = upstream.calls.lock().expect("calls lock").clone();
+    assert_eq!(calls.len(), 2);
+    for call in &calls {
+        assert_eq!(
+            call.body["tools"][0]["name"], "ReadFile",
+            "the request reached the vendor unmasked: {}",
+            call.body
+        );
+        let system = call.body["system"].to_string();
+        assert!(
+            !system.contains("Inbound Context"),
+            "the classifier section survived: {system}"
+        );
+    }
+}
+
+/// A Responses client is sanitized like a Messages one, because the Classifier reads
+/// the body, not the dialect. Each masked name has to come back as the client's own
+/// name in a `function_call` output item, or the client cannot dispatch the call.
+#[tokio::test]
+async fn a_responses_request_is_masked_and_its_tool_names_restored() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_provider_token(tmp.path(), ProviderId::anthropic(), "anthropic@example.com");
+    let upstream = Arc::new(ToolCallingUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    let request = |stream: bool| {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "stream": stream,
+                    "instructions": "House rules.\n\n## Inbound Context (trusted metadata)\nEnvelope framing the classifier reads as a bridge marker.\n",
+                    "tools": [{"type": "function", "name": "read_file", "parameters": {"type": "object"}}],
+                    "input": [{"role": "user", "content": "read it"}]
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+
+    let (status, body) = json_response(app.clone(), request(false)).await;
+    assert_eq!(status, 200, "{body}");
+    let call = body["output"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["type"] == "function_call"))
+        .unwrap_or_else(|| panic!("no function_call in {body}"));
+    assert_eq!(call["name"], "read_file", "{body}");
+
+    let response = app.oneshot(request(true)).await.expect("response");
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("stream body")
+        .to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains(r#""name":"read_file""#),
+        "the streamed call kept the masked name: {text}"
+    );
+    assert!(
+        !text.contains(r#""name":"ReadFile""#),
+        "the masked name reached the client: {text}"
+    );
+
+    let calls = upstream.calls.lock().expect("calls lock").clone();
+    assert_eq!(calls.len(), 2);
+    for call in &calls {
+        assert_eq!(
+            call.body["tools"][0]["name"], "ReadFile",
+            "the request reached the vendor unmasked: {}",
+            call.body
+        );
+        let system = call.body["system"].to_string();
+        assert!(
+            !system.contains("Inbound Context"),
+            "the classifier section survived: {system}"
+        );
     }
 }

@@ -272,6 +272,72 @@ fn anthropic_stream_to_chat_streams_text_and_usage() {
 }
 
 #[test]
+fn anthropic_stream_to_chat_keeps_server_tool_blocks_out_of_tool_calls() {
+    // A server tool runs upstream: the client must not see a call it would try to
+    // dispatch, and the tool's streamed input has no tool call to extend.
+    let mut state = ChatStreamState::new("claude-sonnet-4-6");
+    let mut chunks = Vec::new();
+    chunks.extend(anthropic_sse_to_chat(
+        "message_start",
+        &json!({}),
+        &mut state,
+    ));
+    chunks.extend(anthropic_sse_to_chat(
+        "content_block_start",
+        &json!({
+            "index": 0,
+            "content_block": {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {}}
+        }),
+        &mut state,
+    ));
+    chunks.extend(anthropic_sse_to_chat(
+        "content_block_delta",
+        &json!({"index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"query\":\"rust\"}"}}),
+        &mut state,
+    ));
+    chunks.extend(anthropic_sse_to_chat(
+        "content_block_start",
+        &json!({
+            "index": 1,
+            "content_block": {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": []}
+        }),
+        &mut state,
+    ));
+    chunks.extend(anthropic_sse_to_chat(
+        "content_block_delta",
+        &json!({"index": 2, "delta": {"type": "text_delta", "text": "Rust 1.96"}}),
+        &mut state,
+    ));
+    chunks.extend(anthropic_sse_to_chat(
+        "message_delta",
+        &json!({"delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 3}}),
+        &mut state,
+    ));
+
+    let payloads = chunks
+        .iter()
+        .filter(|chunk| chunk.starts_with("data: {"))
+        .map(|chunk| payload(chunk))
+        .collect::<Vec<_>>();
+    assert!(
+        payloads
+            .iter()
+            .all(|p| p["choices"][0]["delta"].get("tool_calls").is_none()),
+        "a server tool reached the client as a tool call: {payloads:?}"
+    );
+    assert!(
+        payloads
+            .iter()
+            .any(|p| p["choices"][0]["delta"]["content"] == "Rust 1.96")
+    );
+    assert!(
+        payloads
+            .iter()
+            .any(|p| p["choices"][0]["finish_reason"] == "stop")
+    );
+}
+
+#[test]
 fn anthropic_stream_to_chat_streams_tool_use() {
     let mut state = ChatStreamState::new("claude-sonnet-4-6");
     let mut chunks = Vec::new();

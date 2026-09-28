@@ -1,9 +1,33 @@
 use pengepul::translate::{
-    anthropic_to_chat_request, anthropic_to_responses, anthropic_to_responses_request,
-    chat_to_anthropic_message, chat_to_responses_request, openai_to_anthropic,
-    responses_to_anthropic, responses_to_anthropic_message,
+    anthropic_to_chat_request, anthropic_to_openai, anthropic_to_responses,
+    anthropic_to_responses_request, chat_to_anthropic_message, chat_to_responses_request,
+    openai_to_anthropic, responses_to_anthropic, responses_to_anthropic_message,
 };
 use serde_json::json;
+
+#[test]
+fn anthropic_web_search_response_translates_to_chat_as_text() {
+    // A server tool ran upstream: the Chat client gets the answer, never a call it
+    // would try to dispatch.
+    let out = anthropic_to_openai(
+        &json!({
+            "id": "msg_1",
+            "content": [
+                {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {"query": "rust"}},
+                {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": []},
+                {"type": "text", "text": "Rust 1.96"}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }),
+        "claude-sonnet-4-6",
+    );
+
+    let message = &out["choices"][0]["message"];
+    assert_eq!(message["content"], "Rust 1.96");
+    assert!(message.get("tool_calls").is_none(), "{out}");
+    assert_eq!(out["choices"][0]["finish_reason"], "stop");
+}
 
 #[test]
 fn openai_chat_to_anthropic_translates_tools_and_system() {
