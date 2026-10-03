@@ -78,6 +78,31 @@ curl -sS http://127.0.0.1:8317/v1/chat/completions \
 Configured endpoints speak Chat Completions and rotate across their keys with the same
 failure handling as subscription providers.
 
+`/v1/models` advertises what each endpoint's own `/models` publishes under these fields:
+`context_window`, `context_length` or vLLM's `max_model_len`; `max_output_tokens`;
+`input_modalities`; `reasoning`; and `pricing` as `*_per_million` rates. For models it
+knows, pengepul fills, from its own table, the fields an endpoint leaves out. A local server
+such as omlx publishes no `reasoning`, so a client like pi offers no thinking level for a
+model that thinks. State it under the endpoint's `models:`, keyed by the id the endpoint
+lists:
+
+```sh
+# ~/.pengepul/config.yaml
+providers:
+  omlx:
+    base-url: http://10.10.1.25:8000/v1
+    models:
+      Qwen3.8-27B-Uncensored-MLX:
+        reasoning: true
+        context-window: 262144
+        max-output-tokens: 32768
+```
+
+Each field is optional and wins over the endpoint's value and pengepul's table; a field
+left out keeps what pengepul would advertise without it. A model the endpoint does not
+list is not advertised, and an unknown field or a zero limit stops the relay at load.
+`models:` is read at startup, so an edit needs a restart.
+
 Login opens a browser and finishes on a localhost callback. On a remote host, forward the
 port first:
 
@@ -198,6 +223,11 @@ api-keys:
 providers:
   groq:
     base-url: https://api.groq.com/openai/v1
+    models: # optional, per model id the endpoint lists
+      llama-3.3-70b-versatile:
+        reasoning: false
+        context-window: 131072
+        max-output-tokens: 32768
 body-limit: 200mb # largest request body the relay will read; empty means unlimited
 timeouts:
   messages-ms: 120000

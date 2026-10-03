@@ -24,7 +24,7 @@ The root of it is that the field is hand-written. commandcode's `/v1/models` pub
 - The provider thread runs through `parse_openai` / `parse_anthropic` / `parse_codex`, which
   take the Provider the body came from.
 - Upstream metadata still wins: a Provider that publishes its own `input_modalities` overrides
-  a claim here (`merge_curated`), so these claims hold while it stays silent.
+  a claim here (`ranked_metadata`), so these claims hold while it stays silent.
 
 ## Non-goals
 

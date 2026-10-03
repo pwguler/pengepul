@@ -49,8 +49,11 @@ in files.
 - **Model catalog** (`models.rs`) — resolves a model id to exactly one Provider,
   and advertises every served model under its `<provider>/` prefix with the
   per-model metadata the client needs (context window, output cap, modalities,
-  pricing). It also decides the name the vendor is told: `upstream_model`
-  removes the `<provider>/` prefix and nothing else.
+  pricing, reasoning). It also decides the name the vendor is told: `upstream_model`
+  removes the `<provider>/` prefix and nothing else. A model's metadata is
+  ranked in one place, `ranked_metadata`, field by field: the curated table,
+  under the upstream's `/models` body, under what the operator states in a
+  configured provider's `models:` in `config.yaml` (ADR-0029).
 - **Translation** (`translate.rs`, `streaming.rs`) — rewrites a body between
   Inbound and upstream **Dialect**, whole-document and one SSE event at a time;
   pure JSON, no I/O. Every pair the route table can produce has a translation,
@@ -102,7 +105,9 @@ in files.
 
 - **`UpstreamClient`** — the test seam: which vendor wire is spoken and whether
   any HTTP happens at all. `apply_cloaking` runs *below* it inside the HTTP
-  client, so a test double sees the pre-cloak body and headers.
+  client, so a test double sees the pre-cloak body and headers. Model metadata
+  ranking runs below it too, operator tier included, so a test double's models
+  are advertised as it returns them (ADR-0029).
 - **`ProviderKind`** — a closed enum (Anthropic, Codex, Generic) that switches
   the credential lifecycle, the OAuth flow, and whether Cloaking runs; the
   compiler is the checklist when a fourth kind arrives.

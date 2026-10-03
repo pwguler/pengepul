@@ -2,7 +2,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
-use pengepul::config::{BodyLimit, load_config, selected_config_path};
+use pengepul::config::{BodyLimit, ConfiguredModel, load_config, selected_config_path};
 use pengepul::oauth::{
     CODEX_CALLBACK_PATH, CODEX_CALLBACK_PORT, CODEX_CLIENT_ID, generate_anthropic_auth_url,
     generate_codex_auth_url,
@@ -144,6 +144,87 @@ providers:
         config.providers["openrouter"].base_url,
         "https://openrouter.ai/api/v1"
     );
+}
+
+#[test]
+fn configured_models_load_with_the_metadata_the_operator_states() {
+    let (_tmp, home, config_path) = write_config_with(
+        r"api-keys:
+  - sk-local
+providers:
+  omlx:
+    base-url: http://10.10.1.25:8000/v1
+    models:
+      Qwen3.8-27B-Uncensored-MLX:
+        reasoning: true
+        context-window: 262144
+        max-output-tokens: 32768
+      Qwen3-VL-8B-Instruct-MLX-4bit:
+        reasoning: false
+",
+    );
+
+    let config = load_config(Some(&config_path), Some(&home), &home).expect("load config");
+
+    let models = &config.providers["omlx"].models;
+    assert_eq!(
+        models["Qwen3.8-27B-Uncensored-MLX"],
+        ConfiguredModel {
+            reasoning: Some(true),
+            context_window: Some(262_144),
+            max_output_tokens: Some(32_768),
+        }
+    );
+    assert_eq!(
+        models["Qwen3-VL-8B-Instruct-MLX-4bit"],
+        ConfiguredModel {
+            reasoning: Some(false),
+            context_window: None,
+            max_output_tokens: None,
+        }
+    );
+}
+
+#[test]
+fn a_misspelled_model_field_is_refused_at_load() {
+    // A typo that loaded silently would leave the model advertised as before, with nothing
+    // telling the operator why their setting did nothing.
+    let (_tmp, home, config_path) = write_config_with(
+        r"api-keys:
+  - sk-local
+providers:
+  omlx:
+    base-url: http://10.10.1.25:8000/v1
+    models:
+      Qwen3.8-27B-Uncensored-MLX:
+        reasonning: true
+",
+    );
+
+    let error = load_config(Some(&config_path), Some(&home), &home).expect_err("rejected");
+    let full = format!("{error:#}");
+    assert!(
+        full.contains("unknown field `reasonning`"),
+        "error names the unknown field: {full}"
+    );
+}
+
+#[test]
+fn a_zero_token_limit_is_refused_at_load() {
+    for field in ["context-window", "max-output-tokens"] {
+        let (_tmp, home, config_path) = write_config_with(&format!(
+            "api-keys:\n  - sk-local\nproviders:\n  omlx:\n    base-url: http://10.10.1.25:8000/v1\n    models:\n      Qwen3.8-27B-Uncensored-MLX:\n        {field}: 0\n"
+        ));
+
+        let error = load_config(Some(&config_path), Some(&home), &home).expect_err("rejected");
+        let full = format!("{error:#}");
+        assert!(
+            full.contains("omlx")
+                && full.contains("Qwen3.8-27B-Uncensored-MLX")
+                && full.contains(field),
+            "error names the provider, the model and the field: {full}"
+        );
+    }
 }
 
 #[test]

@@ -527,6 +527,7 @@ fn generic_base_url_trims_trailing_slash() {
         "groq".to_string(),
         pengepul::config::ConfiguredProvider {
             base_url: "https://api.groq.com/openai/v1/".to_string(),
+            models: std::collections::BTreeMap::new(),
         },
     );
 

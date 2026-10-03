@@ -2556,6 +2556,7 @@ async fn admin_accounts_lists_configured_provider_keys_loaded_at_startup() {
         "groq".to_string(),
         pengepul::config::ConfiguredProvider {
             base_url: "https://api.groq.com/openai/v1".to_string(),
+            models: std::collections::BTreeMap::new(),
         },
     );
     let app = create_app(cfg);
@@ -2713,6 +2714,7 @@ fn config_with_groq(auth_dir: PathBuf) -> Config {
         "groq".to_string(),
         pengepul::config::ConfiguredProvider {
             base_url: "https://api.groq.com/openai/v1".to_string(),
+            models: std::collections::BTreeMap::new(),
         },
     );
     cfg
@@ -2724,6 +2726,7 @@ fn config_with_static_provider(name: &str, auth_dir: PathBuf) -> Config {
         name.to_string(),
         pengepul::config::ConfiguredProvider {
             base_url: format!("https://{name}.example/v1"),
+            models: std::collections::BTreeMap::new(),
         },
     );
     cfg
@@ -5153,6 +5156,7 @@ async fn admin_toggle_resolves_the_provider_from_the_id() {
         "cerebras".to_string(),
         pengepul::config::ConfiguredProvider {
             base_url: "https://cerebras.example/v1".to_string(),
+            models: std::collections::BTreeMap::new(),
         },
     );
     save_token(
