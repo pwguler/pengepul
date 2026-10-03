@@ -78,6 +78,29 @@ curl -sS http://127.0.0.1:8317/v1/chat/completions \
 Configured endpoints speak Chat Completions and rotate across their keys with the same
 failure handling as subscription providers.
 
+`/v1/models` advertises what each endpoint publishes about its models: context window
+(`context_length`, or vLLM's `max_model_len`), output cap, modalities, pricing, and
+whether the model reasons. A local server such as omlx publishes no `reasoning`, so a
+client like pi offers no thinking level for a model that thinks. State it under the
+endpoint's `models:`, keyed by the id the endpoint lists:
+
+```sh
+# ~/.pengepul/config.yaml
+providers:
+  omlx:
+    base-url: http://10.10.1.25:8000/v1
+    models:
+      Qwen3.8-27B-Uncensored-MLX:
+        reasoning: true
+        context-window: 262144
+        max-output-tokens: 32768
+```
+
+Each field is optional and wins over what the endpoint publishes; a field left out still
+comes from the endpoint. A model the endpoint does not list is not advertised, and an
+unknown field or a zero limit stops the relay at load. Models are read at startup, so an
+edit needs a restart.
+
 Login opens a browser and finishes on a localhost callback. On a remote host, forward the
 port first:
 

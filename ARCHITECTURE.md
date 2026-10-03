@@ -50,7 +50,9 @@ in files.
   and advertises every served model under its `<provider>/` prefix with the
   per-model metadata the client needs (context window, output cap, modalities,
   pricing). It also decides the name the vendor is told: `upstream_model`
-  removes the `<provider>/` prefix and nothing else.
+  removes the `<provider>/` prefix and nothing else. For a configured endpoint,
+  what the operator states under its `models:` in `config.yaml` wins over what
+  the endpoint publishes, field by field (`FetchedModels::with_stated`).
 - **Translation** (`translate.rs`, `streaming.rs`) — rewrites a body between
   Inbound and upstream **Dialect**, whole-document and one SSE event at a time;
   pure JSON, no I/O. Every pair the route table can produce has a translation,

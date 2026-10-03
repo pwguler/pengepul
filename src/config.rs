@@ -10,6 +10,30 @@ use crate::utils::{generate_api_key, resolve_auth_dir};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfiguredProvider {
     pub base_url: String,
+    /// What the operator states about each model, keyed by the id the endpoint lists. It wins
+    /// over whatever the endpoint's `/v1/models` publishes for that id.
+    pub models: BTreeMap<String, ConfiguredModel>,
+}
+
+/// One model's metadata under `providers.<id>.models`. A field left out falls back to what
+/// the endpoint publishes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfiguredModel {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
+    #[serde(
+        default,
+        rename = "context-window",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub context_window: Option<u64>,
+    #[serde(
+        default,
+        rename = "max-output-tokens",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +154,8 @@ struct RawConfig {
 struct RawConfiguredProvider {
     #[serde(rename = "base-url")]
     base_url: String,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    models: BTreeMap<String, ConfiguredModel>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,12 +304,8 @@ pub fn register_provider(path: &Path, id: &str, base_url: &str) -> Result<String
             bail!("{id} already points at {existing}; edit the config to change it");
         }
     }
-    raw.providers.insert(
-        id.to_string(),
-        RawConfiguredProvider {
-            base_url: base_url.to_string(),
-        },
-    );
+    // An entry already present keeps everything else it states, `models:` included.
+    raw.providers.entry(id.to_string()).or_default().base_url = base_url.to_string();
     // The same validation the load path applies, so a name this file
     // would reject cannot enter through this door (AC-7).
     validate_providers(&raw.providers)?;
@@ -483,10 +505,21 @@ fn validate_providers(
         if entry.base_url.trim().is_empty() {
             bail!("providers: {id} is missing base-url");
         }
+        for (model, stated) in &entry.models {
+            for (field, value) in [
+                ("context-window", stated.context_window),
+                ("max-output-tokens", stated.max_output_tokens),
+            ] {
+                if value == Some(0) {
+                    bail!("providers: {id}.models.{model}.{field} must be above 0");
+                }
+            }
+        }
         providers.insert(
             id.clone(),
             ConfiguredProvider {
                 base_url: entry.base_url.trim().to_string(),
+                models: entry.models.clone(),
             },
         );
     }
@@ -841,6 +874,32 @@ mod register_tests {
 
         let after = fs::read_to_string(&path).expect("read config");
         assert!(after.contains("https://api.groq.com/openai/v1"), "{after}");
+    }
+
+    /// `login --base-url` runs again whenever the operator adds a key to a pool, and every
+    /// run rewrites the file. The models the operator stated must come through it.
+    #[test]
+    fn a_repeated_registration_keeps_the_stated_models() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yaml");
+        fs::write(
+            &path,
+            "host: \"127.0.0.1\"\nport: 8317\napi-keys:\n  - sk-test\nproviders:\n  omlx:\n    base-url: http://10.10.1.25:8000/v1\n    models:\n      Qwen3.8-27B-Uncensored-MLX:\n        reasoning: true\n        context-window: 262144\n",
+        )
+        .expect("write config");
+
+        register_provider(&path, "omlx", "http://10.10.1.25:8000/v1").expect("same URL");
+
+        let config = crate::config::load_config(Some(&path), Some(dir.path()), dir.path())
+            .expect("load config");
+        assert_eq!(
+            config.providers["omlx"].models["Qwen3.8-27B-Uncensored-MLX"],
+            crate::config::ConfiguredModel {
+                reasoning: Some(true),
+                context_window: Some(262_144),
+                max_output_tokens: None,
+            }
+        );
     }
 }
 

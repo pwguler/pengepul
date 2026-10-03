@@ -845,7 +845,7 @@ async fn refresh_model_catalog(state: &AppState) {
         }
     }
     // Configured providers: one fetch each, advertised under their own prefix.
-    for provider_id in state.config.providers.keys() {
+    for (provider_id, configured) in &state.config.providers {
         let provider = ProviderId::generic(provider_id.clone());
         let Some(account) = catalog_account_id(state, &provider).await else {
             continue;
@@ -855,12 +855,12 @@ async fn refresh_model_catalog(state: &AppState) {
             .fetch_models(ProviderKind::Generic, account, cloaked_config(state))
             .await
         {
-            Ok(FetchedModels { ids, metadata }) => {
+            Ok(fetched) => {
                 state
                     .catalog
                     .write()
                     .expect("catalog lock poisoned")
-                    .set_generic(provider_id, FetchedModels::with_metadata(ids, metadata));
+                    .set_generic(provider_id, fetched.with_stated(&configured.models));
             }
             Err(error) => {
                 tracing::warn!(provider = provider_id, ?error, "model list fetch failed");
@@ -4536,6 +4536,7 @@ mod tests {
                 name.to_string(),
                 crate::config::ConfiguredProvider {
                     base_url: format!("http://{addr}/v1"),
+                    models: std::collections::BTreeMap::new(),
                 },
             );
         }

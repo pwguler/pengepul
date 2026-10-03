@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::config::ConfiguredProvider;
+use crate::config::{ConfiguredModel, ConfiguredProvider};
 use crate::types::{ProviderId, ProviderKind};
 
 /// What a model costs, in USD per million tokens. Every field is optional: an upstream
@@ -43,13 +43,15 @@ pub struct ModelMetadata {
 impl ModelMetadata {
     /// The metadata one upstream `/v1/models` entry carries, under the field names
     /// pengepul publishes (`context_window`, `context_length`, `max_output_tokens`,
-    /// `input_modalities`, `pricing` with the per-million keys). `None` when the entry
+    /// `input_modalities`, `pricing` with the per-million keys), plus vLLM's
+    /// `max_model_len` for the context window, which omlx publishes too. `None` when the entry
     /// carries none of them, so pass-through stays silent instead of inventing zeros.
     #[must_use]
     pub fn from_json(entry: &Value) -> Option<Self> {
         let context_window = entry
             .get("context_window")
             .or_else(|| entry.get("context_length"))
+            .or_else(|| entry.get("max_model_len"))
             .and_then(Value::as_u64);
         let max_output_tokens = entry.get("max_output_tokens").and_then(Value::as_u64);
         let input_modalities =
@@ -549,6 +551,27 @@ impl FetchedModels {
     #[must_use]
     pub fn with_metadata(ids: Vec<String>, metadata: BTreeMap<String, ModelMetadata>) -> Self {
         Self { ids, metadata }
+    }
+
+    /// Lay what the operator states in `providers.<id>.models` over what the endpoint
+    /// published, field by field. Only ids the endpoint listed are touched: a statement about a
+    /// model it does not serve advertises nothing.
+    #[must_use]
+    pub fn with_stated(mut self, stated: &BTreeMap<String, ConfiguredModel>) -> Self {
+        for id in &self.ids {
+            let Some(model) = stated.get(id) else {
+                continue;
+            };
+            let published = self.metadata.remove(id).unwrap_or_default();
+            let merged = published.merged_with(ModelMetadata {
+                context_window: model.context_window,
+                max_output_tokens: model.max_output_tokens,
+                reasoning: model.reasoning,
+                ..ModelMetadata::default()
+            });
+            self.metadata.insert(id.clone(), merged);
+        }
+        self
     }
 }
 
@@ -1075,6 +1098,21 @@ mod tests {
     }
 
     #[test]
+    fn a_vllm_style_max_model_len_is_the_context_window() {
+        // omlx's live body: vLLM's field name, no context_length
+        let body = json!({"data": [
+            {"id": "Qwen3.8-27B-Uncensored-MLX", "object": "model",
+             "owned_by": "omlx", "max_model_len": 262_144}
+        ]});
+        let fetched = parse_openai(&body, &ProviderId::generic("omlx"));
+        let qwen = fetched
+            .metadata
+            .get("Qwen3.8-27B-Uncensored-MLX")
+            .expect("qwen metadata");
+        assert_eq!(qwen.context_window, Some(262_144));
+    }
+
+    #[test]
     fn codex_body_metadata_wins_over_the_curated_table() {
         let fetched = parse_codex(
             &json!({"models": [
@@ -1297,6 +1335,7 @@ mod tests {
             "groq".to_string(),
             crate::config::ConfiguredProvider {
                 base_url: "https://api.groq.com/openai/v1".to_string(),
+                models: std::collections::BTreeMap::new(),
             },
         )]);
 
@@ -1482,6 +1521,7 @@ fn grok_models_route_bare_prefixed_and_by_shape() {
         "xai".to_string(),
         crate::config::ConfiguredProvider {
             base_url: "https://api.x.ai/v1".to_string(),
+            models: std::collections::BTreeMap::new(),
         },
     )]);
 

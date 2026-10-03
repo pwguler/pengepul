@@ -2556,6 +2556,7 @@ async fn admin_accounts_lists_configured_provider_keys_loaded_at_startup() {
         "groq".to_string(),
         pengepul::config::ConfiguredProvider {
             base_url: "https://api.groq.com/openai/v1".to_string(),
+            models: std::collections::BTreeMap::new(),
         },
     );
     let app = create_app(cfg);
@@ -2713,6 +2714,7 @@ fn config_with_groq(auth_dir: PathBuf) -> Config {
         "groq".to_string(),
         pengepul::config::ConfiguredProvider {
             base_url: "https://api.groq.com/openai/v1".to_string(),
+            models: std::collections::BTreeMap::new(),
         },
     );
     cfg
@@ -2724,6 +2726,7 @@ fn config_with_static_provider(name: &str, auth_dir: PathBuf) -> Config {
         name.to_string(),
         pengepul::config::ConfiguredProvider {
             base_url: format!("https://{name}.example/v1"),
+            models: std::collections::BTreeMap::new(),
         },
     );
     cfg
@@ -3388,6 +3391,68 @@ async fn v1_models_carries_per_model_metadata_additively() {
     // ...and rates the upstream did not publish are omitted, not zeroed.
     assert!(entry["pricing"].get("cache_read_per_million").is_none());
     assert!(entry["pricing"].get("cache_write_per_million").is_none());
+}
+
+/// The `/v1/models` entry advertised under `id`, once the background fetch has filled the
+/// catalog; `Null` when it never appears.
+async fn advertised_entry(app: &axum::Router, id: &str) -> Value {
+    for _ in 0..50 {
+        let (status, body) = json_response(
+            app.clone(),
+            axum::http::Request::builder()
+                .uri("/v1/models")
+                .header("authorization", "Bearer sk-test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let found = body["data"]
+            .as_array()
+            .and_then(|items| items.iter().find(|item| item["id"] == id))
+            .cloned();
+        if let Some(entry) = found {
+            return entry;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    Value::Null
+}
+
+#[tokio::test]
+async fn v1_models_lets_the_config_state_what_the_endpoint_does_not() {
+    // omlx lists its models with no `reasoning`, so a client cannot offer a thinking level
+    // for a model that thinks. The operator's statement fills that in and wins field by
+    // field; what it leaves out still comes from the endpoint.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &groq_key_token()).expect("save groq key");
+    let mut cfg = config_with_groq(tmp.path().to_path_buf());
+    let groq = cfg.providers.get_mut("groq").expect("groq configured");
+    groq.models.insert(
+        "llama-3.3-70b-versatile".to_string(),
+        pengepul::config::ConfiguredModel {
+            reasoning: Some(true),
+            context_window: Some(100_000),
+            max_output_tokens: None,
+        },
+    );
+    groq.models.insert(
+        "not-served".to_string(),
+        pengepul::config::ConfiguredModel {
+            reasoning: Some(true),
+            ..Default::default()
+        },
+    );
+    let app = create_app_with_upstream(cfg, Arc::new(ModelsUpstream::default()));
+
+    let entry = advertised_entry(&app, "groq/llama-3.3-70b-versatile").await;
+
+    assert_eq!(entry["reasoning"], true);
+    assert_eq!(entry["context_window"], 100_000);
+    assert_eq!(entry["max_output_tokens"], 32_768);
+    assert_eq!(entry["pricing"]["input_per_million"], 0.59);
+    // a statement about a model the endpoint does not list advertises nothing
+    assert_eq!(advertised_entry(&app, "groq/not-served").await, Value::Null);
 }
 
 #[tokio::test]
@@ -5153,6 +5218,7 @@ async fn admin_toggle_resolves_the_provider_from_the_id() {
         "cerebras".to_string(),
         pengepul::config::ConfiguredProvider {
             base_url: "https://cerebras.example/v1".to_string(),
+            models: std::collections::BTreeMap::new(),
         },
     );
     save_token(
