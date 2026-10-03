@@ -3393,68 +3393,6 @@ async fn v1_models_carries_per_model_metadata_additively() {
     assert!(entry["pricing"].get("cache_write_per_million").is_none());
 }
 
-/// The `/v1/models` entry advertised under `id`, once the background fetch has filled the
-/// catalog; `Null` when it never appears.
-async fn advertised_entry(app: &axum::Router, id: &str) -> Value {
-    for _ in 0..50 {
-        let (status, body) = json_response(
-            app.clone(),
-            axum::http::Request::builder()
-                .uri("/v1/models")
-                .header("authorization", "Bearer sk-test")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(status, 200);
-        let found = body["data"]
-            .as_array()
-            .and_then(|items| items.iter().find(|item| item["id"] == id))
-            .cloned();
-        if let Some(entry) = found {
-            return entry;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    Value::Null
-}
-
-#[tokio::test]
-async fn v1_models_lets_the_config_state_what_the_upstream_does_not() {
-    // omlx lists its models with no `reasoning`, so a client cannot offer a thinking level
-    // for a model that thinks. The operator's statement fills that in and wins field by
-    // field; what it leaves out keeps the upstream's value.
-    let tmp = tempfile::tempdir().expect("tempdir");
-    save_token(tmp.path(), &groq_key_token()).expect("save groq key");
-    let mut cfg = config_with_groq(tmp.path().to_path_buf());
-    let groq = cfg.providers.get_mut("groq").expect("groq configured");
-    groq.models.insert(
-        "llama-3.3-70b-versatile".to_string(),
-        pengepul::config::ConfiguredModel {
-            reasoning: Some(true),
-            context_window: Some(100_000),
-            max_output_tokens: None,
-        },
-    );
-    groq.models.insert(
-        "not-served".to_string(),
-        pengepul::config::ConfiguredModel {
-            reasoning: Some(true),
-            ..Default::default()
-        },
-    );
-    let app = create_app_with_upstream(cfg, Arc::new(ModelsUpstream::default()));
-
-    let entry = advertised_entry(&app, "groq/llama-3.3-70b-versatile").await;
-
-    assert_eq!(entry["reasoning"], true);
-    assert_eq!(entry["context_window"], 100_000);
-    assert_eq!(entry["max_output_tokens"], 32_768);
-    assert_eq!(entry["pricing"]["input_per_million"], 0.59);
-    // a statement about a model the upstream does not list advertises nothing
-    assert_eq!(advertised_entry(&app, "groq/not-served").await, Value::Null);
-}
-
 #[tokio::test]
 async fn admin_reload_picks_up_a_newly_saved_key_for_a_configured_provider() {
     let tmp = tempfile::tempdir().expect("tempdir");

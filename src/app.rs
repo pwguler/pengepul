@@ -524,7 +524,12 @@ impl UpstreamClient for HttpUpstreamClient {
                     let headers = generic_chat_headers(&account);
                     let body =
                         send_get(client, format!("{base_url}/models"), headers, timeout).await?;
-                    Ok(parse_openai(&body, &account.provider))
+                    let stated = &config
+                        .providers
+                        .get(account.provider.id.as_ref())
+                        .context("generic provider missing from config")?
+                        .models;
+                    Ok(parse_openai(&body, &account.provider, stated))
                 }
                 ProviderKind::Anthropic => {
                     let headers = BTreeMap::from([
@@ -845,7 +850,7 @@ async fn refresh_model_catalog(state: &AppState) {
         }
     }
     // Configured providers: one fetch each, advertised under their own prefix.
-    for (provider_id, configured) in &state.config.providers {
+    for provider_id in state.config.providers.keys() {
         let provider = ProviderId::generic(provider_id.clone());
         let Some(account) = catalog_account_id(state, &provider).await else {
             continue;
@@ -855,12 +860,12 @@ async fn refresh_model_catalog(state: &AppState) {
             .fetch_models(ProviderKind::Generic, account, cloaked_config(state))
             .await
         {
-            Ok(fetched) => {
+            Ok(FetchedModels { ids, metadata }) => {
                 state
                     .catalog
                     .write()
                     .expect("catalog lock poisoned")
-                    .set_generic(provider_id, fetched.with_stated(&configured.models));
+                    .set_generic(provider_id, FetchedModels::with_metadata(ids, metadata));
             }
             Err(error) => {
                 tracing::warn!(provider = provider_id, ?error, "model list fetch failed");
@@ -4506,28 +4511,12 @@ mod tests {
     /// so a constant substituted at the call site fails here.
     #[tokio::test]
     async fn the_fetch_asks_each_provider_for_its_own_modality_claims() {
-        use axum::routing::get;
-
         // The shape the live endpoint serves: ids and context_length, no modalities.
         let body = json!({"data": [
             {"id": "deepseek/deepseek-v4-flash", "context_length": 1_000_000},
             {"id": "deepseek/deepseek-v4.1-flash", "context_length": 1_000_000},
         ]});
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind a loopback port");
-        let addr = listener.local_addr().expect("bound address");
-        let served = body.clone();
-        tokio::spawn(async move {
-            let app = axum::Router::new().route(
-                "/v1/models",
-                get(move || {
-                    let served = served.clone();
-                    async move { axum::Json(served) }
-                }),
-            );
-            let _ = axum::serve(listener, app).await;
-        });
+        let addr = serve_models(body).await;
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut config = test_config(tmp.path().to_path_buf());
@@ -4581,6 +4570,72 @@ mod tests {
                 Some(vec!["text".to_string(), "image".to_string()])
             );
         }
+    }
+
+    /// A local upstream answering `GET /v1/models` with `body`.
+    async fn serve_models(body: Value) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("bound address");
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/v1/models",
+                axum::routing::get(move || {
+                    let served = body.clone();
+                    async move { axum::Json(served) }
+                }),
+            );
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    /// The operator's `models:` reaches the ranking only through `HttpUpstreamClient::fetch_models`, so the test
+    /// drives the real `HttpUpstreamClient`: a statement for one provider must not leak onto
+    /// another reading the same body.
+    #[tokio::test]
+    async fn the_fetch_ranks_each_providers_own_stated_models() {
+        let addr = serve_models(json!({"data": [
+            {"id": "Qwen3.8-27B-Uncensored-MLX", "max_model_len": 128_000},
+        ]}))
+        .await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(tmp.path().to_path_buf());
+        for (name, reasoning) in [("omlx", Some(true)), ("other", None)] {
+            let stated = reasoning.map(|reasoning| crate::config::ConfiguredModel {
+                reasoning: Some(reasoning),
+                ..crate::config::ConfiguredModel::default()
+            });
+            config.providers.insert(
+                name.to_string(),
+                crate::config::ConfiguredProvider {
+                    base_url: format!("http://{addr}/v1"),
+                    models: stated
+                        .map(|model| ("Qwen3.8-27B-Uncensored-MLX".to_string(), model))
+                        .into_iter()
+                        .collect(),
+                },
+            );
+        }
+        let config = Arc::new(config);
+        let client = super::HttpUpstreamClient::default();
+
+        let mut reasoning = Vec::new();
+        for name in ["omlx", "other"] {
+            let fetched = client
+                .fetch_models(
+                    ProviderKind::Generic,
+                    generic_account(name),
+                    Arc::clone(&config),
+                )
+                .await
+                .expect("the local upstream answers");
+            let qwen = &fetched.metadata["Qwen3.8-27B-Uncensored-MLX"];
+            assert_eq!(qwen.context_window, Some(128_000));
+            reasoning.push(qwen.reasoning);
+        }
+        assert_eq!(reasoning, [Some(true), None]);
     }
 
     fn test_config(auth_dir: std::path::PathBuf) -> Config {

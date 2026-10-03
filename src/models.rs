@@ -184,8 +184,8 @@ fn curated_metadata(id: &str, provider: &ProviderId) -> Option<ModelMetadata> {
 /// possible there: that direction costs more than a dropped image, because a client attaches an
 /// image the upstream refuses (issue #8's `404`). Measuring those is not done yet.
 ///
-/// `merge_curated` still lets an upstream's own `input_modalities` win, so a claim here holds only
-/// while the Provider stays silent about modalities, as commandcode does.
+/// `ranked_metadata` still lets an upstream's own `input_modalities` win, so a claim here holds
+/// only while the Provider stays silent about modalities, as commandcode does.
 const PROVIDER_MODALITIES: &[(&str, Option<&str>, &[&str])] = &[
     ("deepseek/deepseek-v4.1-flash", None, TEXT_IMAGE),
     (
@@ -531,8 +531,8 @@ fn capability(context_window: Option<u64>, max_output_tokens: Option<u64>) -> Mo
 }
 
 /// The models a single fetch returned: anthropic and codex each give one list, plus any
-/// per-model metadata the upstream body or the curated table carries for those ids, and for a
-/// configured provider what the operator states ([`FetchedModels::with_stated`]).
+/// per-model metadata those ids get from the curated table, the upstream body and, for a
+/// configured provider, what the operator states (ranked by `ranked_metadata`).
 #[derive(Debug, Clone)]
 pub struct FetchedModels {
     pub ids: Vec<String>,
@@ -551,28 +551,6 @@ impl FetchedModels {
     #[must_use]
     pub fn with_metadata(ids: Vec<String>, metadata: BTreeMap<String, ModelMetadata>) -> Self {
         Self { ids, metadata }
-    }
-
-    /// Lay what the operator states in `providers.<id>.models` over what the fetch already
-    /// carries (the upstream body over the curated table), field by field. Only ids the
-    /// upstream listed are touched: a statement about a model it does not serve advertises
-    /// nothing.
-    #[must_use]
-    pub fn with_stated(mut self, stated: &BTreeMap<String, ConfiguredModel>) -> Self {
-        for id in &self.ids {
-            let Some(model) = stated.get(id) else {
-                continue;
-            };
-            let published = self.metadata.remove(id).unwrap_or_default();
-            let merged = published.merged_with(ModelMetadata {
-                context_window: model.context_window,
-                max_output_tokens: model.max_output_tokens,
-                reasoning: model.reasoning,
-                ..ModelMetadata::default()
-            });
-            self.metadata.insert(id.clone(), merged);
-        }
-        self
     }
 }
 
@@ -749,18 +727,25 @@ pub fn parse_anthropic(body: &Value, provider: &ProviderId) -> FetchedModels {
     FetchedModels::with_metadata(ids, metadata)
 }
 
-/// Merge the curated table with whatever one upstream entry publishes: the curated entry
-/// is the per-field base, the upstream body wins field by field. `None` when neither has
-/// anything.
-fn merge_curated(
+/// One model's metadata from every source, ranked field by field: the curated table is the
+/// base, what the upstream entry publishes wins over it, and what the operator states under
+/// `providers.<id>.models` wins over both. `None` when no source has anything.
+fn ranked_metadata(
     id: &str,
     provider: &ProviderId,
     upstream: Option<ModelMetadata>,
+    stated: Option<&ConfiguredModel>,
 ) -> Option<ModelMetadata> {
-    match (curated_metadata(id, provider), upstream) {
-        (Some(base), Some(upstream)) => Some(base.merged_with(upstream)),
-        (base, upstream) => upstream.or(base),
-    }
+    let stated = stated.map(|model| ModelMetadata {
+        context_window: model.context_window,
+        max_output_tokens: model.max_output_tokens,
+        reasoning: model.reasoning,
+        ..ModelMetadata::default()
+    });
+    [curated_metadata(id, provider), upstream, stated]
+        .into_iter()
+        .flatten()
+        .reduce(ModelMetadata::merged_with)
 }
 
 /// Models from a Codex `/codex/models` body (`{"models": [{"slug": ...}]}`). Per-entry
@@ -782,7 +767,7 @@ pub fn parse_codex(body: &Value, provider: &ProviderId) -> FetchedModels {
         .iter()
         .zip(entries.iter())
         .filter_map(|(id, entry)| {
-            merge_curated(id, provider, ModelMetadata::from_json(entry))
+            ranked_metadata(id, provider, ModelMetadata::from_json(entry), None)
                 .map(|meta| (id.clone(), meta))
         })
         .collect();
@@ -790,11 +775,15 @@ pub fn parse_codex(body: &Value, provider: &ProviderId) -> FetchedModels {
 }
 
 /// Models from an OpenAI-style `/models` body (`{"data": [{"id": ...}]}`), the shape
-/// OpenAI-compatible endpoints return. Whatever per-model metadata an endpoint publishes
-/// overrides the curated table field by field; a model with no curated entry and a silent
-/// upstream stays bare.
+/// OpenAI-compatible endpoints return, ranked per model with `stated`, the provider's
+/// `models:` from config (see `ranked_metadata`). A statement about an id the body does not
+/// list advertises nothing; a model no source describes stays bare.
 #[must_use]
-pub fn parse_openai(body: &Value, provider: &ProviderId) -> FetchedModels {
+pub fn parse_openai(
+    body: &Value,
+    provider: &ProviderId,
+    stated: &BTreeMap<String, ConfiguredModel>,
+) -> FetchedModels {
     let entries = body
         .get("data")
         .and_then(Value::as_array)
@@ -809,8 +798,13 @@ pub fn parse_openai(body: &Value, provider: &ProviderId) -> FetchedModels {
         .iter()
         .zip(entries.iter())
         .filter_map(|(id, entry)| {
-            merge_curated(id, provider, ModelMetadata::from_json(entry))
-                .map(|meta| (id.clone(), meta))
+            ranked_metadata(
+                id,
+                provider,
+                ModelMetadata::from_json(entry),
+                stated.get(id),
+            )
+            .map(|meta| (id.clone(), meta))
         })
         .collect();
     FetchedModels::with_metadata(ids, metadata)
@@ -834,6 +828,7 @@ mod tests {
     use super::{
         FetchedModels, ModelCatalog, capability, parse_anthropic, parse_codex, parse_openai,
     };
+    use crate::config::ConfiguredModel;
     use crate::types::{ProviderId, ProviderKind};
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -859,7 +854,8 @@ mod tests {
         assert_eq!(
             parse_openai(
                 &json!({"data": [{"id": "llama-3.3-70b"}]}),
-                &ProviderId::generic("commandcode")
+                &ProviderId::generic("commandcode"),
+                &BTreeMap::new(),
             )
             .ids,
             vec!["llama-3.3-70b"]
@@ -884,7 +880,7 @@ mod tests {
         let advertised = |provider: &str| {
             let id = ProviderId::generic(provider);
             let mut catalog = ModelCatalog::default();
-            catalog.set_generic(provider, parse_openai(&body, &id));
+            catalog.set_generic(provider, parse_openai(&body, &id, &BTreeMap::new()));
             catalog
                 .advertised()
                 .into_iter()
@@ -954,7 +950,7 @@ mod tests {
     fn a_provider_scoped_claim_holds_only_on_the_provider_it_was_measured_on() {
         let body = |id: &str| json!({"data": [{"id": id}]});
         let modalities = |id: &str, provider: &ProviderId| {
-            parse_openai(&body(id), provider)
+            parse_openai(&body(id), provider, &BTreeMap::new())
                 .metadata
                 .remove(id)
                 .and_then(|meta| meta.input_modalities)
@@ -1081,7 +1077,7 @@ mod tests {
              "pricing": {"input_per_million": 0.5, "output_per_million": "1.5"}},
             {"id": "plain"}
         ]});
-        let fetched = parse_openai(&body, &ProviderId::generic("commandcode"));
+        let fetched = parse_openai(&body, &ProviderId::generic("commandcode"), &BTreeMap::new());
         assert_eq!(fetched.ids, vec!["big", "plain"]);
         let big = fetched.metadata.get("big").expect("big metadata");
         assert_eq!(big.context_window, Some(131_072));
@@ -1105,7 +1101,7 @@ mod tests {
             {"id": "Qwen3.8-27B-Uncensored-MLX", "object": "model",
              "owned_by": "omlx", "max_model_len": 262_144}
         ]});
-        let fetched = parse_openai(&body, &ProviderId::generic("omlx"));
+        let fetched = parse_openai(&body, &ProviderId::generic("omlx"), &BTreeMap::new());
         let qwen = fetched
             .metadata
             .get("Qwen3.8-27B-Uncensored-MLX")
@@ -1131,6 +1127,71 @@ mod tests {
     }
 
     #[test]
+    fn the_operator_statement_ranks_above_the_upstream_and_the_curated_table() {
+        // deepseek-v4-pro has a curated entry (reasoning, max output 384_000); the upstream
+        // publishes its context; the operator overrides reasoning and the context.
+        let stated = BTreeMap::from([
+            (
+                "deepseek/deepseek-v4-pro".to_string(),
+                ConfiguredModel {
+                    reasoning: Some(false),
+                    context_window: Some(500_000),
+                    max_output_tokens: None,
+                },
+            ),
+            (
+                "Qwen3.8-27B-Uncensored-MLX".to_string(),
+                ConfiguredModel {
+                    reasoning: Some(true),
+                    ..ConfiguredModel::default()
+                },
+            ),
+            (
+                "not-served".to_string(),
+                ConfiguredModel {
+                    reasoning: Some(true),
+                    ..ConfiguredModel::default()
+                },
+            ),
+        ]);
+        let fetched = parse_openai(
+            &json!({"data": [
+                {"id": "deepseek/deepseek-v4-pro", "context_length": 1_000_000},
+                {"id": "Qwen3.8-27B-Uncensored-MLX", "max_model_len": 128_000}
+            ]}),
+            &ProviderId::generic("commandcode"),
+            &stated,
+        );
+
+        let pro = &fetched.metadata["deepseek/deepseek-v4-pro"];
+        assert_eq!(
+            pro.reasoning,
+            Some(false),
+            "the statement beats the curated table"
+        );
+        assert_eq!(
+            pro.context_window,
+            Some(500_000),
+            "the statement beats the upstream"
+        );
+        assert_eq!(
+            pro.max_output_tokens,
+            Some(384_000),
+            "left out, the curated value stays"
+        );
+        let qwen = &fetched.metadata["Qwen3.8-27B-Uncensored-MLX"];
+        assert_eq!(qwen.reasoning, Some(true));
+        assert_eq!(
+            qwen.context_window,
+            Some(128_000),
+            "left out, the upstream value stays"
+        );
+        // a statement about a model the upstream does not list advertises nothing
+        assert_eq!(fetched.ids.len(), 2);
+        assert!(!fetched.metadata.contains_key("not-served"));
+    }
+
+    #[test]
     fn reasoning_serializes_only_when_known() {
         let known = capability(None, None);
         let json = serde_json::to_value(&known).expect("serialize");
@@ -1151,6 +1212,7 @@ mod tests {
                 {"id": "totally-unknown-model"}
             ]}),
             &ProviderId::generic("commandcode"),
+            &BTreeMap::new(),
         );
         let pro = fetched
             .metadata
@@ -1223,7 +1285,7 @@ mod tests {
             .iter()
             .map(|id| json!({"id": id, "context_length": 999_999}))
             .collect::<Vec<_>>()});
-        let fetched = parse_openai(&body, &ProviderId::generic("commandcode"));
+        let fetched = parse_openai(&body, &ProviderId::generic("commandcode"), &BTreeMap::new());
         for id in sourced {
             let metadata = fetched
                 .metadata
@@ -1264,7 +1326,7 @@ mod tests {
             .iter()
             .map(|id| json!({"id": id, "context_length": 999_999}))
             .collect::<Vec<_>>()});
-        let fetched = parse_openai(&body, &ProviderId::generic("commandcode"));
+        let fetched = parse_openai(&body, &ProviderId::generic("commandcode"), &BTreeMap::new());
         for id in unsourced {
             let metadata = fetched
                 .metadata
@@ -1390,6 +1452,7 @@ mod tests {
                     {"id": "llama-3.3-70b", "context_window": 131_072}
                 ]}),
                 &ProviderId::generic("commandcode"),
+                &BTreeMap::new(),
             ),
         );
         let advertised = catalog.advertised();
