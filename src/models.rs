@@ -41,11 +41,10 @@ pub struct ModelMetadata {
 }
 
 impl ModelMetadata {
-    /// The metadata one upstream `/v1/models` entry carries, under the field names
-    /// pengepul publishes (`context_window`, `context_length`, `max_output_tokens`,
-    /// `input_modalities`, `pricing` with the per-million keys), plus vLLM's
-    /// `max_model_len` for the context window, which omlx publishes too. `None` when the entry
-    /// carries none of them, so pass-through stays silent instead of inventing zeros.
+    /// The metadata one upstream `/models` entry carries: `context_window`, `context_length` or
+    /// vLLM's `max_model_len` (which omlx publishes) for the context window, `max_output_tokens`,
+    /// `input_modalities`, `reasoning`, and `pricing` with the per-million keys. `None` when the
+    /// entry carries none of them, so pass-through stays silent instead of inventing zeros.
     #[must_use]
     pub fn from_json(entry: &Value) -> Option<Self> {
         let context_window = entry
@@ -532,7 +531,8 @@ fn capability(context_window: Option<u64>, max_output_tokens: Option<u64>) -> Mo
 }
 
 /// The models a single fetch returned: anthropic and codex each give one list, plus any
-/// per-model metadata the upstream body or the curated table carries for those ids.
+/// per-model metadata the upstream body or the curated table carries for those ids, and for a
+/// configured provider what the operator states ([`FetchedModels::with_stated`]).
 #[derive(Debug, Clone)]
 pub struct FetchedModels {
     pub ids: Vec<String>,
@@ -553,9 +553,10 @@ impl FetchedModels {
         Self { ids, metadata }
     }
 
-    /// Lay what the operator states in `providers.<id>.models` over what the endpoint
-    /// published, field by field. Only ids the endpoint listed are touched: a statement about a
-    /// model it does not serve advertises nothing.
+    /// Lay what the operator states in `providers.<id>.models` over what the fetch already
+    /// carries (the upstream body over the curated table), field by field. Only ids the
+    /// upstream listed are touched: a statement about a model it does not serve advertises
+    /// nothing.
     #[must_use]
     pub fn with_stated(mut self, stated: &BTreeMap<String, ConfiguredModel>) -> Self {
         for id in &self.ids {

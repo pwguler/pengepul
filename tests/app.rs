@@ -3420,10 +3420,10 @@ async fn advertised_entry(app: &axum::Router, id: &str) -> Value {
 }
 
 #[tokio::test]
-async fn v1_models_lets_the_config_state_what_the_endpoint_does_not() {
+async fn v1_models_lets_the_config_state_what_the_upstream_does_not() {
     // omlx lists its models with no `reasoning`, so a client cannot offer a thinking level
     // for a model that thinks. The operator's statement fills that in and wins field by
-    // field; what it leaves out still comes from the endpoint.
+    // field; what it leaves out keeps the upstream's value.
     let tmp = tempfile::tempdir().expect("tempdir");
     save_token(tmp.path(), &groq_key_token()).expect("save groq key");
     let mut cfg = config_with_groq(tmp.path().to_path_buf());
@@ -3451,7 +3451,7 @@ async fn v1_models_lets_the_config_state_what_the_endpoint_does_not() {
     assert_eq!(entry["context_window"], 100_000);
     assert_eq!(entry["max_output_tokens"], 32_768);
     assert_eq!(entry["pricing"]["input_per_million"], 0.59);
-    // a statement about a model the endpoint does not list advertises nothing
+    // a statement about a model the upstream does not list advertises nothing
     assert_eq!(advertised_entry(&app, "groq/not-served").await, Value::Null);
 }
 

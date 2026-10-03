@@ -10,13 +10,14 @@ use crate::utils::{generate_api_key, resolve_auth_dir};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfiguredProvider {
     pub base_url: String,
-    /// What the operator states about each model, keyed by the id the endpoint lists. It wins
-    /// over whatever the endpoint's `/v1/models` publishes for that id.
+    /// What the operator states about each model, keyed by the id the upstream lists. It wins
+    /// over whatever the upstream's `/models` publishes for that id, and over pengepul's own
+    /// table.
     pub models: BTreeMap<String, ConfiguredModel>,
 }
 
-/// One model's metadata under `providers.<id>.models`. A field left out falls back to what
-/// the endpoint publishes.
+/// One model's metadata under `providers.<id>.models`. A field left out keeps what pengepul
+/// would advertise without it: the upstream's value, or its own table's.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfiguredModel {
@@ -494,8 +495,9 @@ pub fn validate_provider_id(id: &str) -> Result<()> {
 /// Turn the raw `providers:` section into validated configured
 /// providers.
 ///
-/// Each id passes `validate_provider_id`, and `base-url` is required; the
-/// keys for the endpoint live in the auth-dir, not here.
+/// Each id passes `validate_provider_id`, `base-url` is required, and a stated
+/// model limit must be above 0; the upstream's keys live in the auth-dir,
+/// not here.
 fn validate_providers(
     raw: &BTreeMap<String, RawConfiguredProvider>,
 ) -> Result<BTreeMap<String, ConfiguredProvider>> {
@@ -876,8 +878,8 @@ mod register_tests {
         assert!(after.contains("https://api.groq.com/openai/v1"), "{after}");
     }
 
-    /// `login --base-url` runs again whenever the operator adds a key to a pool, and every
-    /// run rewrites the file. The models the operator stated must come through it.
+    /// The operator repeats `login --base-url` to add a key to a pool, and every run rewrites
+    /// the file. The models the operator stated must come through it.
     #[test]
     fn a_repeated_registration_keeps_the_stated_models() {
         let dir = tempfile::tempdir().expect("tempdir");
