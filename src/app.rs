@@ -3407,7 +3407,8 @@ fn upstream_request_body(
     normalized
 }
 
-/// Build a POST request with a JSON body and provider headers.
+/// Build a POST request with a JSON body and provider headers. Its deadline is the caller's:
+/// a whole-request one for a reply read at once, a silence limit for a stream.
 ///
 /// `.json()` already sets `Content-Type: application/json`, so any `content-type` entry in
 /// `headers` is skipped to avoid sending a duplicate header. The Codex backend rejects a
@@ -3417,13 +3418,9 @@ fn build_upstream_request(
     url: &str,
     headers: BTreeMap<String, String>,
     body: &Value,
-    timeout_ms: u64,
 ) -> reqwest::RequestBuilder {
     tracing::debug!(%url, "upstream request");
-    let mut request = client
-        .post(url)
-        .timeout(std::time::Duration::from_millis(timeout_ms))
-        .json(body);
+    let mut request = client.post(url).json(body);
     for (key, value) in headers {
         if key.eq_ignore_ascii_case("content-type") {
             continue;
@@ -3445,7 +3442,8 @@ async fn send_json(
         .and_then(Value::as_str)
         .unwrap_or("claude-sonnet-4-6")
         .to_string();
-    let response = build_upstream_request(&client, &url, headers, &body, timeout_ms)
+    let response = build_upstream_request(&client, &url, headers, &body)
+        .timeout(Duration::from_millis(timeout_ms))
         .send()
         .await?;
     let mut status = StatusCode::from_u16(response.status().as_u16())?;
@@ -3484,16 +3482,23 @@ async fn send_get(
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+/// Open an upstream stream whose one deadline is `silence_ms`: the longest it may send
+/// nothing, before its response starts and between chunks. A deadline on the whole response
+/// cut healthy long generations and put the Account serving them on Cooldown.
 async fn send_stream(
     client: reqwest::Client,
     url: String,
     headers: BTreeMap<String, String>,
     body: Value,
-    timeout_ms: u64,
+    silence_ms: u64,
 ) -> anyhow::Result<UpstreamSseResponse> {
-    let response = build_upstream_request(&client, &url, headers, &body, timeout_ms)
-        .send()
-        .await?;
+    let silence = Duration::from_millis(silence_ms);
+    let response = tokio::time::timeout(
+        silence,
+        build_upstream_request(&client, &url, headers, &body).send(),
+    )
+    .await
+    .map_err(|_| silence_error(silence))??;
     let status = StatusCode::from_u16(response.status().as_u16())?;
     if status.is_success() {
         tracing::debug!(%url, status = status.as_u16(), "upstream stream opened");
@@ -3502,7 +3507,31 @@ async fn send_stream(
     }
     Ok(UpstreamSseResponse {
         status,
-        body: Box::pin(response.bytes_stream().map_err(anyhow::Error::from)),
+        body: until_silent(
+            Box::pin(response.bytes_stream().map_err(anyhow::Error::from)),
+            silence,
+        ),
+    })
+}
+
+/// What a stream fails with once it has sent nothing for its whole silence limit.
+fn silence_error(silence: Duration) -> anyhow::Error {
+    anyhow::anyhow!(
+        "upstream sent nothing for {} ms (stream-messages-ms)",
+        silence.as_millis()
+    )
+}
+
+/// `input`, ended by [`silence_error`] the first time it goes `silence` without a chunk.
+fn until_silent(mut input: UpstreamSseStream, silence: Duration) -> UpstreamSseStream {
+    Box::pin(try_stream! {
+        loop {
+            match tokio::time::timeout(silence, input.next()).await {
+                Ok(Some(chunk)) => yield chunk?,
+                Ok(None) => break,
+                Err(_) => Err(silence_error(silence))?,
+            }
+        }
     })
 }
 
@@ -3546,7 +3575,7 @@ async fn send_grok_stream(
     client: reqwest::Client,
     account: &AvailableAccount,
     body: Value,
-    timeout_ms: u64,
+    silence_ms: u64,
 ) -> anyhow::Result<UpstreamSseResponse> {
     let url = grok_chat_url();
     let first = send_stream(
@@ -3554,7 +3583,7 @@ async fn send_grok_stream(
         url.clone(),
         grok_chat_headers(account),
         body.clone(),
-        timeout_ms,
+        silence_ms,
     )
     .await?;
     if first.status.as_u16() != 426 {
@@ -3563,7 +3592,7 @@ async fn send_grok_stream(
     let bytes = first.body.try_collect::<Vec<Bytes>>().await?.concat();
     let text = String::from_utf8_lossy(&bytes).to_string();
     if learn_grok_client_version(&text).is_some() {
-        return send_stream(client, url, grok_chat_headers(account), body, timeout_ms).await;
+        return send_stream(client, url, grok_chat_headers(account), body, silence_ms).await;
     }
     Ok(UpstreamSseResponse {
         status: first.status,
@@ -3729,7 +3758,6 @@ mod tests {
             "https://chatgpt.com/backend-api/codex/responses",
             headers,
             &body,
-            30_000,
         )
         .build()
         .expect("request builds");

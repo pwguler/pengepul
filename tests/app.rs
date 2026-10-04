@@ -5712,3 +5712,214 @@ async fn a_responses_request_is_masked_and_its_tool_names_restored() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// cli-hardening: stream-messages-ms is a silence limit, not a deadline
+// ---------------------------------------------------------------------------
+
+/// A configured endpoint on a loopback port, answering `/v1/chat/completions` with `chat`.
+/// The relay reaches it through its real HTTP client, which is where a stream's deadline
+/// lives: a test double above that client could not show where a stream is cut.
+async fn serve_endpoint(chat: axum::routing::MethodRouter) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a loopback port");
+    let addr = listener.local_addr().expect("bound address");
+    let endpoint = axum::Router::new()
+        .route("/v1/chat/completions", chat)
+        .route(
+            "/v1/models",
+            axum::routing::get(|| async { axum::Json(json!({"data": []})) }),
+        );
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, endpoint).await;
+    });
+    addr
+}
+
+/// The relay in front of `endpoint` as the configured provider `local`, holding one key,
+/// with `stream_ms` as its `stream-messages-ms`.
+fn relay_in_front_of(
+    endpoint: std::net::SocketAddr,
+    auth_dir: &std::path::Path,
+    stream_ms: u64,
+) -> axum::Router {
+    save_token(auth_dir, &static_key_token("local", "key-1")).expect("save key");
+    let mut cfg = config(auth_dir.to_path_buf());
+    cfg.timeouts.stream_messages_ms = stream_ms;
+    cfg.providers.insert(
+        "local".to_string(),
+        pengepul::config::ConfiguredProvider {
+            base_url: format!("http://{endpoint}/v1"),
+            models: BTreeMap::new(),
+        },
+    );
+    create_app(cfg)
+}
+
+/// One Chat Completions stream chunk carrying `text`.
+fn chat_chunk(text: &str) -> Bytes {
+    Bytes::from(format!(
+        "data: {}\n\n",
+        json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion.chunk",
+            "model": "m",
+            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
+        })
+    ))
+}
+
+/// An event-stream response whose body is `chunks`, sent as they are yielded.
+fn event_stream(
+    chunks: impl futures_util::Stream<Item = Result<Bytes, std::convert::Infallible>> + Send + 'static,
+) -> axum::response::Response {
+    axum::response::Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(Body::from_stream(chunks))
+        .expect("event-stream response")
+}
+
+/// A streamed Chat Completions request for the `local` provider's model.
+fn streamed_chat_request() -> axum::http::Request<Body> {
+    let body = json!({
+        "model": "local/m",
+        "stream": true,
+        "messages": [{"role": "user", "content": "count"}]
+    })
+    .to_string();
+    axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("authorization", "Bearer sk-test")
+        .header("content-type", "application/json")
+        .header("content-length", body.len().to_string())
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// The client's view of a streamed reply: its status, every byte it received, and the error
+/// the body ended with when it did not end cleanly.
+async fn streamed(
+    app: axum::Router,
+    request: axum::http::Request<Body>,
+) -> (u16, String, Option<String>) {
+    let response = app.oneshot(request).await.expect("response");
+    let status = response.status().as_u16();
+    let mut body = response.into_body();
+    let mut received = Vec::new();
+    let mut ended_with = None;
+    while let Some(frame) = body.frame().await {
+        match frame {
+            Ok(frame) => {
+                if let Ok(data) = frame.into_data() {
+                    received.extend_from_slice(&data);
+                }
+            }
+            Err(error) => {
+                ended_with = Some(error.to_string());
+                break;
+            }
+        }
+    }
+    (
+        status,
+        String::from_utf8_lossy(&received).into_owned(),
+        ended_with,
+    )
+}
+
+/// A long generation is not a hung one. Thirty chunks 40 ms apart take 1.2 s in all, over a
+/// one-second limit: as a deadline on the whole response it cut the reply and put the account
+/// serving it on Cooldown. The gap is a small fraction of the limit on purpose, because the
+/// relay fetches and parses the vendors' CLI release documents at startup on these same
+/// workers, and that must not read as silence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_that_keeps_sending_runs_past_the_silence_limit() {
+    let endpoint = serve_endpoint(axum::routing::post(|| async {
+        event_stream(async_stream::stream! {
+            for index in 0..30 {
+                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                yield Ok(chat_chunk(&index.to_string()));
+            }
+            yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));
+        })
+    }))
+    .await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = relay_in_front_of(endpoint, tmp.path(), 1_000);
+
+    let (status, received, ended_with) = streamed(app.clone(), streamed_chat_request()).await;
+
+    assert_eq!(status, 200);
+    assert_eq!(ended_with, None, "the stream was cut after: {received}");
+    assert_eq!(received.matches("chat.completion.chunk").count(), 30);
+    assert!(received.ends_with("data: [DONE]\n\n"), "{received}");
+    let account = listed(app, "local", "key-1").await;
+    assert_eq!(account["totalSuccesses"], 1);
+    assert_eq!(account["totalFailures"], 0);
+}
+
+/// An endpoint that sends nothing at all, not even its response headers, for longer than
+/// the limit is a hung one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_endpoint_silent_before_its_response_starts_fails_the_request() {
+    let endpoint = serve_endpoint(axum::routing::post(|| async {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        event_stream(async_stream::stream! {
+            yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));
+        })
+    }))
+    .await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = relay_in_front_of(endpoint, tmp.path(), 1_000);
+
+    let (status, received, ended_with) = streamed(app.clone(), streamed_chat_request()).await;
+
+    assert_eq!(status, 502);
+    assert_eq!(ended_with, None);
+    let body: Value = serde_json::from_str(&received).expect("a JSON error body");
+    assert_eq!(
+        body["error"]["message"],
+        "upstream request failed: upstream sent nothing for 1000 ms (stream-messages-ms)"
+    );
+    let account = listed(app, "local", "key-1").await;
+    assert_eq!(account["totalFailures"], 1);
+    assert_eq!(
+        account["lastError"],
+        "server: upstream sent nothing for 1000 ms (stream-messages-ms)"
+    );
+}
+
+/// A stream that goes quiet between chunks for longer than the limit is cut there, and the
+/// client is told rather than handed a reply that merely stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_endpoint_silent_between_chunks_fails_the_stream() {
+    let endpoint = serve_endpoint(axum::routing::post(|| async {
+        event_stream(async_stream::stream! {
+            yield Ok(chat_chunk("first"));
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            yield Ok(chat_chunk("second"));
+            yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));
+        })
+    }))
+    .await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = relay_in_front_of(endpoint, tmp.path(), 1_000);
+
+    let (status, received, ended_with) = streamed(app.clone(), streamed_chat_request()).await;
+
+    assert_eq!(status, 200);
+    assert!(received.contains(r#""content":"first""#), "{received}");
+    assert!(!received.contains(r#""content":"second""#), "{received}");
+    assert_eq!(
+        ended_with.as_deref(),
+        Some("upstream sent nothing for 1000 ms (stream-messages-ms)")
+    );
+    let account = listed(app, "local", "key-1").await;
+    assert_eq!(account["totalFailures"], 1);
+    assert_eq!(
+        account["lastError"],
+        "server: upstream sent nothing for 1000 ms (stream-messages-ms)"
+    );
+}

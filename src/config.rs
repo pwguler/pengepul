@@ -40,7 +40,11 @@ pub struct ConfiguredModel {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimeoutConfig {
+    /// The whole-request deadline of a request the client did not stream.
     pub messages_ms: u64,
+    /// The longest a streamed reply may send nothing, before its response starts and between
+    /// chunks; a stream that keeps sending has no deadline. Codex is streamed upstream even
+    /// when the client did not ask, and there this is that request's whole-request deadline.
     pub stream_messages_ms: u64,
     pub count_tokens_ms: u64,
 }
