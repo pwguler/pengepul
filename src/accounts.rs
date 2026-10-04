@@ -918,9 +918,14 @@ impl AccountManager {
         // seconds and re-select it into a failure loop.
         if cooldown > state.cooldown_until {
             state.cooldown_until = cooldown;
-            state.last_failure_kind = Some(kind.to_string());
-            state.last_error =
-                Some(detail.map_or_else(|| kind.to_string(), |detail| format!("{kind}: {detail}")));
+            // Only a retry hint can outlast a Reauth, and the account still
+            // needs the login its reason asks for, whatever lengthened the wait.
+            if !state.reauth {
+                state.last_failure_kind = Some(kind.to_string());
+                state.last_error = Some(
+                    detail.map_or_else(|| kind.to_string(), |detail| format!("{kind}: {detail}")),
+                );
+            }
         }
         self.persist_usage();
     }

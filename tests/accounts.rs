@@ -2695,3 +2695,31 @@ async fn a_pool_of_one_earns_no_cooldown_from_a_retry_hint() {
         "an hour's hint cooled a Pool of two for {left}s"
     );
 }
+
+#[tokio::test]
+async fn a_retry_hint_that_outlasts_a_reauth_keeps_the_reauth_reason() {
+    // A day-long hint landing after a Reauth began ends later than the Reauth does, so it is the
+    // longer Cooldown and holds. The account still needs a login, and `lastError` is where the
+    // operator reads that (CONTEXT.md, Reauth).
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = pool_of_two(tmp.path());
+    manager.record_refresh_exhausted("a@example.com", "invalid_grant");
+
+    manager.record_failure(
+        "a@example.com",
+        "rate_limit",
+        Some("429"),
+        Some(std::time::Duration::from_hours(48)),
+    );
+
+    let left = cooldown_left(&mut manager, "a@example.com");
+    assert!(
+        (86_390.0..=86_400.0).contains(&left),
+        "the day-long hint cooled {left}s"
+    );
+    assert_eq!(
+        record(&mut manager, "a@example.com")["lastError"],
+        "refresh token invalid_grant; re-run login for commandcode",
+        "a hint that outlasted the Reauth hid the login it still needs"
+    );
+}
