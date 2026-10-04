@@ -1112,9 +1112,9 @@ mod tests {
         );
     }
 
-    /// An entry the upstream lists without its id is skipped on its own. The ids used to be
-    /// filtered first and then zipped against every entry, so each model after the gap was
-    /// advertised with the metadata of the entry before it.
+    /// An entry the upstream lists without its id is skipped on its own. Filtering the ids
+    /// first and zipping them against every entry would advertise each model after the gap
+    /// with the metadata of the entry before it.
     #[test]
     fn an_entry_without_an_id_leaves_every_other_model_its_own_metadata() {
         let openai = parse_openai(

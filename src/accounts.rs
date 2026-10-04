@@ -26,7 +26,7 @@ pub type RefreshFn = Box<dyn Fn(String) -> RefreshFuture + Send + Sync>;
 /// retries keep a single static key (or a lone account) from being locked out by one
 /// transient error. The *ceiling* is what varies — billing, reauth, and a credential
 /// that has never succeeded each sit out longer; see [`AccountState::failure_cooldown`].
-/// A 429 or 503 that names its own reset lengthens the step it earns to that reset, up to
+/// A Retry hint on a 429 or 503 lengthens the step it earns to the wait it names, up to
 /// [`RETRY_HINT_CEILING_SECONDS`], and never shortens it.
 ///
 /// A Cooldown needs a sibling to be worth anything: it exists to send the next request
@@ -52,8 +52,8 @@ const NEVER_SUCCEEDED_COOLDOWN_SECONDS: f64 = 60.0 * 60.0;
 
 const REAUTH_COOLDOWN_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 
-/// The longest Cooldown a vendor's retry hint can ask for. A vendor that names its reset
-/// beats probing at 1s, 2s, 4s; the cap bounds a nonsense value.
+/// The longest Cooldown a Retry hint can set. A wait the vendor names beats probing at 1s,
+/// 2s, 4s; the cap bounds a nonsense value.
 const RETRY_HINT_CEILING_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 
 /// How many conversations keep an account preference before the whole map

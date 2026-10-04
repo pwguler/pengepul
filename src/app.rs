@@ -2597,7 +2597,7 @@ fn error_chain(error: &anyhow::Error) -> String {
     format!("{error:#}")
 }
 
-/// Count a failed request against its account. A 429 or 503 that carried a retry hint cools
+/// Count a failed request against its account. A 429 or 503 that carried a Retry hint cools
 /// the account for the longer of the hint and its backoff; any other status's hint is ignored.
 async fn record_provider_failure(
     state: &AppState,
@@ -3296,10 +3296,8 @@ fn transform_sse_event(
             |data| chat_sse_to_responses(&data, responses_state, model),
         ),
         // A generic endpoint answers in Chat Completions, so a Chat client
-        // reads its stream unchanged. Grok streams the same dialect (its
-        // reasoning_content deltas ride along untouched, per the spec).
-        // Grok streams the same dialect a generic endpoint does; its
-        // reasoning_content deltas ride along untouched (AC-3).
+        // reads its stream unchanged. Grok streams the same dialect; its
+        // reasoning_content deltas ride along untouched.
         (ProviderKind::Grok | ProviderKind::Generic, RequestRoute::Chat) => parsed.map_or_else(
             |_| Vec::new(),
             |data| vec![sse(&data, passthrough_event(event))],
@@ -3339,14 +3337,13 @@ fn body_with_model(body: &Value, model: &str) -> Value {
     next_body
 }
 
-/// What one (Inbound dialect, Provider) pair does, in one place.
+/// What one (Inbound dialect, Provider) pair does to the request body, the whole
+/// response and the stream's close.
 ///
-/// The four stages of serving a request each used to carry their own match
-/// over the pair: the request body, the whole response, each stream event,
-/// and closing the stream. Four matches meant a new pair could be added to
-/// three of them and nobody would know — which is what happened to the
-/// stream finaliser. Each stage now asks this, so the pair is stated once
-/// and the compiler carries it to every stage.
+/// Those three stages ask this instead of each matching on the pair, so a new
+/// pair is one more arm here and the compiler carries it to all three. Each
+/// stream event is the exception: `transform_sse_event` translates it under its
+/// own match over the same pair, so a new pair is stated there too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Translation {
     /// The dialect the provider speaks: nothing to translate.
@@ -3529,7 +3526,7 @@ async fn send_get(
 
 /// Open an upstream stream whose one deadline is `silence_ms`: the longest it may send
 /// nothing, before its response starts and between chunks. A deadline on the whole response
-/// cut healthy long generations and put the Account serving them on Cooldown.
+/// would cut healthy long generations and cool the Account serving them.
 async fn send_stream(
     client: reqwest::Client,
     url: String,

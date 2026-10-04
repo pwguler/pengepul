@@ -5849,8 +5849,8 @@ async fn streamed(
 }
 
 /// A long generation is not a hung one. Thirty chunks 40 ms apart take 1.2 s in all, over a
-/// one-second limit: as a deadline on the whole response it cut the reply and put the account
-/// serving it on Cooldown. The gap is a small fraction of the limit on purpose, because the
+/// one-second limit: as a deadline on the whole response it would cut the reply and cool the
+/// account serving it. The gap is a small fraction of the limit on purpose, because the
 /// relay fetches and parses the vendors' CLI release documents at startup on these same
 /// workers, and that must not read as silence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

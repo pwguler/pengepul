@@ -81,12 +81,11 @@ impl CliRuntime for RealRuntime {
     }
 
     fn can_ask(&mut self) -> bool {
-        // The picker paints to stderr, so stderr is what decides whether
-        // there is anyone to paint for. Gating on stdout meant
-        // `launch claude 2>/dev/null` took raw mode and threw every frame
-        // away: a blank, frozen terminal with no visible way out. Stdin is
-        // deliberately not asked — crossterm reads `/dev/tty` when stdin is
-        // redirected, so the picker still works under `< /dev/null`.
+        // Both ends the operator sits at must be terminals. The picker paints to
+        // stderr: gating on stdout would let `launch claude 2>/dev/null` take raw
+        // mode and throw every frame away, a blank, frozen terminal with no visible
+        // way out. And a redirected stdin means a script is driving, where raw mode
+        // would seize a terminal nobody is watching.
         std::io::IsTerminal::is_terminal(&std::io::stderr())
             && std::io::IsTerminal::is_terminal(&std::io::stdin())
     }
