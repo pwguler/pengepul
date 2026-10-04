@@ -283,15 +283,18 @@ fn body_limit_loads_as_the_number_it_spells() {
 
 #[test]
 fn provider_entry_named_like_a_builtin_is_rejected() {
-    for reserved in ["anthropic", "codex", "claude"] {
+    // grok included: accepted, its entry was shadowed by the built-in Pool's `grok/` prefix
+    // and wrote into that Pool's usage.json.
+    for reserved in ["anthropic", "codex", "claude", "grok"] {
         let (_tmp, home, config_path) = write_config_with(&format!(
             "api-keys:\n  - sk-local\nproviders:\n  {reserved}:\n    base-url: https://example.com/v1\n"
         ));
 
-        let error = load_config(Some(&config_path), Some(&home), &home).expect_err("rejected");
-        assert!(
-            error.to_string().contains(reserved),
-            "error names the reserved id: {error}"
+        let error = load_config(Some(&config_path), Some(&home), &home)
+            .expect_err(&format!("a configured {reserved} entry was accepted"));
+        assert_eq!(
+            error.to_string(),
+            format!("providers: {reserved} is a built-in provider name")
         );
     }
 }
