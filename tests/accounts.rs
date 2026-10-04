@@ -2653,6 +2653,10 @@ async fn a_retry_hint_never_shortens_a_cooldown() {
         (59.5..=60.0).contains(&left),
         "a 60 s hint over a 16 s backoff cooled {left}s"
     );
+    assert_eq!(
+        record(&mut manager, "a@example.com")["lastError"],
+        "rate_limit"
+    );
 
     // A Reauth's day is longer than any hint an hour long.
     manager.record_refresh_exhausted("a@example.com", "invalid_grant");
@@ -2704,22 +2708,38 @@ async fn a_retry_hint_that_outlasts_a_reauth_keeps_the_reauth_reason() {
     let tmp = tempdir().expect("tempdir");
     let mut manager = pool_of_two(tmp.path());
     manager.record_refresh_exhausted("a@example.com", "invalid_grant");
+    let reauth_until = record(&mut manager, "a@example.com")["cooldownUntil"]
+        .as_f64()
+        .expect("cooldownUntil");
+    // Let the clock move, so a wait that ends later than the Reauth's is visibly later.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    manager.record_failure(
-        "a@example.com",
-        "rate_limit",
-        Some("429"),
-        Some(std::time::Duration::from_hours(48)),
-    );
+    let day_long = Some(std::time::Duration::from_hours(48));
+    manager.record_failure("a@example.com", "rate_limit", Some("429"), day_long);
+    manager.record_failure("b@example.com", "rate_limit", Some("429"), day_long);
 
-    let left = cooldown_left(&mut manager, "a@example.com");
+    let reauthed = record(&mut manager, "a@example.com");
+    let lengthened = reauthed["cooldownUntil"].as_f64().expect("cooldownUntil") - reauth_until;
     assert!(
-        (86_390.0..=86_400.0).contains(&left),
-        "the day-long hint cooled {left}s"
+        lengthened >= 0.05,
+        "the hint did not outlast the Reauth: {lengthened}s later"
     );
     assert_eq!(
-        record(&mut manager, "a@example.com")["lastError"],
-        "refresh token invalid_grant; re-run login for commandcode",
+        reauthed["lastError"], "refresh token invalid_grant; re-run login for commandcode",
         "a hint that outlasted the Reauth hid the login it still needs"
+    );
+    // The same hint on an account not in Reauth writes its own reason.
+    assert_eq!(
+        record(&mut manager, "b@example.com")["lastError"],
+        "rate_limit: 429"
+    );
+
+    // And once the Reauth's wait is cleared, a failure writes its own reason again: the
+    // reason is kept only while the Reauth's Cooldown runs.
+    manager.enable("a@example.com").expect("enable");
+    manager.record_failure("a@example.com", "server", Some("500"), None);
+    assert_eq!(
+        record(&mut manager, "a@example.com")["lastError"],
+        "server: 500"
     );
 }

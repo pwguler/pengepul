@@ -912,15 +912,18 @@ impl AccountManager {
         let hinted = retry_hint.map_or(0.0, |hint| {
             hint.as_secs_f64().min(RETRY_HINT_CEILING_SECONDS)
         });
-        let cooldown = unix_now() + (base * multiplier).min(maximum).max(hinted);
+        let now = unix_now();
+        let cooldown = now + (base * multiplier).min(maximum).max(hinted);
         // A cooldown only ever grows. A reauth cooldown is 24 hours; a
         // failure recorded after it must not collapse the account back to
         // seconds and re-select it into a failure loop.
         if cooldown > state.cooldown_until {
+            // Only a Retry hint can outlast a Reauth's running Cooldown, and the
+            // account still needs the login its reason asks for, whatever
+            // lengthened the wait.
+            let reauth_running = state.reauth && state.cooldown_until > now;
             state.cooldown_until = cooldown;
-            // Only a retry hint can outlast a Reauth, and the account still
-            // needs the login its reason asks for, whatever lengthened the wait.
-            if !state.reauth {
+            if !reauth_running {
                 state.last_failure_kind = Some(kind.to_string());
                 state.last_error = Some(
                     detail.map_or_else(|| kind.to_string(), |detail| format!("{kind}: {detail}")),
