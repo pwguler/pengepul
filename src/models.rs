@@ -719,7 +719,10 @@ pub fn grok_static_models() -> FetchedModels {
 /// carries ids only, so metadata comes from the curated table where one claims the id.
 #[must_use]
 pub fn parse_anthropic(body: &Value, provider: &ProviderId) -> FetchedModels {
-    let ids = ids_from(body.get("data"), "id");
+    let ids = listed_models(body.get("data"), "id")
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
     let metadata = ids
         .iter()
         .filter_map(|id| curated_metadata(id, provider).map(|meta| (id.clone(), meta)))
@@ -753,24 +756,15 @@ fn ranked_metadata(
 /// leaves out falls back to the curated entry.
 #[must_use]
 pub fn parse_codex(body: &Value, provider: &ProviderId) -> FetchedModels {
-    let entries = body
-        .get("models")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let ids = entries
+    let listed = listed_models(body.get("models"), "slug");
+    let metadata = listed
         .iter()
-        .filter_map(|entry| entry.get("slug").and_then(Value::as_str))
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    let metadata = ids
-        .iter()
-        .zip(entries.iter())
         .filter_map(|(id, entry)| {
             ranked_metadata(id, provider, ModelMetadata::from_json(entry), None)
                 .map(|meta| (id.clone(), meta))
         })
         .collect();
+    let ids = listed.into_iter().map(|(id, _)| id).collect();
     FetchedModels::with_metadata(ids, metadata)
 }
 
@@ -784,19 +778,9 @@ pub fn parse_openai(
     provider: &ProviderId,
     stated: &BTreeMap<String, ConfiguredModel>,
 ) -> FetchedModels {
-    let entries = body
-        .get("data")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let ids = entries
+    let listed = listed_models(body.get("data"), "id");
+    let metadata = listed
         .iter()
-        .filter_map(|entry| entry.get("id").and_then(Value::as_str))
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    let metadata = ids
-        .iter()
-        .zip(entries.iter())
         .filter_map(|(id, entry)| {
             ranked_metadata(
                 id,
@@ -807,17 +791,19 @@ pub fn parse_openai(
             .map(|meta| (id.clone(), meta))
         })
         .collect();
+    let ids = listed.into_iter().map(|(id, _)| id).collect();
     FetchedModels::with_metadata(ids, metadata)
 }
 
-fn ids_from(array: Option<&Value>, field: &str) -> Vec<String> {
+/// Every entry of a `/models` array that carries its id under `field`, paired with that id.
+/// An entry without one is skipped on its own, so no other model is handed its metadata.
+fn listed_models<'a>(array: Option<&'a Value>, field: &str) -> Vec<(String, &'a Value)> {
     array
         .and_then(Value::as_array)
         .map(|items| {
             items
                 .iter()
-                .filter_map(|item| item.get(field).and_then(Value::as_str))
-                .map(ToOwned::to_owned)
+                .filter_map(|item| Some((item.get(field)?.as_str()?.to_owned(), item)))
                 .collect()
         })
         .unwrap_or_default()
@@ -1124,6 +1110,37 @@ mod tests {
                 .and_then(|m| m.context_window),
             Some(272_000)
         );
+    }
+
+    /// An entry the upstream lists without its id is skipped on its own. The ids used to be
+    /// filtered first and then zipped against every entry, so each model after the gap was
+    /// advertised with the metadata of the entry before it.
+    #[test]
+    fn an_entry_without_an_id_leaves_every_other_model_its_own_metadata() {
+        let openai = parse_openai(
+            &json!({"data": [
+                {"object": "model", "context_length": 1_000},
+                {"id": "alpha", "context_length": 2_000},
+                {"id": "beta", "context_length": 3_000}
+            ]}),
+            &ProviderId::generic("omlx"),
+            &BTreeMap::new(),
+        );
+        assert_eq!(openai.ids, vec!["alpha", "beta"]);
+        assert_eq!(openai.metadata["alpha"].context_window, Some(2_000));
+        assert_eq!(openai.metadata["beta"].context_window, Some(3_000));
+
+        let codex = parse_codex(
+            &json!({"models": [
+                {"context_window": 1_000},
+                {"slug": "alpha", "context_window": 2_000},
+                {"slug": "beta", "context_window": 3_000}
+            ]}),
+            &ProviderId::codex(),
+        );
+        assert_eq!(codex.ids, vec!["alpha", "beta"]);
+        assert_eq!(codex.metadata["alpha"].context_window, Some(2_000));
+        assert_eq!(codex.metadata["beta"].context_window, Some(3_000));
     }
 
     #[test]
