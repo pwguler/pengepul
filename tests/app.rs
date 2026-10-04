@@ -70,6 +70,7 @@ impl UpstreamClient for RetryUpstream {
         self.calls.lock().expect("calls lock").push(request);
         Box::pin(async move {
             Ok(UpstreamJsonResponse {
+                retry_hint: None,
                 status,
                 body: if status.is_success() {
                     json!({
@@ -147,6 +148,7 @@ impl UpstreamClient for FakeUpstream {
         self.calls.lock().expect("calls lock").push(request);
         Box::pin(async {
             Ok(UpstreamJsonResponse {
+                retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: json!({
                     "id": "msg_1",
@@ -167,6 +169,7 @@ impl UpstreamClient for FakeUpstream {
         self.calls.lock().expect("calls lock").push(request);
         Box::pin(async {
             Ok(UpstreamSseResponse {
+                retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: Box::pin(futures_util::stream::iter([
                     Ok(Bytes::from_static(
@@ -191,6 +194,7 @@ impl UpstreamClient for FakeUpstream {
         self.calls.lock().expect("calls lock").push(request);
         Box::pin(async {
             Ok(UpstreamJsonResponse {
+                retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: json!({"input_tokens": 2}),
             })
@@ -204,6 +208,7 @@ impl UpstreamClient for FakeUpstream {
         self.calls.lock().expect("calls lock").push(request);
         Box::pin(async {
             Ok(UpstreamJsonResponse {
+                retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: json!({
                     "id": "resp_1",
@@ -229,6 +234,7 @@ impl UpstreamClient for FakeUpstream {
         self.calls.lock().expect("calls lock").push(request);
         Box::pin(async {
             Ok(UpstreamSseResponse {
+                retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: Box::pin(futures_util::stream::iter([
                     Ok(Bytes::from_static(
@@ -1143,6 +1149,7 @@ impl UpstreamClient for RateLimitedUpstream {
         self.calls.lock().expect("calls lock").push(request);
         Box::pin(async {
             Ok(UpstreamJsonResponse {
+                retry_hint: None,
                 status: axum::http::StatusCode::TOO_MANY_REQUESTS,
                 body: json!({"error": {"message": "rate limited"}}),
             })
@@ -1815,6 +1822,7 @@ impl UpstreamClient for ChosenUsageUpstream {
         let usage = self.usage.clone();
         Box::pin(async move {
             Ok(UpstreamJsonResponse {
+                retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: json!({
                     "id": "chatcmpl_usage",
@@ -1845,6 +1853,7 @@ impl UpstreamClient for ChosenUsageUpstream {
         let usage = self.usage.clone();
         Box::pin(async move {
             Ok(UpstreamJsonResponse {
+                retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: json!({
                     "id": "msg_1",
@@ -1880,6 +1889,7 @@ impl UpstreamClient for ChosenUsageUpstream {
         let usage = self.usage.clone();
         Box::pin(async move {
             Ok(UpstreamJsonResponse {
+                retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: json!({
                     "id": "resp_1",
@@ -2602,6 +2612,7 @@ impl UpstreamClient for GenericUpstream {
         self.calls.lock().expect("calls lock").push(request);
         Box::pin(async {
             Ok(UpstreamJsonResponse {
+                retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: json!({
                     "id": "chatcmpl_generic",
@@ -2621,6 +2632,7 @@ impl UpstreamClient for GenericUpstream {
         self.calls.lock().expect("calls lock").push(request);
         Box::pin(async {
             Ok(UpstreamSseResponse {
+                retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: Box::pin(futures_util::stream::iter([
                     Ok(Bytes::from_static(
@@ -2906,6 +2918,7 @@ impl UpstreamClient for FirstKeyFailsUpstream {
         self.calls.lock().expect("calls lock").push(request);
         Box::pin(async move {
             Ok(UpstreamJsonResponse {
+                retry_hint: None,
                 status: if fail {
                     axum::http::StatusCode::TOO_MANY_REQUESTS
                 } else {
@@ -3180,6 +3193,7 @@ impl UpstreamClient for BillingFailoverUpstream {
         Box::pin(async move {
             if call_index == 1 {
                 Ok(UpstreamJsonResponse {
+                    retry_hint: None,
                     status: axum::http::StatusCode::BAD_REQUEST,
                     body: json!({
                         "error": {
@@ -3191,6 +3205,7 @@ impl UpstreamClient for BillingFailoverUpstream {
                 })
             } else {
                 Ok(UpstreamJsonResponse {
+                    retry_hint: None,
                     status: axum::http::StatusCode::OK,
                     body: json!({
                         "id": "chatcmpl_billfailover",
@@ -3874,6 +3889,7 @@ impl UpstreamClient for RejectingUpstream {
     ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
         Box::pin(async {
             Ok(UpstreamJsonResponse {
+                retry_hint: None,
                 status: axum::http::StatusCode::BAD_REQUEST,
                 body: json!({"error": {"message": "context length exceeded"}}),
             })
@@ -4230,6 +4246,7 @@ impl UpstreamClient for GrokUpstream {
         self.calls.lock().expect("calls lock").push(request);
         Box::pin(async {
             Ok(UpstreamJsonResponse {
+                retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: GrokUpstream::default_json_body(),
             })
@@ -4243,6 +4260,7 @@ impl UpstreamClient for GrokUpstream {
         self.calls.lock().expect("calls lock").push(request);
         Box::pin(async {
             Ok(UpstreamSseResponse {
+                retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: Box::pin(futures_util::stream::iter([
                     Ok(Bytes::from_static(
@@ -4657,6 +4675,7 @@ impl UpstreamClient for PerAccountCacheUpstream {
         if self.failing.lock().expect("failing lock").contains(&email) {
             return Box::pin(async move {
                 Ok(UpstreamJsonResponse {
+                    retry_hint: None,
                     status: axum::http::StatusCode::UNAUTHORIZED,
                     body: json!({"error": {
                         "message": "invalid api key",
@@ -4680,6 +4699,7 @@ impl UpstreamClient for PerAccountCacheUpstream {
 
         Box::pin(async move {
             Ok(UpstreamJsonResponse {
+                retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: json!({
                     "id": "chatcmpl_peraccountcache",
@@ -5434,6 +5454,7 @@ impl UpstreamClient for ToolCallingUpstream {
         let name = self.offered_name(&request);
         Box::pin(async move {
             Ok(UpstreamJsonResponse {
+                retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: json!({
                     "id": "msg_1",
@@ -5460,6 +5481,7 @@ impl UpstreamClient for ToolCallingUpstream {
         );
         Box::pin(async move {
             Ok(UpstreamSseResponse {
+                retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: Box::pin(futures_util::stream::iter([
                     Ok(Bytes::from_static(
@@ -5710,5 +5732,334 @@ async fn a_responses_request_is_masked_and_its_tool_names_restored() {
             !system.contains("Inbound Context"),
             "the classifier section survived: {system}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cli-hardening: stream-messages-ms is a silence limit, not a deadline
+// ---------------------------------------------------------------------------
+
+/// A configured endpoint on a loopback port, answering `/v1/chat/completions` with `chat`.
+/// The relay reaches it through its real HTTP client, which is where a stream's deadline
+/// lives: a test double above that client could not show where a stream is cut.
+async fn serve_endpoint(chat: axum::routing::MethodRouter) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a loopback port");
+    let addr = listener.local_addr().expect("bound address");
+    let endpoint = axum::Router::new()
+        .route("/v1/chat/completions", chat)
+        .route(
+            "/v1/models",
+            axum::routing::get(|| async { axum::Json(json!({"data": []})) }),
+        );
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, endpoint).await;
+    });
+    addr
+}
+
+/// The relay in front of `endpoint` as the configured provider `local`, holding one key,
+/// with `stream_ms` as its `stream-messages-ms`.
+fn relay_in_front_of(
+    endpoint: std::net::SocketAddr,
+    auth_dir: &std::path::Path,
+    stream_ms: u64,
+) -> axum::Router {
+    save_token(auth_dir, &static_key_token("local", "key-1")).expect("save key");
+    let mut cfg = config_with_static_provider("local", auth_dir.to_path_buf());
+    cfg.timeouts.stream_messages_ms = stream_ms;
+    cfg.providers
+        .get_mut("local")
+        .expect("the local provider")
+        .base_url = format!("http://{endpoint}/v1");
+    create_app(cfg)
+}
+
+/// One Chat Completions stream chunk carrying `text`.
+fn chat_chunk(text: &str) -> Bytes {
+    Bytes::from(format!(
+        "data: {}\n\n",
+        json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion.chunk",
+            "model": "m",
+            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
+        })
+    ))
+}
+
+/// An event-stream response whose body is `chunks`, sent as they are yielded.
+fn event_stream(
+    chunks: impl futures_util::Stream<Item = Result<Bytes, std::convert::Infallible>> + Send + 'static,
+) -> axum::response::Response {
+    axum::response::Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(Body::from_stream(chunks))
+        .expect("event-stream response")
+}
+
+/// A Chat Completions request for the `local` provider's model.
+fn chat_request(stream: bool) -> axum::http::Request<Body> {
+    let body = json!({
+        "model": "local/m",
+        "stream": stream,
+        "messages": [{"role": "user", "content": "count"}]
+    })
+    .to_string();
+    axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("authorization", "Bearer sk-test")
+        .header("content-type", "application/json")
+        .header("content-length", body.len().to_string())
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// The client's view of a streamed reply: its status, every byte it received, and the error
+/// the body ended with when it did not end cleanly.
+async fn streamed(
+    app: axum::Router,
+    request: axum::http::Request<Body>,
+) -> (u16, String, Option<String>) {
+    let response = app.oneshot(request).await.expect("response");
+    let status = response.status().as_u16();
+    let mut body = response.into_body();
+    let mut received = Vec::new();
+    let mut ended_with = None;
+    while let Some(frame) = body.frame().await {
+        match frame {
+            Ok(frame) => {
+                if let Ok(data) = frame.into_data() {
+                    received.extend_from_slice(&data);
+                }
+            }
+            Err(error) => {
+                ended_with = Some(error.to_string());
+                break;
+            }
+        }
+    }
+    (
+        status,
+        String::from_utf8_lossy(&received).into_owned(),
+        ended_with,
+    )
+}
+
+/// A long generation is not a hung one. Thirty chunks 40 ms apart take 1.2 s in all, over a
+/// one-second limit: as a deadline on the whole response it would cut the reply and cool the
+/// account serving it. The gap is a small fraction of the limit on purpose, because the
+/// relay fetches and parses the vendors' CLI release documents at startup on these same
+/// workers, and that must not read as silence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_that_keeps_sending_runs_past_the_silence_limit() {
+    let endpoint = serve_endpoint(axum::routing::post(|| async {
+        event_stream(async_stream::stream! {
+            for index in 0..30 {
+                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                yield Ok(chat_chunk(&index.to_string()));
+            }
+            yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));
+        })
+    }))
+    .await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = relay_in_front_of(endpoint, tmp.path(), 1_000);
+
+    let (status, received, ended_with) = streamed(app.clone(), chat_request(true)).await;
+
+    assert_eq!(status, 200);
+    assert_eq!(ended_with, None, "the stream was cut after: {received}");
+    assert_eq!(received.matches("chat.completion.chunk").count(), 30);
+    assert!(received.ends_with("data: [DONE]\n\n"), "{received}");
+    let account = listed(app, "local", "key-1").await;
+    assert_eq!(account["totalSuccesses"], 1);
+    assert_eq!(account["totalFailures"], 0);
+}
+
+/// An endpoint that sends nothing at all, not even its response headers, for longer than
+/// the limit is a hung one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_endpoint_silent_before_its_response_starts_fails_the_request() {
+    let endpoint = serve_endpoint(axum::routing::post(|| async {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        event_stream(async_stream::stream! {
+            yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));
+        })
+    }))
+    .await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = relay_in_front_of(endpoint, tmp.path(), 1_000);
+
+    let (status, received, ended_with) = streamed(app.clone(), chat_request(true)).await;
+
+    assert_eq!(status, 502);
+    assert_eq!(ended_with, None);
+    let body: Value = serde_json::from_str(&received).expect("a JSON error body");
+    assert_eq!(
+        body["error"]["message"],
+        "upstream request failed: upstream sent nothing for 1000 ms (stream-messages-ms)"
+    );
+    let account = listed(app, "local", "key-1").await;
+    assert_eq!(account["totalFailures"], 1);
+    assert_eq!(
+        account["lastError"],
+        "server: upstream sent nothing for 1000 ms (stream-messages-ms)"
+    );
+}
+
+/// A stream that goes quiet between chunks for longer than the limit is cut there, and the
+/// client is told rather than handed a reply that merely stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_endpoint_silent_between_chunks_fails_the_stream() {
+    let endpoint = serve_endpoint(axum::routing::post(|| async {
+        event_stream(async_stream::stream! {
+            yield Ok(chat_chunk("first"));
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            yield Ok(chat_chunk("second"));
+            yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));
+        })
+    }))
+    .await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = relay_in_front_of(endpoint, tmp.path(), 1_000);
+
+    let (status, received, ended_with) = streamed(app.clone(), chat_request(true)).await;
+
+    assert_eq!(status, 200);
+    assert!(received.contains(r#""content":"first""#), "{received}");
+    assert!(!received.contains(r#""content":"second""#), "{received}");
+    assert_eq!(
+        ended_with.as_deref(),
+        Some("upstream sent nothing for 1000 ms (stream-messages-ms)")
+    );
+    let account = listed(app, "local", "key-1").await;
+    assert_eq!(account["totalFailures"], 1);
+    assert_eq!(
+        account["lastError"],
+        "server: upstream sent nothing for 1000 ms (stream-messages-ms)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// cli-hardening: a 429 or 503 retry hint is the length of the Cooldown
+// ---------------------------------------------------------------------------
+
+fn seconds_since_epoch() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs_f64()
+}
+
+/// Seconds left on an account's Cooldown, as `/admin/accounts` reports it.
+async fn cooldown_left(app: axum::Router, provider: &str, id: &str) -> f64 {
+    listed(app, provider, id).await["cooldownUntil"]
+        .as_f64()
+        .expect("cooldownUntil")
+        - seconds_since_epoch()
+}
+
+/// A vendor that names its reset is believed, on either wire and in each of the three
+/// spellings: an endpoint answering every key with the hint leaves both keys of a Pool of
+/// two cooling for as long as it asked, and the relay probes neither before then.
+#[tokio::test]
+async fn a_retry_hint_sets_the_cooldown_on_streamed_and_plain_requests() {
+    let in_an_hour = (chrono::Utc::now() + chrono::Duration::seconds(3_600))
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string();
+    for (status, header, value, stream) in [
+        (429, "retry-after", "3600".to_string(), false),
+        (503, "retry-after", "3600".to_string(), true),
+        (429, "retry-after-ms", "3600000".to_string(), true),
+        (503, "retry-after-ms", "3600000".to_string(), false),
+        (429, "retry-after", in_an_hour.clone(), false),
+        (503, "retry-after", in_an_hour.clone(), true),
+    ] {
+        let endpoint = serve_endpoint(axum::routing::post(move || {
+            let value = value.clone();
+            async move {
+                (
+                    axum::http::StatusCode::from_u16(status).expect("status"),
+                    [(header, value)],
+                    axum::Json(json!({"error": {"message": "slow down"}})),
+                )
+            }
+        }))
+        .await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        save_token(tmp.path(), &static_key_token("local", "key-2")).expect("save key");
+        let app = relay_in_front_of(endpoint, tmp.path(), 600_000);
+
+        let (answered, _, _) = streamed(app.clone(), chat_request(stream)).await;
+
+        assert_eq!(answered, status, "{header}: {status}, stream {stream}");
+        for key in ["key-1", "key-2"] {
+            let left = cooldown_left(app.clone(), "local", key).await;
+            assert!(
+                (3_590.0..=3_600.0).contains(&left),
+                "{header} on a {status}, stream {stream}: {key} cools {left}s, not an hour"
+            );
+        }
+    }
+}
+
+/// A hint is a vendor's word, not a promise to keep an account out for good: one above a day
+/// is held to a day.
+#[tokio::test]
+async fn a_retry_hint_above_a_day_is_capped_at_a_day() {
+    let endpoint = serve_endpoint(axum::routing::post(|| async {
+        (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", "172800")],
+            axum::Json(json!({"error": {"message": "slow down"}})),
+        )
+    }))
+    .await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_key_token("local", "key-2")).expect("save key");
+    let app = relay_in_front_of(endpoint, tmp.path(), 600_000);
+
+    let (answered, _, _) = streamed(app.clone(), chat_request(false)).await;
+
+    assert_eq!(answered, 429);
+    let left = cooldown_left(app, "local", "key-1").await;
+    assert!(
+        (86_390.0..=86_400.0).contains(&left),
+        "a two-day hint cools {left}s, not a day"
+    );
+}
+
+/// Only a 429 or a 503 is read for a hint. A 500 that carries one earns the backoff it always
+/// has, where the same header on a 429 is the length of the Cooldown.
+#[tokio::test]
+async fn a_retry_hint_on_another_status_is_not_read() {
+    for (status, hint_read) in [(500, false), (429, true)] {
+        let endpoint = serve_endpoint(axum::routing::post(move || async move {
+            (
+                axum::http::StatusCode::from_u16(status).expect("status"),
+                [("retry-after", "3600")],
+                axum::Json(json!({"error": {"message": "no"}})),
+            )
+        }))
+        .await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        save_token(tmp.path(), &static_key_token("local", "key-2")).expect("save key");
+        let app = relay_in_front_of(endpoint, tmp.path(), 600_000);
+
+        let (answered, _, _) = streamed(app.clone(), chat_request(false)).await;
+
+        assert_eq!(answered, status);
+        let left = cooldown_left(app, "local", "key-1").await;
+        if hint_read {
+            assert!((3_590.0..=3_600.0).contains(&left), "a 429 cooled {left}s");
+        } else {
+            assert!(
+                left <= 1.0,
+                "a 500's hint cooled {left}s, not the 1 s backoff"
+            );
+        }
     }
 }

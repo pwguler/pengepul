@@ -7,12 +7,16 @@ pengepul pools several AI-vendor accounts behind one local API and spreads clien
 ### Providers
 
 **Provider**:
-An upstream vendor family pengepul relays to — anthropic, codex, or a configured OpenAI-compatible endpoint (e.g. groq) — and the top-level axis by which accounts, credentials, models and admin output are partitioned.
+An upstream vendor family pengepul relays to — anthropic, codex, grok, or a configured OpenAI-compatible endpoint (e.g. groq) — and the top-level axis by which accounts, credentials, models and admin output are partitioned.
 _Avoid_: kind, provider id, backend, owned_by
 
 **Upstream**:
 The vendor side of the relay: the service pengepul calls out to on behalf of a client, as opposed to the client calling pengepul.
 _Avoid_: backend, endpoint, provider (when the vendor connection, not the partition, is meant)
+
+**Silence limit**:
+The longest a streamed reply from an **Upstream** may send nothing, before it starts or between chunks: `stream-messages-ms`. A stream that keeps sending has no deadline; one silent past the limit is a failure on its Account, and the client gets an error if its reply had started, while one that had not fails over like any other upstream error. A reply the client did not stream has a whole-request deadline instead.
+_Avoid_: stream timeout, stream deadline
 
 ### Wire shapes
 
@@ -43,8 +47,12 @@ The state an account enters when its refresh token is itself rejected, where not
 _Avoid_: refresh exhausted, invalid_grant, dead token
 
 **Cooldown**:
-A period during which an account is passed over by rotation, entered on failure and cleared by the next success, by reloading accounts after a fresh login, or by the operator's `pengepul accounts enable`. A Pool that holds one account earns none: a Cooldown hands the next request to a sibling, and with no sibling it would only withhold the account the Pool has (ADR-0027).
+A period during which an account is passed over by rotation, entered on failure and cleared by the next success, by reloading accounts after a fresh login, or by the operator's `pengepul accounts enable`. Its length is what the failure's duration policy sets, or the **Retry hint** a 429 or 503 carried when that is longer, up to a day; a hint never shortens one. A Pool that holds one account earns none: a Cooldown hands the next request to a sibling, and with no sibling it would only withhold the account the Pool has (ADR-0027).
 _Avoid_: backoff, lockout, unavailable, cooling down
+
+**Retry hint**:
+The wait a vendor names on a 429 or 503: `retry-after-ms`, or `retry-after` as seconds or an HTTP date. The relay takes it as the length of the Cooldown that failure earns when it is longer than what the duration policy sets, capped at a day so a nonsense value cannot park an account for good. It never shortens a Cooldown, never applies to a Pool of one, and never rewrites the reason of a Reauth whose Cooldown is running; another status's hint is ignored. It sets the Cooldown and nothing else: the relay passes no upstream header on to the client.
+_Avoid_: retry-after, rate-limit reset, backoff hint
 
 **Disabled**:
 An Account the operator has taken out of its Pool, held out of Rotation and Failover until the operator enables it again; no success and no passage of time clears it. Its credential is intact and renamed `<account>.json.disabled` beside the others, which is the whole of the state: it survives restarts, and it ends when the operator runs `pengepul accounts enable`, logs the account in afresh, or renames the file back by hand and reloads. It is counted and listed like any other Account, printed `disabled`. A Pool whose only enabled Account sits beside Disabled ones is a Pool of one for Cooldown purposes (ADR-0027).
@@ -108,17 +116,17 @@ _Avoid_: billing classifier, detector, filter
 
 ## Relationships
 
-- pengepul has two built-in **Providers** — anthropic, codex — plus one configured **Provider** per `providers:` config entry.
+- pengepul has three built-in **Providers** — anthropic, codex, grok — plus one configured **Provider** per `providers:` config entry, which may not take a built-in's name.
 - One **Provider** has zero or more **Accounts**; one **Account** belongs to exactly one **Provider**.
-- Within one **Provider** an **Account** is keyed by exactly one email (anthropic/codex) or by a label derived from the key (static-key providers), and keys are unique.
-- One **Account** holds exactly one credential: an access-token/refresh-token pair for anthropic and codex, or one static API key for a configured OpenAI-compatible **Provider**.
-- One **Account** has at most one **Cooldown** in effect, with three duration policies: an ordinary failure cooldown, a longer one for **Reauth**, and a separate ceiling of up to an hour for an account that has never once succeeded — shorter than Reauth's, because it bounds how often a dead key is probed while a Reauth waits for a human (ADR-0020). A **Pool** of one account has none of the three: the account keeps serving its failures, and the client sees the vendor's own error (ADR-0027).
+- Within one **Provider** an **Account** is keyed by exactly one email (anthropic, codex, grok) or by a label derived from the key (static-key providers), and keys are unique.
+- One **Account** holds exactly one credential: an access-token/refresh-token pair for anthropic, codex and grok, or one static API key for a configured OpenAI-compatible **Provider**.
+- One **Account** has at most one **Cooldown** in effect, with three duration policies: an ordinary failure cooldown, a longer one for **Reauth**, and a separate ceiling of up to an hour for an account that has never once succeeded — shorter than Reauth's, because it bounds how often a dead key is probed while a Reauth waits for a human (ADR-0020). A **Retry hint** stretches whichever applies to the wait the vendor named, up to a day, and never shortens it. A **Pool** of one account has none of the three: the account keeps serving its failures, and the client sees the vendor's own error (ADR-0027).
 - One model id resolves to exactly one **Provider**.
 - One client request is served by one **Account** at a time, and **Failover** only moves it between **Accounts** of the same **Provider**.
-- **Cloaking** applies to requests bound for the anthropic and codex **Upstreams**; configured OpenAI-compatible endpoints are never cloaked. The **Local API key** applies to requests arriving from a client.
+- **Cloaking** applies to requests bound for the anthropic and codex **Upstreams**; grok and configured OpenAI-compatible endpoints are never cloaked. The **Local API key** applies to requests arriving from a client.
 - One pengepul endpoint accepts exactly one **Inbound dialect**; one **Provider** accepts exactly one **Dialect** upstream.
 - A **Harness** reaches the relay through its own configuration, never through a route made for it (ADR-0007). `pengepul launch` writes that configuration into one process instead of onto disk, so it covers only the **Harnesses** that can be redirected per-process.
-- Any **Inbound dialect** may be served by anthropic or codex, and **Translation** is what closes the gap. A configured OpenAI-compatible endpoint speaks only Chat Completions upstream, so Messages is translated onto it and Responses answers 501. count_tokens is anthropic-only and answers 501 elsewhere.
+- Any **Inbound dialect** may be served by anthropic, codex or grok, and **Translation** is what closes the gap; grok speaks only Chat Completions upstream, and the other two dialects are translated onto it. A configured OpenAI-compatible endpoint speaks only Chat Completions upstream too, so Messages is translated onto it and Responses answers 501. count_tokens is anthropic-only and answers 501 elsewhere.
 
 ## Example dialogue
 
@@ -128,7 +136,7 @@ _Avoid_: billing classifier, detector, filter
 >
 > **Dev:** "But it recovered without me. So why does `pengepul accounts` still show one as unavailable?"
 >
-> **Operator:** "That one is on the long **cooldown** — the **reauth** one. Same mechanism you just waited out, different cause and a very different duration. `pengepul accounts` prints both as unavailable, so the tell is `lastError` reading `refresh token ...; re-run login`, and a cooldown measured in hours rather than seconds. The short **cooldown** doubles per consecutive failure and caps out in minutes, and any success clears it. **Reauth** means the **upstream** rejected the refresh token itself — **refresh** can't fix it, so that **account** sits out for a day and comes back only to fail again."
+> **Operator:** "That one is on the long **cooldown** — the **reauth** one. Same mechanism you just waited out, different cause and a very different duration. `pengepul accounts` prints both as unavailable, so the tell is `lastError` reading `refresh token ...; re-run login`, and a cooldown measured in hours rather than seconds. The short **cooldown** doubles per consecutive failure and caps out in minutes, unless the 429 carried a **retry hint** naming a longer wait, and any success clears it. **Reauth** means the **upstream** rejected the refresh token itself — **refresh** can't fix it, so that **account** sits out for a day and comes back only to fail again."
 >
 > **Dev:** "So the 503 and the unavailable line are unrelated?"
 >
@@ -140,11 +148,11 @@ _Avoid_: billing classifier, detector, filter
 
 ## Flagged ambiguities
 
-- "provider" names both the vendor and a configured entry for that vendor. Resolved: **Provider** means the vendor. For a configured OpenAI-compatible endpoint, the config entry is the Provider; for anthropic and codex there is no config entry because they are built in.
+- "provider" names both the vendor and a configured entry for that vendor. Resolved: **Provider** means the vendor. For a configured OpenAI-compatible endpoint, the config entry is the Provider; for anthropic, codex and grok there is no config entry because they are built in.
 - "claude" appears as an alias for anthropic in stored credentials. Resolved: **anthropic** is the only spelling an operator uses or types.
 - "account", "credential" and "token" all name the same file under the auth directory across the README, the CLI and the source. Resolved: **Account** is the domain noun — the identity, its credential, and its record. Credential is the secret inside an account. Token is a wire artifact and never means the account.
 - Accounts are keyed by email. Resolved: read the field as the account key, not as an address.
-- "backoff", "lockout" and "unavailable" appear across the README, the CLI and the admin output for one mechanism. Resolved: there is one **Cooldown** with three duration policies — an ordinary failure cooldown (up to five minutes), a longer **Reauth** cooldown (24 hours), and a **never-succeeded cooldown** (up to one hour) for an account that has never once served a request (ADR-0020). The never-succeeded ceiling is shorter than the Reauth one, not longer: it bounds how often a dead key is probed, while a Reauth waits for a human. Say "failure cooldown", "reauth cooldown" and "never-succeeded cooldown" when the durations must be distinguished.
+- "backoff", "lockout" and "unavailable" appear across the README, the CLI and the admin output for one mechanism. Resolved: there is one **Cooldown** with three duration policies — an ordinary failure cooldown (up to five minutes), a longer **Reauth** cooldown (24 hours), and a **never-succeeded cooldown** (up to one hour) for an account that has never once served a request (ADR-0020). The never-succeeded ceiling is shorter than the Reauth one, not longer: it bounds how often a dead key is probed, while a Reauth waits for a human. A **Retry hint** on a 429 or 503 stretches the policy's step to the wait the vendor named, up to a day. Say "failure cooldown", "reauth cooldown" and "never-succeeded cooldown" when the durations must be distinguished.
 - "API key" covers two unrelated secrets: the keys clients present to pengepul, and the credentials pengepul presents upstream. Resolved: **Local API key** is what clients present; the upstream credential is what pengepul presents upstream. They point in opposite directions on the wire.
 - "cloaking" and "masquerade" are used interchangeably. Resolved: **Cloaking** is the domain term.
 - "refresh" names both the secret an account holds and the act of replacing its expiring access token. Resolved: **Refresh** is the act. The secret is the refresh token.

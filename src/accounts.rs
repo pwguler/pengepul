@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -25,6 +26,8 @@ pub type RefreshFn = Box<dyn Fn(String) -> RefreshFuture + Send + Sync>;
 /// retries keep a single static key (or a lone account) from being locked out by one
 /// transient error. The *ceiling* is what varies — billing, reauth, and a credential
 /// that has never succeeded each sit out longer; see [`AccountState::failure_cooldown`].
+/// A Retry hint on a 429 or 503 lengthens the step it earns to the wait it names, up to
+/// [`RETRY_HINT_CEILING_SECONDS`], and never shortens it.
 ///
 /// A Cooldown needs a sibling to be worth anything: it exists to send the next request
 /// somewhere else, so a Pool that holds one account earns none at all (ADR-0027).
@@ -48,6 +51,10 @@ const BILLING_COOLDOWN_SECONDS: f64 = 10.0 * 60.0;
 const NEVER_SUCCEEDED_COOLDOWN_SECONDS: f64 = 60.0 * 60.0;
 
 const REAUTH_COOLDOWN_SECONDS: f64 = 24.0 * 60.0 * 60.0;
+
+/// The longest Cooldown a Retry hint can set. A wait the vendor names beats probing at 1s,
+/// 2s, 4s; the cap bounds a nonsense value.
+const RETRY_HINT_CEILING_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 
 /// How many conversations keep an account preference before the whole map
 /// is dropped. A relay serves a handful of harnesses at once; this is far
@@ -871,7 +878,16 @@ impl AccountManager {
         self.persist_usage();
     }
 
-    pub fn record_failure(&mut self, email: &str, kind: &str, detail: Option<&str>) {
+    /// Count a failed request and cool the account for its backoff, or for `retry_hint` when
+    /// the upstream named a longer wait (capped at a day). A Pool of one records the failure
+    /// and earns no Cooldown either way (ADR-0027).
+    pub fn record_failure(
+        &mut self,
+        email: &str,
+        kind: &str,
+        detail: Option<&str>,
+        retry_hint: Option<Duration>,
+    ) {
         let has_sibling = self.has_sibling();
         let Some(state) = self.accounts.get_mut(email) else {
             return;
@@ -893,15 +909,26 @@ impl AccountManager {
         }
         let (base, maximum) = state.failure_cooldown(kind);
         let multiplier = 2_f64.powi(i32::try_from(state.failure_count - 1).unwrap_or(0));
-        let cooldown = unix_now() + (base * multiplier).min(maximum);
+        let hinted = retry_hint.map_or(0.0, |hint| {
+            hint.as_secs_f64().min(RETRY_HINT_CEILING_SECONDS)
+        });
+        let now = unix_now();
+        let cooldown = now + (base * multiplier).min(maximum).max(hinted);
         // A cooldown only ever grows. A reauth cooldown is 24 hours; a
         // failure recorded after it must not collapse the account back to
         // seconds and re-select it into a failure loop.
         if cooldown > state.cooldown_until {
+            // Only a Retry hint can outlast a Reauth's running Cooldown, and the
+            // account still needs the login its reason asks for, whatever
+            // lengthened the wait.
+            let reauth_running = state.reauth && state.cooldown_until > now;
             state.cooldown_until = cooldown;
-            state.last_failure_kind = Some(kind.to_string());
-            state.last_error =
-                Some(detail.map_or_else(|| kind.to_string(), |detail| format!("{kind}: {detail}")));
+            if !reauth_running {
+                state.last_failure_kind = Some(kind.to_string());
+                state.last_error = Some(
+                    detail.map_or_else(|| kind.to_string(), |detail| format!("{kind}: {detail}")),
+                );
+            }
         }
         self.persist_usage();
     }

@@ -3,7 +3,7 @@
 ## What this is
 
 pengepul is a local relay. It pools subscription **Accounts** per **Provider** —
-anthropic, codex, and OpenAI-compatible endpoints configured in `config.yaml` —
+anthropic, codex, grok, and OpenAI-compatible endpoints configured in `config.yaml` —
 behind one REST surface, so a harness runs on a subscription instead of a
 per-token key. It authenticates each caller by a **Local API key**, **Cloaks**
 anthropic- and codex-bound requests so the vendor **Classifier** reads them as
@@ -17,11 +17,16 @@ in files.
 - **Relay** (`app.rs`) — the fixed route table, the request path, the
   `UpstreamClient` trait and its HTTP implementation, and **Failover** across the
   Accounts of one Provider. One route accepts exactly one Inbound dialect and no
-  route keys off client identity.
+  route keys off client identity. The HTTP implementation owns the deadlines, a
+  whole-request one for a reply read whole and only the **Silence limit**
+  (`stream-messages-ms`) for a stream, and reads each response's **Retry hint**
+  off its headers (`retry-after-ms`, or `retry-after` as seconds or an HTTP date).
 - **Account** (`accounts.rs`) — `AccountManager`: holds every Account of one
   Provider and picks who serves next; **Rotation**, **Cooldown** and due
   **Refresh** live here, and every request outcome updates the Account's
-  Usage counters, which it hands to the Credential store to persist. Every
+  Usage counters, which it hands to the Credential store to persist. A
+  Cooldown's length is what its failure's policy sets, or the Retry hint a 429
+  or 503 carried when that is longer, capped at a day. Every
   outcome passes through one private seam (`AccountState::settle`), so the
   attempt/outcome invariant holds by construction rather than by each
   recorder remembering it; counters read from disk are repaired at load,
@@ -35,8 +40,14 @@ in files.
   registration, `config.yaml.lock` sit there too. The only other
   long-lived file under the auth dir, `cloaking-versions.json`, is the
   Upstream module's own cache — `cloaking_versions.rs`.)
-- **OAuth** (`oauth.rs`) — mints and Refreshes the anthropic and codex
-  credential, and is the only place a rejected refresh token becomes **Reauth**.
+- **OAuth** (`oauth.rs`) — mints and Refreshes the anthropic, codex and grok
+  credential, each through an authorization-code flow with PKCE (S256), and is the
+  only place a rejected refresh token becomes **Reauth**. A grok code is exchanged
+  from whichever arrives first, which the runtime waits on: the loopback callback
+  on `127.0.0.1:14550`, or the code auth.x.ai shows when that callback cannot be
+  reached, pasted as the code or the whole callback URL. A pasted code's state is
+  not checked; the PKCE verifier, which only this process holds, binds it to this
+  login.
 - **Cloaking sanitizer** (`masquerade.rs`) — strips a harness's bot-identity
   system sections, `PascalCase`s its tool names, and rewrites the literal phrases
   that trip the Classifier (openclaw sections and tool names; pi and opencode
@@ -45,7 +56,10 @@ in files.
   call behind one trait, and `apply_cloaking` injects the billing-header block,
   the "You are Claude Code" prefix, the account metadata and the identifying
   headers. `cloaking_versions.rs` supplies the vendor CLI versions it learns at
-  runtime.
+  runtime. A grok call carries the bearer and the two headers the grok Upstream
+  (grok build's chat proxy) requires (`grok_chat_headers`), and no Cloaking; a
+  426 naming a newer client version is retried once with it, and that version is
+  kept for the process lifetime (`learn_grok_client_version`).
 - **Model catalog** (`models.rs`) — resolves a model id to exactly one Provider,
   and advertises every served model under its `<provider>/` prefix with the
   per-model metadata the client needs (context window, output cap, modalities,
@@ -53,18 +67,23 @@ in files.
   removes the `<provider>/` prefix and nothing else. A model's metadata is
   ranked in one place, `ranked_metadata`, field by field: the curated table,
   under the upstream's `/models` body, under what the operator states in a
-  configured provider's `models:` in `config.yaml` (ADR-0029).
+  configured provider's `models:` in `config.yaml` (ADR-0029). grok publishes no
+  list to fetch: its two models, `grok-4.6` and `grok-4.5`, are a static one
+  (`grok_static_models`).
 - **Translation** (`translate.rs`, `streaming.rs`) — rewrites a body between
   Inbound and upstream **Dialect**, whole-document and one SSE event at a time;
   pure JSON, no I/O. Every pair the route table can produce has a translation,
   Messages↔Chat Completions included, so a configured endpoint serves a
   Messages client by translation rather than by refusal. Which translation a
   pair gets is `app.rs`'s `Translation` enum, resolved once from
-  (Provider, Inbound dialect): the request body, the whole response, each
-  stream event and the stream's close all ask it, so a new pair is stated in
-  one place instead of four that could disagree.
+  (Provider, Inbound dialect): the request body, the whole response and the
+  stream's close ask it. Each stream event does not: `transform_sse_event`
+  translates it under its own match over the same pair, so a new pair is
+  stated there as well as in `Translation`.
 - **Config** (`config.rs`) — parses `config.yaml`, including the `providers:`
   section, which is the only Provider registry: there is no database table.
+  An entry named for a built-in (`anthropic`, `claude`, `codex`, `grok`)
+  stops the relay at load, since the built-in Pool's prefix would shadow it.
   It also writes it: `register_provider` adds one entry for `login
   --base-url`, and refuses an id already present with a different URL
   rather than overwriting it. The write is a read-modify-write on one
@@ -74,7 +93,8 @@ in files.
 - **CLI + Runtime + Service** (`cli.rs`, `runtime.rs`, `service.rs`) — command
   parsing and dispatch (pure), the `CliRuntime` adapter that makes a verb touch
   the real world, and the per-user systemd/launchd unit — including the parser
-  that turns the platform tool's status text into panel rows. `launch` is
+  that turns the platform tool's status text into panel rows. `serve` runs the
+  relay until SIGTERM or SIGINT, then drains it (`serve_until_drained`). `launch` is
   dispatch too: `launch_plan` turns a harness name into the binary, the
   arguments and the environment that point it at the relay, and the runtime
   `exec`s that plan — the whole of the per-harness knowledge is that one
@@ -107,10 +127,13 @@ in files.
   any HTTP happens at all. `apply_cloaking` runs *below* it inside the HTTP
   client, so a test double sees the pre-cloak body and headers. Model metadata
   ranking runs below it too, operator tier included, so a test double's models
-  are advertised as it returns them (ADR-0029).
-- **`ProviderKind`** — a closed enum (Anthropic, Codex, Generic) that switches
-  the credential lifecycle, the OAuth flow, and whether Cloaking runs; the
-  compiler is the checklist when a fourth kind arrives.
+  are advertised as it returns them (ADR-0029). So do a stream's Silence limit
+  and the Retry hint's parse: a test double hands back a parsed hint, and only a
+  test that streams from a real HTTP server can show where a stream is cut.
+- **`ProviderKind`** — a closed enum (Anthropic, Codex, Grok, Generic) that
+  switches the credential lifecycle, the OAuth flow, and whether Cloaking runs,
+  and names the ids a `providers:` entry may not take; the compiler is the
+  checklist when a fifth kind arrives.
 - **`CliRuntime`** — every side effect a CLI verb performs, so `cli.rs` stays
   pure argument handling.
 - **`Style`** — decided once from the TTY and environment in `main.rs` and
@@ -138,8 +161,8 @@ in files.
   one, because the Classifier reads the body, not the client's dialect
   (ADR-0028, amending ADR-0002, ADR-0004 and ADR-0007). The vendor-identity
   inject (`apply_cloaking`) runs inside the Upstream client. codex is
-  header-only; a configured OpenAI-compatible endpoint is never Cloaked;
-  `count_tokens` gets identifying headers but no body Cloaking.
+  header-only; grok and a configured OpenAI-compatible endpoint are never
+  Cloaked; `count_tokens` gets identifying headers but no body Cloaking.
 - **Tool-name rewrites are bijective within a request and restored before the
   reply reaches the client**, on the upstream's Messages-shaped reply, before
   translation moves each name into the client's dialect.
@@ -167,16 +190,39 @@ in files.
   window, not a growing slice, so appends keep the key. It is bounded and not
   persisted: a restart re-learns it at the cost of one cold read.
 - **A credential that has never once succeeded sits out past the flat cooldown.**
-  Ordinary failures cool an account for 1s, 2s, 4s, … capped at five minutes, and a
-  billing rejection sits out a flat ten; an account with no success to its name caps
-  at an hour instead, so a depleted key stops spending a round trip every ten
-  minutes. It is delayed, never excluded, and its first success restores the
-  ordinary regime (ADR-0020).
+  Ordinary failures cool an account for 1s, 2s, 4s, … capped at five minutes (a
+  Retry hint can ask for longer, below), and a billing rejection sits out a flat
+  ten; an account with no success to its name caps at an hour instead, so a
+  depleted key stops spending a round trip every ten minutes. It is delayed,
+  never excluded, and its first success restores the ordinary regime (ADR-0020).
+- **A Retry hint is believed, for a day at most.** A 429 or 503 carrying one
+  cools its Account for the longer of the hint and what the rule above sets,
+  capped at 24 hours so a nonsense value cannot park an account for good. A hint
+  only lengthens: one shorter than that, or one that arrives during a Reauth
+  Cooldown, leaves the longer Cooldown in place, and a running Reauth keeps its
+  reason even when a hint outlasts it. Another status's hint is ignored. The hint
+  sets the Cooldown and nothing else: the relay passes no upstream header on to
+  the client.
 - **A Pool that holds one Account keeps no Cooldown.** A Cooldown hands the next
   request to a sibling, so with no sibling it would withhold the only way that
   Provider has to serve. The failure is still recorded — streak, counters,
   `lastError` — and the next request reaches the vendor, whose own error answers the
-  client instead of a local `503` (ADR-0027).
+  client instead of a local `503` (ADR-0027). A Retry hint changes nothing here.
+- **A stream is limited by its silence, not its length.** `stream-messages-ms` is
+  the longest a streamed upstream may send nothing, before its response starts
+  and between chunks; a stream that keeps sending runs as long as it takes. Past
+  the limit the Account records a failure whose `lastError` names the silence. A
+  stream already under way then ends with an error to the client; silence before
+  the response starts is a 502 that fails over like any other upstream error. A
+  deadline on the whole response would cut healthy long generations and cool the
+  Account that served them. A reply read whole keeps a whole-request deadline:
+  `messages-ms`, or `stream-messages-ms` on codex, which streams every request
+  upstream.
+- **A stop drains for up to 15 seconds, then exits.** On SIGTERM or SIGINT the
+  relay closes its listener at once and exits as soon as the requests in flight
+  finish, or at 15 s, when one still running is dropped as the process exits.
+  15 s fits inside launchd's default of about 20 s and systemd's 90 s before
+  either kills the process, so the unit files carry no stop timeout of their own.
 - **Every route authenticates before it parses a body.** `/health` is the only
   unauthenticated route.
 - **One Account holds exactly one credential**, on disk at `0600` and never

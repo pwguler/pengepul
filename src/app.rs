@@ -4,7 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context as _;
 use async_stream::try_stream;
@@ -76,11 +76,15 @@ pub struct UpstreamRequest {
 pub struct UpstreamJsonResponse {
     pub status: StatusCode,
     pub body: Value,
+    /// How long the upstream asked to be left alone (`retry-after-ms` or `retry-after`).
+    pub retry_hint: Option<Duration>,
 }
 
 pub struct UpstreamSseResponse {
     pub status: StatusCode,
     pub body: UpstreamSseStream,
+    /// How long the upstream asked to be left alone (`retry-after-ms` or `retry-after`).
+    pub retry_hint: Option<Duration>,
 }
 
 pub trait UpstreamClient: Send + Sync {
@@ -1355,8 +1359,15 @@ async fn count_tokens(State(state): State<AppState>, headers: HeaderMap, body: B
                 // the account's failure streak.
                 record_provider_success(&state, provider.clone(), &account, None, &model).await;
             } else {
-                record_provider_failure(&state, provider.clone(), &account, response.status, None)
-                    .await;
+                record_provider_failure(
+                    &state,
+                    provider.clone(),
+                    &account,
+                    response.status,
+                    None,
+                    response.retry_hint,
+                )
+                .await;
             }
             (response.status, Json(response.body)).into_response()
         }
@@ -1367,6 +1378,7 @@ async fn count_tokens(State(state): State<AppState>, headers: HeaderMap, body: B
                 &account,
                 StatusCode::BAD_GATEWAY,
                 Some(&error_chain(&error)),
+                None,
             )
             .await;
             upstream_error_response(provider, &error)
@@ -1682,6 +1694,7 @@ async fn route_generic_chat_request(
                     account.provider.clone(),
                     account,
                     response.status,
+                    response.retry_hint,
                     model,
                 )
                 .await;
@@ -1751,6 +1764,7 @@ async fn route_grok_request(
                     account.provider.clone(),
                     account,
                     response.status,
+                    response.retry_hint,
                     model,
                 )
                 .await;
@@ -1815,6 +1829,7 @@ async fn route_codex_request(
                     account.provider.clone(),
                     account,
                     response.status,
+                    response.retry_hint,
                     model,
                 )
                 .await;
@@ -1889,6 +1904,7 @@ async fn route_anthropic_request(
                     account.provider.clone(),
                     account,
                     response.status,
+                    response.retry_hint,
                     model,
                 )
                 .await;
@@ -1931,6 +1947,7 @@ async fn stream_accounting(
     provider: ProviderId,
     account: &AvailableAccount,
     status: StatusCode,
+    retry_hint: Option<Duration>,
     model: &str,
 ) -> Option<StreamAccounting> {
     if status.is_success() {
@@ -1942,7 +1959,7 @@ async fn stream_accounting(
             owed: Arc::new(AtomicBool::new(true)),
         })
     } else {
-        record_provider_failure(state, provider, account, status, None).await;
+        record_provider_failure(state, provider, account, status, None, retry_hint).await;
         None
     }
 }
@@ -1964,7 +1981,15 @@ async fn record_json_result(
         )
         .await;
     } else {
-        record_provider_failure(state, provider, account, response.status, None).await;
+        record_provider_failure(
+            state,
+            provider,
+            account,
+            response.status,
+            None,
+            response.retry_hint,
+        )
+        .await;
     }
 }
 
@@ -1980,6 +2005,7 @@ async fn upstream_failure_response(
         account,
         StatusCode::BAD_GATEWAY,
         Some(&error_chain(error)),
+        None,
     )
     .await;
     upstream_error_response(provider, error)
@@ -2402,7 +2428,7 @@ async fn next_provider_account(
             ));
         }
         Err(error) => {
-            manager.record_failure(&email, "auth", Some(&error_chain(&error)));
+            manager.record_failure(&email, "auth", Some(&error_chain(&error)), None);
             return Err(AppError::provider(
                 StatusCode::BAD_GATEWAY,
                 format!("failed to refresh {provider} account: {error}"),
@@ -2571,12 +2597,15 @@ fn error_chain(error: &anyhow::Error) -> String {
     format!("{error:#}")
 }
 
+/// Count a failed request against its account. A 429 or 503 that carried a Retry hint cools
+/// the account for the longer of the hint and its backoff; any other status's hint is ignored.
 async fn record_provider_failure(
     state: &AppState,
     provider: ProviderId,
     account: &AvailableAccount,
     status: StatusCode,
     detail: Option<&str>,
+    retry_hint: Option<Duration>,
 ) {
     // 400/402 by themselves say nothing about account health — a malformed request is
     // the client's fault, and a drained balance is recorded by the failover path with
@@ -2590,7 +2619,16 @@ async fn record_provider_failure(
         record_provider_refusal(state, &provider, account).await;
         return;
     }
-    record_provider_failure_kind(state, provider, account, classify_status(status), detail).await;
+    let retry_hint = retry_hint.filter(|_| matches!(status.as_u16(), 429 | 503));
+    record_provider_failure_kind(
+        state,
+        provider,
+        account,
+        classify_status(status),
+        detail,
+        retry_hint,
+    )
+    .await;
 }
 
 async fn record_provider_failure_kind(
@@ -2599,6 +2637,7 @@ async fn record_provider_failure_kind(
     account: &AvailableAccount,
     kind: &'static str,
     detail: Option<&str>,
+    retry_hint: Option<Duration>,
 ) {
     let mut manager = match provider.kind {
         ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
@@ -2611,7 +2650,7 @@ async fn record_provider_failure_kind(
             manager.lock().await
         }
     };
-    manager.record_failure(account.token.email.as_str(), kind, detail);
+    manager.record_failure(account.token.email.as_str(), kind, detail, retry_hint);
 }
 
 fn no_account_message(
@@ -3003,6 +3042,7 @@ async fn record_stream_failure(accounting: Option<&StreamAccounting>, detail: &s
             &accounting.account,
             StatusCode::BAD_GATEWAY,
             Some(detail),
+            None,
         )
         .await;
     }
@@ -3256,10 +3296,8 @@ fn transform_sse_event(
             |data| chat_sse_to_responses(&data, responses_state, model),
         ),
         // A generic endpoint answers in Chat Completions, so a Chat client
-        // reads its stream unchanged. Grok streams the same dialect (its
-        // reasoning_content deltas ride along untouched, per the spec).
-        // Grok streams the same dialect a generic endpoint does; its
-        // reasoning_content deltas ride along untouched (AC-3).
+        // reads its stream unchanged. Grok streams the same dialect; its
+        // reasoning_content deltas ride along untouched.
         (ProviderKind::Grok | ProviderKind::Generic, RequestRoute::Chat) => parsed.map_or_else(
             |_| Vec::new(),
             |data| vec![sse(&data, passthrough_event(event))],
@@ -3299,14 +3337,13 @@ fn body_with_model(body: &Value, model: &str) -> Value {
     next_body
 }
 
-/// What one (Inbound dialect, Provider) pair does, in one place.
+/// What one (Inbound dialect, Provider) pair does to the request body, the whole
+/// response and the stream's close.
 ///
-/// The four stages of serving a request each used to carry their own match
-/// over the pair: the request body, the whole response, each stream event,
-/// and closing the stream. Four matches meant a new pair could be added to
-/// three of them and nobody would know — which is what happened to the
-/// stream finaliser. Each stage now asks this, so the pair is stated once
-/// and the compiler carries it to every stage.
+/// Those three stages ask this instead of each matching on the pair, so a new
+/// pair is one more arm here and the compiler carries it to all three. Each
+/// stream event is the exception: `transform_sse_event` translates it under its
+/// own match over the same pair, so a new pair is stated there too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Translation {
     /// The dialect the provider speaks: nothing to translate.
@@ -3407,7 +3444,8 @@ fn upstream_request_body(
     normalized
 }
 
-/// Build a POST request with a JSON body and provider headers.
+/// Build a POST request with a JSON body and provider headers. Its deadline is the caller's:
+/// a whole-request one for a reply read at once, a silence limit for a stream.
 ///
 /// `.json()` already sets `Content-Type: application/json`, so any `content-type` entry in
 /// `headers` is skipped to avoid sending a duplicate header. The Codex backend rejects a
@@ -3417,13 +3455,9 @@ fn build_upstream_request(
     url: &str,
     headers: BTreeMap<String, String>,
     body: &Value,
-    timeout_ms: u64,
 ) -> reqwest::RequestBuilder {
     tracing::debug!(%url, "upstream request");
-    let mut request = client
-        .post(url)
-        .timeout(std::time::Duration::from_millis(timeout_ms))
-        .json(body);
+    let mut request = client.post(url).json(body);
     for (key, value) in headers {
         if key.eq_ignore_ascii_case("content-type") {
             continue;
@@ -3445,11 +3479,13 @@ async fn send_json(
         .and_then(Value::as_str)
         .unwrap_or("claude-sonnet-4-6")
         .to_string();
-    let response = build_upstream_request(&client, &url, headers, &body, timeout_ms)
+    let response = build_upstream_request(&client, &url, headers, &body)
+        .timeout(Duration::from_millis(timeout_ms))
         .send()
         .await?;
     let mut status = StatusCode::from_u16(response.status().as_u16())?;
     let headers = response.headers().clone();
+    let retry_hint = retry_hint_from(&headers, SystemTime::now());
     let bytes = response.bytes().await?;
     let body = decode_upstream_body(&headers, &bytes, &model);
     if status.is_success() && is_decoded_upstream_error(&body) {
@@ -3460,7 +3496,11 @@ async fn send_json(
     } else {
         tracing::warn!(%url, model = %model, status = status.as_u16(), "upstream error response");
     }
-    Ok(UpstreamJsonResponse { status, body })
+    Ok(UpstreamJsonResponse {
+        status,
+        body,
+        retry_hint,
+    })
 }
 
 async fn send_get(
@@ -3484,16 +3524,23 @@ async fn send_get(
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+/// Open an upstream stream whose one deadline is `silence_ms`: the longest it may send
+/// nothing, before its response starts and between chunks. A deadline on the whole response
+/// would cut healthy long generations and cool the Account serving them.
 async fn send_stream(
     client: reqwest::Client,
     url: String,
     headers: BTreeMap<String, String>,
     body: Value,
-    timeout_ms: u64,
+    silence_ms: u64,
 ) -> anyhow::Result<UpstreamSseResponse> {
-    let response = build_upstream_request(&client, &url, headers, &body, timeout_ms)
-        .send()
-        .await?;
+    let silence = Duration::from_millis(silence_ms);
+    let response = tokio::time::timeout(
+        silence,
+        build_upstream_request(&client, &url, headers, &body).send(),
+    )
+    .await
+    .map_err(|_| silence_error(silence))??;
     let status = StatusCode::from_u16(response.status().as_u16())?;
     if status.is_success() {
         tracing::debug!(%url, status = status.as_u16(), "upstream stream opened");
@@ -3502,8 +3549,71 @@ async fn send_stream(
     }
     Ok(UpstreamSseResponse {
         status,
-        body: Box::pin(response.bytes_stream().map_err(anyhow::Error::from)),
+        retry_hint: retry_hint_from(response.headers(), SystemTime::now()),
+        body: until_silent(
+            Box::pin(response.bytes_stream().map_err(anyhow::Error::from)),
+            silence,
+        ),
     })
+}
+
+/// What a stream fails with once it has sent nothing for its whole silence limit.
+fn silence_error(silence: Duration) -> anyhow::Error {
+    anyhow::anyhow!(
+        "upstream sent nothing for {} ms (stream-messages-ms)",
+        silence.as_millis()
+    )
+}
+
+/// `input`, ended by [`silence_error`] the first time it goes `silence` without a chunk.
+fn until_silent(mut input: UpstreamSseStream, silence: Duration) -> UpstreamSseStream {
+    Box::pin(try_stream! {
+        loop {
+            match tokio::time::timeout(silence, input.next()).await {
+                Ok(Some(chunk)) => yield chunk?,
+                Ok(None) => break,
+                Err(_) => Err(silence_error(silence))?,
+            }
+        }
+    })
+}
+
+/// How long an upstream response asks to be left alone: `retry-after-ms`, the finer of the
+/// two and the one the vendors' own SDKs read first, else `retry-after` as seconds or as an
+/// HTTP date. `None` when neither is sent or neither parses.
+fn retry_hint_from(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
+    let header = |name: &str| headers.get(name)?.to_str().ok().map(str::trim);
+    if let Some(ms) = header("retry-after-ms").and_then(decimal) {
+        return Some(seconds_hint(ms / 1000.0));
+    }
+    let value = header("retry-after")?;
+    if let Some(seconds) = decimal(value) {
+        return Some(seconds_hint(seconds));
+    }
+    // An HTTP date; one already past asks for no wait at all.
+    let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    Some(
+        SystemTime::from(date)
+            .duration_since(now)
+            .unwrap_or_default(),
+    )
+}
+
+/// A plain decimal number: digits and at most one point. `f64`'s own parser also takes `inf`,
+/// `NaN`, a sign and an exponent, none of which is a wait a vendor would name.
+fn decimal(value: &str) -> Option<f64> {
+    let digits = value.bytes().filter(u8::is_ascii_digit).count();
+    let points = value.bytes().filter(|&byte| byte == b'.').count();
+    if digits == 0 || points > 1 || digits + points != value.len() {
+        return None;
+    }
+    value.parse().ok()
+}
+
+/// A wait of `seconds`. One too long for a `Duration` is the longest there is, which the
+/// Cooldown caps anyway.
+fn seconds_hint(seconds: f64) -> Duration {
+    Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX)
 }
 
 /// The grok relay's chat endpoint. `/v1` rides on the base constant because
@@ -3546,7 +3656,7 @@ async fn send_grok_stream(
     client: reqwest::Client,
     account: &AvailableAccount,
     body: Value,
-    timeout_ms: u64,
+    silence_ms: u64,
 ) -> anyhow::Result<UpstreamSseResponse> {
     let url = grok_chat_url();
     let first = send_stream(
@@ -3554,7 +3664,7 @@ async fn send_grok_stream(
         url.clone(),
         grok_chat_headers(account),
         body.clone(),
-        timeout_ms,
+        silence_ms,
     )
     .await?;
     if first.status.as_u16() != 426 {
@@ -3563,10 +3673,11 @@ async fn send_grok_stream(
     let bytes = first.body.try_collect::<Vec<Bytes>>().await?.concat();
     let text = String::from_utf8_lossy(&bytes).to_string();
     if learn_grok_client_version(&text).is_some() {
-        return send_stream(client, url, grok_chat_headers(account), body, timeout_ms).await;
+        return send_stream(client, url, grok_chat_headers(account), body, silence_ms).await;
     }
     Ok(UpstreamSseResponse {
         status: first.status,
+        retry_hint: first.retry_hint,
         body: Box::pin(futures_util::stream::once(async move {
             Ok::<Bytes, anyhow::Error>(Bytes::from(bytes))
         })),
@@ -3717,6 +3828,61 @@ mod tests {
     }
 
     #[test]
+    fn a_retry_hint_reads_each_spelling_and_nothing_else() {
+        use std::time::{Duration, SystemTime};
+        // 2025-10-09T08:53:20Z
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_760_000_000);
+        let hint = |pairs: &[(&'static str, &str)]| {
+            let mut headers = HeaderMap::new();
+            for (name, value) in pairs {
+                headers.insert(*name, value.parse().expect("header value"));
+            }
+            super::retry_hint_from(&headers, now)
+        };
+
+        assert_eq!(
+            hint(&[("retry-after", "3600")]),
+            Some(Duration::from_hours(1))
+        );
+        assert_eq!(
+            hint(&[("retry-after-ms", "1500")]),
+            Some(Duration::from_millis(1_500))
+        );
+        // The finer spelling wins where both are sent, and one that does not parse yields to
+        // the other.
+        assert_eq!(
+            hint(&[("retry-after-ms", "1500"), ("retry-after", "2")]),
+            Some(Duration::from_millis(1_500))
+        );
+        assert_eq!(
+            hint(&[("retry-after-ms", "soon"), ("retry-after", "2")]),
+            Some(Duration::from_secs(2))
+        );
+        // An HTTP date is the wait until then; one already past asks for none.
+        assert_eq!(
+            hint(&[("retry-after", "Thu, 09 Oct 2025 09:53:20 GMT")]),
+            Some(Duration::from_hours(1))
+        );
+        assert_eq!(
+            hint(&[("retry-after", "Thu, 09 Oct 2025 07:53:20 GMT")]),
+            Some(Duration::ZERO)
+        );
+        // Absent, unparseable and negative are no hint at all, and so is anything but a plain
+        // decimal number: f64's own parser would take `inf` and `1e3`.
+        assert_eq!(hint(&[]), None);
+        assert_eq!(hint(&[("retry-after", "soon")]), None);
+        assert_eq!(hint(&[("retry-after", "-5")]), None);
+        assert_eq!(hint(&[("retry-after", "inf")]), None);
+        assert_eq!(hint(&[("retry-after", "1e3")]), None);
+        assert_eq!(hint(&[("retry-after-ms", "NaN")]), None);
+        // A fraction is a number, as the vendors' SDKs read it.
+        assert_eq!(
+            hint(&[("retry-after", "1.5")]),
+            Some(Duration::from_millis(1_500))
+        );
+    }
+
+    #[test]
     fn upstream_request_sends_single_content_type() {
         let headers = BTreeMap::from([
             ("Content-Type".to_string(), "application/json".to_string()),
@@ -3729,7 +3895,6 @@ mod tests {
             "https://chatgpt.com/backend-api/codex/responses",
             headers,
             &body,
-            30_000,
         )
         .build()
         .expect("request builds");
@@ -3771,6 +3936,7 @@ mod tests {
                 .push(request.account.token.email);
             Box::pin(async {
                 Ok(UpstreamJsonResponse {
+                    retry_hint: None,
                     status: StatusCode::OK,
                     body: json!({
                         "id": "msg_1",
@@ -3829,6 +3995,7 @@ mod tests {
             let (input, cache_read) = (self.input, self.cache_read);
             Box::pin(async move {
                 Ok(UpstreamJsonResponse {
+                    retry_hint: None,
                     status: StatusCode::OK,
                     body: json!({
                         "id": "msg_1",

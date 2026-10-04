@@ -1,6 +1,7 @@
 use std::io::{BufRead as _, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -64,8 +65,9 @@ impl CliRuntime for RealRuntime {
             let listener = tokio::net::TcpListener::bind(&bind_addr)
                 .await
                 .with_context(|| format!("failed to bind {bind_addr}"))?;
+            let stop = stop_signal()?;
             tracing::info!("pengepul listening on {bind_addr}");
-            axum::serve(listener, app).await.context("server failed")
+            serve_until_drained(listener, app, stop).await
         })
     }
 
@@ -79,12 +81,11 @@ impl CliRuntime for RealRuntime {
     }
 
     fn can_ask(&mut self) -> bool {
-        // The picker paints to stderr, so stderr is what decides whether
-        // there is anyone to paint for. Gating on stdout meant
-        // `launch claude 2>/dev/null` took raw mode and threw every frame
-        // away: a blank, frozen terminal with no visible way out. Stdin is
-        // deliberately not asked — crossterm reads `/dev/tty` when stdin is
-        // redirected, so the picker still works under `< /dev/null`.
+        // Both ends the operator sits at must be terminals. The picker paints to
+        // stderr: gating on stdout would let `launch claude 2>/dev/null` take raw
+        // mode and throw every frame away, a blank, frozen terminal with no visible
+        // way out. And a redirected stdin means a script is driving, where raw mode
+        // would seize a terminal nobody is watching.
         std::io::IsTerminal::is_terminal(&std::io::stderr())
             && std::io::IsTerminal::is_terminal(&std::io::stdin())
     }
@@ -404,6 +405,58 @@ fn server_bind_addr(config: &Config) -> String {
         format!("[{host}]:{}", config.port)
     } else {
         format!("{host}:{}", config.port)
+    }
+}
+
+/// How long the requests in flight get to finish once SIGTERM or SIGINT lands. It fits inside
+/// launchd's default of about 20 s and systemd's 90 s before either kills the process, so the
+/// unit files need no stop timeout of their own.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(15);
+
+/// Resolves on the first SIGTERM or SIGINT. Both are registered here, before the relay
+/// listens, so a relay that could not be stopped cleanly fails to start instead.
+fn stop_signal() -> Result<impl Future<Output = ()> + Send + 'static> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut terminate = signal(SignalKind::terminate()).context("failed to listen for SIGTERM")?;
+    let mut interrupt = signal(SignalKind::interrupt()).context("failed to listen for SIGINT")?;
+    Ok(async move {
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+    })
+}
+
+/// Serve `app` until `stop` resolves, then accept no new connection and give the requests in
+/// flight [`SHUTDOWN_DRAIN`] to finish. One still running at that mark does not keep the
+/// process alive: the relay returns, and the runtime drops what is left.
+async fn serve_until_drained(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    stop: impl Future<Output = ()> + Send + 'static,
+) -> Result<()> {
+    let stopping = Arc::new(tokio::sync::Notify::new());
+    let stopped = Arc::clone(&stopping);
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        stop.await;
+        tracing::info!(
+            "stopping: no new connections, {} s for the requests in flight",
+            SHUTDOWN_DRAIN.as_secs()
+        );
+        stopped.notify_one();
+    });
+    tokio::select! {
+        outcome = server.into_future() => outcome.context("server failed"),
+        () = async {
+            stopping.notified().await;
+            tokio::time::sleep(SHUTDOWN_DRAIN).await;
+        } => {
+            tracing::warn!(
+                "requests still in flight after {} s; exiting without them",
+                SHUTDOWN_DRAIN.as_secs()
+            );
+            Ok(())
+        }
     }
 }
 

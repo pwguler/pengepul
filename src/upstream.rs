@@ -308,12 +308,6 @@ fn detect_classifier_tripping_in_messages(body: &Value) -> bool {
     body.get("messages").is_some_and(contains_sentence)
 }
 
-/// Keep a request under Anthropic's limit of `max` (4) `cache_control` breakpoints,
-/// which are summed across `system`, `tools`, AND every message's `content`. The
-/// client (e.g. hermes) may already spend its full budget there; our injected
-/// prefix would push it over. Strip the earliest markers first — our prefix is the
-/// first `cache_control` block in `system` — so the client's later, larger-prefix
-/// breakpoints survive.
 /// How many messages a conversation checkpoint holds its position for.
 /// Long enough that the anchor is read back many turns running, short
 /// enough that re-anchoring throws away little.
@@ -404,6 +398,12 @@ fn reallocate_prefix_breakpoint(object: &mut serde_json::Map<String, Value>, max
     }
 }
 
+/// Keep a request under Anthropic's limit of `max` (4) `cache_control` breakpoints,
+/// which are summed across `system`, `tools`, AND every message's `content`. The
+/// client (e.g. hermes) may already spend its full budget there; our injected
+/// prefix would push it over. Strip the earliest markers first — our prefix is the
+/// first `cache_control` block in `system` — so the client's later, larger-prefix
+/// breakpoints survive.
 fn cap_cache_control(object: &mut serde_json::Map<String, Value>, max: usize) {
     fn count(value: Option<&Value>) -> usize {
         value.and_then(Value::as_array).map_or(0, |blocks| {

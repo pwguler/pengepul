@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::types::ProviderKind;
 use crate::utils::{generate_api_key, resolve_auth_dir};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,7 +40,11 @@ pub struct ConfiguredModel {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimeoutConfig {
+    /// The whole-request deadline of a request the client did not stream.
     pub messages_ms: u64,
+    /// The longest a streamed reply may send nothing, before its response starts and between
+    /// chunks; a stream that keeps sending has no deadline. Codex is streamed upstream even
+    /// when the client did not ask, and there this is that request's whole-request deadline.
     pub stream_messages_ms: u64,
     pub count_tokens_ms: u64,
 }
@@ -462,7 +467,9 @@ pub fn normalize_base_url(url: &str) -> &str {
 ///
 /// Returns an error when `id` names a built-in Provider or contains `/`.
 pub fn validate_provider_id(id: &str) -> Result<()> {
-    if matches!(id, "anthropic" | "codex" | "claude") {
+    // Every name a built-in Provider answers to, aliases included: an entry under one of them
+    // is shadowed by the built-in Pool's prefix and writes into that Pool's usage.json.
+    if id.parse::<ProviderKind>().is_ok() {
         bail!("providers: {id} is a built-in provider name");
     }
     // An allowlist, not a denylist. This id becomes a directory name

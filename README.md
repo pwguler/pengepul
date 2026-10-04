@@ -1,6 +1,6 @@
 # pengepul
 
-Run your own API relay for your AI subscriptions. Log in your Claude and ChatGPT/Codex
+Run your own API relay for your AI subscriptions. Log in your Claude, ChatGPT/Codex and Grok
 accounts once and every request is served from the pool, so your harness runs on your
 subscription instead of a per-token key.
 
@@ -24,15 +24,17 @@ From source: `cargo install --git https://github.com/pwguler/pengepul.git --lock
 ```sh
 pengepul login --provider anthropic # authorize an Anthropic account
 pengepul login --provider codex # authorize a ChatGPT/Codex account
+pengepul login --provider grok # authorize a grok.com account
 pengepul serve # binds 127.0.0.1:8317
 pengepul serve --host 0.0.0.0 --port 8317 # reachable across your network
 ```
 
-Log in more than once per provider to pool accounts; requests rotate across them.
-Credentials live in `~/.pengepul` (`0600`); a running relay picks up a fresh login on
-restart or `pengepul accounts --reload`. Read the key clients use with `pengepul config
-api-key`. That key alone guards your subscriptions, so keep it secret and prefer a trusted
-network or an SSH tunnel.
+Log in more than once per provider to pool accounts; requests rotate across them. A grok
+account serves `grok-4.6` and `grok-4.5`, each with a 500k context window, named bare or
+as `grok/grok-4.6`. Credentials live in `~/.pengepul` (`0600`); a running relay picks up a
+fresh login on restart or `pengepul accounts --reload`. Read the key clients use with
+`pengepul config api-key`. That key alone guards your subscriptions, so keep it secret and
+prefer a trusted network or an SSH tunnel.
 
 ### OpenAI-compatible endpoints
 
@@ -46,10 +48,11 @@ systemctl --user restart pengepul   # or: pengepul service restart
 ```
 
 A provider id becomes a directory under the auth dir: letters, digits, `.`, `-`, `_`;
-never `.` or `..`, which a filesystem reads as somewhere else. Providers load at startup, so a new one needs a restart. Registration
-only adds: an id already present with a different `base-url` errors, naming the URL it
-kept, so a mistyped flag cannot move live traffic. Repeating is safe; changing or removing
-one means editing the file.
+never `.` or `..`, which a filesystem reads as somewhere else, and never a built-in's
+name (`anthropic`, `claude`, `codex`, `grok`). Providers load at startup, so a new one
+needs a restart. Registration only adds: an id already present with a different
+`base-url` errors, naming the URL it kept, so a mistyped flag cannot move live traffic.
+Repeating is safe; changing or removing one means editing the file.
 
 Registration rewrites `config.yaml`: values survive, comments do not. It holds a
 `config.yaml.lock` for the write, and a killed registration can leave that lock behind.
@@ -109,7 +112,12 @@ port first:
 ```sh
 ssh -L 54545:localhost:54545 user@host # anthropic
 ssh -L 1455:localhost:1455 user@host # codex
+ssh -L 14550:127.0.0.1:14550 user@host # grok
 ```
+
+For grok the tunnel is optional: when the browser cannot reach its callback, auth.x.ai
+shows a code instead, and pasting that code, or the full callback URL, at the login prompt
+finishes the same login.
 
 ## Clients
 
@@ -187,7 +195,7 @@ curl -sS http://127.0.0.1:8317/v1/chat/completions \
 
 ```sh
 pengepul serve # start the relay (the default with no subcommand)
-pengepul login --provider anthropic # authorize an account in a browser (--provider codex for Codex)
+pengepul login --provider anthropic # authorize an account in a browser (--provider codex or grok for the others)
 pengepul login --provider groq --key $KEY # save a static key for a configured provider
 pengepul login --provider groq --base-url $URL --key $KEY # register a new OpenAI-compatible provider and save its key
 pengepul status # health of the running relay: build, uptime, what each pool can serve
@@ -201,7 +209,8 @@ pengepul service install|start|stop|restart|status|uninstall|logs # manage the u
 
 Run `pengepul <command> --help` for flags. The service is user-scoped, so
 `systemctl status pengepul` will not find it: use `pengepul service status` or add
-`--user`.
+`--user`. On SIGTERM or SIGINT (a service stop, or Ctrl-C) the relay takes no new
+connections and gives the requests in flight up to 15 s to finish, then exits.
 
 ## Reference
 
@@ -230,8 +239,13 @@ providers:
         max-output-tokens: 32768
 body-limit: 200mb # largest request body the relay will read; empty means unlimited
 timeouts:
-  messages-ms: 120000
-  stream-messages-ms: 600000
+  messages-ms: 120000 # deadline for a whole reply the client did not stream
+  stream-messages-ms: 600000 # longest a streamed reply may send nothing
   count-tokens-ms: 30000
 debug: off # off | errors | verbose
 ```
+
+`stream-messages-ms` is a silence limit, not a deadline: a streamed reply runs as long as it
+keeps sending, and fails once it sends nothing for that long, before it starts or between
+chunks. codex streams every request upstream, so there it is also the deadline of a reply
+the client did not stream.
