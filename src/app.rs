@@ -3586,15 +3586,12 @@ fn until_silent(mut input: UpstreamSseStream, silence: Duration) -> UpstreamSseS
 /// HTTP date. `None` when neither is sent or neither parses.
 fn retry_hint_from(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
     let header = |name: &str| headers.get(name)?.to_str().ok().map(str::trim);
-    if let Some(hint) = header("retry-after-ms")
-        .and_then(|value| value.parse::<f64>().ok())
-        .and_then(|ms| seconds_hint(ms / 1000.0))
-    {
-        return Some(hint);
+    if let Some(ms) = header("retry-after-ms").and_then(decimal) {
+        return Some(seconds_hint(ms / 1000.0));
     }
     let value = header("retry-after")?;
-    if let Ok(seconds) = value.parse::<f64>() {
-        return seconds_hint(seconds);
+    if let Some(seconds) = decimal(value) {
+        return Some(seconds_hint(seconds));
     }
     // An HTTP date; one already past asks for no wait at all.
     let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
@@ -3605,10 +3602,21 @@ fn retry_hint_from(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
     )
 }
 
-/// A wait of `seconds`. A negative one is no hint; one too long for a `Duration` is the
-/// longest there is, which the Cooldown caps anyway.
-fn seconds_hint(seconds: f64) -> Option<Duration> {
-    (seconds >= 0.0).then(|| Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX))
+/// A plain decimal number: digits and at most one point. `f64`'s own parser also takes `inf`,
+/// `NaN`, a sign and an exponent, none of which is a wait a vendor would name.
+fn decimal(value: &str) -> Option<f64> {
+    let digits = value.bytes().filter(u8::is_ascii_digit).count();
+    let points = value.bytes().filter(|&byte| byte == b'.').count();
+    if digits == 0 || points > 1 || digits + points != value.len() {
+        return None;
+    }
+    value.parse().ok()
+}
+
+/// A wait of `seconds`. One too long for a `Duration` is the longest there is, which the
+/// Cooldown caps anyway.
+fn seconds_hint(seconds: f64) -> Duration {
+    Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX)
 }
 
 /// The grok relay's chat endpoint. `/v1` rides on the base constant because
@@ -3862,10 +3870,19 @@ mod tests {
             hint(&[("retry-after", "Thu, 09 Oct 2025 07:53:20 GMT")]),
             Some(Duration::ZERO)
         );
-        // Absent, unparseable and negative are no hint at all.
+        // Absent, unparseable and negative are no hint at all, and so is anything but a plain
+        // decimal number: f64's own parser would take `inf` and `1e3`.
         assert_eq!(hint(&[]), None);
         assert_eq!(hint(&[("retry-after", "soon")]), None);
         assert_eq!(hint(&[("retry-after", "-5")]), None);
+        assert_eq!(hint(&[("retry-after", "inf")]), None);
+        assert_eq!(hint(&[("retry-after", "1e3")]), None);
+        assert_eq!(hint(&[("retry-after-ms", "NaN")]), None);
+        // A fraction is a number, as the vendors' SDKs read it.
+        assert_eq!(
+            hint(&[("retry-after", "1.5")]),
+            Some(Duration::from_millis(1_500))
+        );
     }
 
     #[test]
