@@ -215,6 +215,13 @@ async fn drains_on(signal: &str) {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // A relay that does not drain exits at the signal and cuts the request. Holding it a while
+    // longer keeps the test from passing by racing that exit.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        relay.child.try_wait().expect("poll the relay").is_none(),
+        "SIG{signal}: the relay exited with a request in flight"
+    );
     endpoint.release.notify_one();
     let (status, body) = in_flight
         .await
