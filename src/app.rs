@@ -4,7 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context as _;
 use async_stream::try_stream;
@@ -76,11 +76,15 @@ pub struct UpstreamRequest {
 pub struct UpstreamJsonResponse {
     pub status: StatusCode,
     pub body: Value,
+    /// How long the upstream asked to be left alone (`retry-after-ms` or `retry-after`).
+    pub retry_hint: Option<Duration>,
 }
 
 pub struct UpstreamSseResponse {
     pub status: StatusCode,
     pub body: UpstreamSseStream,
+    /// How long the upstream asked to be left alone (`retry-after-ms` or `retry-after`).
+    pub retry_hint: Option<Duration>,
 }
 
 pub trait UpstreamClient: Send + Sync {
@@ -1355,8 +1359,15 @@ async fn count_tokens(State(state): State<AppState>, headers: HeaderMap, body: B
                 // the account's failure streak.
                 record_provider_success(&state, provider.clone(), &account, None, &model).await;
             } else {
-                record_provider_failure(&state, provider.clone(), &account, response.status, None)
-                    .await;
+                record_provider_failure(
+                    &state,
+                    provider.clone(),
+                    &account,
+                    response.status,
+                    None,
+                    response.retry_hint,
+                )
+                .await;
             }
             (response.status, Json(response.body)).into_response()
         }
@@ -1367,6 +1378,7 @@ async fn count_tokens(State(state): State<AppState>, headers: HeaderMap, body: B
                 &account,
                 StatusCode::BAD_GATEWAY,
                 Some(&error_chain(&error)),
+                None,
             )
             .await;
             upstream_error_response(provider, &error)
@@ -1682,6 +1694,7 @@ async fn route_generic_chat_request(
                     account.provider.clone(),
                     account,
                     response.status,
+                    response.retry_hint,
                     model,
                 )
                 .await;
@@ -1751,6 +1764,7 @@ async fn route_grok_request(
                     account.provider.clone(),
                     account,
                     response.status,
+                    response.retry_hint,
                     model,
                 )
                 .await;
@@ -1815,6 +1829,7 @@ async fn route_codex_request(
                     account.provider.clone(),
                     account,
                     response.status,
+                    response.retry_hint,
                     model,
                 )
                 .await;
@@ -1889,6 +1904,7 @@ async fn route_anthropic_request(
                     account.provider.clone(),
                     account,
                     response.status,
+                    response.retry_hint,
                     model,
                 )
                 .await;
@@ -1931,6 +1947,7 @@ async fn stream_accounting(
     provider: ProviderId,
     account: &AvailableAccount,
     status: StatusCode,
+    retry_hint: Option<Duration>,
     model: &str,
 ) -> Option<StreamAccounting> {
     if status.is_success() {
@@ -1942,7 +1959,7 @@ async fn stream_accounting(
             owed: Arc::new(AtomicBool::new(true)),
         })
     } else {
-        record_provider_failure(state, provider, account, status, None).await;
+        record_provider_failure(state, provider, account, status, None, retry_hint).await;
         None
     }
 }
@@ -1964,7 +1981,15 @@ async fn record_json_result(
         )
         .await;
     } else {
-        record_provider_failure(state, provider, account, response.status, None).await;
+        record_provider_failure(
+            state,
+            provider,
+            account,
+            response.status,
+            None,
+            response.retry_hint,
+        )
+        .await;
     }
 }
 
@@ -1980,6 +2005,7 @@ async fn upstream_failure_response(
         account,
         StatusCode::BAD_GATEWAY,
         Some(&error_chain(error)),
+        None,
     )
     .await;
     upstream_error_response(provider, error)
@@ -2402,7 +2428,7 @@ async fn next_provider_account(
             ));
         }
         Err(error) => {
-            manager.record_failure(&email, "auth", Some(&error_chain(&error)));
+            manager.record_failure(&email, "auth", Some(&error_chain(&error)), None);
             return Err(AppError::provider(
                 StatusCode::BAD_GATEWAY,
                 format!("failed to refresh {provider} account: {error}"),
@@ -2571,12 +2597,15 @@ fn error_chain(error: &anyhow::Error) -> String {
     format!("{error:#}")
 }
 
+/// Count a failed request against its account. A 429 or 503 that carried a retry hint cools
+/// the account for the longer of the hint and its backoff; any other status's hint is ignored.
 async fn record_provider_failure(
     state: &AppState,
     provider: ProviderId,
     account: &AvailableAccount,
     status: StatusCode,
     detail: Option<&str>,
+    retry_hint: Option<Duration>,
 ) {
     // 400/402 by themselves say nothing about account health — a malformed request is
     // the client's fault, and a drained balance is recorded by the failover path with
@@ -2590,7 +2619,16 @@ async fn record_provider_failure(
         record_provider_refusal(state, &provider, account).await;
         return;
     }
-    record_provider_failure_kind(state, provider, account, classify_status(status), detail).await;
+    let retry_hint = retry_hint.filter(|_| matches!(status.as_u16(), 429 | 503));
+    record_provider_failure_kind(
+        state,
+        provider,
+        account,
+        classify_status(status),
+        detail,
+        retry_hint,
+    )
+    .await;
 }
 
 async fn record_provider_failure_kind(
@@ -2599,6 +2637,7 @@ async fn record_provider_failure_kind(
     account: &AvailableAccount,
     kind: &'static str,
     detail: Option<&str>,
+    retry_hint: Option<Duration>,
 ) {
     let mut manager = match provider.kind {
         ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
@@ -2611,7 +2650,7 @@ async fn record_provider_failure_kind(
             manager.lock().await
         }
     };
-    manager.record_failure(account.token.email.as_str(), kind, detail);
+    manager.record_failure(account.token.email.as_str(), kind, detail, retry_hint);
 }
 
 fn no_account_message(
@@ -3003,6 +3042,7 @@ async fn record_stream_failure(accounting: Option<&StreamAccounting>, detail: &s
             &accounting.account,
             StatusCode::BAD_GATEWAY,
             Some(detail),
+            None,
         )
         .await;
     }
@@ -3448,6 +3488,7 @@ async fn send_json(
         .await?;
     let mut status = StatusCode::from_u16(response.status().as_u16())?;
     let headers = response.headers().clone();
+    let retry_hint = retry_hint_from(&headers, SystemTime::now());
     let bytes = response.bytes().await?;
     let body = decode_upstream_body(&headers, &bytes, &model);
     if status.is_success() && is_decoded_upstream_error(&body) {
@@ -3458,7 +3499,11 @@ async fn send_json(
     } else {
         tracing::warn!(%url, model = %model, status = status.as_u16(), "upstream error response");
     }
-    Ok(UpstreamJsonResponse { status, body })
+    Ok(UpstreamJsonResponse {
+        status,
+        body,
+        retry_hint,
+    })
 }
 
 async fn send_get(
@@ -3507,6 +3552,7 @@ async fn send_stream(
     }
     Ok(UpstreamSseResponse {
         status,
+        retry_hint: retry_hint_from(response.headers(), SystemTime::now()),
         body: until_silent(
             Box::pin(response.bytes_stream().map_err(anyhow::Error::from)),
             silence,
@@ -3533,6 +3579,36 @@ fn until_silent(mut input: UpstreamSseStream, silence: Duration) -> UpstreamSseS
             }
         }
     })
+}
+
+/// How long an upstream response asks to be left alone: `retry-after-ms`, the finer of the
+/// two and the one the vendors' own SDKs read first, else `retry-after` as seconds or as an
+/// HTTP date. `None` when neither is sent or neither parses.
+fn retry_hint_from(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
+    let header = |name: &str| headers.get(name)?.to_str().ok().map(str::trim);
+    if let Some(hint) = header("retry-after-ms")
+        .and_then(|value| value.parse::<f64>().ok())
+        .and_then(|ms| seconds_hint(ms / 1000.0))
+    {
+        return Some(hint);
+    }
+    let value = header("retry-after")?;
+    if let Ok(seconds) = value.parse::<f64>() {
+        return seconds_hint(seconds);
+    }
+    // An HTTP date; one already past asks for no wait at all.
+    let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    Some(
+        SystemTime::from(date)
+            .duration_since(now)
+            .unwrap_or_default(),
+    )
+}
+
+/// A wait of `seconds`. A negative one is no hint; one too long for a `Duration` is the
+/// longest there is, which the Cooldown caps anyway.
+fn seconds_hint(seconds: f64) -> Option<Duration> {
+    (seconds >= 0.0).then(|| Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX))
 }
 
 /// The grok relay's chat endpoint. `/v1` rides on the base constant because
@@ -3596,6 +3672,7 @@ async fn send_grok_stream(
     }
     Ok(UpstreamSseResponse {
         status: first.status,
+        retry_hint: first.retry_hint,
         body: Box::pin(futures_util::stream::once(async move {
             Ok::<Bytes, anyhow::Error>(Bytes::from(bytes))
         })),
@@ -3746,6 +3823,52 @@ mod tests {
     }
 
     #[test]
+    fn a_retry_hint_reads_each_spelling_and_nothing_else() {
+        use std::time::{Duration, SystemTime};
+        // 2025-10-09T08:53:20Z
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_760_000_000);
+        let hint = |pairs: &[(&'static str, &str)]| {
+            let mut headers = HeaderMap::new();
+            for (name, value) in pairs {
+                headers.insert(*name, value.parse().expect("header value"));
+            }
+            super::retry_hint_from(&headers, now)
+        };
+
+        assert_eq!(
+            hint(&[("retry-after", "3600")]),
+            Some(Duration::from_hours(1))
+        );
+        assert_eq!(
+            hint(&[("retry-after-ms", "1500")]),
+            Some(Duration::from_millis(1_500))
+        );
+        // The finer spelling wins where both are sent, and one that does not parse yields to
+        // the other.
+        assert_eq!(
+            hint(&[("retry-after-ms", "1500"), ("retry-after", "2")]),
+            Some(Duration::from_millis(1_500))
+        );
+        assert_eq!(
+            hint(&[("retry-after-ms", "soon"), ("retry-after", "2")]),
+            Some(Duration::from_secs(2))
+        );
+        // An HTTP date is the wait until then; one already past asks for none.
+        assert_eq!(
+            hint(&[("retry-after", "Thu, 09 Oct 2025 09:53:20 GMT")]),
+            Some(Duration::from_hours(1))
+        );
+        assert_eq!(
+            hint(&[("retry-after", "Thu, 09 Oct 2025 07:53:20 GMT")]),
+            Some(Duration::ZERO)
+        );
+        // Absent, unparseable and negative are no hint at all.
+        assert_eq!(hint(&[]), None);
+        assert_eq!(hint(&[("retry-after", "soon")]), None);
+        assert_eq!(hint(&[("retry-after", "-5")]), None);
+    }
+
+    #[test]
     fn upstream_request_sends_single_content_type() {
         let headers = BTreeMap::from([
             ("Content-Type".to_string(), "application/json".to_string()),
@@ -3799,6 +3922,7 @@ mod tests {
                 .push(request.account.token.email);
             Box::pin(async {
                 Ok(UpstreamJsonResponse {
+                    retry_hint: None,
                     status: StatusCode::OK,
                     body: json!({
                         "id": "msg_1",
@@ -3857,6 +3981,7 @@ mod tests {
             let (input, cache_read) = (self.input, self.cache_read);
             Box::pin(async move {
                 Ok(UpstreamJsonResponse {
+                    retry_hint: None,
                     status: StatusCode::OK,
                     body: json!({
                         "id": "msg_1",

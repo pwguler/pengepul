@@ -155,7 +155,7 @@ async fn failure_cooldown_doubles_from_one_second() {
 
     // regardless of failure kind, consecutive failures back off 1s, 2s, 4s, …
     for expected in [1.0, 2.0, 4.0] {
-        manager.record_failure("codex-abc12345", "auth", Some("Insufficient balance"));
+        manager.record_failure("codex-abc12345", "auth", Some("Insufficient balance"), None);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -220,7 +220,7 @@ async fn a_credential_that_never_succeeded_is_parked_past_the_transient_error_ce
     // 2^12 seconds is past the transient ceiling, so the never-succeeded cap is
     // what the cooldown settles against.
     for _ in 0..13 {
-        manager.record_failure("codex-abc12345", "upstream", Some("400"));
+        manager.record_failure("codex-abc12345", "upstream", Some("400"), None);
     }
     let parked = remaining(&mut manager);
     assert!(
@@ -232,7 +232,7 @@ async fn a_credential_that_never_succeeded_is_parked_past_the_transient_error_ce
     // being treated as good and the five-minute ceiling applies again.
     manager.record_success("codex-abc12345", None, "gpt-5.6");
     for _ in 0..13 {
-        manager.record_failure("codex-abc12345", "upstream", Some("400"));
+        manager.record_failure("codex-abc12345", "upstream", Some("400"), None);
     }
     let transient = remaining(&mut manager);
     assert!(
@@ -393,7 +393,7 @@ async fn the_selection_says_whether_affinity_was_honored_or_fell_through() {
 
     // Account cooled: the preference exists but could not be honored, and saying
     // `honored` here is exactly the lie that would hide a cache-moving failure.
-    manager.record_failure(&chosen, "upstream", Some("503"));
+    manager.record_failure(&chosen, "upstream", Some("503"), None);
     let fallen_through = manager.account_for("conversation-a");
     assert_eq!(fallen_through.affinity.as_str(), "rotation");
 }
@@ -687,7 +687,7 @@ async fn a_pool_of_one_never_earns_a_cooldown() {
         match kind {
             "billing" => manager.record_billing_cooldown("solo@example.com", detail),
             "auth" => manager.record_refresh_exhausted("solo@example.com", "invalid_grant"),
-            _ => manager.record_failure("solo@example.com", kind, Some(detail)),
+            _ => manager.record_failure("solo@example.com", kind, Some(detail), None),
         }
 
         let snapshot = record(&mut manager, "solo@example.com");
@@ -769,7 +769,7 @@ async fn usage_counters_survive_a_manager_rebuild() {
         }),
         "claude-fable-5-1",
     );
-    manager.record_failure("k@example.com", "upstream", Some("boom"));
+    manager.record_failure("k@example.com", "upstream", Some("boom"), None);
 
     // AC-1..AC-3: a fresh manager over the same auth dir sees the totals.
     let mut rebuilt = never_refresh_manager(tmp.path().to_path_buf());
@@ -1098,7 +1098,7 @@ async fn outcomes_accumulate_into_one_bucket_per_local_day() {
         }),
         "claude-fable-5-1",
     );
-    manager.record_failure("k@example.com", "upstream", Some("boom"));
+    manager.record_failure("k@example.com", "upstream", Some("boom"), None);
 
     let days = manager.snapshots()[0]["days"].clone();
     let days = days.as_array().expect("days array");
@@ -1207,7 +1207,7 @@ async fn a_reauth_lockout_lands_in_the_daily_bucket_too() {
     manager.load().expect("load");
 
     // Two requests, two outcomes: the relay counts an attempt before each.
-    manager.record_failure("k@example.com", "upstream", Some("boom"));
+    manager.record_failure("k@example.com", "upstream", Some("boom"), None);
     manager.record_refresh_exhausted("k@example.com", "expired");
 
     let snapshot = &manager.snapshots()[0];
@@ -1503,7 +1503,9 @@ async fn no_sequence_of_outcomes_can_break_the_invariant() {
         for call in &calls {
             match *call {
                 "success" => manager.record_success("k@example.com", Some(&usage), "model-a"),
-                "failure" => manager.record_failure("k@example.com", "upstream", Some("boom")),
+                "failure" => {
+                    manager.record_failure("k@example.com", "upstream", Some("boom"), None);
+                }
                 "refusal" => manager.record_refusal("k@example.com"),
                 "exhausted" => manager.record_refresh_exhausted("k@example.com", "expired"),
                 "billing" => manager.record_billing_cooldown("k@example.com", "insufficient"),
@@ -1543,7 +1545,7 @@ async fn the_invariant_holds_across_a_restart() {
     save_token(tmp.path(), &static_token("k@example.com")).expect("save token");
     let mut manager = never_refresh_manager(tmp.path().to_path_buf());
     manager.load().expect("load");
-    manager.record_failure("k@example.com", "upstream", Some("boom"));
+    manager.record_failure("k@example.com", "upstream", Some("boom"), None);
 
     let mut rebuilt = never_refresh_manager(tmp.path().to_path_buf());
     rebuilt.load().expect("reload");
@@ -1740,7 +1742,12 @@ async fn a_reauth_lockout_is_not_clobbered_by_the_paired_failure() {
     };
 
     manager.record_refresh_exhausted("k@example.com", "expired");
-    manager.record_failure("k@example.com", "auth", Some("token refresh declined"));
+    manager.record_failure(
+        "k@example.com",
+        "auth",
+        Some("token refresh declined"),
+        None,
+    );
 
     let snapshot = record(&mut manager, "k@example.com");
     let remaining = snapshot["cooldownUntil"].as_f64().unwrap_or(0.0) - now();
@@ -1809,7 +1816,7 @@ async fn a_pinned_account_on_cooldown_falls_through_to_rotation() {
     assert_eq!(again.token.email, pinned);
 
     // Once it is benched, the conversation moves rather than stalling.
-    manager.record_failure(&pinned, "upstream", Some("503"));
+    manager.record_failure(&pinned, "upstream", Some("503"), None);
     let after = manager
         .account_for("conversation-a")
         .account
@@ -1872,7 +1879,7 @@ async fn a_conversation_that_failed_over_stays_on_the_account_that_rescued_it() 
 
     // That upstream rejects it, and attempt two of the same request falls
     // through to the account that goes on to serve the client.
-    manager.record_failure(&drew, "billing", Some("insufficient credits"));
+    manager.record_failure(&drew, "billing", Some("insufficient credits"), None);
     let rescued = manager
         .account_for("conversation-a")
         .account
@@ -2331,7 +2338,7 @@ async fn enable_clears_a_cooldown_and_the_streak() {
     let mut manager = pool_of_two(tmp.path());
     manager.record_success("a@example.com", None, "deepseek-v4.1-flash");
     for _ in 0..4 {
-        manager.record_failure("a@example.com", "network", None);
+        manager.record_failure("a@example.com", "network", None, None);
     }
     assert_eq!(record(&mut manager, "a@example.com")["available"], false);
 
@@ -2345,7 +2352,7 @@ async fn enable_clears_a_cooldown_and_the_streak() {
     assert_eq!(a["cooldownUntil"], 0.0);
     assert!(served(&mut manager, 2).contains(&"a@example.com".to_string()));
     // The streak is reset: the next failure earns the base second, not 16.
-    manager.record_failure("a@example.com", "network", None);
+    manager.record_failure("a@example.com", "network", None, None);
     let remaining = record(&mut manager, "a@example.com")["cooldownUntil"]
         .as_f64()
         .expect("cooldownUntil")
@@ -2551,7 +2558,7 @@ async fn one_enabled_account_beside_disabled_ones_earns_no_cooldown() {
     let mut manager = pool_of_two(tmp.path());
     manager.disable("b@example.com").expect("disable b");
 
-    manager.record_failure("a@example.com", "network", None);
+    manager.record_failure("a@example.com", "network", None, None);
 
     assert_eq!(record(&mut manager, "a@example.com")["cooldownUntil"], 0.0);
     assert_eq!(served(&mut manager, 1), ["a@example.com"]);
@@ -2598,4 +2605,93 @@ impl ExpectAccount for pengepul::accounts::AccountResult {
     fn expect_account(self) -> String {
         self.account.expect("an account").token.email
     }
+}
+
+// ---------------------------------------------------------------------------
+// cli-hardening: a retry hint lengthens a Cooldown, never shortens one
+// ---------------------------------------------------------------------------
+
+const AN_HOUR: std::time::Duration = std::time::Duration::from_hours(1);
+
+fn cooldown_left(manager: &mut AccountManager, email: &str) -> f64 {
+    record(manager, email)["cooldownUntil"]
+        .as_f64()
+        .expect("cooldownUntil")
+        - unix_now()
+}
+
+#[tokio::test]
+async fn a_retry_hint_never_shortens_a_cooldown() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = pool_of_two(tmp.path());
+
+    // Three failures walk the backoff to 4 s, so the fourth earns 8 s, and a 2 s hint is
+    // shorter than that.
+    for _ in 0..3 {
+        manager.record_failure("a@example.com", "rate_limit", None, None);
+    }
+    manager.record_failure(
+        "a@example.com",
+        "rate_limit",
+        None,
+        Some(std::time::Duration::from_secs(2)),
+    );
+    let left = cooldown_left(&mut manager, "a@example.com");
+    assert!(
+        (7.5..=8.0).contains(&left),
+        "a short hint cut the 8 s backoff to {left}s"
+    );
+    // And a hint longer than the backoff is the one that holds.
+    manager.record_failure(
+        "a@example.com",
+        "rate_limit",
+        None,
+        Some(std::time::Duration::from_mins(1)),
+    );
+    let left = cooldown_left(&mut manager, "a@example.com");
+    assert!(
+        (59.5..=60.0).contains(&left),
+        "a 60 s hint over a 16 s backoff cooled {left}s"
+    );
+
+    // A Reauth's day is longer than any hint an hour long.
+    manager.record_refresh_exhausted("a@example.com", "invalid_grant");
+    manager.record_failure("a@example.com", "rate_limit", None, Some(AN_HOUR));
+    let left = cooldown_left(&mut manager, "a@example.com");
+    assert!(
+        (86_390.0..=86_400.0).contains(&left),
+        "an hour's hint cut the reauth cooldown to {left}s"
+    );
+    assert_eq!(
+        record(&mut manager, "a@example.com")["lastError"],
+        "refresh token invalid_grant; re-run login for commandcode",
+        "a hint that set no cooldown rewrote the reason for the one in place"
+    );
+}
+
+#[tokio::test]
+async fn a_pool_of_one_earns_no_cooldown_from_a_retry_hint() {
+    // ADR-0027 with a hint: the vendor asked for an hour, and a Pool of one still has no
+    // sibling to hand the next request to.
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("solo@example.com")).expect("save token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+
+    manager.record_failure("solo@example.com", "rate_limit", None, Some(AN_HOUR));
+
+    let snapshot = record(&mut manager, "solo@example.com");
+    assert_eq!(snapshot["available"], true);
+    assert_eq!(snapshot["cooldownUntil"], 0.0);
+    assert_eq!(snapshot["lastError"], "rate_limit");
+
+    // One sibling and the same hint cools it for the hour it names.
+    add_sibling(tmp.path(), "zz-sibling@example.com");
+    manager.reload().expect("reach two accounts");
+    manager.record_failure("solo@example.com", "rate_limit", None, Some(AN_HOUR));
+    let left = cooldown_left(&mut manager, "solo@example.com");
+    assert!(
+        (3_599.0..=3_600.0).contains(&left),
+        "an hour's hint cooled a Pool of two for {left}s"
+    );
 }
