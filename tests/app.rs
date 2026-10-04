@@ -5767,15 +5767,12 @@ fn relay_in_front_of(
     stream_ms: u64,
 ) -> axum::Router {
     save_token(auth_dir, &static_key_token("local", "key-1")).expect("save key");
-    let mut cfg = config(auth_dir.to_path_buf());
+    let mut cfg = config_with_static_provider("local", auth_dir.to_path_buf());
     cfg.timeouts.stream_messages_ms = stream_ms;
-    cfg.providers.insert(
-        "local".to_string(),
-        pengepul::config::ConfiguredProvider {
-            base_url: format!("http://{endpoint}/v1"),
-            models: BTreeMap::new(),
-        },
-    );
+    cfg.providers
+        .get_mut("local")
+        .expect("the local provider")
+        .base_url = format!("http://{endpoint}/v1");
     create_app(cfg)
 }
 
