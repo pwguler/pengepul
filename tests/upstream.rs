@@ -7,7 +7,7 @@ use pengepul::config::{
 use pengepul::types::{AvailableAccount, ProviderId, ProviderKind, TokenData};
 use pengepul::upstream::{
     RequestShape, anthropic_headers, apply_cloaking, build_beta_header, codex_headers,
-    generic_base_url, generic_chat_headers, normalize_codex_responses_body,
+    generic_base_url, generic_chat_headers, generic_headers, normalize_codex_responses_body,
 };
 use serde_json::{Value, json};
 
@@ -487,9 +487,9 @@ fn apply_cloaking_leaves_messages_containing_the_sentence_untouched() {
     );
 }
 
-#[test]
-fn generic_chat_headers_are_exactly_content_type_and_bearer() {
-    let account = AvailableAccount {
+/// A configured endpoint's account, holding the static key `gsk-secret`.
+fn static_key_account() -> AvailableAccount {
+    AvailableAccount {
         token: TokenData {
             access_token: "gsk-secret".to_string(),
             refresh_token: String::new(),
@@ -505,9 +505,12 @@ fn generic_chat_headers_are_exactly_content_type_and_bearer() {
         account_uuid: "acct".to_string(),
         provider: ProviderId::generic("groq"),
         chatgpt_account_id: None,
-    };
+    }
+}
 
-    let headers = generic_chat_headers(&account);
+#[test]
+fn generic_headers_are_exactly_content_type_and_bearer() {
+    let headers = generic_headers(&static_key_account());
 
     assert_eq!(headers.len(), 2, "exactly two headers: {headers:?}");
     assert_eq!(headers["Content-Type"], "application/json");
@@ -678,4 +681,36 @@ fn the_checkpoint_inherits_the_retention_the_client_asked_for() {
         cloaked["messages"][20]["content"][0]["cache_control"], long,
         "the checkpoint dropped the client's 1h retention"
     );
+}
+
+/// The session header is `OpenCode`'s, so only its own host is sent it: `opencode.ai` or a
+/// subdomain, in any case. A host that merely contains the name, and every other configured
+/// endpoint, gets the bare two headers.
+#[test]
+fn only_an_opencode_host_is_sent_the_session() {
+    let account = static_key_account();
+    let session = |base_url: &str| {
+        generic_chat_headers(&account, base_url, "conversation-a")
+            .get("x-opencode-session")
+            .cloned()
+    };
+
+    let opencode = session("https://opencode.ai/zen/go/v1");
+    assert!(opencode.is_some(), "opencode.ai was not sent the session");
+    assert_eq!(session("https://zen.opencode.ai/v1"), opencode);
+    assert_eq!(session("https://OpenCode.AI/zen/v1"), opencode);
+    for elsewhere in [
+        "https://openrouter.ai/api/v1",
+        "https://api.commandcode.ai/provider/v1",
+        "http://10.10.1.25:8000/v1",
+        "https://opencode.ai.example.com/v1",
+        "https://notopencode.ai/v1",
+        "not a url",
+    ] {
+        assert_eq!(
+            generic_chat_headers(&account, elsewhere, "conversation-a"),
+            generic_headers(&account),
+            "{elsewhere}"
+        );
+    }
 }

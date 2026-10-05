@@ -820,12 +820,12 @@ fn codex_arch() -> &'static str {
     }
 }
 
-/// Headers for a configured OpenAI-compatible endpoint: exactly the two the
-/// drill settled on — Content-Type and the bearer key. No cloaking, no session
-/// or stainless headers: there is no billing classifier to appease, and a
-/// minimal header set is what OpenAI-compatible endpoints expect.
+/// Headers for a configured OpenAI-compatible endpoint: Content-Type and the bearer key.
+/// No cloaking and no stainless headers: there is no Classifier to appease, and a
+/// minimal header set is what OpenAI-compatible endpoints expect (ADR-0011). A chat call to
+/// an `opencode.ai` host adds the conversation it belongs to, in [`generic_chat_headers`].
 #[must_use]
-pub fn generic_chat_headers(account: &AvailableAccount) -> BTreeMap<String, String> {
+pub fn generic_headers(account: &AvailableAccount) -> BTreeMap<String, String> {
     BTreeMap::from([
         ("Content-Type".to_string(), "application/json".to_string()),
         (
@@ -833,6 +833,33 @@ pub fn generic_chat_headers(account: &AvailableAccount) -> BTreeMap<String, Stri
             format!("Bearer {}", account.token.access_token),
         ),
     ])
+}
+
+/// [`generic_headers`] for a chat call. `OpenCode` Go answers a chat that names no session with
+/// 400 `MissingSessionID`, so a chat to an `opencode.ai` host also names the conversation it
+/// belongs to in `x-opencode-session`: a hash of the conversation key, the same on every turn
+/// of a conversation, and a valid header value whatever the client named its session. It is
+/// the one vendor rule on this path; every other configured endpoint is sent
+/// [`generic_headers`] alone.
+#[must_use]
+pub fn generic_chat_headers(
+    account: &AvailableAccount,
+    base_url: &str,
+    conversation: &str,
+) -> BTreeMap<String, String> {
+    let mut headers = generic_headers(account);
+    if is_opencode_host(base_url) {
+        headers.insert("x-opencode-session".to_string(), sha256_hex(conversation));
+    }
+    headers
+}
+
+/// Whether `base_url` points at `OpenCode`'s own host: `opencode.ai` or a subdomain of it.
+fn is_opencode_host(base_url: &str) -> bool {
+    url::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "opencode.ai" || host.ends_with(".opencode.ai"))
 }
 
 /// Headers for grok build's relay: the session token as bearer, the header

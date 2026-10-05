@@ -1,6 +1,8 @@
 # 11. Reintroduce a static-key provider class as configurable OpenAI-compatible endpoints
 
-Status: Accepted (inbound-dialect clause superseded by ADR-0016)
+Status: Accepted (inbound-dialect clause superseded by ADR-0016; header clause amended by
+one vendor rule: a chat call to an `opencode.ai` host also names its conversation in
+`x-opencode-session`, which OpenCode Go requires, see `generic_chat_headers`)
 
 ## Context
 
