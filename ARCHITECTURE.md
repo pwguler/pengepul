@@ -59,7 +59,11 @@ in files.
   runtime. A grok call carries the bearer and the two headers the grok Upstream
   (grok build's chat proxy) requires (`grok_chat_headers`), and no Cloaking; a
   426 naming a newer client version is retried once with it, and that version is
-  kept for the process lifetime (`learn_grok_client_version`).
+  kept for the process lifetime (`learn_grok_client_version`). A chat call to a
+  configured endpoint carries the bearer key; one to an `opencode.ai` host also names
+  its conversation in `x-opencode-session`, a hash of Rotation's key
+  (`generic_chat_headers`), because OpenCode Go refuses a chat without one. That host
+  check is the one vendor rule on the configured-endpoint path.
 - **Model catalog** (`models.rs`) — resolves a model id to exactly one Provider,
   and advertises every served model under its `<provider>/` prefix with the
   per-model metadata the client needs (context window, output cap, modalities,

@@ -47,8 +47,8 @@ use crate::types::{AvailableAccount, ProviderId, ProviderKind, UsageData};
 use crate::upstream::{
     ANTHROPIC_BASE_URL, CODEX_BASE_URL, CODEX_DEFAULT_CLI_VERSION, CODEX_MODELS_PATH,
     CODEX_RESPONSES_PATH, GROK_CHAT_BASE_URL, anthropic_headers, apply_cloaking, codex_headers,
-    generic_base_url, generic_chat_headers, grok_chat_headers, learn_grok_client_version,
-    normalize_codex_responses_body,
+    generic_base_url, generic_chat_headers, generic_headers, grok_chat_headers,
+    learn_grok_client_version, normalize_codex_responses_body,
 };
 use crate::utils::now_iso;
 use crate::utils::sha256_hex;
@@ -70,6 +70,11 @@ pub struct UpstreamRequest {
     pub request_headers: BTreeMap<String, String>,
     pub account: AvailableAccount,
     pub config: Arc<Config>,
+    /// The conversation the request belongs to, by the key Rotation prefers an Account by:
+    /// the session the harness named, its `prompt_cache_key`, or a hash of its cacheable
+    /// prefix. A chat call to an `opencode.ai` host sends a hash of it as
+    /// `x-opencode-session`.
+    pub conversation: String,
 }
 
 #[derive(Debug, Clone)]
@@ -458,7 +463,7 @@ impl UpstreamClient for HttpUpstreamClient {
             send_json(
                 client,
                 format!("{base_url}/chat/completions"),
-                generic_chat_headers(&request.account),
+                generic_chat_headers(&request.account, &base_url, &request.conversation),
                 request.body,
                 timeout_ms,
             )
@@ -474,7 +479,7 @@ impl UpstreamClient for HttpUpstreamClient {
             send_stream(
                 client,
                 format!("{base_url}/chat/completions"),
-                generic_chat_headers(&request.account),
+                generic_chat_headers(&request.account, &base_url, &request.conversation),
                 request.body,
                 request.config.timeouts.stream_messages_ms,
             )
@@ -525,7 +530,7 @@ impl UpstreamClient for HttpUpstreamClient {
                 ProviderKind::Generic => {
                     let base_url = generic_base_url(&config, &account.provider.id)
                         .context("generic provider missing from config")?;
-                    let headers = generic_chat_headers(&account);
+                    let headers = generic_headers(&account);
                     let body =
                         send_get(client, format!("{base_url}/models"), headers, timeout).await?;
                     let stated = &config
@@ -1332,13 +1337,8 @@ async fn count_tokens(State(state): State<AppState>, headers: HeaderMap, body: B
         )
         .into_response();
     }
-    let account = match next_provider_account(
-        &state,
-        provider.clone(),
-        &conversation_key(&headers, &body, RequestRoute::Messages),
-    )
-    .await
-    {
+    let conversation = conversation_key(&headers, &body, RequestRoute::Messages);
+    let account = match next_provider_account(&state, provider.clone(), &conversation).await {
         Ok(account) => account,
         Err(error) => return error.into_response(),
     };
@@ -1350,6 +1350,7 @@ async fn count_tokens(State(state): State<AppState>, headers: HeaderMap, body: B
             request_headers: headers_to_map(&headers),
             account: account.clone(),
             config: cloaked_config(&state),
+            conversation,
         })
         .await
     {
@@ -1394,16 +1395,24 @@ fn parse_request(state: &AppState, headers: &HeaderMap, body: &[u8]) -> Result<V
 }
 
 /// The parts of a client request routing needs: the provider its model
-/// resolves to, the id the upstream is asked for, and whether the client
-/// wants a stream.
+/// resolves to, the id the upstream is asked for, whether the client wants a
+/// stream, and the conversation it belongs to.
 struct ResolvedRequest {
     provider: ProviderId,
     model: String,
     client_wants_stream: bool,
+    /// Rotation's affinity key, which every upstream request carries too. Resolved once,
+    /// before the attempt loop: the body does not change between attempts.
+    conversation: String,
 }
 
 /// Resolve a client body to a routed request, or the error to return.
-fn resolve_route_request(state: &AppState, body: &Value) -> Result<ResolvedRequest, AppError> {
+fn resolve_route_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &Value,
+    route: RequestRoute,
+) -> Result<ResolvedRequest, AppError> {
     let Some(model_id) = required_model(body) else {
         return Err(AppError::simple(
             StatusCode::BAD_REQUEST,
@@ -1424,6 +1433,7 @@ fn resolve_route_request(state: &AppState, body: &Value) -> Result<ResolvedReque
     Ok(ResolvedRequest {
         model: upstream_model(model_id, &provider).to_string(),
         client_wants_stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
+        conversation: conversation_key(headers, body, route),
         provider,
     })
 }
@@ -1434,24 +1444,22 @@ async fn route_provider_request(
     body: &Value,
     route: RequestRoute,
 ) -> Response {
-    let request = match resolve_route_request(state, body) {
+    let request = match resolve_route_request(state, headers, body, route) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
     let ResolvedRequest {
         provider,
         model,
-        client_wants_stream,
-    } = request;
+        conversation,
+        ..
+    } = &request;
     let attempts = provider_account_count(state, provider.clone()).await.max(1);
-    // One request, one conversation: computed before the attempt loop, not
-    // inside it, because the body does not change between attempts.
-    let conversation = conversation_key(headers, body, route);
-    log_cacheable_prefix(&provider, route, &model, &conversation, body);
+    log_cacheable_prefix(provider, route, model, conversation, body);
     let mut last_response = None;
 
     for _ in 0..attempts {
-        let account = match next_provider_account(state, provider.clone(), &conversation).await {
+        let account = match next_provider_account(state, provider.clone(), conversation).await {
             Ok(account) => account,
             Err(error) if error.error_type == Some("token_refresh_failed") => {
                 last_response = Some(error.into_response());
@@ -1467,58 +1475,23 @@ async fn route_provider_request(
                 // relay exists. Responses has no client asking for it and
                 // stays a Refusal.
                 if matches!(route, RequestRoute::Chat | RequestRoute::Messages) {
-                    route_generic_chat_request(
-                        state,
-                        headers,
-                        body,
-                        route,
-                        &model,
-                        &account,
-                        client_wants_stream,
-                    )
-                    .await
+                    route_generic_chat_request(state, headers, body, route, &request, &account)
+                        .await
                 } else {
-                    return route_refusal(state, &provider, &account, route).await;
+                    return route_refusal(state, provider, &account, route).await;
                 }
             }
             ProviderKind::Codex => {
-                route_codex_request(
-                    state,
-                    headers,
-                    body,
-                    route,
-                    &model,
-                    &account,
-                    client_wants_stream,
-                )
-                .await
+                route_codex_request(state, headers, body, route, &request, &account).await
             }
             ProviderKind::Grok => {
                 // Every inbound dialect translates onto the relay's chat
                 // dialect, so nothing is refused here. A future route must
                 // decide: Translation::between forces the choice.
-                route_grok_request(
-                    state,
-                    headers,
-                    body,
-                    route,
-                    &model,
-                    &account,
-                    client_wants_stream,
-                )
-                .await
+                route_grok_request(state, headers, body, route, &request, &account).await
             }
             ProviderKind::Anthropic => {
-                route_anthropic_request(
-                    state,
-                    headers,
-                    body,
-                    route,
-                    &model,
-                    &account,
-                    client_wants_stream,
-                )
-                .await
+                route_anthropic_request(state, headers, body, route, &request, &account).await
             }
         };
         if !should_retry_upstream_status(response.status())
@@ -1536,7 +1509,7 @@ async fn route_provider_request(
             StatusCode::SERVICE_UNAVAILABLE,
             format!("no available {provider} account"),
             "no_account_for_provider",
-            provider,
+            provider.clone(),
         )
         .into_response()
     })
@@ -1669,10 +1642,11 @@ async fn route_generic_chat_request(
     headers: &HeaderMap,
     body: &Value,
     route: RequestRoute,
-    model: &str,
+    request: &ResolvedRequest,
     account: &AvailableAccount,
-    client_wants_stream: bool,
 ) -> Response {
+    let model = request.model.as_str();
+    let client_wants_stream = request.client_wants_stream;
     let mut upstream_body = upstream_request_body(ProviderKind::Generic, route, body, model);
     if let Some(object) = upstream_body.as_object_mut() {
         object.insert("stream".to_string(), Value::Bool(client_wants_stream));
@@ -1685,6 +1659,7 @@ async fn route_generic_chat_request(
                 request_headers: headers_to_map(headers),
                 account: account.clone(),
                 config: cloaked_config(state),
+                conversation: request.conversation.clone(),
             })
             .await
         {
@@ -1719,6 +1694,7 @@ async fn route_generic_chat_request(
             request_headers: headers_to_map(headers),
             account: account.clone(),
             config: cloaked_config(state),
+            conversation: request.conversation.clone(),
         })
         .await
     {
@@ -1737,10 +1713,11 @@ async fn route_grok_request(
     headers: &HeaderMap,
     body: &Value,
     route: RequestRoute,
-    model: &str,
+    request: &ResolvedRequest,
     account: &AvailableAccount,
-    client_wants_stream: bool,
 ) -> Response {
+    let model = request.model.as_str();
+    let client_wants_stream = request.client_wants_stream;
     // Chat Completions is the dialect grok build's relay speaks; every
     // inbound dialect translates onto it, like the generic path.
     let mut upstream_body = upstream_request_body(ProviderKind::Grok, route, body, model);
@@ -1755,6 +1732,7 @@ async fn route_grok_request(
                 request_headers: headers_to_map(headers),
                 account: account.clone(),
                 config: cloaked_config(state),
+                conversation: request.conversation.clone(),
             })
             .await
         {
@@ -1789,6 +1767,7 @@ async fn route_grok_request(
             request_headers: headers_to_map(headers),
             account: account.clone(),
             config: cloaked_config(state),
+            conversation: request.conversation.clone(),
         })
         .await
     {
@@ -1807,10 +1786,11 @@ async fn route_codex_request(
     headers: &HeaderMap,
     body: &Value,
     route: RequestRoute,
-    model: &str,
+    request: &ResolvedRequest,
     account: &AvailableAccount,
-    client_wants_stream: bool,
 ) -> Response {
+    let model = request.model.as_str();
+    let client_wants_stream = request.client_wants_stream;
     let body = upstream_request_body(ProviderKind::Codex, route, body, model);
     if client_wants_stream {
         return match state
@@ -1820,6 +1800,7 @@ async fn route_codex_request(
                 request_headers: headers_to_map(headers),
                 account: account.clone(),
                 config: cloaked_config(state),
+                conversation: request.conversation.clone(),
             })
             .await
         {
@@ -1854,6 +1835,7 @@ async fn route_codex_request(
             request_headers: headers_to_map(headers),
             account: account.clone(),
             config: cloaked_config(state),
+            conversation: request.conversation.clone(),
         })
         .await
     {
@@ -1872,10 +1854,11 @@ async fn route_anthropic_request(
     headers: &HeaderMap,
     body: &Value,
     route: RequestRoute,
-    model: &str,
+    request: &ResolvedRequest,
     account: &AvailableAccount,
-    client_wants_stream: bool,
 ) -> Response {
+    let model = request.model.as_str();
+    let client_wants_stream = request.client_wants_stream;
     let body = upstream_request_body(ProviderKind::Anthropic, route, body, model);
     // The Cloaking sanitizer rewrites a harness's tool names and bot-persona
     // system prompt so the Classifier reads the request as first-party Claude
@@ -1895,6 +1878,7 @@ async fn route_anthropic_request(
                 request_headers: headers_to_map(headers),
                 account: account.clone(),
                 config: cloaked_config(state),
+                conversation: request.conversation.clone(),
             })
             .await
         {
@@ -1929,6 +1913,7 @@ async fn route_anthropic_request(
             request_headers: headers_to_map(headers),
             account: account.clone(),
             config: cloaked_config(state),
+            conversation: request.conversation.clone(),
         })
         .await
     {
@@ -4803,6 +4788,151 @@ mod tests {
             reasoning.push(qwen.reasoning);
         }
         assert_eq!(reasoning, [Some(true), None]);
+    }
+
+    /// A local chat-completions upstream that records the `x-opencode-session` each chat
+    /// carried, and answers plain or streamed as the body asks.
+    async fn serve_chat() -> (std::net::SocketAddr, Arc<Mutex<Vec<Option<String>>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("bound address");
+        let sessions = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&sessions);
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(
+                move |headers: HeaderMap, axum::Json(body): axum::Json<Value>| {
+                    let seen = Arc::clone(&seen);
+                    async move {
+                        seen.lock().expect("sessions lock").push(
+                            headers
+                                .get("x-opencode-session")
+                                .and_then(|value| value.to_str().ok())
+                                .map(ToOwned::to_owned),
+                        );
+                        if body["stream"] == true {
+                            axum::response::Response::builder()
+                                .header("content-type", "text/event-stream")
+                                .body(axum::body::Body::from(
+                                    "data: {\"choices\":[{\"delta\":{\"content\":\"pong\"}}]}\n\ndata: [DONE]\n\n",
+                                ))
+                                .expect("event stream")
+                        } else {
+                            axum::response::IntoResponse::into_response(axum::Json(json!({
+                                "choices": [{
+                                    "index": 0,
+                                    "message": {"role": "assistant", "content": "pong"},
+                                    "finish_reason": "stop"
+                                }]
+                            })))
+                        }
+                    }
+                },
+            ),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, sessions)
+    }
+
+    /// `OpenCode` Go refuses a chat that names no session, so a chat to an `opencode.ai` host
+    /// names its conversation in `x-opencode-session`: one value on every turn, plain or
+    /// streamed, another for another conversation, and a valid header value whatever the key
+    /// holds. No other configured endpoint is sent the header. Both hosts resolve to one
+    /// loopback upstream, so the host in the base URL is all that differs.
+    #[tokio::test]
+    async fn only_an_opencode_host_is_told_the_conversation() {
+        use futures_util::TryStreamExt as _;
+
+        let (addr, sessions) = serve_chat().await;
+        let client = super::HttpUpstreamClient {
+            client: reqwest::Client::builder()
+                .resolve("opencode.ai", addr)
+                .resolve("openrouter.ai", addr)
+                .build()
+                .expect("an HTTP client"),
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(tmp.path().to_path_buf());
+        for (name, host) in [("opencode", "opencode.ai"), ("openrouter", "openrouter.ai")] {
+            config.providers.insert(
+                name.to_string(),
+                crate::config::ConfiguredProvider {
+                    base_url: format!("http://{host}:{}/v1", addr.port()),
+                    models: BTreeMap::new(),
+                },
+            );
+        }
+        let config = Arc::new(config);
+        let chat = |name: &str, stream: bool, conversation: &str| UpstreamRequest {
+            body: json!({
+                "model": "m",
+                "stream": stream,
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+            request_headers: BTreeMap::new(),
+            account: generic_account(name),
+            config: Arc::clone(&config),
+            conversation: conversation.to_string(),
+        };
+
+        client
+            .generic_chat(chat("opencode", false, "conversation-a"))
+            .await
+            .expect("a plain chat");
+        let streamed = client
+            .generic_chat_stream(chat("opencode", true, "conversation-a"))
+            .await
+            .expect("a streamed chat");
+        streamed
+            .body
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("the streamed body");
+        client
+            .generic_chat(chat("opencode", false, "conversation-b"))
+            .await
+            .expect("another conversation");
+        // A line break is no header value: sent as the key holds it, the request would fail
+        // before it left the relay.
+        client
+            .generic_chat(chat("opencode", false, "turn\n1"))
+            .await
+            .expect("a key holding a line break");
+        client
+            .generic_chat(chat("openrouter", false, "conversation-a"))
+            .await
+            .expect("a chat elsewhere");
+
+        let sessions = sessions.lock().expect("sessions lock").clone();
+        let [a, a_streamed, b, line_break, elsewhere] = sessions.as_slice() else {
+            panic!(
+                "the upstream saw {} chats, not 5: {sessions:?}",
+                sessions.len()
+            );
+        };
+        let a = a.as_deref().expect("the opencode.ai chat named no session");
+        assert_eq!(
+            a_streamed.as_deref(),
+            Some(a),
+            "one conversation, two sessions"
+        );
+        assert!(
+            b.as_deref().is_some_and(|b| b != a),
+            "two conversations, one session: {b:?}"
+        );
+        assert!(
+            line_break
+                .as_deref()
+                .is_some_and(|key| key != a && Some(key) != b.as_deref()),
+            "{line_break:?}"
+        );
+        assert_eq!(
+            elsewhere, &None,
+            "an endpoint off opencode.ai was told the conversation"
+        );
     }
 
     fn test_config(auth_dir: std::path::PathBuf) -> Config {

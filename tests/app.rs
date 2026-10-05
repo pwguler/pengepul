@@ -6063,3 +6063,72 @@ async fn a_retry_hint_on_another_status_is_not_read() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// every upstream request carries the conversation Rotation keyed it by
+// ---------------------------------------------------------------------------
+
+/// The relay resolves a request's conversation once, as the key Rotation keeps it on an
+/// Account by, and hands it to the upstream with the request: the session the harness named,
+/// on every turn and on either dialect a configured endpoint serves, else its
+/// `prompt_cache_key`, else a hash of its cacheable prefix.
+#[tokio::test]
+async fn every_upstream_request_carries_its_conversation() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &groq_key_token()).expect("save groq key");
+    let upstream = Arc::new(GenericUpstream::default());
+    let app =
+        create_app_with_upstream(config_with_groq(tmp.path().to_path_buf()), upstream.clone());
+    let ask = |uri: &str, stream: bool, session: Option<&str>, cache_key: Option<&str>| {
+        let mut body = json!({
+            "model": "groq/llama-3.3-70b",
+            "max_tokens": 16,
+            "stream": stream,
+            "messages": [{"role": "user", "content": "count"}]
+        });
+        if let Some(key) = cache_key {
+            body["prompt_cache_key"] = json!(key);
+        }
+        let body = body.to_string();
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", body.len().to_string());
+        if let Some(session) = session {
+            request = request.header("x-session-id", session);
+        }
+        request.body(Body::from(body)).unwrap()
+    };
+
+    let chat = "/v1/chat/completions";
+    for (uri, stream, session, cache_key) in [
+        (chat, false, Some("conversation-a"), None),
+        (chat, true, Some("conversation-a"), None),
+        ("/v1/messages", false, Some("conversation-a"), None),
+        (chat, false, None, Some("turn-1")),
+        (chat, false, None, None),
+    ] {
+        let (status, received, _) =
+            streamed(app.clone(), ask(uri, stream, session, cache_key)).await;
+        assert_eq!(status, 200, "{uri} {session:?} {cache_key:?}: {received}");
+    }
+
+    let conversations: Vec<String> = upstream
+        .calls()
+        .into_iter()
+        .map(|call| call.conversation)
+        .collect();
+    assert_eq!(conversations.len(), 5, "{conversations:?}");
+    assert_eq!(
+        conversations[..4],
+        [
+            "conversation-a",
+            "conversation-a",
+            "conversation-a",
+            "turn-1"
+        ]
+    );
+    assert!(conversations[4].starts_with("prefix:"), "{conversations:?}");
+}
