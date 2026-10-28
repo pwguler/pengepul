@@ -18,8 +18,9 @@ today's plain text.
   hold the row columns without truncating most emails — and the layout is
   identical in every terminal; no terminal-width queries.
 - **No quota bars.** The bar shows share-of-pool (an account's total tokens
-  divided by its pool's total); it never implies a plan limit, which the
-  domain does not have.
+  divided by its pool's total); it never implies a plan limit of its own.
+  Plan quota arrived later, read from the vendor rather than inferred from
+  traffic (ADR-0030), and prints as its own row under the account.
 - **No layout change to plain output.** The 42 existing `tests/cli.rs`
   assertions on plain text keep passing byte-for-byte; the panel renderer is
   additive.

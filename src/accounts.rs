@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::Result;
 use serde_json::{Value, json};
 
+use crate::quota::{QuotaSnapshot, load_quota, save_quota};
 use crate::tokens::{
     DayUsage, ModelUsage, PersistedUsage, RETENTION_DAYS, load_all_tokens, load_disabled_tokens,
     load_usage, save_token, save_usage, set_credential_disabled, trim_days, usage_file_unreadable,
@@ -441,6 +442,11 @@ pub struct AccountManager {
     persisted_usage: BTreeMap<String, PersistedUsage>,
     /// Conversation key -> the account that served it last.
     affinity: BTreeMap<String, String>,
+    /// Latest quota snapshot per account, observed from response headers or
+    /// polled from the vendor. Persisted beside the usage counters, so a
+    /// restart keeps the last-known reset times instead of forgetting a window
+    /// that is still running.
+    quota: BTreeMap<String, QuotaSnapshot>,
 }
 
 impl AccountManager {
@@ -461,6 +467,7 @@ impl AccountManager {
             last_used_index: None,
             persisted_usage: BTreeMap::new(),
             affinity: BTreeMap::new(),
+            quota: BTreeMap::new(),
         }
     }
 
@@ -490,6 +497,7 @@ impl AccountManager {
     /// restart would otherwise keep a stale file behind a correct panel.
     pub fn load(&mut self) -> Result<()> {
         self.persisted_usage = load_usage(&self.auth_dir, &self.provider);
+        self.quota = load_quota(&self.auth_dir, &self.provider);
         for token in load_all_tokens(&self.auth_dir, Some(&self.provider))? {
             self.upsert_loaded_token(token);
         }
@@ -958,6 +966,84 @@ impl AccountManager {
         self.persist_usage();
     }
 
+    /// Book one account's quota snapshot. A snapshot observed earlier than the
+    /// one held is dropped: a poll that raced a response must not walk the
+    /// numbers back. Every other source is recorded the same way, so a header
+    /// reading and a usage poll need no precedence rule beyond their instants.
+    pub fn record_quota(&mut self, email: &str, snapshot: QuotaSnapshot) {
+        if snapshot.is_empty() || !self.accounts.contains_key(email) {
+            return;
+        }
+        if self
+            .quota
+            .get(email)
+            .is_some_and(|held| held.observed_at > snapshot.observed_at)
+        {
+            return;
+        }
+        self.quota.insert(email.to_string(), snapshot);
+        self.persist_quota();
+    }
+
+    /// The accounts a poll should refresh now: every serving account whose
+    /// snapshot is missing, older than `fresh_seconds`, or describes a window
+    /// that has already rolled.
+    ///
+    /// The last case is what keeps the tightest window honest. A five-hour
+    /// window that resets at 17:03 makes an 11% reading from 16:59 describe a
+    /// cycle that ended: the panel prints `n/a` until a fresh observation
+    /// replaces it, and the poll that replaces it is due the moment the reset
+    /// lands, not a whole freshness period later.
+    ///
+    /// A Reauth is skipped: its refresh token is dead until a human logs in, so
+    /// the poll could only fail. A Disabled account is skipped too, and for a
+    /// reason worth stating: `refresh_account` refuses to write a Disabled
+    /// credential (that write would re-enable it), while an OAuth access token
+    /// lasts hours and an account that sits out is past them. Its last snapshot
+    /// stays readable until the windows it describes roll.
+    #[must_use]
+    pub fn quota_candidates(&self, fresh_seconds: i64, now: i64) -> Vec<String> {
+        self.order
+            .iter()
+            .filter(|email| {
+                let Some(state) = self.accounts.get(*email) else {
+                    return false;
+                };
+                if state.reauth {
+                    return false;
+                }
+                match self.quota.get(*email) {
+                    None => true,
+                    Some(snapshot) => {
+                        snapshot
+                            .windows
+                            .values()
+                            .any(|window| crate::quota::rolled(window, now))
+                            || crate::quota::observed_epoch(snapshot)
+                                .is_none_or(|observed| now - observed >= fresh_seconds)
+                    }
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Snapshot every account's quota to `quota.json`. Write failures are
+    /// swallowed, as the usage write's are: losing observability must never
+    /// fail the request that produced it.
+    fn persist_quota(&self) {
+        // Only accounts the relay holds a credential for. A removed
+        // credential's last readings describe a pool membership that no
+        // longer exists.
+        let held: BTreeMap<String, QuotaSnapshot> = self
+            .quota
+            .iter()
+            .filter(|(email, _)| self.accounts.contains_key(*email))
+            .map(|(email, snapshot)| (email.clone(), snapshot.clone()))
+            .collect();
+        let _ = save_quota(&self.auth_dir, &self.provider, &held);
+    }
+
     /// Every account the relay has a record for, in account-key order.
     ///
     /// That includes a record whose credential the auth directory no longer holds:
@@ -999,6 +1085,12 @@ impl AccountManager {
                 fields.insert("expiresAt".to_string(), json!(state.token.expires_at));
                 fields.insert("refreshing".to_string(), json!(false));
                 fields.insert("planType".to_string(), json!(state.token.plan_type));
+                fields.insert(
+                    "quota".to_string(),
+                    self.quota
+                        .get(email)
+                        .map_or(Value::Null, QuotaSnapshot::to_json),
+                );
                 (email.clone(), Value::Object(fields))
             })
             .collect();
@@ -1020,6 +1112,10 @@ impl AccountManager {
             fields.insert("expiresAt".to_string(), json!(""));
             fields.insert("refreshing".to_string(), json!(false));
             fields.insert("planType".to_string(), Value::Null);
+            // A record without a credential has no way to observe its quota,
+            // and any snapshot it kept belonged to that credential's last days
+            // in the pool. The field stays, null, so one shape serves both.
+            fields.insert("quota".to_string(), Value::Null);
             records.insert(email.clone(), Value::Object(fields));
         }
         records.into_values().collect()

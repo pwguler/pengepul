@@ -1,4 +1,5 @@
 pub mod accounts;
+pub mod admin_report;
 pub mod app;
 pub mod cli;
 pub mod cloaking_versions;
@@ -7,6 +8,7 @@ pub mod masquerade;
 pub mod models;
 pub mod oauth;
 pub mod picker;
+pub mod quota;
 pub mod render;
 pub mod runtime;
 pub mod service;

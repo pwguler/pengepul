@@ -199,7 +199,7 @@ pengepul login --provider anthropic # authorize an account in a browser (--provi
 pengepul login --provider groq --key $KEY # save a static key for a configured provider
 pengepul login --provider groq --base-url $URL --key $KEY # register a new OpenAI-compatible provider and save its key
 pengepul status # health of the running relay: build, uptime, what each pool can serve
-pengepul accounts # loaded accounts (-v per model, --reload re-reads from disk)
+pengepul accounts # loaded accounts with quota bars (-v per model, --reload re-reads from disk)
 pengepul accounts disable|enable <id> # take an account out of its pool, or put it back and clear its cooldown
 pengepul usage # the relay's numbers: 30-day trend, all-time peak, total, requests, tokens
 pengepul update # install the most recent release (--check only reports)
@@ -216,9 +216,16 @@ connections and gives the requests in flight up to 15 s to finish, then exits.
 
 Routes: `POST /v1/messages`, `POST /v1/chat/completions`, `POST /v1/responses`,
 `POST /v1/messages/count_tokens`, `GET /v1/models`, `GET /admin/accounts`,
-`POST /admin/reload`, `POST /admin/accounts/disable`, `POST /admin/accounts/enable`, and
-`GET /health` (unauthenticated). Every route but `/health` needs
-the local API key, sent as `Authorization: Bearer <key>` or `x-api-key: <key>`.
+`GET /admin/status`, `GET /admin/usage?days=30`, `POST /admin/reload`,
+`POST /admin/accounts/disable`, `POST /admin/accounts/enable`, and `GET /health`
+(unauthenticated). Every route but `/health` needs the local API key, sent as
+`Authorization: Bearer <key>` or `x-api-key: <key>`.
+
+`/admin/status` is the dashboard's health block: version, uptime, address, how
+many accounts can serve, today's requests, and the same per provider.
+`/admin/usage` is a request and token window over every pool, one entry per
+local day (`days` defaults to 30, bounded to 1–90), plus the stored peak day and
+the all-time totals with the prompt's cache split.
 
 pengepul writes `~/.pengepul/config.yaml` when missing, with a fresh `sk-local-…` key. The
 keys you can set:
@@ -243,9 +250,35 @@ timeouts:
   stream-messages-ms: 600000 # longest a streamed reply may send nothing
   count-tokens-ms: 30000
 debug: off # off | errors | verbose
+quota:
+  poll: true # read an idle account's quota from the vendor's usage route
+  poll-minutes: 15 # how old a snapshot may be before a poll refreshes it
 ```
 
 `stream-messages-ms` is a silence limit, not a deadline: a streamed reply runs as long as it
 keeps sending, and fails once it sends nothing for that long, before it starts or between
 chunks. codex streams every request upstream, so there it is also the deadline of a reply
 the client did not stream.
+
+## Quota
+
+`pengepul accounts` prints one bar row per window under each account of the three providers
+that report quota: anthropic (`5h`, `week`), commandcode and opencode (`5h`, `week`,
+`month`). The numbers are the vendors' own, taken from response headers on every request and
+from each vendor's usage route when an account is idle, so the relay needs no traffic to
+know where a pool stands.
+
+```
+  tech.intiva@gmail.com available failures=0 plan=max last_ok=2m
+    requests 28,098 (27,869 ok) input 5.0B cached 4.9B (97%) uncached 149.0M output 33.5M
+    5h    █████████████████░░░   83%  reset 18:59 (1h35m)
+    week  █████████████████░░░   86%  reset Fri 00:00 (1d6h)
+```
+
+A window with no observation, or one whose reset instant has passed, reads `n/a`; at the cap,
+or when the vendor says the window is rejected, it reads `LIMIT`. Nothing is estimated from
+token counts. `GET /admin/accounts` carries the same thing under each account's `quota`
+field: `source`, `observedAt`, and `windows.<name>.{usedPct, resetsAt, status}`, with
+`resetsAt` in Unix epoch seconds. Other providers print no quota rows. The Windows tray
+dashboard reads this and the two report routes below, so its cards and this panel show the
+same numbers.
