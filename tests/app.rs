@@ -13,9 +13,11 @@ use pengepul::app::{
 };
 use pengepul::cloaking_versions::CliVersions;
 use pengepul::config::{
-    BodyLimit, CloakingConfig, Config, DEFAULT_BODY_LIMIT_BYTES, DebugMode, TimeoutConfig,
+    BodyLimit, CloakingConfig, Config, DEFAULT_BODY_LIMIT_BYTES, DebugMode, QuotaConfig,
+    TimeoutConfig,
 };
 use pengepul::models::{FetchedModels, ModelMetadata, ModelPricing};
+use pengepul::quota::{QuotaSnapshot, QuotaWindow};
 use pengepul::tokens::save_token;
 use pengepul::types::{AvailableAccount, ProviderId, ProviderKind, TokenData};
 use serde_json::{Value, json};
@@ -70,6 +72,7 @@ impl UpstreamClient for RetryUpstream {
         self.calls.lock().expect("calls lock").push(request);
         Box::pin(async move {
             Ok(UpstreamJsonResponse {
+                quota: None,
                 retry_hint: None,
                 status,
                 body: if status.is_success() {
@@ -148,6 +151,7 @@ impl UpstreamClient for FakeUpstream {
         self.calls.lock().expect("calls lock").push(request);
         Box::pin(async {
             Ok(UpstreamJsonResponse {
+                quota: None,
                 retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: json!({
@@ -169,6 +173,7 @@ impl UpstreamClient for FakeUpstream {
         self.calls.lock().expect("calls lock").push(request);
         Box::pin(async {
             Ok(UpstreamSseResponse {
+                quota: None,
                 retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: Box::pin(futures_util::stream::iter([
@@ -194,6 +199,7 @@ impl UpstreamClient for FakeUpstream {
         self.calls.lock().expect("calls lock").push(request);
         Box::pin(async {
             Ok(UpstreamJsonResponse {
+                quota: None,
                 retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: json!({"input_tokens": 2}),
@@ -208,6 +214,7 @@ impl UpstreamClient for FakeUpstream {
         self.calls.lock().expect("calls lock").push(request);
         Box::pin(async {
             Ok(UpstreamJsonResponse {
+                quota: None,
                 retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: json!({
@@ -234,6 +241,7 @@ impl UpstreamClient for FakeUpstream {
         self.calls.lock().expect("calls lock").push(request);
         Box::pin(async {
             Ok(UpstreamSseResponse {
+                quota: None,
                 retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: Box::pin(futures_util::stream::iter([
@@ -282,6 +290,10 @@ fn config(auth_dir: PathBuf) -> Config {
         stats_enabled: true,
         debug: DebugMode::Off,
         providers: BTreeMap::default(),
+        quota: QuotaConfig {
+            poll: false,
+            poll_minutes: 15,
+        },
     }
 }
 
@@ -1149,6 +1161,32 @@ impl UpstreamClient for RateLimitedUpstream {
         self.calls.lock().expect("calls lock").push(request);
         Box::pin(async {
             Ok(UpstreamJsonResponse {
+                // A rejected response still carries the unified headers in
+                // reality, and they are the reading an operator wants at
+                // exactly that moment.
+                quota: Some(QuotaSnapshot {
+                    source: "headers".to_string(),
+                    observed_at: "2026-10-28T09:47:39Z".to_string(),
+                    representative: Some("seven_day".to_string()),
+                    windows: std::collections::BTreeMap::from([
+                        (
+                            "5h".to_string(),
+                            QuotaWindow {
+                                used_pct: 100.0,
+                                resets_at: Some(1_793_188_800),
+                                status: Some("rejected".to_string()),
+                            },
+                        ),
+                        (
+                            "week".to_string(),
+                            QuotaWindow {
+                                used_pct: 91.0,
+                                resets_at: Some(1_793_293_200),
+                                status: Some("allowed_warning".to_string()),
+                            },
+                        ),
+                    ]),
+                }),
                 retry_hint: None,
                 status: axum::http::StatusCode::TOO_MANY_REQUESTS,
                 body: json!({"error": {"message": "rate limited"}}),
@@ -1246,6 +1284,25 @@ async fn a_lone_account_is_never_parked_out_of_rotation() {
         assert_eq!(status, 429, "request {attempt} did not reach the upstream");
         assert_eq!(body["error"]["message"], "rate limited");
     }
+
+    // The 429's own rate-limit headers are booked against the account, and the
+    // admin payload is where a widget reads them.
+    let (_, accounts) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .uri("/admin/accounts")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let entry = &accounts["providers"]["anthropic"]["accounts"][0];
+    assert_eq!(entry["email"], "solo@example.com");
+    assert_eq!(entry["quota"]["source"], "headers");
+    assert_eq!(entry["quota"]["windows"]["5h"]["usedPct"], 100.0);
+    assert_eq!(entry["quota"]["windows"]["5h"]["status"], "rejected");
+    assert_eq!(entry["quota"]["windows"]["week"]["usedPct"], 91.0);
+    assert_eq!(entry["quota"]["representative"], "seven_day");
 
     let calls = upstream.calls();
     assert_eq!(
@@ -1822,6 +1879,7 @@ impl UpstreamClient for ChosenUsageUpstream {
         let usage = self.usage.clone();
         Box::pin(async move {
             Ok(UpstreamJsonResponse {
+                quota: None,
                 retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: json!({
@@ -1853,6 +1911,7 @@ impl UpstreamClient for ChosenUsageUpstream {
         let usage = self.usage.clone();
         Box::pin(async move {
             Ok(UpstreamJsonResponse {
+                quota: None,
                 retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: json!({
@@ -1889,6 +1948,7 @@ impl UpstreamClient for ChosenUsageUpstream {
         let usage = self.usage.clone();
         Box::pin(async move {
             Ok(UpstreamJsonResponse {
+                quota: None,
                 retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: json!({
@@ -2612,6 +2672,7 @@ impl UpstreamClient for GenericUpstream {
         self.calls.lock().expect("calls lock").push(request);
         Box::pin(async {
             Ok(UpstreamJsonResponse {
+                quota: None,
                 retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: json!({
@@ -2632,6 +2693,7 @@ impl UpstreamClient for GenericUpstream {
         self.calls.lock().expect("calls lock").push(request);
         Box::pin(async {
             Ok(UpstreamSseResponse {
+                quota: None,
                 retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: Box::pin(futures_util::stream::iter([
@@ -2918,6 +2980,7 @@ impl UpstreamClient for FirstKeyFailsUpstream {
         self.calls.lock().expect("calls lock").push(request);
         Box::pin(async move {
             Ok(UpstreamJsonResponse {
+                quota: None,
                 retry_hint: None,
                 status: if fail {
                     axum::http::StatusCode::TOO_MANY_REQUESTS
@@ -3193,6 +3256,7 @@ impl UpstreamClient for BillingFailoverUpstream {
         Box::pin(async move {
             if call_index == 1 {
                 Ok(UpstreamJsonResponse {
+                    quota: None,
                     retry_hint: None,
                     status: axum::http::StatusCode::BAD_REQUEST,
                     body: json!({
@@ -3205,6 +3269,7 @@ impl UpstreamClient for BillingFailoverUpstream {
                 })
             } else {
                 Ok(UpstreamJsonResponse {
+                    quota: None,
                     retry_hint: None,
                     status: axum::http::StatusCode::OK,
                     body: json!({
@@ -3889,6 +3954,7 @@ impl UpstreamClient for RejectingUpstream {
     ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
         Box::pin(async {
             Ok(UpstreamJsonResponse {
+                quota: None,
                 retry_hint: None,
                 status: axum::http::StatusCode::BAD_REQUEST,
                 body: json!({"error": {"message": "context length exceeded"}}),
@@ -4246,6 +4312,7 @@ impl UpstreamClient for GrokUpstream {
         self.calls.lock().expect("calls lock").push(request);
         Box::pin(async {
             Ok(UpstreamJsonResponse {
+                quota: None,
                 retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: GrokUpstream::default_json_body(),
@@ -4260,6 +4327,7 @@ impl UpstreamClient for GrokUpstream {
         self.calls.lock().expect("calls lock").push(request);
         Box::pin(async {
             Ok(UpstreamSseResponse {
+                quota: None,
                 retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: Box::pin(futures_util::stream::iter([
@@ -4675,6 +4743,7 @@ impl UpstreamClient for PerAccountCacheUpstream {
         if self.failing.lock().expect("failing lock").contains(&email) {
             return Box::pin(async move {
                 Ok(UpstreamJsonResponse {
+                    quota: None,
                     retry_hint: None,
                     status: axum::http::StatusCode::UNAUTHORIZED,
                     body: json!({"error": {
@@ -4699,6 +4768,7 @@ impl UpstreamClient for PerAccountCacheUpstream {
 
         Box::pin(async move {
             Ok(UpstreamJsonResponse {
+                quota: None,
                 retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: json!({
@@ -5036,6 +5106,7 @@ async fn admin_accounts_lists_a_record_whose_credential_is_gone() {
             "lastSuccessAt",
             "models",
             "planType",
+            "quota",
             "refreshing",
             "totalCacheCreation1hInputTokens",
             "totalCacheCreationInputTokens",
@@ -5454,6 +5525,7 @@ impl UpstreamClient for ToolCallingUpstream {
         let name = self.offered_name(&request);
         Box::pin(async move {
             Ok(UpstreamJsonResponse {
+                quota: None,
                 retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: json!({
@@ -5481,6 +5553,7 @@ impl UpstreamClient for ToolCallingUpstream {
         );
         Box::pin(async move {
             Ok(UpstreamSseResponse {
+                quota: None,
                 retry_hint: None,
                 status: axum::http::StatusCode::OK,
                 body: Box::pin(futures_util::stream::iter([

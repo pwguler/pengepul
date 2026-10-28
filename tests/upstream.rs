@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 use pengepul::config::{
-    BodyLimit, CloakingConfig, Config, DEFAULT_BODY_LIMIT_BYTES, DebugMode, TimeoutConfig,
+    BodyLimit, CloakingConfig, Config, DEFAULT_BODY_LIMIT_BYTES, DebugMode, QuotaConfig,
+    TimeoutConfig,
 };
 use pengepul::types::{AvailableAccount, ProviderId, ProviderKind, TokenData};
 use pengepul::upstream::{
@@ -36,6 +37,10 @@ fn config() -> Config {
         stats_enabled: true,
         debug: DebugMode::Off,
         providers: BTreeMap::default(),
+        quota: QuotaConfig {
+            poll: false,
+            poll_minutes: 15,
+        },
     }
 }
 

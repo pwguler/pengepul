@@ -30,6 +30,7 @@ use crate::models::{
     upstream_model,
 };
 use crate::oauth::{refresh_anthropic_tokens, refresh_codex_tokens, refresh_grok_tokens};
+use crate::quota::{self, QuotaSnapshot};
 use crate::streaming::{
     AnthropicStreamState, ChatStreamState, ResponsesStreamState, anthropic_sse_to_chat,
     anthropic_sse_to_responses, chat_sse_to_anthropic, chat_sse_to_responses,
@@ -46,9 +47,9 @@ use crate::translate::{
 use crate::types::{AvailableAccount, ProviderId, ProviderKind, UsageData};
 use crate::upstream::{
     ANTHROPIC_BASE_URL, CODEX_BASE_URL, CODEX_DEFAULT_CLI_VERSION, CODEX_MODELS_PATH,
-    CODEX_RESPONSES_PATH, GROK_CHAT_BASE_URL, anthropic_headers, apply_cloaking, codex_headers,
-    generic_base_url, generic_chat_headers, generic_headers, grok_chat_headers,
-    learn_grok_client_version, normalize_codex_responses_body,
+    CODEX_RESPONSES_PATH, GROK_CHAT_BASE_URL, anthropic_headers, anthropic_usage_headers,
+    apply_cloaking, codex_headers, generic_base_url, generic_chat_headers, generic_headers,
+    grok_chat_headers, learn_grok_client_version, normalize_codex_responses_body,
 };
 use crate::utils::now_iso;
 use crate::utils::sha256_hex;
@@ -83,6 +84,10 @@ pub struct UpstreamJsonResponse {
     pub body: Value,
     /// How long the upstream asked to be left alone (`retry-after-ms` or `retry-after`).
     pub retry_hint: Option<Duration>,
+    /// The quota the response's own headers reported, when it carried any.
+    /// Taken on every outcome, including an error: a 429's headers say where
+    /// the account's windows stand, which is exactly what an operator needs.
+    pub quota: Option<QuotaSnapshot>,
 }
 
 pub struct UpstreamSseResponse {
@@ -90,6 +95,9 @@ pub struct UpstreamSseResponse {
     pub body: UpstreamSseStream,
     /// How long the upstream asked to be left alone (`retry-after-ms` or `retry-after`).
     pub retry_hint: Option<Duration>,
+    /// The quota the response's own headers reported; see
+    /// [`UpstreamJsonResponse::quota`].
+    pub quota: Option<QuotaSnapshot>,
 }
 
 pub trait UpstreamClient: Send + Sync {
@@ -624,6 +632,9 @@ pub fn create_app_with_upstream(config: Config, upstream: Arc<dyn UpstreamClient
     if tokio::runtime::Handle::try_current().is_ok() {
         tokio::spawn(model_catalog_refresh_loop(state.clone()));
         tokio::spawn(cli_versions_refresh_loop(state.clone()));
+        if state.config.quota.poll {
+            tokio::spawn(quota_poll_loop(state.clone()));
+        }
     }
 
     // The two SDK families disagree on where `/v1` lives: OpenAI clients want it in the
@@ -717,6 +728,201 @@ fn build_account_managers(config: &Config) -> AccountManagers {
         grok: tokio::sync::Mutex::new(grok),
         generic,
     }
+}
+
+/// Where an idle account's quota can be read, per Provider. A pool outside
+/// this list has no quota source the relay knows, and is never polled.
+#[derive(Clone, Copy)]
+enum QuotaSource {
+    AnthropicUsage,
+    OpenCodeUsage,
+    CommandCodeBilling,
+}
+
+/// How often the loop looks for work. Each account is polled at most once per
+/// configured interval, so this is a cheap in-memory check, not a request.
+const QUOTA_POLL_TICK: Duration = Duration::from_mins(1);
+
+/// The floor between two polls of the same account, however urgent the reason.
+/// A window that just rolled is worth a call; an endpoint that keeps failing
+/// is not worth one a minute, so a failed attempt waits out this floor.
+const QUOTA_ATTEMPT_FLOOR: Duration = Duration::from_mins(5);
+
+const QUOTA_POLL_TIMEOUT_MS: u64 = 30_000;
+
+/// The source for a Provider, gated on the host its configured base URL names.
+/// The relay polls a vendor's own usage route, so a configured endpoint that
+/// merely speaks the same dialect is not assumed to have one.
+fn quota_source(provider: &ProviderId, config: &Config) -> Option<QuotaSource> {
+    match provider.kind {
+        ProviderKind::Anthropic => Some(QuotaSource::AnthropicUsage),
+        ProviderKind::Generic => {
+            let host = url::Url::parse(&config.providers.get(provider.id.as_ref())?.base_url)
+                .ok()?
+                .host_str()?
+                .to_ascii_lowercase();
+            if host == "api.commandcode.ai" {
+                Some(QuotaSource::CommandCodeBilling)
+            } else if host == "opencode.ai" || host.ends_with(".opencode.ai") {
+                Some(QuotaSource::OpenCodeUsage)
+            } else {
+                None
+            }
+        }
+        ProviderKind::Codex | ProviderKind::Grok => None,
+    }
+}
+
+/// `scheme://host[:port]`, for a vendor whose usage routes live beside the
+/// configured API base rather than under it.
+fn origin_of(base_url: &str) -> Option<String> {
+    let url = url::Url::parse(base_url).ok()?;
+    let host = url.host_str()?;
+    Some(match url.port() {
+        Some(port) => format!("{}://{host}:{port}", url.scheme()),
+        None => format!("{}://{host}", url.scheme()),
+    })
+}
+
+/// What one idle account's quota is, read from the vendor's own route. `None`
+/// when the call failed or answered nothing usable: a poll that learned
+/// nothing must never overwrite numbers an earlier observation produced.
+async fn poll_quota_snapshot(
+    client: &reqwest::Client,
+    provider: &ProviderId,
+    config: &Config,
+    account: &AvailableAccount,
+) -> Option<QuotaSnapshot> {
+    let source = quota_source(provider, config)?;
+    let observed_at = now_iso();
+    match source {
+        QuotaSource::AnthropicUsage => {
+            let body = send_get(
+                client.clone(),
+                format!("{ANTHROPIC_BASE_URL}/api/oauth/usage"),
+                anthropic_usage_headers(&account.token.access_token, config),
+                QUOTA_POLL_TIMEOUT_MS,
+            )
+            .await
+            .ok()?;
+            quota::anthropic_usage(&body, &observed_at)
+        }
+        QuotaSource::OpenCodeUsage => {
+            let base = config.providers.get(provider.id.as_ref())?.base_url.clone();
+            let body = send_get(
+                client.clone(),
+                format!("{}/usage", base.trim_end_matches('/')),
+                generic_headers(account),
+                QUOTA_POLL_TIMEOUT_MS,
+            )
+            .await
+            .ok()?;
+            quota::opencode_usage(&body, &observed_at)
+        }
+        QuotaSource::CommandCodeBilling => {
+            let origin = origin_of(&config.providers.get(provider.id.as_ref())?.base_url)?;
+            let credits = send_get(
+                client.clone(),
+                format!("{origin}/alpha/billing/credits"),
+                generic_headers(account),
+                QUOTA_POLL_TIMEOUT_MS,
+            )
+            .await
+            .ok()?;
+            // The plan id and the period end size and date the monthly pool.
+            // A failed lookup leaves the run's windows usable rather than
+            // losing the whole poll.
+            let subscription = send_get(
+                client.clone(),
+                format!("{origin}/alpha/billing/subscriptions"),
+                generic_headers(account),
+                QUOTA_POLL_TIMEOUT_MS,
+            )
+            .await
+            .ok()
+            .and_then(|body| body.get("data").cloned());
+            quota::commandcode_usage(&credits, subscription.as_ref(), &observed_at)
+        }
+    }
+}
+
+/// Ask each covered vendor for the accounts whose quota the relay has not
+/// observed recently. One poll per account per interval, at the vendor's own
+/// route, with the account's own credential.
+async fn poll_quota(
+    state: &AppState,
+    attempts: &mut std::collections::BTreeMap<(String, String), Instant>,
+) {
+    let Ok(client) = reqwest::Client::builder().build() else {
+        return;
+    };
+    let config = cloaked_config(state);
+    let now = unix_now_seconds();
+    let fresh_seconds =
+        i64::try_from(config.quota.poll_minutes.saturating_mul(60)).unwrap_or(i64::MAX);
+    for (provider, manager) in state.account_managers.pools() {
+        if quota_source(&provider, &config).is_none() {
+            continue;
+        }
+        let candidates = manager.lock().await.quota_candidates(fresh_seconds, now);
+        for email in candidates {
+            let key = (provider.to_string(), email.clone());
+            if attempts
+                .get(&key)
+                .is_some_and(|last| last.elapsed() < QUOTA_ATTEMPT_FLOOR)
+            {
+                continue;
+            }
+            attempts.insert(key, Instant::now());
+            // Refresh first: an idle account's OAuth token expires long before
+            // its quota does, and a poll with a dead token answers 401.
+            let account = {
+                let mut guard = manager.lock().await;
+                if let Err(error) = guard.refresh_if_due(&email).await {
+                    tracing::debug!(provider = %provider, account = %email, error = %error,
+                        "quota poll could not refresh the account");
+                    continue;
+                }
+                guard.account(&email)
+            };
+            let Some(account) = account else {
+                continue;
+            };
+            if let Some(snapshot) = poll_quota_snapshot(&client, &provider, &config, &account).await
+            {
+                tracing::debug!(provider = %provider, account = %email,
+                    source = %snapshot.source, "quota polled");
+                manager.lock().await.record_quota(&email, snapshot);
+            } else {
+                tracing::debug!(provider = %provider, account = %email,
+                    "quota poll returned nothing usable");
+            }
+        }
+    }
+}
+
+/// The polling loop. It looks for work once a minute and polls an account when
+/// its snapshot is due: no snapshot, older than the configured interval, or
+/// describing a window that has rolled. The first check waits, because a relay
+/// that just restarted is about to serve the requests whose headers answer the
+/// same question for free. Jitter keeps a second relay from polling in lockstep
+/// with this one.
+async fn quota_poll_loop(state: AppState) {
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    let mut attempts = std::collections::BTreeMap::new();
+    loop {
+        poll_quota(&state, &mut attempts).await;
+        let jitter = Duration::from_secs(rand::random_range(0..15));
+        tokio::time::sleep(QUOTA_POLL_TICK + jitter).await;
+    }
+}
+
+fn unix_now_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+        })
 }
 
 const MODEL_CATALOG_TTL: Duration = Duration::from_mins(15);
@@ -1355,6 +1561,7 @@ async fn count_tokens(State(state): State<AppState>, headers: HeaderMap, body: B
         .await
     {
         Ok(response) => {
+            record_provider_quota(&state, &provider, &account, response.quota.clone()).await;
             if response.status.is_success() {
                 // Token counting bills no usage; the success still clears
                 // the account's failure streak.
@@ -1670,6 +1877,7 @@ async fn route_generic_chat_request(
                     account,
                     response.status,
                     response.retry_hint,
+                    response.quota.clone(),
                     model,
                 )
                 .await;
@@ -1743,6 +1951,7 @@ async fn route_grok_request(
                     account,
                     response.status,
                     response.retry_hint,
+                    response.quota.clone(),
                     model,
                 )
                 .await;
@@ -1811,6 +2020,7 @@ async fn route_codex_request(
                     account,
                     response.status,
                     response.retry_hint,
+                    response.quota.clone(),
                     model,
                 )
                 .await;
@@ -1889,6 +2099,7 @@ async fn route_anthropic_request(
                     account,
                     response.status,
                     response.retry_hint,
+                    response.quota.clone(),
                     model,
                 )
                 .await;
@@ -1933,8 +2144,13 @@ async fn stream_accounting(
     account: &AvailableAccount,
     status: StatusCode,
     retry_hint: Option<Duration>,
+    quota: Option<QuotaSnapshot>,
     model: &str,
 ) -> Option<StreamAccounting> {
+    // The headers arrive with the stream's response, before any body, so they
+    // are booked here whatever the status: a 429 stream is still an
+    // observation of where the account's windows stand.
+    record_provider_quota(state, &provider, account, quota).await;
     if status.is_success() {
         Some(StreamAccounting {
             state: state.clone(),
@@ -1956,6 +2172,7 @@ async fn record_json_result(
     response: &UpstreamJsonResponse,
     model: &str,
 ) {
+    record_provider_quota(state, &provider, account, response.quota.clone()).await;
     if response.status.is_success() {
         record_provider_success(
             state,
@@ -2540,6 +2757,46 @@ async fn record_provider_refusal(
         }
     };
     manager.record_refusal(account.token.email.as_str());
+}
+
+/// Book a response's quota headers onto the account that served it, on a
+/// success and on an error alike. A 429's headers are the whole point: they
+/// say how close the account is to its cap at the moment it was rejected.
+async fn record_provider_quota(
+    state: &AppState,
+    provider: &ProviderId,
+    account: &AvailableAccount,
+    quota: Option<QuotaSnapshot>,
+) {
+    let Some(quota) = quota else {
+        return;
+    };
+    let mut manager = match provider.kind {
+        ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
+        ProviderKind::Codex => state.account_managers.codex.lock().await,
+        ProviderKind::Grok => state.account_managers.grok.lock().await,
+        ProviderKind::Generic => {
+            let Some(manager) = state.account_managers.generic.get(provider.id.as_ref()) else {
+                return;
+            };
+            manager.lock().await
+        }
+    };
+    // One line per observation, and the only place the numbers appear in the
+    // log. A window that moved is what an operator correlates with a 429.
+    tracing::debug!(
+        provider = %provider,
+        account = %account.token.email,
+        source = %quota.source,
+        windows = %quota
+            .windows
+            .iter()
+            .map(|(window, value)| format!("{window}={:.0}%", value.used_pct))
+            .collect::<Vec<_>>()
+            .join(","),
+        "upstream quota"
+    );
+    manager.record_quota(account.token.email.as_str(), quota);
 }
 
 /// Put an account on the billing cooldown without counting a second
@@ -3470,6 +3727,7 @@ async fn send_json(
         .await?;
     let mut status = StatusCode::from_u16(response.status().as_u16())?;
     let headers = response.headers().clone();
+    let quota = quota::anthropic_headers(&headers, &now_iso());
     let retry_hint = retry_hint_from(&headers, SystemTime::now());
     let bytes = response.bytes().await?;
     let body = decode_upstream_body(&headers, &bytes, &model);
@@ -3485,6 +3743,7 @@ async fn send_json(
         status,
         body,
         retry_hint,
+        quota,
     })
 }
 
@@ -3527,6 +3786,7 @@ async fn send_stream(
     .await
     .map_err(|_| silence_error(silence))??;
     let status = StatusCode::from_u16(response.status().as_u16())?;
+    let quota = quota::anthropic_headers(response.headers(), &now_iso());
     if status.is_success() {
         tracing::debug!(%url, status = status.as_u16(), "upstream stream opened");
     } else {
@@ -3535,6 +3795,7 @@ async fn send_stream(
     Ok(UpstreamSseResponse {
         status,
         retry_hint: retry_hint_from(response.headers(), SystemTime::now()),
+        quota,
         body: until_silent(
             Box::pin(response.bytes_stream().map_err(anyhow::Error::from)),
             silence,
@@ -3663,6 +3924,7 @@ async fn send_grok_stream(
     Ok(UpstreamSseResponse {
         status: first.status,
         retry_hint: first.retry_hint,
+        quota: first.quota,
         body: Box::pin(futures_util::stream::once(async move {
             Ok::<Bytes, anyhow::Error>(Bytes::from(bytes))
         })),
@@ -3746,7 +4008,7 @@ mod tests {
         refresh_model_catalog, route_provider_request,
     };
     use crate::accounts::{AccountManager, RefreshPolicy};
-    use crate::config::{CloakingConfig, Config, DebugMode, TimeoutConfig};
+    use crate::config::{CloakingConfig, Config, DebugMode, QuotaConfig, TimeoutConfig};
     use crate::models::{FetchedModels, ModelCatalog};
     use crate::tokens::save_token;
     use crate::types::{AvailableAccount, ProviderId, ProviderKind, TokenData};
@@ -3922,6 +4184,7 @@ mod tests {
             Box::pin(async {
                 Ok(UpstreamJsonResponse {
                     retry_hint: None,
+                    quota: None,
                     status: StatusCode::OK,
                     body: json!({
                         "id": "msg_1",
@@ -3981,6 +4244,7 @@ mod tests {
             Box::pin(async move {
                 Ok(UpstreamJsonResponse {
                     retry_hint: None,
+                    quota: None,
                     status: StatusCode::OK,
                     body: json!({
                         "id": "msg_1",
@@ -4955,6 +5219,10 @@ mod tests {
             stats_enabled: true,
             debug: DebugMode::Off,
             providers: std::collections::BTreeMap::new(),
+            quota: QuotaConfig {
+                poll: false,
+                poll_minutes: 15,
+            },
         }
     }
 

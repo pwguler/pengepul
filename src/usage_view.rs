@@ -7,11 +7,22 @@ use std::fmt::Write as _;
 
 use serde_json::Value;
 
+use crate::quota::{self, QuotaWindow};
 use crate::render::{
     AMBER, ActionGlyph, BOLD, DIM, Fact, GREEN, INNER_WIDTH, Output, RED, fact_panel, fact_row,
     format_count, format_duration, format_exact, label_column, pad, paint, panel_row, share_bar,
     sparkline, status_glyph, strip_ansi, top_rule,
 };
+
+/// The bar's width in the rich panel: the fixed 64-column box has to hold the
+/// label, the bar, the percent and the reset's own words, and the longest of
+/// those (`reset Nov 11 15:10 (14d5h)`, or `LIMIT` in the percent's field)
+/// leaves this many cells.
+const RICH_BAR_WIDTH: usize = 17;
+
+/// The label column the quota rows share: `month` is the longest window name,
+/// padded one past it, as the plain view's bars line up with each other.
+const QUOTA_LABEL_WIDTH: usize = 6;
 
 /// How long ago the account last served a request successfully (`3h5m`), or
 /// `None` when the payload holds no instant or one that does not parse.
@@ -46,6 +57,72 @@ pub(crate) fn cooldown_label(now: f64, cooldown_until: f64) -> String {
             format!("on cooldown {minutes}m{seconds}s")
         }
     }
+}
+
+/// The quota lines under one account: one per window its provider reports,
+/// `n/a` for a window with no fresh number. The bar is monochrome in both
+/// styles: the percentage and the `LIMIT` word carry the reading, and a
+/// colored bar would be the one place a piped line and a panel differed in
+/// meaning rather than in painting.
+///
+/// A window whose reset instant has passed is `n/a` too: the number describes
+/// a cycle that already rolled, and carrying it forward would read as
+/// headroom the account may not have.
+pub(crate) fn quota_lines(
+    provider_id: &str,
+    account: &Value,
+    now: f64,
+    rich: bool,
+    width: usize,
+) -> Vec<String> {
+    let now = now.round();
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "an instant kept in whole seconds; the fraction is sub-second noise"
+    )]
+    let now = now as i64;
+    quota::quota_windows(provider_id)
+        .iter()
+        .map(|window| {
+            let indent = if rich { "  " } else { "    " };
+            let Some(entry) = account
+                .get("quota")
+                .and_then(|quota| quota.get("windows"))
+                .and_then(|windows| windows.get(*window))
+            else {
+                return format!("{indent}{}n/a", pad(window, QUOTA_LABEL_WIDTH));
+            };
+            let Some(used_pct) = entry.get("usedPct").and_then(Value::as_f64) else {
+                return format!("{indent}{}n/a", pad(window, QUOTA_LABEL_WIDTH));
+            };
+            let window_data = QuotaWindow {
+                used_pct,
+                resets_at: entry.get("resetsAt").and_then(Value::as_i64),
+                status: entry
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+            };
+            if quota::rolled(&window_data, now) {
+                return format!("{indent}{}n/a", pad(window, QUOTA_LABEL_WIDTH));
+            }
+            let limited = quota::limited(&window_data);
+            let percent = if limited {
+                "LIMIT".to_string()
+            } else {
+                quota::percent_text(used_pct)
+            };
+            let cells = quota::bar_cells(used_pct, width);
+            let reset = window_data
+                .resets_at
+                .map(|at| format!("  reset {}", quota::reset_text(at, now)))
+                .unwrap_or_default();
+            format!(
+                "{indent}{}{cells}  {percent}{reset}",
+                pad(window, QUOTA_LABEL_WIDTH)
+            )
+        })
+        .collect()
 }
 
 /// `verbose` adds each account's per-model lines (accounts-verbose).
@@ -108,6 +185,9 @@ pub(crate) fn print_accounts(payload: &Value, output: &mut Output, now: f64, ver
                 ),
             );
             output.line(&detail);
+            for line in quota_lines(provider_id, account, now, false, quota::BAR_WIDTH) {
+                output.line(&line);
+            }
             // AC-7: the same per-model breakdown, plain.
             if !verbose {
                 continue;
@@ -385,6 +465,9 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64, ve
             output.line(&panel_row(&account_row(account, pool_total, now)));
             for fact in account_detail_facts(account, now) {
                 output.line(&panel_row(&format!("  {}", fact_row(&fact, column))));
+            }
+            for line in quota_lines(provider_id, account, now, true, RICH_BAR_WIDTH) {
+                output.line(&panel_row(&line));
             }
             // AC-5: the models this account served, heaviest first.
             if !verbose {

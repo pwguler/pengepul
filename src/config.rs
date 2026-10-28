@@ -56,6 +56,15 @@ pub struct CloakingConfig {
     pub codex: std::collections::BTreeMap<String, String>,
 }
 
+/// Whether and how often the relay asks the vendors' own usage endpoints for
+/// quota. On by default: an account that serves no traffic shows no numbers
+/// without it, and an idle account is exactly the one an operator asks about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuotaConfig {
+    pub poll: bool,
+    pub poll_minutes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub host: String,
@@ -68,6 +77,7 @@ pub struct Config {
     pub stats_enabled: bool,
     pub debug: DebugMode,
     pub providers: BTreeMap<String, ConfiguredProvider>,
+    pub quota: QuotaConfig,
 }
 
 /// The largest request body the relay will read, resolved once at config load.
@@ -153,6 +163,7 @@ struct RawConfig {
     stats: RawStats,
     debug: serde_yaml::Value,
     providers: BTreeMap<String, RawConfiguredProvider>,
+    quota: RawQuota,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -190,6 +201,23 @@ struct RawStats {
     enabled: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawQuota {
+    poll: bool,
+    #[serde(rename = "poll-minutes")]
+    poll_minutes: u64,
+}
+
+impl Default for RawQuota {
+    fn default() -> Self {
+        Self {
+            poll: true,
+            poll_minutes: 15,
+        }
+    }
+}
+
 impl Default for RawConfig {
     fn default() -> Self {
         Self {
@@ -203,6 +231,7 @@ impl Default for RawConfig {
             stats: RawStats::default(),
             debug: serde_yaml::Value::String("off".to_string()),
             providers: BTreeMap::new(),
+            quota: RawQuota::default(),
         }
     }
 }
@@ -382,6 +411,12 @@ pub fn load_config(
         stats_enabled: raw.stats.enabled,
         debug: normalize_debug(&raw.debug),
         providers,
+        quota: QuotaConfig {
+            poll: raw.quota.poll,
+            // A poll interval of zero would be a busy loop against the
+            // vendors' endpoints. One minute is the floor an operator gets.
+            poll_minutes: raw.quota.poll_minutes.max(1),
+        },
     })
 }
 

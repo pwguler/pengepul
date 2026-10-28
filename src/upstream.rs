@@ -862,6 +862,32 @@ fn is_opencode_host(base_url: &str) -> bool {
         .is_some_and(|host| host == "opencode.ai" || host.ends_with(".opencode.ai"))
 }
 
+/// Headers for `GET /api/oauth/usage`, the route Claude Code reads its quota
+/// from. A GET needs no body sizing, session or streaming headers: the
+/// account's own bearer and the CLI identity the relay presents everywhere
+/// else are the whole request. The OAuth beta header is what makes the
+/// subscription token acceptable on a non-inference route.
+#[must_use]
+pub fn anthropic_usage_headers(token: &str, config: &Config) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("Authorization".to_string(), format!("Bearer {token}")),
+        (
+            "User-Agent".to_string(),
+            format!(
+                "claude-cli/{} (external, {})",
+                config.cloaking.cli_version, config.cloaking.entrypoint
+            ),
+        ),
+        ("Accept".to_string(), "application/json".to_string()),
+        (
+            "anthropic-beta".to_string(),
+            ANTHROPIC_OAUTH_BETA.to_string(),
+        ),
+        ("anthropic-version".to_string(), "2023-06-01".to_string()),
+        ("x-app".to_string(), "cli".to_string()),
+    ])
+}
+
 /// Headers for grok build's relay: the session token as bearer, the header
 /// that routes the auth subrequest, and the CLI version the proxy gates on.
 #[must_use]

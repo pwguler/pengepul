@@ -6156,3 +6156,197 @@ fn usage_with_no_history_case(payload: Value) {
         "{plain}"
     );
 }
+
+/// The quota rows behind `accounts`, whose fixture both tests below render:
+/// one line per window a covered provider reports, `n/a` where there is no
+/// fresh number, `LIMIT` at the cap, and no row at all for a pool outside the
+/// three providers.
+///
+/// An epoch second `offset` from now, for a quota window's reset. Absolute
+/// instants would make the countdown's word length depend on the calendar;
+/// an offset keeps the row's geometry the same on any day the suite runs.
+fn instant_in(offset_seconds: i64) -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    i64::try_from(now).unwrap_or(i64::MAX) + offset_seconds
+}
+
+fn quota_payload() -> Value {
+    json!({
+        "providers": {
+            "anthropic": {
+                "account_count": 2,
+                "accounts": [
+                    json!({
+                        "email": "live@example.com",
+                        "available": true,
+                        "failureCount": 0,
+                        "quota": {
+                            "source": "headers",
+                            "observedAt": "2026-10-28T09:47:39Z",
+                            "representative": "seven_day",
+                            "windows": {
+                                "5h": {"usedPct": 77.0, "resetsAt": instant_in(3 * 3_600), "status": "allowed"},
+                                "week": {"usedPct": 100.0, "resetsAt": instant_in(3 * 86_400), "status": "rejected"}
+                            }
+                        }
+                    }),
+                    json!({
+                        "email": "rolled@example.com",
+                        "available": true,
+                        "failureCount": 0,
+                        "quota": {
+                            "source": "usage-api",
+                            "observedAt": "2026-10-28T09:47:39Z",
+                            "windows": {
+                                // Long past: the cycle rolled, and carrying the
+                                // number forward would read as headroom.
+                                "5h": {"usedPct": 12.0, "resetsAt": instant_in(-3_600)},
+                                "week": null
+                            }
+                        }
+                    })
+                ]
+            },
+            "commandcode": {
+                "account_count": 1,
+                "accounts": [json!({
+                    "email": "cc@example.com",
+                    "available": true,
+                    "failureCount": 0,
+                    "quota": {
+                        "source": "billing",
+                        "observedAt": "2026-10-28T09:48:00Z",
+                        "windows": {
+                            "5h": {"usedPct": 4.0, "resetsAt": instant_in(3_600)},
+                            "week": {"usedPct": 13.0, "resetsAt": instant_in(4 * 86_400)},
+                            "month": {"usedPct": 35.0, "resetsAt": instant_in(10 * 86_400)}
+                        }
+                    }
+                })]
+            },
+            "opencode": {
+                "account_count": 1,
+                "accounts": [json!({
+                    "email": "oc@example.com",
+                    "available": true,
+                    "failureCount": 0,
+                    "quota": null
+                })]
+            },
+            "groq": {
+                "account_count": 1,
+                "accounts": [json!({
+                    "email": "g@example.com",
+                    "available": true,
+                    "failureCount": 0,
+                    // A quota object on a pool outside the three providers stays
+                    // unprinted: those panels are unchanged.
+                    "quota": {
+                        "source": "headers",
+                        "observedAt": "2026-10-28T09:47:39Z",
+                        "windows": {"5h": {"usedPct": 42.0}}
+                    }
+                })]
+            }
+        }
+    })
+}
+
+#[test]
+fn accounts_prints_quota_bars_in_the_plain_view() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        accounts_payload: Some(quota_payload()),
+        ..FakeRuntime::default()
+    };
+
+    let plain = run(&["accounts"], tmp.path(), &mut runtime).stdout;
+    // Nothing here paints: a pipe carries the same reading a terminal does.
+    assert!(!plain.contains('\x1b'), "plain output painted: {plain:?}");
+    let bars = |prefix: &str| -> Vec<String> {
+        plain
+            .lines()
+            .filter(|line| line.starts_with(prefix))
+            .map(ToOwned::to_owned)
+            .collect()
+    };
+
+    // 77% fills fifteen of the twenty cells; the reset's own words follow.
+    let five = bars("    5h    ");
+    assert_eq!(five.len(), 4, "one 5h row per covered account:\n{plain}");
+    assert!(
+        five.iter()
+            .any(|line| line.starts_with("    5h    ███████████████░░░░░   77%  reset ")),
+        "{plain}"
+    );
+    // A window the vendor says is over reads LIMIT, whatever the percent.
+    assert!(
+        plain.contains("    week  ████████████████████  LIMIT  reset "),
+        "{plain}"
+    );
+    // 4% is one cell, 13% is three, 35% is seven.
+    assert!(
+        plain.contains("    5h    █░░░░░░░░░░░░░░░░░░░    4%  reset "),
+        "{plain}"
+    );
+    assert!(
+        plain.contains("    week  ███░░░░░░░░░░░░░░░░░   13%  reset "),
+        "{plain}"
+    );
+    // A rolled cycle and a window with no number both read n/a, with no bar:
+    // two 5h rows here (the rolled account and the pool the relay never read).
+    assert_eq!(five.iter().filter(|line| line.ends_with("n/a")).count(), 2);
+    // The month row exists only where the provider has one.
+    assert_eq!(bars("    month ").len(), 2, "{plain}");
+    assert!(
+        plain.contains("    month ███████░░░░░░░░░░░░░   35%  reset "),
+        "{plain}"
+    );
+    // Nothing for a pool outside the three providers.
+    assert_eq!(bars("    week  ").len(), 4, "{plain}");
+    assert!(!plain.contains("42%"), "groq gained a quota row:\n{plain}");
+
+    // Each bar is exactly twenty cells wide.
+    for line in plain
+        .lines()
+        .filter(|line| line.contains('█') || line.contains('░'))
+    {
+        let cells = line.chars().filter(|c| *c == '█' || *c == '░').count();
+        assert_eq!(cells, 20, "a bar lost its width: {line}");
+    }
+}
+
+#[test]
+fn accounts_prints_quota_bars_in_the_rich_panel() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(quota_payload()),
+        ..FakeRuntime::default()
+    };
+
+    let rich = strip_ansi(&run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich).stdout);
+    assert!(rich.contains("77%"), "{rich}");
+    assert!(rich.contains("LIMIT"), "{rich}");
+    // The panel's quota rows indent two columns, not the plain view's four.
+    assert!(rich.contains("\n│   5h    "), "{rich}");
+    assert!(rich.contains("\n│   month "), "{rich}");
+    // The panel is a fixed 64 columns, so the shorter bar and the reset's own
+    // words have to fit rather than be clipped.
+    let is_quota_row = |line: &str| {
+        let body = line.trim_start_matches('│').trim_start();
+        ["5h", "week", "month"]
+            .iter()
+            .any(|window| body.starts_with(&format!("{window} ")))
+    };
+    for line in rich.lines() {
+        assert_eq!(line.chars().count(), 64, "off the fixed width: {line}");
+        if is_quota_row(line) {
+            assert!(!line.contains('…'), "a quota row clipped: {line}");
+        }
+    }
+}

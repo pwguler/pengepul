@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use pengepul::accounts::{
     AccountManager, RefreshPolicy, RefreshPolicyKind, ToggleError, ToggleOutcome,
 };
+use pengepul::quota::{QuotaSnapshot, QuotaWindow};
 use pengepul::tokens::save_token;
 use pengepul::types::{ProviderId, RefreshTokenExhaustedError, TokenData, UsageData};
 use serde_json::{Value, json};
@@ -1961,6 +1962,113 @@ async fn a_removed_credential_keeps_its_usage_record_in_the_payload() {
     assert_eq!(file["goes@example.com"]["total_requests"], 1);
     assert_eq!(file["stays@example.com"]["total_requests"], 2);
     assert_eq!(manager.snapshots().len(), 2);
+}
+
+/// When a poll is due. Three reasons and no others: no observation yet, an
+/// observation older than the interval, or one describing a window that has
+/// already rolled. The rolled case is what keeps a five-hour window from
+/// reading `n/a` for a whole freshness period after it resets.
+#[test]
+fn quota_candidates_cover_missing_stale_fresh_and_rolled_snapshots() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("a@example.com")).expect("save token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+
+    // No observation yet: the account is due.
+    assert_eq!(
+        manager.quota_candidates(600, 1_793_178_000),
+        ["a@example.com".to_string()]
+    );
+
+    let snapshot = |observed_at: &str, resets_at: i64| QuotaSnapshot {
+        source: "billing".to_string(),
+        observed_at: observed_at.to_string(),
+        representative: None,
+        windows: std::collections::BTreeMap::from([(
+            "week".to_string(),
+            QuotaWindow {
+                used_pct: 12.0,
+                resets_at: Some(resets_at),
+                status: None,
+            },
+        )]),
+    };
+
+    // Fresh, and its window still running: not due.
+    manager.record_quota(
+        "a@example.com",
+        snapshot("2026-10-28T09:00:00Z", 1_793_546_903),
+    );
+    let observed = 1_793_178_000;
+    assert!(manager.quota_candidates(600, observed).is_empty());
+
+    // The same observation past the interval: due again.
+    assert_eq!(
+        manager.quota_candidates(600, observed + 601),
+        ["a@example.com".to_string()]
+    );
+
+    // Fresh but rolled: due on the reset alone.
+    manager.record_quota(
+        "a@example.com",
+        snapshot("2026-10-28T09:00:00Z", observed + 30),
+    );
+    assert_eq!(
+        manager.quota_candidates(600, observed + 60),
+        ["a@example.com".to_string()]
+    );
+
+    // An older observation never walks a newer one back.
+    manager.record_quota(
+        "a@example.com",
+        snapshot("2026-10-28T08:00:00Z", 1_793_546_903),
+    );
+    let entry = manager
+        .snapshots()
+        .into_iter()
+        .find(|record| record["email"] == "a@example.com")
+        .expect("record");
+    assert_eq!(entry["quota"]["observedAt"], "2026-10-28T09:00:00Z");
+}
+
+/// A snapshot survives a restart, because a five-hour or weekly window keeps
+/// running across one and forgetting it would blank the panel until the next
+/// request.
+#[test]
+fn quota_is_persisted_and_read_back_beside_the_usage_counters() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_token("a@example.com")).expect("save token");
+    let mut manager = never_refresh_manager(tmp.path().to_path_buf());
+    manager.load().expect("load");
+    manager.record_quota(
+        "a@example.com",
+        QuotaSnapshot {
+            source: "headers".to_string(),
+            observed_at: "2026-10-28T09:47:39Z".to_string(),
+            representative: Some("seven_day".to_string()),
+            windows: std::collections::BTreeMap::from([(
+                "5h".to_string(),
+                QuotaWindow {
+                    used_pct: 77.0,
+                    resets_at: Some(1_793_188_800),
+                    status: Some("allowed".to_string()),
+                },
+            )]),
+        },
+    );
+    assert!(tmp.path().join("commandcode/quota.json").exists());
+
+    let mut restarted = never_refresh_manager(tmp.path().to_path_buf());
+    restarted.load().expect("reload");
+    let entry = restarted
+        .snapshots()
+        .into_iter()
+        .find(|record| record["email"] == "a@example.com")
+        .expect("record");
+    assert_eq!(entry["quota"]["source"], "headers");
+    assert_eq!(entry["quota"]["windows"]["5h"]["usedPct"], 77.0);
+    assert_eq!(entry["quota"]["representative"], "seven_day");
 }
 
 #[tokio::test]
