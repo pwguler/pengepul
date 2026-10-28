@@ -1056,7 +1056,19 @@ impl AccountManager {
     /// records with a credential, so such a record is never handed a request.
     #[must_use]
     pub fn snapshots(&self) -> Vec<Value> {
-        let cutoff = retention_cutoff();
+        self.snapshots_since(&retention_cutoff())
+    }
+
+    /// The same records, with each day bucket older than `cutoff` (a
+    /// `YYYY-MM-DD`) left out.
+    ///
+    /// `/admin/accounts?days=N` passes the window its caller can actually
+    /// render: the dashboard asks for thirty and needs no more, and the
+    /// difference between a 76 KB payload and a 30 KB one is a body that can
+    /// stall on a VPN. The default stays the store's own retention, so
+    /// `pengepul accounts` and every existing reader see what they always did.
+    #[must_use]
+    pub fn snapshots_since(&self, cutoff: &str) -> Vec<Value> {
         let now = unix_now();
         let mut records: BTreeMap<String, Value> = self
             .accounts
@@ -1064,7 +1076,7 @@ impl AccountManager {
             .map(|(email, state)| {
                 let cooldown_remaining = (state.cooldown_until - now).max(0.0);
                 let mut fields =
-                    usage_json(&state.token.email, &PersistedUsage::from(state), &cutoff);
+                    usage_json(&state.token.email, &PersistedUsage::from(state), cutoff);
                 fields.insert(
                     "available".to_string(),
                     json!(cooldown_remaining == 0.0 && !state.disabled),
@@ -1098,7 +1110,7 @@ impl AccountManager {
             if self.accounts.contains_key(email) {
                 continue;
             }
-            let mut fields = usage_json(email, usage, &cutoff);
+            let mut fields = usage_json(email, usage, cutoff);
             // An account that cannot serve: no Cooldown to name (there is nothing
             // to wait out) and no failure to report (nothing has been attempted since
             // its credential went away).

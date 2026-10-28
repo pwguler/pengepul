@@ -1,6 +1,6 @@
 [package]
 name = "pengepul"
-version = "0.112.0"
+version = "0.112.1"
 edition = "2024"
 rust-version = "1.96"
 
@@ -30,7 +30,7 @@ plist = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.6", features = ["compression-gzip", "cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"

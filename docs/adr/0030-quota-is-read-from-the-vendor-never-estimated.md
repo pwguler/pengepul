@@ -52,6 +52,12 @@ the stored peak, and the all-time totals with the prompt's cache split). Both ar
 functions over the same snapshots `/admin/accounts` serves, so the dashboard and
 `pengepul accounts` cannot disagree about a figure.
 
+`/admin/accounts` also takes a `?days=N` window, defaulting to the store's retention. A
+widget that draws thirty days asks for thirty: the difference between a 76 KB payload and a
+50 KB one is a body that can stall on a VPN. The admin responses are gzip-compressed for the
+same reason, and only they are: a compressed byte stream cannot be read chunk by chunk, and
+the inference API next door is exactly that.
+
 ## Considered options
 
 - **A separate `pengepul quota` verb.** Rejected: the brief was to extend `accounts`, and a

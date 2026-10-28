@@ -6372,3 +6372,129 @@ async fn admin_usage_reports_the_window_and_all_time_totals() {
     .await;
     assert_eq!(status, 401);
 }
+
+/// `/admin/accounts?days=N` trims each record's day buckets to the window the
+/// caller renders. The dashboard asks for thirty; the default stays the store's
+/// own retention, so every existing reader sees what it always did.
+#[tokio::test]
+async fn admin_accounts_windows_the_days_it_is_asked_for() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_key_token("commandcode", "key-90445c90")).expect("save key");
+    let provider_dir = tmp.path().join("commandcode");
+    std::fs::create_dir_all(&provider_dir).expect("provider dir");
+    let today = chrono::Local::now().date_naive();
+    let mut days = serde_json::Map::new();
+    for back in 0..40 {
+        let date = (today - chrono::Duration::days(back)).format("%Y-%m-%d");
+        days.insert(
+            date.to_string(),
+            json!({"requests": 1, "successes": 1, "failures": 0}),
+        );
+    }
+    std::fs::write(
+        provider_dir.join("usage.json"),
+        json!({"key-90445c90": {"total_requests": 40, "total_successes": 40, "days": days}})
+            .to_string(),
+    )
+    .expect("write usage");
+    let app = create_app_with_upstream(
+        config_with_static_provider("commandcode", tmp.path().to_path_buf()),
+        Arc::new(FakeUpstream::default()),
+    );
+
+    let entry_days = |body: &Value| -> Vec<String> {
+        body["providers"]["commandcode"]["accounts"][0]["days"]
+            .as_array()
+            .expect("days")
+            .iter()
+            .map(|day| day["date"].as_str().expect("date").to_string())
+            .collect()
+    };
+    let (status, body) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .uri("/admin/accounts?days=3")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let window = entry_days(&body);
+    assert_eq!(window.len(), 3, "three days, got {window:?}");
+    assert_eq!(window[2], today.format("%Y-%m-%d").to_string());
+    assert_eq!(
+        window[0],
+        (today - chrono::Duration::days(2))
+            .format("%Y-%m-%d")
+            .to_string()
+    );
+
+    // No query: the store's own retention, which holds all forty here.
+    let (_, body) = json_response(
+        app,
+        axum::http::Request::builder()
+            .uri("/admin/accounts")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(entry_days(&body).len(), 40);
+}
+
+/// The admin payloads are compressed for a caller that asks for it, and the
+/// inference API is not: a compressed byte stream cannot be read chunk by
+/// chunk, and a five-hour reply is exactly that.
+#[tokio::test]
+async fn admin_payloads_compress_and_inference_does_not() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = create_app_with_upstream(
+        config(tmp.path().to_path_buf()),
+        Arc::new(FakeUpstream::default()),
+    );
+    let (status, headers) = headers_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .uri("/admin/accounts?days=30")
+            .header("authorization", "Bearer sk-test")
+            .header("accept-encoding", "gzip")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok()),
+        Some("gzip"),
+        "the admin payload was not compressed"
+    );
+
+    let (status, headers) = headers_response(
+        app,
+        axum::http::Request::builder()
+            .uri("/v1/models")
+            .header("authorization", "Bearer sk-test")
+            .header("accept-encoding", "gzip")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        headers.get("content-encoding").is_none(),
+        "the inference API was compressed"
+    );
+}
+
+/// One request's status and headers, without reading the body: the compressed
+/// body is bytes, not JSON.
+async fn headers_response(
+    app: axum::Router,
+    request: axum::http::Request<Body>,
+) -> (u16, axum::http::HeaderMap) {
+    let response = app.oneshot(request).await.expect("response");
+    (response.status().as_u16(), response.headers().clone())
+}

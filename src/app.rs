@@ -17,6 +17,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{Stream, StreamExt, TryStreamExt};
 use serde_json::{Value, json};
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::accounts::{
@@ -652,14 +653,21 @@ pub fn create_app_with_upstream(config: Config, upstream: Arc<dyn UpstreamClient
         .route("/responses", post(responses))
         .route("/messages", post(messages))
         .route("/messages/count_tokens", post(count_tokens));
+    // Compressed only here. These payloads are tens of kilobytes of JSON and a
+    // dashboard reads them over a VPN, where a body that size is a body that can
+    // stall. The inference API next door must never be compressed: a compressed
+    // byte stream cannot be read chunk by chunk.
+    let admin = Router::new()
+        .route("/accounts", get(admin_accounts))
+        .route("/status", get(admin_status))
+        .route("/usage", get(admin_usage))
+        .route("/reload", post(admin_reload))
+        .route("/accounts/disable", post(admin_disable))
+        .route("/accounts/enable", post(admin_enable))
+        .layer(CompressionLayer::new());
     Router::new()
         .route("/health", get(health))
-        .route("/admin/accounts", get(admin_accounts))
-        .route("/admin/status", get(admin_status))
-        .route("/admin/usage", get(admin_usage))
-        .route("/admin/reload", post(admin_reload))
-        .route("/admin/accounts/disable", post(admin_disable))
-        .route("/admin/accounts/enable", post(admin_enable))
+        .nest("/admin", admin)
         .nest("/v1", api.clone())
         .nest("/v1/v1", api)
         .with_state(state)
@@ -1133,14 +1141,39 @@ async fn health() -> Json<Value> {
     Json(json!({"status": "ok"}))
 }
 
-async fn admin_accounts(State(state): State<AppState>, headers: HeaderMap) -> Response {
+/// `/admin/accounts?days=N`: how many local days of per-account history each
+/// record carries. The default is the store's own retention.
+#[derive(Debug, serde::Deserialize)]
+struct AccountsQuery {
+    days: Option<usize>,
+}
+
+/// The oldest date a `days`-long window ending today holds, as `YYYY-MM-DD`.
+fn window_cutoff(days: usize) -> String {
+    let back = i64::try_from(days.saturating_sub(1)).unwrap_or(0);
+    (chrono::Local::now() - chrono::Duration::days(back))
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+async fn admin_accounts(
+    State(state): State<AppState>,
+    Query(query): Query<AccountsQuery>,
+    headers: HeaderMap,
+) -> Response {
     if let Err(error) = require_api_key(&state, &headers, false) {
         return error.into_response();
     }
 
+    let cutoff = window_cutoff(
+        query
+            .days
+            .unwrap_or(usize::try_from(crate::tokens::RETENTION_DAYS).unwrap_or(90))
+            .clamp(1, 90),
+    );
     let mut pools = Vec::new();
     for (provider, manager) in state.account_managers.pools() {
-        pools.push((provider, manager.lock().await.snapshots()));
+        pools.push((provider, manager.lock().await.snapshots_since(&cutoff)));
     }
     let peak = record_peak(
         &state.config.auth_dir,
