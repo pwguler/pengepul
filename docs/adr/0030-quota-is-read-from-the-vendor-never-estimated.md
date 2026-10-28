@@ -40,9 +40,17 @@ id's grant (GOAT 70, Go 10, Provider 15, Max 150, Ultra 300, Teams Pro 40), and 
 account corroborates the table: 70 less the period's spend equals the remaining credits the
 API reports, to within a tenth. An unknown plan id leaves the month window unmeasured.
 
-The bars are monochrome by operator request. The percentage and `LIMIT` carry the reading,
-and a colored bar would be the one place a piped line and a panel differed in meaning rather
-than in painting.
+The CLI's bars are monochrome by operator request: the percentage and `LIMIT` carry the
+reading, and a colored bar would be the one place a piped line and a panel differed in
+meaning rather than in painting. A consumer with its own approved design may color its own
+bars; the Windows dashboard does.
+
+The dashboard's other two numbers come from two report routes rather than from arithmetic in
+the widget: `GET /admin/status` (build, uptime, address, per-pool availability, today's
+requests) and `GET /admin/usage?days=N` (requests and tokens per local day over every pool,
+the stored peak, and the all-time totals with the prompt's cache split). Both are pure
+functions over the same snapshots `/admin/accounts` serves, so the dashboard and
+`pengepul accounts` cannot disagree about a figure.
 
 ## Considered options
 

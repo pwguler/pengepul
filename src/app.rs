@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::Context as _;
 use async_stream::try_stream;
 use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -22,6 +22,7 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::accounts::{
     AccountManager, RefreshPolicy, RefreshPolicyKind, ToggleError, ToggleOutcome,
 };
+use crate::admin_report::{status_json, usage_json};
 use crate::cloaking_versions::{CliVersions, codex_release, effective, npm_latest};
 use crate::config::{BodyLimit, Config};
 use crate::masquerade::{masquerade_request, restore_tool_use_names};
@@ -150,6 +151,8 @@ struct AppState {
     account_managers: Arc<AccountManagers>,
     rate_limit_buckets: Arc<StdMutex<BTreeMap<String, RateLimitBucket>>>,
     catalog: Arc<StdRwLock<ModelCatalog>>,
+    /// Process start, for the uptime `/admin/status` reports.
+    started_at: Instant,
 }
 
 struct AccountManagers {
@@ -625,6 +628,7 @@ pub fn create_app_with_upstream(config: Config, upstream: Arc<dyn UpstreamClient
         account_managers: Arc::new(account_managers),
         rate_limit_buckets: Arc::new(StdMutex::new(BTreeMap::new())),
         catalog: Arc::new(StdRwLock::new(ModelCatalog::default())),
+        started_at: Instant::now(),
     };
 
     // Keep the model catalog fresh off the request path. Requires a Tokio runtime, which
@@ -651,6 +655,8 @@ pub fn create_app_with_upstream(config: Config, upstream: Arc<dyn UpstreamClient
     Router::new()
         .route("/health", get(health))
         .route("/admin/accounts", get(admin_accounts))
+        .route("/admin/status", get(admin_status))
+        .route("/admin/usage", get(admin_usage))
         .route("/admin/reload", post(admin_reload))
         .route("/admin/accounts/disable", post(admin_disable))
         .route("/admin/accounts/enable", post(admin_enable))
@@ -1153,6 +1159,66 @@ async fn admin_accounts(State(state): State<AppState>, headers: HeaderMap) -> Re
         "peak": peak.map(|peak| json!({"date": peak.date, "tokens": peak.tokens})),
         "generated_at": now_iso()
     }))
+    .into_response()
+}
+
+/// Every pool's snapshots, with the provider that holds them: one shape for
+/// both report handlers, so the two cannot disagree about what a pool is.
+async fn pool_snapshots(state: &AppState) -> Vec<(String, Vec<Value>)> {
+    let mut pools = Vec::new();
+    for (provider, manager) in state.account_managers.pools() {
+        pools.push((provider.to_string(), manager.lock().await.snapshots()));
+    }
+    pools
+}
+
+/// The dashboard's health block: build, uptime, where the relay listens, and
+/// what each pool can serve.
+async fn admin_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(error) = require_api_key(&state, &headers, false) {
+        return error.into_response();
+    }
+    let pools = pool_snapshots(&state).await;
+    let address = format!("{}:{}", state.config.host, state.config.port);
+    let uptime_seconds = state.started_at.elapsed().as_secs();
+    Json(status_json(
+        &pools,
+        env!("CARGO_PKG_VERSION"),
+        uptime_seconds,
+        &address,
+        &crate::utils::local_today(),
+    ))
+    .into_response()
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct UsageQuery {
+    days: Option<usize>,
+}
+
+/// The dashboard's usage window: requests and tokens per local day over every
+/// pool. `days` defaults to 30 and is bounded to what the store can hold.
+async fn admin_usage(
+    State(state): State<AppState>,
+    Query(query): Query<UsageQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(error) = require_api_key(&state, &headers, false) {
+        return error.into_response();
+    }
+    let days = query.days.unwrap_or(30).clamp(1, 90);
+    let snapshots: Vec<Value> = pool_snapshots(&state)
+        .await
+        .into_iter()
+        .flat_map(|(_, accounts)| accounts)
+        .collect();
+    let peak = load_peak(&state.config.auth_dir).ok().flatten();
+    Json(usage_json(
+        &snapshots,
+        peak.as_ref(),
+        days,
+        &crate::utils::local_today(),
+    ))
     .into_response()
 }
 
@@ -4014,6 +4080,7 @@ mod tests {
     use crate::types::{AvailableAccount, ProviderId, ProviderKind, TokenData};
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
+    use std::time::Instant;
 
     #[test]
     fn refusal_stream_event_becomes_deliverable_text() {
@@ -5262,6 +5329,7 @@ mod tests {
                 RateLimitBucket,
             >::new())),
             catalog: Arc::new(StdRwLock::new(ModelCatalog::default())),
+            started_at: Instant::now(),
         }
     }
 

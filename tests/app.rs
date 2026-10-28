@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
@@ -6204,4 +6204,171 @@ async fn every_upstream_request_carries_its_conversation() {
         ]
     );
     assert!(conversations[4].starts_with("prefix:"), "{conversations:?}");
+}
+
+// ---------------------------------------------------------------------------
+// The dashboard's two report routes
+// ---------------------------------------------------------------------------
+
+/// Seed one provider's `usage.json` with an all-time figure and today's bucket.
+fn seed_dashboard_usage(auth_dir: &Path) {
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let provider_dir = auth_dir.join("commandcode");
+    std::fs::create_dir_all(&provider_dir).expect("provider dir");
+    std::fs::write(
+        provider_dir.join("usage.json"),
+        json!({
+            "key-90445c90": {
+                "total_requests": 10,
+                "total_successes": 9,
+                "total_failures": 1,
+                "total_input_tokens": 100,
+                "total_output_tokens": 25,
+                "total_cache_creation_input_tokens": 50,
+                "total_cache_read_input_tokens": 400,
+                "total_reasoning_output_tokens": 5,
+                // The file keeps its days as a map keyed by date; the admin
+                // payload is what turns them into the array a reader sees.
+                "days": {
+                    today: {
+                        "requests": 4,
+                        "successes": 3,
+                        "failures": 1,
+                        "input_tokens": 40,
+                        "output_tokens": 10,
+                        "cache_creation_input_tokens": 5,
+                        "cache_read_input_tokens": 60,
+                        "reasoning_output_tokens": 2
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write usage");
+}
+
+/// `/admin/status` is the dashboard's health block: the build, the uptime, the
+/// address, and what each pool can serve, counted by the same rule the account
+/// rows use.
+#[tokio::test]
+async fn admin_status_reports_health_and_per_pool_counts() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_key_token("commandcode", "key-90445c90")).expect("save key");
+    save_token(tmp.path(), &static_key_token("commandcode", "key-11111111")).expect("save key");
+    seed_dashboard_usage(tmp.path());
+    let app = create_app_with_upstream(
+        config_with_static_provider("commandcode", tmp.path().to_path_buf()),
+        Arc::new(FakeUpstream::default()),
+    );
+
+    let (status, body) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .uri("/admin/status")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    assert!(body["uptimeSeconds"].as_u64().is_some());
+    assert!(
+        body["address"]
+            .as_str()
+            .expect("address")
+            .ends_with(":8317")
+    );
+    assert_eq!(body["accounts"]["available"], 2);
+    assert_eq!(body["accounts"]["total"], 2);
+    // Only today's bucket counts toward today, and every pool is summed.
+
+    assert_eq!(body["requestsToday"], 4);
+    assert_eq!(body["providers"]["commandcode"]["available"], 2);
+    assert_eq!(body["providers"]["commandcode"]["total"], 2);
+    assert!(body["generatedAt"].is_string());
+
+    // The route is admin-scoped like the payload it summarizes.
+    let (status, _) = json_response(
+        app,
+        axum::http::Request::builder()
+            .uri("/admin/status")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 401);
+}
+
+/// `/admin/usage` folds every pool into one calendar window: one entry per day,
+/// idle days included, with the prompt's cache split and an all-time total that
+/// comes from the account counters rather than the retained days.
+#[tokio::test]
+async fn admin_usage_reports_the_window_and_all_time_totals() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_key_token("commandcode", "key-90445c90")).expect("save key");
+    seed_dashboard_usage(tmp.path());
+    let app = create_app_with_upstream(
+        config_with_static_provider("commandcode", tmp.path().to_path_buf()),
+        Arc::new(FakeUpstream::default()),
+    );
+
+    let (status, body) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .uri("/admin/usage?days=7")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["days"], 7);
+    let daily = body["daily"].as_array().expect("daily");
+    assert_eq!(daily.len(), 7, "one column per calendar day");
+    assert_eq!(
+        daily[6]["date"],
+        chrono::Local::now().format("%Y-%m-%d").to_string()
+    );
+    assert_eq!(daily[6]["requests"], 4);
+    assert_eq!(daily[6]["recorded"], true);
+    assert_eq!(daily[0]["recorded"], false, "an idle day is still a column");
+    // prompt = input + cache read + cache creation; cached is the read share.
+    assert_eq!(daily[6]["inputTokens"], 40 + 60 + 5);
+    assert_eq!(daily[6]["cachedTokens"], 60);
+    assert_eq!(daily[6]["uncachedInputTokens"], 45);
+    assert_eq!(daily[6]["totalTokens"], 105 + 10);
+    assert_eq!(body["window"]["requests"], 4);
+    assert_eq!(body["window"]["failures"], 1);
+    assert_eq!(body["failedPct"], 25.0);
+    // All-time is the account's counters, not the seven retained days.
+    assert_eq!(body["allTime"]["requests"], 10);
+    assert_eq!(body["allTime"]["totalTokens"], 550 + 25);
+    assert_eq!(body["allTime"]["cachedTokens"], 400);
+    assert_eq!(body["allTime"]["uncachedInputTokens"], 150);
+    assert!(body["from"].as_str().is_some());
+    assert!(body["to"].as_str().is_some());
+
+    // The window is bounded to what the store can hold.
+    let (_, body) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .uri("/admin/usage?days=100000")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["days"], 90);
+
+    let (status, _) = json_response(
+        app,
+        axum::http::Request::builder()
+            .uri("/admin/usage")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 401);
 }

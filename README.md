@@ -216,9 +216,16 @@ connections and gives the requests in flight up to 15 s to finish, then exits.
 
 Routes: `POST /v1/messages`, `POST /v1/chat/completions`, `POST /v1/responses`,
 `POST /v1/messages/count_tokens`, `GET /v1/models`, `GET /admin/accounts`,
-`POST /admin/reload`, `POST /admin/accounts/disable`, `POST /admin/accounts/enable`, and
-`GET /health` (unauthenticated). Every route but `/health` needs
-the local API key, sent as `Authorization: Bearer <key>` or `x-api-key: <key>`.
+`GET /admin/status`, `GET /admin/usage?days=30`, `POST /admin/reload`,
+`POST /admin/accounts/disable`, `POST /admin/accounts/enable`, and `GET /health`
+(unauthenticated). Every route but `/health` needs the local API key, sent as
+`Authorization: Bearer <key>` or `x-api-key: <key>`.
+
+`/admin/status` is the dashboard's health block: version, uptime, address, how
+many accounts can serve, today's requests, and the same per provider.
+`/admin/usage` is a request and token window over every pool, one entry per
+local day (`days` defaults to 30, bounded to 1–90), plus the stored peak day and
+the all-time totals with the prompt's cache split.
 
 pengepul writes `~/.pengepul/config.yaml` when missing, with a fresh `sk-local-…` key. The
 keys you can set:
@@ -272,4 +279,6 @@ A window with no observation, or one whose reset instant has passed, reads `n/a`
 or when the vendor says the window is rejected, it reads `LIMIT`. Nothing is estimated from
 token counts. `GET /admin/accounts` carries the same thing under each account's `quota`
 field: `source`, `observedAt`, and `windows.<name>.{usedPct, resetsAt, status}`, with
-`resetsAt` in Unix epoch seconds. Other providers print no quota rows.
+`resetsAt` in Unix epoch seconds. Other providers print no quota rows. The Windows tray
+dashboard reads this and the two report routes below, so its cards and this panel show the
+same numbers.

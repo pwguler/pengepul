@@ -1,4 +1,5 @@
 pub mod accounts;
+pub mod admin_report;
 pub mod app;
 pub mod cli;
 pub mod cloaking_versions;
