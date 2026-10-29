@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
@@ -7,7 +8,8 @@ use std::time::Duration;
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use crate::quota::{QuotaSnapshot, load_quota, save_quota};
+use crate::config::DEFAULT_PRIORITY;
+use crate::quota::{QuotaSnapshot, WINDOW_WEEK, load_quota, save_quota};
 use crate::tokens::{
     DayUsage, ModelUsage, PersistedUsage, RETENTION_DAYS, load_all_tokens, load_disabled_tokens,
     load_usage, save_token, save_usage, set_credential_disabled, trim_days, usage_file_unreadable,
@@ -434,7 +436,12 @@ pub struct AccountManager {
     refresh_policy: RefreshPolicy,
     accounts: BTreeMap<String, AccountState>,
     order: Vec<String>,
-    last_used_index: Option<usize>,
+    /// Each Account's configured Priority, keyed by Account key. An Account left out holds
+    /// [`DEFAULT_PRIORITY`], and every such Account holds the same one, so a Pool with no
+    /// configuration at all is ordered by the tie-breakers alone. A key the Pool does not
+    /// hold is kept and reported at startup rather than dropped: the operator's typo is
+    /// still there when a later login or restart brings the Account it meant (AC-1).
+    priorities: BTreeMap<String, i64>,
     /// Usage counters read from disk at `load()` and merged into fresh
     /// account states. Never updated afterwards: writes rebuild the accounts that
     /// loaded from memory and carry the rest of the file through unchanged
@@ -454,6 +461,7 @@ impl AccountManager {
     pub fn new(
         auth_dir: PathBuf,
         provider: ProviderId,
+        priorities: BTreeMap<String, i64>,
         refresh: impl Fn(String) -> RefreshFuture + Send + Sync + 'static,
         refresh_policy: RefreshPolicy,
     ) -> Self {
@@ -464,7 +472,7 @@ impl AccountManager {
             refresh_policy,
             accounts: BTreeMap::new(),
             order: Vec::new(),
-            last_used_index: None,
+            priorities,
             persisted_usage: BTreeMap::new(),
             affinity: BTreeMap::new(),
             quota: BTreeMap::new(),
@@ -701,20 +709,9 @@ impl AccountManager {
         }
     }
 
-    /// Drop an account from the rotation order, keeping Rotation's place: the
-    /// account after the one used last is still next.
+    /// Drop an account from the rotation order: the next selection orders whatever is left.
     fn leave_rotation(&mut self, email: &str) {
-        let Some(index) = self.order.iter().position(|held| held == email) else {
-            return;
-        };
-        self.order.remove(index);
-        self.last_used_index = match self.last_used_index {
-            Some(last) if last >= index => last.checked_sub(1),
-            other => other,
-        };
-        if self.order.is_empty() {
-            self.last_used_index = None;
-        }
+        self.order.retain(|held| held != email);
     }
 
     fn join_rotation(&mut self, email: &str) {
@@ -1097,6 +1094,9 @@ impl AccountManager {
                 fields.insert("expiresAt".to_string(), json!(state.token.expires_at));
                 fields.insert("refreshing".to_string(), json!(false));
                 fields.insert("planType".to_string(), json!(state.token.plan_type));
+                let (priority, source) = self.priority_fields(email);
+                fields.insert("priority".to_string(), json!(priority));
+                fields.insert("prioritySource".to_string(), json!(source));
                 fields.insert(
                     "quota".to_string(),
                     self.quota
@@ -1124,6 +1124,11 @@ impl AccountManager {
             fields.insert("expiresAt".to_string(), json!(""));
             fields.insert("refreshing".to_string(), json!(false));
             fields.insert("planType".to_string(), Value::Null);
+            // A removed credential leaves an Account of the Pool (ADR-0026), so it carries
+            // the same Priority pair as one that can serve: one shape for every record.
+            let (priority, source) = self.priority_fields(email);
+            fields.insert("priority".to_string(), json!(priority));
+            fields.insert("prioritySource".to_string(), json!(source));
             // A record without a credential has no way to observe its quota,
             // and any snapshot it kept belonged to that credential's last days
             // in the pool. The field stays, null, so one shape serves both.
@@ -1134,8 +1139,97 @@ impl AccountManager {
     }
 
     #[must_use]
-    pub fn next_account(&mut self) -> Option<AvailableAccount> {
+    pub fn next_account(&self) -> Option<AvailableAccount> {
         self.next_account_result().account
+    }
+
+    /// The Priority this Pool orders an Account by: the number the config gives it, or
+    /// [`DEFAULT_PRIORITY`] for an Account the config leaves out.
+    #[must_use]
+    pub fn priority(&self, email: &str) -> i64 {
+        self.priorities
+            .get(email)
+            .copied()
+            .unwrap_or(DEFAULT_PRIORITY)
+    }
+
+    /// The admin payload's pair: the effective Priority, and the word naming where it came
+    /// from — `config` or `default`. Every view reads it here, so the CLI and the tray cannot
+    /// disagree about which number is configured (AC-7).
+    #[must_use]
+    fn priority_fields(&self, email: &str) -> (i64, &'static str) {
+        let source = if self.priorities.contains_key(email) {
+            "config"
+        } else {
+            "default"
+        };
+        (self.priority(email), source)
+    }
+
+    /// The Priority entries naming an Account this Pool holds no record of.
+    ///
+    /// A warning at startup, never an error (AC-1): a key the auth directory has not seen is
+    /// a typo the operator can see and fix, and refusing to load the Pool over it would turn
+    /// a cosmetic mistake into an outage.
+    #[must_use]
+    pub fn unknown_priorities(&self) -> Vec<String> {
+        self.priorities
+            .keys()
+            .filter(|email| !self.holds(email))
+            .cloned()
+            .collect()
+    }
+
+    /// When the vendor says this Account's weekly (`7d`) quota window rolls, in epoch
+    /// seconds, or `None` when it says nothing usable.
+    ///
+    /// A reset instant already in the past is `None`: the store prints `n/a` for a window
+    /// it describes that has rolled (ADR-0030), and a cycle that ended says nothing about
+    /// the next one. This is the only place selection reads quota at all, and it reads the
+    /// reset, never the utilization: near-exhausted quota is not a reason to leave an
+    /// Account (AC-3).
+    fn weekly_reset(&self, email: &str, now: f64) -> Option<i64> {
+        self.quota
+            .get(email)?
+            .windows
+            .get(WINDOW_WEEK)?
+            .resets_at
+            .filter(|at| epoch_seconds(now) < *at)
+    }
+
+    /// The selection order inside one Pool (AC-2): the smaller Priority first, then the
+    /// Account whose weekly window resets soonest — one with no known reset last within its
+    /// tier — and then the Account key, so the choice is deterministic.
+    fn prefer(&self, left: &str, right: &str, now: f64) -> Ordering {
+        self.priority(left)
+            .cmp(&self.priority(right))
+            .then_with(
+                || match (self.weekly_reset(left, now), self.weekly_reset(right, now)) {
+                    (Some(left), Some(right)) => left.cmp(&right),
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => Ordering::Equal,
+                },
+            )
+            .then_with(|| left.cmp(right))
+    }
+
+    /// The Account a new conversation is handed: the best Account that can serve by
+    /// [`Self::prefer`], or `None` when every Account is on Cooldown.
+    ///
+    /// The rotation order holds exactly the Accounts that can serve on state — one with a
+    /// credential, not Disabled — so a Cooldown is the only thing left to filter. Should a
+    /// tier's Accounts all be cooling, the next tier is ordered the same way, which is what
+    /// makes Priority an order over the serving set rather than a pin (AC-3).
+    fn best_serving(&self, now: f64) -> Option<&String> {
+        self.order
+            .iter()
+            .filter(|email| {
+                self.accounts
+                    .get(*email)
+                    .is_some_and(|state| state.cooldown_until <= now)
+            })
+            .min_by(|left, right| self.prefer(left, right, now))
     }
 
     #[must_use]
@@ -1145,7 +1239,10 @@ impl AccountManager {
     /// between accounts throws away the prefix it just paid to cache.
     /// Affinity is a preference and never a pin: an account on Cooldown
     /// falls through to Rotation, which is what keeps availability ahead of
-    /// cache efficiency.
+    /// cache efficiency. It outranks Priority for the same reason (AC-4): a
+    /// conversation stays on the Account that can serve it even after a more
+    /// preferred Account recovers, and only new conversations go to the
+    /// preferred one.
     pub fn account_for(&mut self, affinity: &str) -> AccountResult {
         let now = unix_now();
         if let Some(email) = self.affinity.get(affinity)
@@ -1154,9 +1251,6 @@ impl AccountManager {
             && !state.disabled
         {
             let account = self.available_account(state);
-            if let Some(index) = self.order.iter().position(|held| held == email) {
-                self.last_used_index = Some(index);
-            }
             return AccountResult {
                 account: Some(account),
                 failure_kind: None,
@@ -1179,7 +1273,8 @@ impl AccountManager {
         result
     }
 
-    pub fn next_account_result(&mut self) -> AccountResult {
+    #[must_use]
+    pub fn next_account_result(&self) -> AccountResult {
         if self.order.is_empty() {
             return AccountResult {
                 account: None,
@@ -1189,20 +1284,15 @@ impl AccountManager {
             };
         }
         let now = unix_now();
-        let start = self.last_used_index.map_or(0, |index| index + 1);
-        for offset in 0..self.order.len() {
-            let index = (start + offset) % self.order.len();
-            let email = &self.order[index];
-            let state = &self.accounts[email];
-            if state.cooldown_until <= now {
-                self.last_used_index = Some(index);
-                return AccountResult {
-                    account: Some(self.available_account(state)),
-                    failure_kind: None,
-                    retry_after_seconds: None,
-                    affinity: AffinityOutcome::Rotation,
-                };
-            }
+        if let Some(email) = self.best_serving(now)
+            && let Some(state) = self.accounts.get(email)
+        {
+            return AccountResult {
+                account: Some(self.available_account(state)),
+                failure_kind: None,
+                retry_after_seconds: None,
+                affinity: AffinityOutcome::Rotation,
+            };
         }
         let best = self
             .order
@@ -1352,6 +1442,15 @@ fn unix_now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |duration| duration.as_secs_f64())
+}
+
+/// A fractional epoch second as the whole second a reset instant is kept in.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "a reset instant is kept in whole seconds; the fraction is sub-second noise"
+)]
+fn epoch_seconds(seconds: f64) -> i64 {
+    seconds as i64
 }
 
 /// Close any attempt/outcome gap a file carries, in either direction. At

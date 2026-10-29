@@ -41,6 +41,7 @@ fn config() -> Config {
             poll: false,
             poll_minutes: 15,
         },
+        priority: BTreeMap::default(),
     }
 }
 

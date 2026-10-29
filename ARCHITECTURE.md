@@ -22,8 +22,8 @@ in files.
   (`stream-messages-ms`) for a stream, and reads each response's **Retry hint**
   off its headers (`retry-after-ms`, or `retry-after` as seconds or an HTTP date).
 - **Account** (`accounts.rs`) — `AccountManager`: holds every Account of one
-  Provider and picks who serves next; **Rotation**, **Cooldown** and due
-  **Refresh** live here, and every request outcome updates the Account's
+  Provider and picks who serves next; **Rotation**, **Priority**, **Cooldown**
+  and due **Refresh** live here, and every request outcome updates the Account's
   Usage counters, which it hands to the Credential store to persist. A
   Cooldown's length is what its failure's policy sets, or the Retry hint a 429
   or 503 carried when that is longer, capped at a day. Every
@@ -183,6 +183,13 @@ in files.
   shorthand (ADR-0025).
 - **Failover only moves a request between Accounts of the same Provider**,
   resolved once before the attempt loop.
+- **Priority orders new conversations inside one Pool, and decides nothing else.** Each
+  Account carries an integer (`priority:` in the config, keyed by Provider and Account key,
+  default `0`); a new conversation takes the serving Account of smallest one, then the soonest
+  weekly quota reset, then the Account key. It never compares across Pools, never reads quota
+  utilization, and never overrides cache affinity or availability: an Account leaves the
+  serving set only on Cooldown, Disabled or a missing credential, and a conversation with
+  affinity keeps its Account while that Account can serve (ADR-0031).
 - **Rotation prefers the Account holding the cache, and never waits for it.**
   Each upstream keeps its own prompt cache, so a conversation stays on the
   Account that served it last while that Account is off Cooldown, and takes
