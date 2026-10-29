@@ -78,7 +78,14 @@ pub struct Config {
     pub debug: DebugMode,
     pub providers: BTreeMap<String, ConfiguredProvider>,
     pub quota: QuotaConfig,
+    /// Each Account's Priority, keyed by Provider id and then Account key. Smaller is
+    /// preferred; an Account left out takes [`DEFAULT_PRIORITY`].
+    pub priority: BTreeMap<String, BTreeMap<String, i64>>,
 }
+
+/// The Priority of an Account the config does not rank. Every unranked Account shares it, so
+/// a positive number demotes an Account below them and a negative one promotes it.
+pub const DEFAULT_PRIORITY: i64 = 0;
 
 /// The largest request body the relay will read, resolved once at config load.
 ///
@@ -164,6 +171,8 @@ struct RawConfig {
     debug: serde_yaml::Value,
     providers: BTreeMap<String, RawConfiguredProvider>,
     quota: RawQuota,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    priority: BTreeMap<String, BTreeMap<String, i64>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -232,6 +241,7 @@ impl Default for RawConfig {
             debug: serde_yaml::Value::String("off".to_string()),
             providers: BTreeMap::new(),
             quota: RawQuota::default(),
+            priority: BTreeMap::new(),
         }
     }
 }
@@ -417,6 +427,7 @@ pub fn load_config(
             // vendors' endpoints. One minute is the floor an operator gets.
             poll_minutes: raw.quota.poll_minutes.max(1),
         },
+        priority: raw.priority,
     })
 }
 
@@ -465,6 +476,25 @@ impl FileLock {
 impl Drop for FileLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+impl Config {
+    /// The Priorities configured for one Provider's Pool, keyed by Account key. A Provider
+    /// the config does not rank gets an empty map, so every Account of it holds the default.
+    #[must_use]
+    pub fn priority_for(&self, provider_id: &str) -> BTreeMap<String, i64> {
+        self.priority.get(provider_id).cloned().unwrap_or_default()
+    }
+
+    /// The Provider ids a `priority:` entry can name: the three built-in Pools plus every
+    /// configured one.
+    #[must_use]
+    pub fn known_providers(&self) -> HashSet<&str> {
+        ["anthropic", "codex", "grok"]
+            .into_iter()
+            .chain(self.providers.keys().map(String::as_str))
+            .collect()
     }
 }
 

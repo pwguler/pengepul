@@ -171,6 +171,9 @@ pub(crate) fn print_accounts(payload: &Value, output: &mut Output, now: f64, ver
             }
             let last_ok = last_ok_age(account, now).unwrap_or_else(|| "never".to_string());
             write!(line, " last_ok={last_ok}").expect("write to String cannot fail");
+            if let Some(priority) = priority_text(account) {
+                write!(line, " priority={priority}").expect("write to String cannot fail");
+            }
             output.line(&line);
             let detail = format!(
                 "    requests {} ({} ok) {}",
@@ -920,6 +923,19 @@ pub(crate) fn account_row(account: &Value, pool_total: i64, now: f64) -> String 
     .join(" ")
 }
 
+/// An Account's effective Priority and where the number came from: `1 (config)`, `0
+/// (default)`. `None` for a payload that predates the field, so no number is invented
+/// (ADR-0024) — the relay and the CLI are versioned together, and an old relay ranks every
+/// Account alike, which is what an empty line would have to guess at.
+pub(crate) fn priority_text(account: &Value) -> Option<String> {
+    let priority = account.get("priority").and_then(Value::as_i64)?;
+    let source = account
+        .get("prioritySource")
+        .and_then(Value::as_str)
+        .unwrap_or("default");
+    Some(format!("{priority} ({source})"))
+}
+
 /// `part` as a rounded percentage of `whole`, or `None` when there is no whole to divide by.
 ///
 /// `i128` so a counter near `i64::MAX` cannot overflow the multiply, and `None` rather than
@@ -1043,6 +1059,11 @@ pub(crate) fn account_detail_facts(account: &Value, now: f64) -> Vec<Fact> {
     let last_ok =
         last_ok_age(account, now).map_or_else(|| "never".to_string(), |age| format!("{age} ago"));
     let mut facts = vec![Fact::new("last ok", &paint(DIM, &last_ok))];
+    // A Priority is the fact that picks this account for new work, so it follows the one
+    // usage fact and opens the token block (AC-7).
+    if let Some(priority) = priority_text(account) {
+        facts.push(Fact::new("priority", &paint(DIM, &priority)));
+    }
     facts.extend(token_block_facts(
         i64_field(account, "totalInputTokens"),
         i64_field(account, "totalOutputTokens"),
