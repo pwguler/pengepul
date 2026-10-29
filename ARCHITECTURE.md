@@ -192,8 +192,9 @@ in files.
   affinity keeps its Account while that Account can serve (ADR-0031).
 - **Rotation prefers the Account holding the cache, and never waits for it.**
   Each upstream keeps its own prompt cache, so a conversation stays on the
-  Account that served it last while that Account is off Cooldown, and takes
-  the next one the moment it is not (ADR-0017). The preference is keyed by
+  Account that served it last while that Account is off Cooldown, and takes the
+  best serving Account by the Priority order the moment it is not (ADR-0017,
+  ADR-0031). The preference is keyed by
   the session a harness names — a session header, or the `prompt_cache_key`
   its body carries — or, when it names none, by a hash of the cacheable
   prefix: the system blocks, `tools` and `model`, plus a fixed window over the

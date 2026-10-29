@@ -2936,6 +2936,23 @@ async fn a_new_conversation_takes_the_smallest_priority() {
 }
 
 #[tokio::test]
+async fn the_priority_outranks_the_weekly_reset() {
+    // AC-2's order has two keys, and a fixture where both point at the same Account proves
+    // neither. Here they disagree: `b` refreshes tomorrow and `a` in five days, and the
+    // smaller Priority still wins. Swapping `prefer`'s first two comparisons fails this.
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = priority_pool(
+        tmp.path(),
+        &["a@example.com", "b@example.com"],
+        &[("b@example.com", 1)],
+    );
+    manager.record_quota("a@example.com", weekly("2026-10-28T09:00:00Z", in_days(5)));
+    manager.record_quota("b@example.com", weekly("2026-10-28T09:00:00Z", in_days(1)));
+
+    assert_eq!(served(&mut manager, 3), ["a@example.com"; 3]);
+}
+
+#[tokio::test]
 async fn within_one_priority_the_soonest_weekly_reset_serves_first() {
     // AC-2. Both accounts sit in the same tier, so the vendor's own weekly reset decides.
     let tmp = tempdir().expect("tempdir");
@@ -3009,6 +3026,45 @@ async fn near_exhausted_quota_never_moves_a_request_to_a_lower_priority() {
     );
 
     assert_eq!(served(&mut manager, 3), ["a@example.com"; 3]);
+}
+
+#[tokio::test]
+async fn a_disabled_or_credential_less_account_is_never_handed_work_whatever_its_priority() {
+    // AC-3: Disabled and "unavailable" are the other two states that cannot serve, and a
+    // Priority is not a way back in. A Disabled Account keeps its record and its number, and
+    // a record whose credential was deleted keeps both too (ADR-0026).
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = priority_pool(
+        tmp.path(),
+        &["a@example.com", "z@example.com"],
+        &[("a@example.com", -1), ("z@example.com", 5)],
+    );
+    manager
+        .disable("a@example.com")
+        .expect("disable the preferred account");
+    assert_eq!(served(&mut manager, 2), ["z@example.com"; 2]);
+    assert_eq!(record(&mut manager, "a@example.com")["priority"], -1);
+
+    // A record with no credential at all, ranked better than anything that can serve.
+    let tmp = tempdir().expect("tempdir");
+    let provider_dir = tmp.path().join("commandcode");
+    fs::create_dir_all(&provider_dir).expect("provider dir");
+    fs::write(
+        provider_dir.join("usage.json"),
+        json!({"gone@example.com": {"total_requests": 3, "total_successes": 3}}).to_string(),
+    )
+    .expect("write usage");
+    let mut manager = priority_pool(
+        tmp.path(),
+        &["z@example.com"],
+        &[("gone@example.com", -100), ("z@example.com", 5)],
+    );
+
+    assert_eq!(served(&mut manager, 2), ["z@example.com"; 2]);
+    let gone = record(&mut manager, "gone@example.com");
+    assert_eq!(gone["available"], false);
+    assert_eq!(gone["priority"], -100);
+    assert_eq!(gone["prioritySource"], "config");
 }
 
 #[tokio::test]

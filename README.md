@@ -84,8 +84,8 @@ curl -sS http://127.0.0.1:8317/v1/chat/completions \
   "messages": [{"role": "user", "content": "reply exactly: pong"}]}'
 ```
 
-Configured endpoints speak Chat Completions and rotate across their keys with the same
-failure handling as subscription providers.
+Configured endpoints speak Chat Completions and hand each new conversation to the key of
+smallest `priority:` with the same failure handling as subscription providers.
 
 `/v1/models` advertises what each endpoint's own `/models` publishes under these fields:
 `context_window`, `context_length` or vLLM's `max_model_len`; `max_output_tokens`;
@@ -246,7 +246,9 @@ port: 8317
 auth-dir: ~/.pengepul
 api-keys:
   - sk-local-example
-priority: # optional, per provider and account key; smaller is preferred, default 0
+# optional; smaller is preferred, default 0. A build older than the one that added this key
+# refuses a config that carries it, so keep the relay current before writing it.
+priority:
   anthropic:
     you@example.com: 1 # below the accounts the config leaves at the default
 providers:

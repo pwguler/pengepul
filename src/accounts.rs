@@ -9,7 +9,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 
 use crate::config::DEFAULT_PRIORITY;
-use crate::quota::{QuotaSnapshot, WINDOW_WEEK, load_quota, save_quota};
+use crate::quota::{QuotaSnapshot, WINDOW_WEEK, epoch_seconds, load_quota, rolled, save_quota};
 use crate::tokens::{
     DayUsage, ModelUsage, PersistedUsage, RETENTION_DAYS, load_all_tokens, load_disabled_tokens,
     load_usage, save_token, save_usage, set_credential_disabled, trim_days, usage_file_unreadable,
@@ -1183,18 +1183,18 @@ impl AccountManager {
     /// When the vendor says this Account's weekly (`7d`) quota window rolls, in epoch
     /// seconds, or `None` when it says nothing usable.
     ///
-    /// A reset instant already in the past is `None`: the store prints `n/a` for a window
-    /// it describes that has rolled (ADR-0030), and a cycle that ended says nothing about
-    /// the next one. This is the only place selection reads quota at all, and it reads the
-    /// reset, never the utilization: near-exhausted quota is not a reason to leave an
-    /// Account (AC-3).
+    /// A window the store would print `n/a` for says nothing usable: it has rolled, so it
+    /// describes a cycle that ended (ADR-0030). The predicate is the store's own
+    /// [`rolled`], not a second copy of it, so the panel and selection cannot disagree
+    /// about which readings are current. This is the only place selection reads quota at
+    /// all, and it reads the reset, never the utilization: near-exhausted quota is not a
+    /// reason to leave an Account (AC-3).
     fn weekly_reset(&self, email: &str, now: f64) -> Option<i64> {
-        self.quota
-            .get(email)?
-            .windows
-            .get(WINDOW_WEEK)?
-            .resets_at
-            .filter(|at| epoch_seconds(now) < *at)
+        let window = self.quota.get(email)?.windows.get(WINDOW_WEEK)?;
+        if rolled(window, epoch_seconds(now)) {
+            return None;
+        }
+        window.resets_at
     }
 
     /// The selection order inside one Pool (AC-2): the smaller Priority first, then the
@@ -1214,22 +1214,18 @@ impl AccountManager {
             .then_with(|| left.cmp(right))
     }
 
-    /// The Account a new conversation is handed: the best Account that can serve by
-    /// [`Self::prefer`], or `None` when every Account is on Cooldown.
+    /// The Account a new conversation is handed: the best Account of the serving set by
+    /// [`Self::prefer`], or `None` when no Account can serve.
     ///
-    /// The rotation order holds exactly the Accounts that can serve on state — one with a
-    /// credential, not Disabled — so a Cooldown is the only thing left to filter. Should a
-    /// tier's Accounts all be cooling, the next tier is ordered the same way, which is what
-    /// makes Priority an order over the serving set rather than a pin (AC-3).
-    fn best_serving(&self, now: f64) -> Option<&String> {
+    /// Cooling Accounts are left out of the candidates rather than compared, so a tier whose
+    /// Accounts are all cooling cannot shadow the next one: the best of what is left wins,
+    /// which is what makes Priority an order over the serving set rather than a pin (AC-3).
+    fn best_serving(&self, now: f64) -> Option<&AccountState> {
         self.order
             .iter()
-            .filter(|email| {
-                self.accounts
-                    .get(*email)
-                    .is_some_and(|state| state.cooldown_until <= now)
-            })
-            .min_by(|left, right| self.prefer(left, right, now))
+            .filter_map(|email| self.accounts.get(email))
+            .filter(|state| can_serve(state, now))
+            .min_by(|left, right| self.prefer(&left.token.email, &right.token.email, now))
     }
 
     #[must_use]
@@ -1247,8 +1243,7 @@ impl AccountManager {
         let now = unix_now();
         if let Some(email) = self.affinity.get(affinity)
             && let Some(state) = self.accounts.get(email)
-            && state.cooldown_until <= now
-            && !state.disabled
+            && can_serve(state, now)
         {
             let account = self.available_account(state);
             return AccountResult {
@@ -1284,9 +1279,7 @@ impl AccountManager {
             };
         }
         let now = unix_now();
-        if let Some(email) = self.best_serving(now)
-            && let Some(state) = self.accounts.get(email)
-        {
+        if let Some(state) = self.best_serving(now) {
             return AccountResult {
                 account: Some(self.available_account(state)),
                 failure_kind: None,
@@ -1444,13 +1437,13 @@ fn unix_now() -> f64 {
         .map_or(0.0, |duration| duration.as_secs_f64())
 }
 
-/// A fractional epoch second as the whole second a reset instant is kept in.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "a reset instant is kept in whole seconds; the fraction is sub-second noise"
-)]
-fn epoch_seconds(seconds: f64) -> i64 {
-    seconds as i64
+/// Whether an Account can be handed a request now: not Disabled, and off Cooldown.
+///
+/// This is the state half of "can serve". The other half is membership in `order` — a
+/// credential on disk — and every path that selects asks through this one function, so no
+/// path can honour a state the others pass over (AC-3, ADR-0027).
+fn can_serve(state: &AccountState, now: f64) -> bool {
+    !state.disabled && state.cooldown_until <= now
 }
 
 /// Close any attempt/outcome gap a file carries, in either direction. At
