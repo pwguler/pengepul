@@ -35,6 +35,7 @@ async fn since_last_refresh_refreshes_legacy_token_without_last_refresh() {
     let mut manager = AccountManager::new(
         tmp.path().to_path_buf(),
         "codex".parse().unwrap(),
+        std::collections::BTreeMap::new(),
         move |refresh_token| {
             let captured = Arc::clone(&captured);
             Box::pin(async move {
@@ -94,6 +95,7 @@ async fn exhausted_refresh_token_marks_account_for_reauth() {
     let mut manager = AccountManager::new(
         tmp.path().to_path_buf(),
         "codex".parse().unwrap(),
+        std::collections::BTreeMap::new(),
         |_refresh_token| {
             Box::pin(async move {
                 Err(RefreshTokenExhaustedError::new(
@@ -149,6 +151,7 @@ async fn failure_cooldown_doubles_from_one_second() {
     let mut manager = AccountManager::new(
         tmp.path().to_path_buf(),
         "codex".parse().unwrap(),
+        std::collections::BTreeMap::new(),
         |_refresh_token| Box::pin(async { anyhow::bail!("unused refresh") }),
         RefreshPolicy::default(),
     );
@@ -200,6 +203,7 @@ async fn a_credential_that_never_succeeded_is_parked_past_the_transient_error_ce
     let mut manager = AccountManager::new(
         tmp.path().to_path_buf(),
         "codex".parse().unwrap(),
+        std::collections::BTreeMap::new(),
         |_refresh_token| Box::pin(async { anyhow::bail!("unused refresh") }),
         RefreshPolicy::default(),
     );
@@ -591,6 +595,7 @@ fn never_refresh_manager(auth_dir: PathBuf) -> AccountManager {
     AccountManager::new(
         auth_dir,
         ProviderId::generic("commandcode"),
+        std::collections::BTreeMap::new(),
         |_refresh_token| {
             Box::pin(async { Err(anyhow::anyhow!("refresh must never run for static keys")) })
         },
@@ -668,6 +673,7 @@ async fn a_pool_of_one_never_earns_a_cooldown() {
     let mut manager = AccountManager::new(
         tmp.path().to_path_buf(),
         "codex".parse().unwrap(),
+        std::collections::BTreeMap::new(),
         |_refresh_token| Box::pin(async { anyhow::bail!("unused refresh") }),
         RefreshPolicy::default(),
     );
@@ -1791,6 +1797,7 @@ async fn a_pinned_account_on_cooldown_falls_through_to_rotation() {
     let mut manager = AccountManager::new(
         tmp.path().to_path_buf(),
         ProviderId::anthropic(),
+        std::collections::BTreeMap::new(),
         |_refresh_token| {
             Box::pin(
                 async move { Err(RefreshTokenExhaustedError::new("unused", None, None).into()) },
@@ -1857,6 +1864,7 @@ async fn a_conversation_that_failed_over_stays_on_the_account_that_rescued_it() 
     let mut manager = AccountManager::new(
         tmp.path().to_path_buf(),
         ProviderId::anthropic(),
+        std::collections::BTreeMap::new(),
         |_refresh_token| {
             Box::pin(
                 async move { Err(RefreshTokenExhaustedError::new("unused", None, None).into()) },
@@ -2236,6 +2244,7 @@ fn refreshing_codex_manager(auth_dir: &Path) -> AccountManager {
     let mut manager = AccountManager::new(
         auth_dir.to_path_buf(),
         "codex".parse().unwrap(),
+        std::collections::BTreeMap::new(),
         |_refresh_token| {
             Box::pin(async {
                 Ok(TokenData {
@@ -2432,10 +2441,11 @@ async fn enable_puts_a_disabled_account_back_in_rotation() {
             .join("a@example.com.json.disabled")
             .exists()
     );
-    let mut turns = served(&mut manager, 4);
-    turns.sort();
-    turns.dedup();
-    assert_eq!(turns, ["a@example.com", "b@example.com"]);
+    // Back in the Pool means the next selection orders it with its sibling, and here it
+    // wins the tie on the Account key (AC-2), so `b` serves only while `a` cannot.
+    assert_eq!(served(&mut manager, 2), ["a@example.com"; 2]);
+    manager.record_billing_cooldown("a@example.com", "insufficient credits");
+    assert_eq!(served(&mut manager, 2), ["b@example.com"; 2]);
     assert_eq!(record(&mut manager, "a@example.com")["disabled"], false);
 }
 
@@ -2614,10 +2624,11 @@ async fn a_fresh_login_enables_a_disabled_account() {
     );
     manager.reload().expect("reload");
     assert_eq!(record(&mut manager, "a@example.com")["disabled"], false);
-    let mut turns = served(&mut manager, 4);
-    turns.sort();
-    turns.dedup();
-    assert_eq!(turns, ["a@example.com", "b@example.com"]);
+    // The login put it back in the Pool, ordered with its sibling and ahead of it on the
+    // Account key (AC-2); only a Cooldown moves the request to `b`.
+    assert_eq!(served(&mut manager, 2), ["a@example.com"; 2]);
+    manager.record_billing_cooldown("a@example.com", "insufficient credits");
+    assert_eq!(served(&mut manager, 2), ["b@example.com"; 2]);
 }
 
 #[tokio::test]
@@ -2850,4 +2861,337 @@ async fn a_retry_hint_that_outlasts_a_reauth_keeps_the_reauth_reason() {
         record(&mut manager, "a@example.com")["lastError"],
         "server: 500"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Priority: the selection order inside one Pool (account-priority)
+// ---------------------------------------------------------------------------
+
+/// A loaded `commandcode` Pool holding `emails`, with `priorities` keyed by Account key.
+/// Every one of them is a static key, so no refresh callback ever runs.
+fn priority_pool(auth_dir: &Path, emails: &[&str], priorities: &[(&str, i64)]) -> AccountManager {
+    for email in emails {
+        save_token(auth_dir, &static_token(email)).expect("save token");
+    }
+    let mut manager = AccountManager::new(
+        auth_dir.to_path_buf(),
+        ProviderId::generic("commandcode"),
+        priorities
+            .iter()
+            .map(|(email, priority)| ((*email).to_string(), *priority))
+            .collect(),
+        |_refresh_token| Box::pin(async { anyhow::bail!("static keys do not refresh") }),
+        RefreshPolicy {
+            kind: RefreshPolicyKind::Never,
+            seconds: 0,
+        },
+    );
+    manager.load().expect("load");
+    manager
+}
+
+/// A vendor reading of the weekly window only: the number every Priority tie is broken on.
+fn weekly(observed_at: &str, resets_at: i64) -> QuotaSnapshot {
+    QuotaSnapshot {
+        source: "headers".to_string(),
+        observed_at: observed_at.to_string(),
+        representative: Some("seven_day".to_string()),
+        windows: std::collections::BTreeMap::from([(
+            "week".to_string(),
+            QuotaWindow {
+                used_pct: 10.0,
+                resets_at: Some(resets_at),
+                status: Some("allowed".to_string()),
+            },
+        )]),
+    }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn in_days(days: i64) -> i64 {
+    let now = unix_now() as i64;
+    now + days * 86_400
+}
+
+#[tokio::test]
+async fn a_new_conversation_takes_the_smallest_priority() {
+    // AC-2, AC-6. Nothing else is configured, so the order alone decides: the account the
+    // config leaves out holds Priority 0, and 1 is below it.
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = priority_pool(
+        tmp.path(),
+        &["a@example.com", "b@example.com"],
+        &[("b@example.com", 1)],
+    );
+    assert_eq!(served(&mut manager, 3), ["a@example.com"; 3]);
+
+    // Smaller is preferred, not larger: a negative number outranks the default.
+    let tmp = tempdir().expect("tempdir");
+    let mut promoted = priority_pool(
+        tmp.path(),
+        &["a@example.com", "b@example.com"],
+        &[("b@example.com", -1)],
+    );
+    assert_eq!(served(&mut promoted, 3), ["b@example.com"; 3]);
+}
+
+#[tokio::test]
+async fn within_one_priority_the_soonest_weekly_reset_serves_first() {
+    // AC-2. Both accounts sit in the same tier, so the vendor's own weekly reset decides.
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = priority_pool(
+        tmp.path(),
+        &["a@example.com", "b@example.com"],
+        &[("a@example.com", 1), ("b@example.com", 1)],
+    );
+    manager.record_quota("a@example.com", weekly("2026-10-28T09:00:00Z", in_days(5)));
+    manager.record_quota("b@example.com", weekly("2026-10-28T09:00:00Z", in_days(1)));
+
+    assert_eq!(served(&mut manager, 3), ["b@example.com"; 3]);
+
+    // A reset that has already rolled says nothing about the next one, so it sorts as an
+    // account with no weekly reading at all: behind the tier-mate that has a live one.
+    manager.record_quota("a@example.com", weekly("2026-10-28T09:00:00Z", in_days(-1)));
+    assert_eq!(served(&mut manager, 2), ["b@example.com"; 2]);
+}
+
+#[tokio::test]
+async fn an_account_with_no_weekly_reading_sorts_last_within_its_tier() {
+    // AC-2. No quota data is not a reason to prefer an account, and it is not a reason to
+    // skip it either — it only loses the tie.
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = priority_pool(
+        tmp.path(),
+        &["a@example.com", "b@example.com"],
+        &[("a@example.com", 1), ("b@example.com", 1)],
+    );
+    manager.record_quota("b@example.com", weekly("2026-10-28T09:00:00Z", in_days(4)));
+
+    assert_eq!(served(&mut manager, 3), ["b@example.com"; 3]);
+}
+
+#[tokio::test]
+async fn a_tie_on_priority_and_reset_breaks_by_account_key() {
+    // AC-2. Deterministic, not a cursor: the same Pool answers the same account every time.
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = priority_pool(tmp.path(), &["b@example.com", "a@example.com"], &[]);
+    manager.record_quota("a@example.com", weekly("2026-10-28T09:00:00Z", in_days(3)));
+    manager.record_quota("b@example.com", weekly("2026-10-28T09:00:00Z", in_days(3)));
+
+    assert_eq!(served(&mut manager, 3), ["a@example.com"; 3]);
+}
+
+#[tokio::test]
+async fn near_exhausted_quota_never_moves_a_request_to_a_lower_priority() {
+    // AC-3. Quota is a display figure, not a selection input: only an Account that cannot
+    // serve drops the request a tier.
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = priority_pool(
+        tmp.path(),
+        &["a@example.com", "b@example.com"],
+        &[("b@example.com", 1)],
+    );
+    manager.record_quota(
+        "a@example.com",
+        QuotaSnapshot {
+            source: "headers".to_string(),
+            observed_at: "2026-10-28T09:00:00Z".to_string(),
+            representative: Some("seven_day".to_string()),
+            windows: std::collections::BTreeMap::from([(
+                "week".to_string(),
+                QuotaWindow {
+                    used_pct: 100.0,
+                    resets_at: Some(in_days(6)),
+                    status: Some("rejected".to_string()),
+                },
+            )]),
+        },
+    );
+
+    assert_eq!(served(&mut manager, 3), ["a@example.com"; 3]);
+}
+
+#[tokio::test]
+async fn a_cooling_or_disabled_account_hands_the_request_to_the_next_priority() {
+    // AC-3. Cooldown and Disabled are the two states that drop a tier.
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = priority_pool(
+        tmp.path(),
+        &["a@example.com", "b@example.com"],
+        &[("b@example.com", 1)],
+    );
+    manager.record_billing_cooldown("a@example.com", "insufficient credits");
+    assert_eq!(served(&mut manager, 2), ["b@example.com"; 2]);
+
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = priority_pool(
+        tmp.path(),
+        &["a@example.com", "b@example.com"],
+        &[("b@example.com", 1)],
+    );
+    manager.disable("a@example.com").expect("disable");
+    assert_eq!(served(&mut manager, 2), ["b@example.com"; 2]);
+}
+
+#[tokio::test]
+async fn a_sticky_conversation_stays_put_when_a_higher_priority_account_recovers() {
+    // AC-4. Cache affinity outranks Priority: the conversation keeps its Account while that
+    // Account can serve, even after the preferred one is back.
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = priority_pool(
+        tmp.path(),
+        &["a@example.com", "b@example.com"],
+        &[("b@example.com", 1)],
+    );
+    manager.record_billing_cooldown("a@example.com", "insufficient credits");
+    let first = manager.account_for("conversation-a");
+    assert_eq!(
+        first.account.as_ref().expect("an account").token.email,
+        "b@example.com"
+    );
+
+    // `a` recovers. New work goes to it; the conversation already on `b` does not move.
+    manager.enable("a@example.com").expect("recover");
+    let sticky = manager.account_for("conversation-a");
+    assert_eq!(sticky.affinity.as_str(), "honored");
+    assert_eq!(
+        sticky.account.as_ref().expect("an account").token.email,
+        "b@example.com"
+    );
+    let fresh = manager.account_for("conversation-b");
+    assert_eq!(
+        fresh.account.as_ref().expect("an account").token.email,
+        "a@example.com"
+    );
+}
+
+#[tokio::test]
+async fn the_soonest_reset_decides_new_conversations_not_the_round_robin_cursor() {
+    // AC-6. With no Priority configured anywhere, the AC-2 order decides: every new
+    // conversation starts on the soonest-resetting Account instead of walking the Pool.
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = priority_pool(tmp.path(), &["a@example.com", "b@example.com"], &[]);
+    manager.record_quota("a@example.com", weekly("2026-10-28T09:00:00Z", in_days(5)));
+    manager.record_quota("b@example.com", weekly("2026-10-28T09:00:00Z", in_days(2)));
+
+    let conversations = (0..4)
+        .map(|turn| {
+            manager
+                .account_for(&format!("conversation-{turn}"))
+                .account
+                .expect("an account")
+                .token
+                .email
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(conversations, ["b@example.com"; 4]);
+}
+
+#[tokio::test]
+async fn the_payload_names_each_accounts_effective_priority_and_where_it_came_from() {
+    // AC-7. The payload is what the CLI and the tray both read, so the effective number and
+    // its source are one field pair on every record.
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = priority_pool(
+        tmp.path(),
+        &["a@example.com", "b@example.com"],
+        &[("b@example.com", 2)],
+    );
+
+    let configured = record(&mut manager, "b@example.com");
+    assert_eq!(configured["priority"], 2);
+    assert_eq!(configured["prioritySource"], "config");
+
+    let defaulted = record(&mut manager, "a@example.com");
+    assert_eq!(defaulted["priority"], 0);
+    assert_eq!(defaulted["prioritySource"], "default");
+}
+
+#[tokio::test]
+async fn a_record_without_a_credential_carries_the_same_priority_pair() {
+    // ADR-0026: a removed credential leaves an Account of the Pool. It is listed with the
+    // one shape every record has, so its Priority is resolved the same way.
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = priority_pool(
+        tmp.path(),
+        &["a@example.com", "b@example.com"],
+        &[("b@example.com", 2)],
+    );
+    fs::remove_file(tmp.path().join("commandcode").join("b@example.com.json"))
+        .expect("remove credential");
+    manager.reload().expect("reload");
+
+    let removed = record(&mut manager, "b@example.com");
+    assert_eq!(removed["available"], false);
+    assert_eq!(removed["priority"], 2);
+    assert_eq!(removed["prioritySource"], "config");
+}
+
+#[tokio::test]
+async fn an_unknown_priority_key_is_reported_and_the_pool_still_loads() {
+    // AC-1. A typo in the config must not stop the relay, and it must not be silent either.
+    let tmp = tempdir().expect("tempdir");
+    let manager = priority_pool(
+        tmp.path(),
+        &["a@example.com"],
+        &[("a@example.com", 1), ("ghost@example.com", 2)],
+    );
+
+    assert_eq!(
+        manager.unknown_priorities(),
+        vec!["ghost@example.com".to_string()]
+    );
+    assert_eq!(manager.account_count(), 1);
+    let mut manager = manager;
+    assert_eq!(record(&mut manager, "a@example.com")["priority"], 1);
+}
+
+#[tokio::test]
+async fn the_demo_pool_lands_on_the_soonest_reset_tier_then_holds_its_sticky_conversation() {
+    // The spec's demo fixture: Priorities 1, 1, 2 and different weekly resets.
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = priority_pool(
+        tmp.path(),
+        &["p@example.com", "q@example.com", "r@example.com"],
+        &[
+            ("p@example.com", 1),
+            ("q@example.com", 1),
+            ("r@example.com", 2),
+        ],
+    );
+    manager.record_quota("p@example.com", weekly("2026-10-28T09:00:00Z", in_days(5)));
+    manager.record_quota("q@example.com", weekly("2026-10-28T09:00:00Z", in_days(1)));
+    manager.record_quota("r@example.com", weekly("2026-10-28T09:00:00Z", in_days(3)));
+
+    // A new conversation lands on the soonest-resetting Priority-1 account.
+    assert_eq!(served(&mut manager, 2), ["q@example.com"; 2]);
+
+    // With `q` cooling, the conversation pins to `p`; once `q` recovers the conversation
+    // stays on `p` while new conversations go back to `q`.
+    manager.record_billing_cooldown("q@example.com", "insufficient credits");
+    let sticky = manager.account_for("sticky");
+    assert_eq!(
+        sticky.account.as_ref().expect("an account").token.email,
+        "p@example.com"
+    );
+    manager.enable("q@example.com").expect("recover");
+    assert_eq!(
+        manager.account_for("sticky").affinity.as_str(),
+        "honored",
+        "the sticky conversation moved off its account after the preferred one recovered"
+    );
+    assert_eq!(
+        manager
+            .account_for("sticky")
+            .account
+            .expect("an account")
+            .token
+            .email,
+        "p@example.com"
+    );
+
+    // Only while both Priority-1 accounts are cooling does traffic reach Priority 2.
+    manager.record_billing_cooldown("p@example.com", "insufficient credits");
+    manager.record_billing_cooldown("q@example.com", "insufficient credits");
+    assert_eq!(served(&mut manager, 2), ["r@example.com"; 2]);
 }

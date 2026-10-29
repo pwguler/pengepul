@@ -300,6 +300,46 @@ fn provider_entry_named_like_a_builtin_is_rejected() {
 }
 
 #[test]
+fn account_priorities_load_per_provider_and_account_key() {
+    let (_tmp, home, config_path) = write_config_with(
+        r"api-keys:
+  - sk-local
+priority:
+  anthropic:
+    alice@example.com: 1
+    bob@example.com: -2
+  commandcode:
+    key-4f84698d: 3
+",
+    );
+
+    let config = load_config(Some(&config_path), Some(&home), &home).expect("load config");
+
+    assert_eq!(config.priority["anthropic"]["alice@example.com"], 1);
+    assert_eq!(config.priority["anthropic"]["bob@example.com"], -2);
+    assert_eq!(config.priority["commandcode"]["key-4f84698d"], 3);
+    assert_eq!(config.priority.len(), 2);
+}
+
+#[test]
+fn a_priority_that_is_not_an_integer_is_refused_at_load() {
+    let (_tmp, home, config_path) = write_config_with(
+        r"api-keys:
+  - sk-local
+priority:
+  anthropic:
+    alice@example.com: high
+",
+    );
+
+    let error = load_config(Some(&config_path), Some(&home), &home).expect_err("rejected");
+    assert!(
+        format!("{error:#}").contains("priority"),
+        "error names the section: {error:#}"
+    );
+}
+
+#[test]
 fn provider_entry_with_unknown_field_is_rejected() {
     let (_tmp, home, config_path) = write_config_with(
         r"api-keys:

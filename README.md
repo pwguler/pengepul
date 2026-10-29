@@ -4,7 +4,9 @@ Run your own API relay for your AI subscriptions. Log in your Claude, ChatGPT/Co
 accounts once and every request is served from the pool, so your harness runs on your
 subscription instead of a per-token key.
 
-- Pools several subscription accounts per provider and spreads requests across them.
+- Pools several subscription accounts per provider and orders them by a `priority:` of your
+  choosing, so the preferred account takes the new conversations while a running one keeps the
+  account holding its cache.
 - Serves your subscription inside openclaw and hermes, with no API key.
 - Relays any OpenAI-compatible API (groq, openrouter, deepseek, ...) through the pool.
 - Exposes the pool as a REST API, local or networked, for your own tools.
@@ -29,7 +31,11 @@ pengepul serve # binds 127.0.0.1:8317
 pengepul serve --host 0.0.0.0 --port 8317 # reachable across your network
 ```
 
-Log in more than once per provider to pool accounts; requests rotate across them. A grok
+Log in more than once per provider to pool accounts; each new conversation goes to the
+account of smallest `priority:` (default `0`, smaller is preferred), then to the one whose
+weekly quota resets soonest — an account with no reading sorts last, and the account key breaks
+the final tie — and a conversation already running stays on the account that holds its cache
+while that account can serve. A grok
 account serves `grok-4.6` and `grok-4.5`, each with a 500k context window, named bare or
 as `grok/grok-4.6`. Credentials live in `~/.pengepul` (`0600`); a running relay picks up a
 fresh login on restart or `pengepul accounts --reload`. Read the key clients use with
@@ -221,6 +227,10 @@ Routes: `POST /v1/messages`, `POST /v1/chat/completions`, `POST /v1/responses`,
 (unauthenticated). Every route but `/health` needs the local API key, sent as
 `Authorization: Bearer <key>` or `x-api-key: <key>`.
 
+`/admin/accounts` takes an optional `?days=N` window (default: the store's retention, at most
+90) that trims each account's per-day history; the admin routes answer gzip-compressed when
+the client asks, and the inference routes never do.
+
 `/admin/status` is the dashboard's health block: version, uptime, address, how
 many accounts can serve, today's requests, and the same per provider.
 `/admin/usage` is a request and token window over every pool, one entry per
@@ -236,6 +246,9 @@ port: 8317
 auth-dir: ~/.pengepul
 api-keys:
   - sk-local-example
+priority: # optional, per provider and account key; smaller is preferred, default 0
+  anthropic:
+    you@example.com: 1 # below the accounts the config leaves at the default
 providers:
   groq:
     base-url: https://api.groq.com/openai/v1
@@ -260,25 +273,3 @@ keeps sending, and fails once it sends nothing for that long, before it starts o
 chunks. codex streams every request upstream, so there it is also the deadline of a reply
 the client did not stream.
 
-## Quota
-
-`pengepul accounts` prints one bar row per window under each account of the three providers
-that report quota: anthropic (`5h`, `week`), commandcode and opencode (`5h`, `week`,
-`month`). The numbers are the vendors' own, taken from response headers on every request and
-from each vendor's usage route when an account is idle, so the relay needs no traffic to
-know where a pool stands.
-
-```
-  tech.intiva@gmail.com available failures=0 plan=max last_ok=2m
-    requests 28,098 (27,869 ok) input 5.0B cached 4.9B (97%) uncached 149.0M output 33.5M
-    5h    █████████████████░░░   83%  reset 18:59 (1h35m)
-    week  █████████████████░░░   86%  reset Fri 00:00 (1d6h)
-```
-
-A window with no observation, or one whose reset instant has passed, reads `n/a`; at the cap,
-or when the vendor says the window is rejected, it reads `LIMIT`. Nothing is estimated from
-token counts. `GET /admin/accounts` carries the same thing under each account's `quota`
-field: `source`, `observedAt`, and `windows.<name>.{usedPct, resetsAt, status}`, with
-`resetsAt` in Unix epoch seconds. Other providers print no quota rows. The Windows tray
-dashboard reads this and the two report routes below, so its cards and this panel show the
-same numbers.

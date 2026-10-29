@@ -939,19 +939,25 @@ fn accounts_detail_prints_usage_and_cooldown_per_account() {
                             "totalCacheCreationInputTokens": 6_000_000,
                             "totalCacheReadInputTokens": 155_000_000,
                             "totalReasoningOutputTokens": 64_000,
-                            "planType": "max"
+                            "planType": "max",
+                            "priority": 1,
+                            "prioritySource": "config"
                         }),
                         json!({
                             "email": "b@x.com",
                             "available": false,
                             "cooldownUntil": soon(191.0),
                             "failureCount": 2,
-                            "planType": "pro"
+                            "planType": "pro",
+                            "priority": 0,
+                            "prioritySource": "default"
                         }),
                         json!({
                             "email": "c@x.com",
                             "available": false,
-                            "failureCount": 5
+                            "failureCount": 5,
+                            "priority": -2,
+                            "prioritySource": "config"
                         })
                     ]
                 }
@@ -966,10 +972,20 @@ fn accounts_detail_prints_usage_and_cooldown_per_account() {
     // Account header keeps its legacy shape; the cooldown account reads
     // "on cooldown" with remaining time, not "unavailable" (AC-6).
     assert!(stdout.contains("anthropic: 3 accounts\n"));
-    assert!(stdout.contains("  a@x.com available failures=0 plan=max last_ok=never\n"));
-    assert!(stdout.contains("  b@x.com on cooldown 3m10s failures=2 plan=pro last_ok=never\n"));
+    // AC-7: each Account names its effective Priority and where the number came from, so
+    // the operator can tell a configured number from the default one.
+    assert!(
+        stdout.contains(
+            "  a@x.com available failures=0 plan=max last_ok=never priority=1 (config)\n"
+        )
+    );
+    assert!(stdout.contains(
+        "  b@x.com on cooldown 3m10s failures=2 plan=pro last_ok=never priority=0 (default)\n"
+    ));
     // An unavailable snapshot with no future cooldownUntil keeps the old word.
-    assert!(stdout.contains("  c@x.com unavailable failures=5 last_ok=never\n"));
+    assert!(
+        stdout.contains("  c@x.com unavailable failures=5 last_ok=never priority=-2 (config)\n")
+    );
     // Detail line under each account: requests (ok) plus the token block,
     // in the same words and order as the panel (ADR-0024). reasoning prints
     // only when non-zero.
@@ -5666,6 +5682,49 @@ fn last_ok_ends_the_plain_account_line() {
             "{argv:?}"
         );
     }
+}
+
+/// account-priority AC-7: the panel names each Account's effective Priority and where the
+/// number came from, in the account's block and on the panel's one label column.
+#[test]
+fn accounts_panel_names_each_accounts_priority() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 2,
+                    "accounts": [
+                        {"email": "set@x.com", "available": true,
+                         "priority": 1, "prioritySource": "config"},
+                        {"email": "default@x.com", "available": true,
+                         "priority": 0, "prioritySource": "default"}
+                    ]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let rich = strip_ansi(&run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich).stdout);
+    let lines: Vec<&str> = rich.lines().collect();
+    let row = |email: &str| {
+        lines
+            .iter()
+            .position(|line| line.contains(email))
+            .unwrap_or_else(|| panic!("{email} missing: {rich}"))
+    };
+    let fact = |email: &str| -> String {
+        lines[row(email) + 2]
+            .trim_matches(|c: char| c == '│' || c.is_whitespace())
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    assert_eq!(fact("set@x.com"), "priority 1 (config)", "{rich}");
+    assert_eq!(fact("default@x.com"), "priority 0 (default)", "{rich}");
 }
 
 // ---------------------------------------------------------------------------

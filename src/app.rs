@@ -17,6 +17,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{Stream, StreamExt, TryStreamExt};
 use serde_json::{Value, json};
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::accounts::{
@@ -652,14 +653,21 @@ pub fn create_app_with_upstream(config: Config, upstream: Arc<dyn UpstreamClient
         .route("/responses", post(responses))
         .route("/messages", post(messages))
         .route("/messages/count_tokens", post(count_tokens));
+    // Compressed only here. These payloads are tens of kilobytes of JSON and a
+    // dashboard reads them over a VPN, where a body that size is a body that can
+    // stall. The inference API next door must never be compressed: a compressed
+    // byte stream cannot be read chunk by chunk.
+    let admin = Router::new()
+        .route("/accounts", get(admin_accounts))
+        .route("/status", get(admin_status))
+        .route("/usage", get(admin_usage))
+        .route("/reload", post(admin_reload))
+        .route("/accounts/disable", post(admin_disable))
+        .route("/accounts/enable", post(admin_enable))
+        .layer(CompressionLayer::new());
     Router::new()
         .route("/health", get(health))
-        .route("/admin/accounts", get(admin_accounts))
-        .route("/admin/status", get(admin_status))
-        .route("/admin/usage", get(admin_usage))
-        .route("/admin/reload", post(admin_reload))
-        .route("/admin/accounts/disable", post(admin_disable))
-        .route("/admin/accounts/enable", post(admin_enable))
+        .nest("/admin", admin)
         .nest("/v1", api.clone())
         .nest("/v1/v1", api)
         .with_state(state)
@@ -677,15 +685,18 @@ pub fn create_app_with_upstream(config: Config, upstream: Arc<dyn UpstreamClient
 }
 
 fn build_account_managers(config: &Config) -> AccountManagers {
+    warn_unknown_priority_providers(config);
     let mut anthropic = AccountManager::new(
         config.auth_dir.clone(),
         ProviderId::anthropic(),
+        config.priority_for("anthropic"),
         |refresh_token| Box::pin(refresh_anthropic_tokens(refresh_token)),
         RefreshPolicy::default(),
     );
     let mut codex = AccountManager::new(
         config.auth_dir.clone(),
         ProviderId::codex(),
+        config.priority_for("codex"),
         |refresh_token| Box::pin(refresh_codex_tokens(refresh_token)),
         RefreshPolicy {
             kind: RefreshPolicyKind::SinceLastRefresh,
@@ -696,6 +707,7 @@ fn build_account_managers(config: &Config) -> AccountManagers {
     let mut grok = AccountManager::new(
         config.auth_dir.clone(),
         ProviderId::grok(),
+        config.priority_for("grok"),
         |refresh_token| Box::pin(refresh_grok_tokens(refresh_token)),
         RefreshPolicy {
             kind: RefreshPolicyKind::ExpiresLead,
@@ -705,6 +717,9 @@ fn build_account_managers(config: &Config) -> AccountManagers {
     let _ = anthropic.load();
     let _ = codex.load();
     let _ = grok.load();
+    warn_unknown_priority_accounts("anthropic", &anthropic);
+    warn_unknown_priority_accounts("codex", &codex);
+    warn_unknown_priority_accounts("grok", &grok);
     // One manager per configured provider; static keys never refresh, so the
     // callback exists only to satisfy the type and must never be called.
     let mut generic = BTreeMap::new();
@@ -712,6 +727,7 @@ fn build_account_managers(config: &Config) -> AccountManagers {
         let mut manager = AccountManager::new(
             config.auth_dir.clone(),
             ProviderId::generic(id.clone()),
+            config.priority_for(id),
             |_refresh_token| Box::pin(async { anyhow::bail!("static keys do not refresh") }),
             RefreshPolicy {
                 kind: RefreshPolicyKind::Never,
@@ -719,6 +735,7 @@ fn build_account_managers(config: &Config) -> AccountManagers {
             },
         );
         let _ = manager.load();
+        warn_unknown_priority_accounts(id, &manager);
         generic.insert(id.clone(), tokio::sync::Mutex::new(manager));
     }
     tracing::info!(
@@ -733,6 +750,35 @@ fn build_account_managers(config: &Config) -> AccountManagers {
         codex: tokio::sync::Mutex::new(codex),
         grok: tokio::sync::Mutex::new(grok),
         generic,
+    }
+}
+
+/// A `priority:` entry naming a Provider this relay does not serve. Warned, never refused:
+/// a mis-keyed entry is cosmetic, and failing the load over it would turn a typo into an
+/// outage (AC-1, account-priority).
+fn warn_unknown_priority_providers(config: &Config) {
+    let known = config.known_providers();
+    for provider_id in config
+        .priority
+        .keys()
+        .filter(|id| !known.contains(id.as_str()))
+    {
+        tracing::warn!(
+            provider = %provider_id,
+            "priority names a provider this relay does not serve; the entry decides nothing"
+        );
+    }
+}
+
+/// A `priority:` entry naming an Account the Pool holds no record of. Warned for the same
+/// reason, and kept in the map: an Account added by a later login picks its number up.
+fn warn_unknown_priority_accounts(provider_id: &str, manager: &AccountManager) {
+    for email in manager.unknown_priorities() {
+        tracing::warn!(
+            provider = %provider_id,
+            account = %email,
+            "priority names an account this pool does not hold; a restart that loads it applies it"
+        );
     }
 }
 
@@ -1125,22 +1171,46 @@ async fn catalog_account(state: &AppState, kind: ProviderKind) -> Option<Availab
 /// An account for a configured provider's model fetch: static keys never refresh.
 async fn catalog_account_id(state: &AppState, provider: &ProviderId) -> Option<AvailableAccount> {
     let manager = state.account_managers.generic.get(provider.id.as_ref())?;
-    let mut manager = manager.lock().await;
-    manager.next_account()
+    manager.lock().await.next_account()
 }
 
 async fn health() -> Json<Value> {
     Json(json!({"status": "ok"}))
 }
 
-async fn admin_accounts(State(state): State<AppState>, headers: HeaderMap) -> Response {
+/// `/admin/accounts?days=N`: how many local days of per-account history each
+/// record carries. The default is the store's own retention.
+#[derive(Debug, serde::Deserialize)]
+struct AccountsQuery {
+    days: Option<usize>,
+}
+
+/// The oldest date a `days`-long window ending today holds, as `YYYY-MM-DD`.
+fn window_cutoff(days: usize) -> String {
+    let back = i64::try_from(days.saturating_sub(1)).unwrap_or(0);
+    (chrono::Local::now() - chrono::Duration::days(back))
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+async fn admin_accounts(
+    State(state): State<AppState>,
+    Query(query): Query<AccountsQuery>,
+    headers: HeaderMap,
+) -> Response {
     if let Err(error) = require_api_key(&state, &headers, false) {
         return error.into_response();
     }
 
+    let cutoff = window_cutoff(
+        query
+            .days
+            .unwrap_or(usize::try_from(crate::tokens::RETENTION_DAYS).unwrap_or(90))
+            .clamp(1, 90),
+    );
     let mut pools = Vec::new();
     for (provider, manager) in state.account_managers.pools() {
-        pools.push((provider, manager.lock().await.snapshots()));
+        pools.push((provider, manager.lock().await.snapshots_since(&cutoff)));
     }
     let peak = record_peak(
         &state.config.auth_dir,
@@ -4795,7 +4865,14 @@ mod tests {
             super::next_provider_account(&state, ProviderId::anthropic(), "conversation-a")
                 .await
                 .expect("conversation-a, second");
-        // conversation-b is new, so Rotation advances to the other anthropic account.
+        // A new conversation is handed the serving account of smallest Priority, and with
+        // no Priority and no quota reading that is the same one alice's is. The only thing that
+        // moves it is a state the account cannot serve in, so park alice the way an upstream
+        // billing rejection does and let the log line follow the move (AC-2, AC-3).
+        {
+            let mut manager = state.account_managers.anthropic.lock().await;
+            manager.record_billing_cooldown(&a_first.token.email, "insufficient credits");
+        }
         let b = super::next_provider_account(&state, ProviderId::anthropic(), "conversation-b")
             .await
             .expect("conversation-b");
@@ -5290,6 +5367,7 @@ mod tests {
                 poll: false,
                 poll_minutes: 15,
             },
+            priority: BTreeMap::default(),
         }
     }
 
@@ -5297,6 +5375,7 @@ mod tests {
         let mut manager = AccountManager::new(
             auth_dir.to_path_buf(),
             provider,
+            std::collections::BTreeMap::new(),
             |_refresh_token| {
                 Box::pin(async {
                     bail!("unused refresh");

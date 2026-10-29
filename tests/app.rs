@@ -294,6 +294,7 @@ fn config(auth_dir: PathBuf) -> Config {
             poll: false,
             poll_minutes: 15,
         },
+        priority: BTreeMap::default(),
     }
 }
 
@@ -898,7 +899,7 @@ async fn messages_route_forwards_anthropic_account_with_resolved_model() {
 }
 
 #[tokio::test]
-async fn messages_route_rotates_available_anthropic_accounts() {
+async fn messages_route_hands_new_conversations_to_the_configured_priority() {
     let tmp = tempfile::tempdir().expect("tempdir");
     for (email, access_token) in [
         ("alice@example.com", "anthropic-access-alice"),
@@ -921,12 +922,18 @@ async fn messages_route_rotates_available_anthropic_accounts() {
         .expect("save token");
     }
     let upstream = Arc::new(FakeUpstream::default());
-    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    // Bob carries a smaller Priority than the default 0, so every new conversation starts on him no
+    // matter which prefix it carries (AC-2). The config is the only place the number comes
+    // from: this is also the wiring check that `build_account_managers` hands it down.
+    let mut cfg = config(tmp.path().to_path_buf());
+    cfg.priority.insert(
+        "anthropic".to_string(),
+        std::collections::BTreeMap::from([("bob@example.com".to_string(), -1)]),
+    );
+    let app = create_app_with_upstream(cfg, upstream.clone());
 
-    // Two conversations, so two different cacheable prefixes. Identical
-    // requests deliberately do not rotate any more: they share a prefix,
-    // and moving them between accounts throws away the cache each just
-    // paid to write (ADR-0017).
+    // Two conversations, so two different cacheable prefixes. Neither alternates to the
+    // default-Priority account: the order decides, not a rotation cursor (AC-6).
     for system in ["you are a poet", "you are a lawyer"] {
         let (status, _) = json_response(
             app.clone(),
@@ -952,10 +959,12 @@ async fn messages_route_rotates_available_anthropic_accounts() {
 
     let calls = upstream.calls();
     assert_eq!(calls.len(), 2);
-    assert_ne!(
-        calls[0].account.token.access_token,
-        calls[1].account.token.access_token
-    );
+    for call in &calls {
+        assert_eq!(
+            call.account.token.access_token, "anthropic-access-bob",
+            "a new conversation skipped the configured Priority"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1025,9 +1034,10 @@ async fn one_conversation_stays_on_one_account() {
 }
 
 #[tokio::test]
-async fn a_different_conversation_still_takes_the_next_account() {
-    // Affinity is a preference, not a pin on the pool: two conversations
-    // still spread across the accounts.
+async fn without_a_configured_priority_new_conversations_do_not_alternate() {
+    // AC-6. Equal Priority, no quota reading and no round-robin cursor left the order
+    // fully determined by the Account key: both conversations start on alice, and a
+    // Cooldown — not a turn count — is what moves the next one to bob.
     let tmp = tempfile::tempdir().expect("tempdir");
     for (email, access_token) in [
         ("alice@example.com", "anthropic-access-alice"),
@@ -1076,9 +1086,13 @@ async fn a_different_conversation_still_takes_the_next_account() {
     }
 
     let calls = upstream.calls();
-    assert_ne!(
+    assert_eq!(
         calls[0].account.token.access_token, calls[1].account.token.access_token,
-        "two conversations landed on the same account"
+        "a rotation cursor still decides new conversations"
+    );
+    assert_eq!(
+        calls[0].account.token.access_token,
+        "anthropic-access-alice"
     );
 }
 
@@ -4947,8 +4961,14 @@ async fn assert_failover_does_not_re_bill_a_sibling(signal: ChatIdentity) {
     );
     let alpha_account = first[0].0.clone();
     let bravo_account = first[1].0.clone();
-    assert_eq!(first[0].2, 0, "[{label}] nothing is cached yet");
-    assert_eq!(first[1].2, 0, "[{label}] nothing is cached yet");
+    assert_eq!(
+        first[0].2, 0,
+        "[{label}] the Pool's first request cannot be cached"
+    );
+    // Bravo's may not be zero: the two conversations start on the same Account now
+    // (AC-2, AC-6), so when they share an opening the second one reads the prefix the
+    // first one already wrote. That is the cache the order is trying to keep, not a
+    // collapse — only the failure below distinguishes them.
 
     // Alpha's account starts rejecting. Its next turn must move; bravo's must not.
     upstream
@@ -4963,6 +4983,20 @@ async fn assert_failover_does_not_re_bill_a_sibling(signal: ChatIdentity) {
     )
     .await;
     assert_eq!(status, 200, "[{label}] alpha should fail over, not fail");
+
+    // Alpha's account is healthy again upstream, and its Cooldown is cleared the way an
+    // operator clears one. Bravo never moved: its next turn goes back to the account that
+    // still holds its prefix, even though alpha failed over to the other one.
+    upstream.failing.lock().expect("failing lock").clear();
+    let (status, body) = toggle(
+        app.clone(),
+        "enable",
+        json!({"provider": "commandcode", "account": alpha_account}),
+        Some("sk-test"),
+    )
+    .await;
+    assert_eq!(status, 200, "[{label}] clearing the cooldown: {body}");
+
     let (status, _) = json_response(
         app.clone(),
         chat_turn_request(bravo_key, bravo_open, "turn two"),
@@ -5000,11 +5034,11 @@ async fn assert_failover_does_not_re_bill_a_sibling(signal: ChatIdentity) {
     );
     let _ = alpha_cached;
 
-    // And the mechanism: two conversations on one model and tool set are no longer one
-    // key, so they spread instead of stacking on whichever account won first.
-    assert_ne!(
+    // Both conversations started on the same account, which is now the contract: with no
+    // Priority configured and no quota reading, the Account key breaks the tie (AC-2, AC-6).
+    assert_eq!(
         alpha_account, bravo_account,
-        "[{label}] two conversations on one model and tool set were collapsed onto one account"
+        "[{label}] two new conversations of one Pool did not share the preferred account"
     );
 }
 
@@ -5106,6 +5140,9 @@ async fn admin_accounts_lists_a_record_whose_credential_is_gone() {
             "lastSuccessAt",
             "models",
             "planType",
+            // account-priority AC-7
+            "priority",
+            "prioritySource",
             "quota",
             "refreshing",
             "totalCacheCreation1hInputTokens",
@@ -6371,4 +6408,130 @@ async fn admin_usage_reports_the_window_and_all_time_totals() {
     )
     .await;
     assert_eq!(status, 401);
+}
+
+/// `/admin/accounts?days=N` trims each record's day buckets to the window the
+/// caller renders. The dashboard asks for thirty; the default stays the store's
+/// own retention, so every existing reader sees what it always did.
+#[tokio::test]
+async fn admin_accounts_windows_the_days_it_is_asked_for() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &static_key_token("commandcode", "key-90445c90")).expect("save key");
+    let provider_dir = tmp.path().join("commandcode");
+    std::fs::create_dir_all(&provider_dir).expect("provider dir");
+    let today = chrono::Local::now().date_naive();
+    let mut days = serde_json::Map::new();
+    for back in 0..40 {
+        let date = (today - chrono::Duration::days(back)).format("%Y-%m-%d");
+        days.insert(
+            date.to_string(),
+            json!({"requests": 1, "successes": 1, "failures": 0}),
+        );
+    }
+    std::fs::write(
+        provider_dir.join("usage.json"),
+        json!({"key-90445c90": {"total_requests": 40, "total_successes": 40, "days": days}})
+            .to_string(),
+    )
+    .expect("write usage");
+    let app = create_app_with_upstream(
+        config_with_static_provider("commandcode", tmp.path().to_path_buf()),
+        Arc::new(FakeUpstream::default()),
+    );
+
+    let entry_days = |body: &Value| -> Vec<String> {
+        body["providers"]["commandcode"]["accounts"][0]["days"]
+            .as_array()
+            .expect("days")
+            .iter()
+            .map(|day| day["date"].as_str().expect("date").to_string())
+            .collect()
+    };
+    let (status, body) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .uri("/admin/accounts?days=3")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let window = entry_days(&body);
+    assert_eq!(window.len(), 3, "three days, got {window:?}");
+    assert_eq!(window[2], today.format("%Y-%m-%d").to_string());
+    assert_eq!(
+        window[0],
+        (today - chrono::Duration::days(2))
+            .format("%Y-%m-%d")
+            .to_string()
+    );
+
+    // No query: the store's own retention, which holds all forty here.
+    let (_, body) = json_response(
+        app,
+        axum::http::Request::builder()
+            .uri("/admin/accounts")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(entry_days(&body).len(), 40);
+}
+
+/// The admin payloads are compressed for a caller that asks for it, and the
+/// inference API is not: a compressed byte stream cannot be read chunk by
+/// chunk, and a five-hour reply is exactly that.
+#[tokio::test]
+async fn admin_payloads_compress_and_inference_does_not() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = create_app_with_upstream(
+        config(tmp.path().to_path_buf()),
+        Arc::new(FakeUpstream::default()),
+    );
+    let (status, headers) = headers_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .uri("/admin/accounts?days=30")
+            .header("authorization", "Bearer sk-test")
+            .header("accept-encoding", "gzip")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok()),
+        Some("gzip"),
+        "the admin payload was not compressed"
+    );
+
+    let (status, headers) = headers_response(
+        app,
+        axum::http::Request::builder()
+            .uri("/v1/models")
+            .header("authorization", "Bearer sk-test")
+            .header("accept-encoding", "gzip")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        headers.get("content-encoding").is_none(),
+        "the inference API was compressed"
+    );
+}
+
+/// One request's status and headers, without reading the body: the compressed
+/// body is bytes, not JSON.
+async fn headers_response(
+    app: axum::Router,
+    request: axum::http::Request<Body>,
+) -> (u16, axum::http::HeaderMap) {
+    let response = app.oneshot(request).await.expect("response");
+    (response.status().as_u16(), response.headers().clone())
 }
