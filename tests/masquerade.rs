@@ -470,6 +470,36 @@ fn already_native_server_tool_keeps_its_configuration() {
     );
 }
 
+#[test]
+fn custom_typed_tools_are_masked_like_untyped_ones() {
+    // `type: "custom"` is Anthropic's explicit marker for a client tool, which
+    // LiteLLM's anthropic provider stamps on every tool Hermes sends. It names no
+    // server tool, so the request must be masked exactly as the untyped form is.
+    let tool =
+        |name: &str| json!({"type": "custom", "name": name, "input_schema": {"type": "object"}});
+    let body = json!({
+        "tools": [tool("delegate_task"), tool("web_search")],
+        "tool_choice": {"type": "tool", "name": "delegate_task"},
+        "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "tu_1", "name": "delegate_task", "input": {}}
+            ]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu_1", "content": "ok"}]}
+        ]
+    });
+
+    let (out, rev) = masquerade_request(&body);
+    assert_eq!(
+        out["tools"][0],
+        json!({"type": "custom", "name": "DelegateTask", "input_schema": {"type": "object"}})
+    );
+    assert_eq!(out["tools"][1]["type"], "web_search_20250305");
+    assert_eq!(out["tool_choice"]["name"], "DelegateTask");
+    assert_eq!(out["messages"][1]["content"][0]["name"], "DelegateTask");
+    assert_eq!(rev["DelegateTask"], "delegate_task");
+}
+
 /// pi's system prompt, verbatim from its `buildSystemPrompt`. The rewrites are
 /// exact substrings of this text, so drift in either place fails the test rather
 /// than silently reverting the request to a 400.

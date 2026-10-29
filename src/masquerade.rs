@@ -9,7 +9,7 @@
 //! openclaw's `snake_case` ones (verified against the live classifier — `Exec`,
 //! `CreateGoal`, `Subagents` all pass; `exec`, `create_goal` all trip). So each
 //! tool name is `PascalCase`, preserving its meaning, and the bot-identity sections
-//! are stripped from the system prompt. Server tools (a `type` field, e.g.
+//! are stripped from the system prompt. Server tools (a versioned `type`, e.g.
 //! `web_search_20250305`) are left untouched so Anthropic still executes them. The
 //! mapping is deterministic so multi-turn history stays consistent, and the reverse
 //! map is returned to restore `tool_use` names in the response before openclaw
@@ -123,14 +123,22 @@ fn native_replacement(name: &str) -> Option<Value> {
     }
 }
 
+/// A server tool carries a versioned `type` (`web_search_20250305`). `custom` is
+/// the one `type` that names a client tool instead: the `anthropic/` provider of
+/// `LiteLLM` stamps it on every tool, so Hermes's tools arrive that way.
+fn is_server_tool(tool: &Value) -> bool {
+    tool.get("type")
+        .is_some_and(|kind| kind.as_str() != Some("custom"))
+}
+
 /// Map every custom tool name to its `PascalCase` pseudo-name. Skipped: server tools
-/// (a `type` field, already Anthropic-native) and tools with a native replacement
-/// (handled separately, keep their real name).
+/// (already Anthropic-native) and tools with a native replacement (handled
+/// separately, keep their real name).
 fn build_tool_map(tools: &[Value]) -> BTreeMap<String, String> {
     let mut taken = BTreeSet::new();
     let mut map = BTreeMap::new();
     for tool in tools {
-        if tool.get("type").is_some() {
+        if is_server_tool(tool) {
             continue;
         }
         if let Some(name) = tool.get("name").and_then(Value::as_str)
@@ -347,15 +355,13 @@ pub fn masquerade_request(body: &Value) -> (Value, BTreeMap<String, String>) {
 
     if let Some(tools) = object.get_mut("tools").and_then(Value::as_array_mut) {
         for tool in tools {
-            // A tool carrying `type` is already an Anthropic server tool; replacing
-            // it would discard the caller's own configuration.
-            let already_native = tool.get("type").is_some();
+            // Replacing a server tool would discard the caller's own configuration.
+            if is_server_tool(tool) {
+                continue;
+            }
             let Some(name) = tool.get("name").and_then(Value::as_str) else {
                 continue;
             };
-            if already_native {
-                continue;
-            }
             if let Some(native) = native_replacement(name) {
                 *tool = native;
             } else if let Some(pseudo) = tool_map.get(name) {
