@@ -3,10 +3,12 @@
 //! box, in both styles. Pure over the payload and a `now` handed in by the
 //! caller.
 
+use std::cmp::Ordering;
 use std::fmt::Write as _;
 
 use serde_json::Value;
 
+use crate::config::DEFAULT_PRIORITY;
 use crate::quota::{self, QuotaWindow};
 use crate::render::{
     AMBER, ActionGlyph, BOLD, DIM, Fact, GREEN, INNER_WIDTH, Output, RED, fact_panel, fact_row,
@@ -134,10 +136,10 @@ pub(crate) fn print_accounts(payload: &Value, output: &mut Output, now: f64, ver
             .unwrap_or(0);
         let suffix = if count == 1 { "account" } else { "accounts" };
         output.line(&format!("{provider_id}: {count} {suffix}"));
-        let Some(accounts) = provider.get("accounts").and_then(Value::as_array) else {
+        let Some(records) = provider.get("accounts").and_then(Value::as_array) else {
             continue;
         };
-        for account in accounts {
+        for account in accounts_in_priority_order(records, now) {
             let failures = account
                 .get("failureCount")
                 .and_then(Value::as_i64)
@@ -207,6 +209,51 @@ pub(crate) fn print_accounts(payload: &Value, output: &mut Output, now: f64, ver
             }
         }
     }
+}
+
+/// An Account's Priority as the payload states it, and the default for a payload that
+/// predates the field. The views never invent a rank; they only read the one sent.
+fn priority_of(account: &Value) -> i64 {
+    account
+        .get("priority")
+        .and_then(Value::as_i64)
+        .unwrap_or(DEFAULT_PRIORITY)
+}
+
+/// When the vendor says this Account's weekly window rolls, from the payload alone: `None`
+/// when the window is absent or has rolled, because a cycle that ended says nothing about the
+/// next one (ADR-0030).
+fn weekly_reset(account: &Value, now: f64) -> Option<i64> {
+    let resets_at = account
+        .get("quota")?
+        .get("windows")?
+        .get(quota::WINDOW_WEEK)?
+        .get("resetsAt")?
+        .as_i64()?;
+    (!quota::rolled_at(Some(resets_at), quota::epoch_seconds(now))).then_some(resets_at)
+}
+
+/// The Accounts of one Pool in the order Rotation hands out new conversations, which is the
+/// order the operator reads them in: smallest **Priority**, then the soonest weekly reset the
+/// vendor named (an Account without a current one last), then the Account key (AC-2). The
+/// relay lists records in Account-key order, so a view that prints a Priority has to reorder
+/// them; otherwise the page ranks the Accounts against the policy it is showing.
+pub(crate) fn accounts_in_priority_order(accounts: &[Value], now: f64) -> Vec<&Value> {
+    let mut ordered: Vec<&Value> = accounts.iter().collect();
+    ordered.sort_by(|left, right| {
+        priority_of(left)
+            .cmp(&priority_of(right))
+            .then_with(
+                || match (weekly_reset(left, now), weekly_reset(right, now)) {
+                    (Some(left), Some(right)) => left.cmp(&right),
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => Ordering::Equal,
+                },
+            )
+            .then_with(|| email(left).cmp(email(right)))
+    });
+    ordered
 }
 
 pub(crate) fn providers(payload: &Value) -> Vec<(&str, &Value)> {
@@ -414,7 +461,7 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64, ve
         let accounts = provider
             .get("accounts")
             .and_then(Value::as_array)
-            .map_or(&[][..], Vec::as_slice);
+            .map_or_else(Vec::new, |records| accounts_in_priority_order(records, now));
         let count = provider
             .get("account_count")
             .and_then(Value::as_i64)
@@ -438,9 +485,9 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64, ve
             "pool {provider_id} ─ {count} {suffix}, {available} available"
         )));
 
-        let pool_total: i64 = accounts.iter().map(account_tokens).sum();
+        let pool_total: i64 = accounts.iter().map(|account| account_tokens(account)).sum();
         let mut totals = PoolTotals::default();
-        for account in accounts {
+        for account in &accounts {
             totals.add(account);
         }
         // One name column for the whole panel: the same model's ok cell
@@ -448,7 +495,7 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64, ve
         let width = name_column(
             &accounts
                 .iter()
-                .flat_map(model_rows)
+                .flat_map(|account| model_rows(account))
                 .collect::<Vec<ModelRow>>(),
         );
         // One label column for every fact in the panel -- the per-account
@@ -460,12 +507,12 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64, ve
         panel_facts.extend(
             accounts
                 .iter()
-                .flat_map(model_rows)
+                .flat_map(|account| model_rows(account))
                 .flat_map(|row| row.facts()),
         );
         panel_facts.extend(footer_facts(&totals));
         let column = label_column(&panel_facts);
-        for account in accounts {
+        for account in &accounts {
             output.line(&panel_row(&account_row(account, pool_total, now)));
             for fact in account_detail_facts(account, now) {
                 output.line(&panel_row(&format!("  {}", fact_row(&fact, column))));

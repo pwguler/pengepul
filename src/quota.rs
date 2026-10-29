@@ -414,7 +414,15 @@ fn set_private(_path: &Path) -> Result<()> {
 /// until a later observation replaces it.
 #[must_use]
 pub fn rolled(window: &QuotaWindow, now: i64) -> bool {
-    window.resets_at.is_some_and(|at| at <= now)
+    rolled_at(window.resets_at, now)
+}
+
+/// The same rule for a reader holding only the instant, such as the admin payload. One
+/// definition, so a view and the selection that reads the same snapshot cannot disagree
+/// about which readings are current (ADR-0030, ADR-0031).
+#[must_use]
+pub fn rolled_at(resets_at: Option<i64>, now: i64) -> bool {
+    resets_at.is_some_and(|at| at <= now)
 }
 
 /// At the cap, or the vendor says so.

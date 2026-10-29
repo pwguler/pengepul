@@ -450,6 +450,15 @@ fn block(lines: &[&str], start: usize, len: usize) -> Vec<String> {
 }
 
 /// An absolute instant `seconds` from now, for `cooldownUntil` fixtures.
+/// An epoch instant `seconds` from now, in whole seconds: the type `resetsAt` carries on the
+/// wire, where [`soon`] is a fractional instant for the cooldown fields.
+fn epoch_in(seconds: i64) -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    i64::try_from(now).expect("an epoch this far from 1970 fits an i64") + seconds
+}
+
 fn soon(seconds: f64) -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -5702,6 +5711,90 @@ fn last_ok_and_the_priority_pair_end_the_plain_account_line() {
             "{argv:?}"
         );
     }
+}
+
+/// account-priority AC-2/AC-7: the Accounts view lists them in the order new conversations
+/// reach them, not in the payload's Account-key order, in both styles.
+#[test]
+fn accounts_lists_records_in_priority_order() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 4,
+                    // Payload order is the Account key, which is the opposite of the rank.
+                    "accounts": [
+                        {"email": "a@x.com", "available": true, "priority": 2,
+                         "prioritySource": "config"},
+                        {"email": "m@x.com", "available": true, "priority": 0,
+                         "prioritySource": "default"},
+                        {"email": "n@x.com", "available": true, "priority": 0,
+                         "prioritySource": "default",
+                         "quota": {"windows": {"week": {"usedPct": 10,
+                                                       "resetsAt": epoch_in(86_400)}}}},
+                        {"email": "z@x.com", "available": true, "priority": 1,
+                         "prioritySource": "config"}
+                    ]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+
+    let plain = run(&["accounts"], tmp.path(), &mut runtime);
+    let lines: Vec<&str> = plain
+        .stdout
+        .lines()
+        .filter(|line| line.starts_with("  ") && line.contains('@'))
+        .collect();
+    let order: Vec<&str> = lines
+        .iter()
+        .map(|line| line.split_whitespace().next().expect("an email"))
+        .collect();
+    // `n` and `m` share Priority 0; `n` names a weekly reset, so it comes first.
+    assert_eq!(
+        order,
+        ["n@x.com", "m@x.com", "z@x.com", "a@x.com"],
+        "{plain:?}"
+    );
+
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(json!({
+            "providers": {
+                "anthropic": {
+                    "account_count": 4,
+                    "accounts": [
+                        {"email": "a@x.com", "available": true, "priority": 2,
+                         "prioritySource": "config"},
+                        {"email": "m@x.com", "available": true, "priority": 0,
+                         "prioritySource": "default"},
+                        {"email": "n@x.com", "available": true, "priority": 0,
+                         "prioritySource": "default",
+                         "quota": {"windows": {"week": {"usedPct": 10,
+                                                       "resetsAt": epoch_in(86_400)}}}},
+                        {"email": "z@x.com", "available": true, "priority": 1,
+                         "prioritySource": "config"}
+                    ]
+                }
+            }
+        })),
+        ..FakeRuntime::default()
+    };
+    let rich = strip_ansi(&run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich).stdout);
+    let positions: Vec<usize> = ["n@x.com", "m@x.com", "z@x.com", "a@x.com"]
+        .iter()
+        .map(|email| {
+            rich.find(email)
+                .unwrap_or_else(|| panic!("{email} missing from the panel: {rich}"))
+        })
+        .collect();
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "the panel kept the payload order: {positions:?}"
+    );
 }
 
 /// account-priority AC-7: the panel names each Account's effective Priority and where the
