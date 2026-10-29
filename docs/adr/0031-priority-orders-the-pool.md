@@ -86,13 +86,19 @@ longer decides, and the Account key is the deterministic last word.
   through `POST /admin/accounts/enable` to show the sibling's prefix survived a failover.
 - **The selection log's `honored`/`rotation` vocabulary is unchanged**, and its test now parks
   one Account to reach the second with a new conversation instead of relying on the cursor.
-- **An Account added by a later login picks its configured Priority up at the next start,** not
-  at `--reload`: the map is read once, with the rest of the config, and the startup warning says
-  the key is waiting.
+- **The map is read once, at startup, and held in the manager.** An Account added by a later
+  login takes its configured Priority up on the `--reload` that adds it, because `priority()`
+  reads the held map; editing `priority:` for an Account the relay already serves needs a
+  restart, since only the startup copy is ever consulted. The startup warning says the key is
+  waiting, and a restart is what changes a number.
 - **One number, one home.** The payload carries `priority` and `prioritySource` (`config` or
   `default`) on every record, including one whose credential was removed (ADR-0026), so
   `pengepul accounts` — plain and rich — and the Windows tray read the same pair and cannot
   disagree about which number is configured (AC-7).
+- **`priority:` is a forward-only key.** `RawConfig` denies unknown fields, so a binary built
+  before this change refuses to load a config that carries the section, rather than ignoring
+  it. Rolling the relay back, or sharing one `config.yaml` between two versions, needs the
+  section removed first; the README says so beside the key.
 - **Nothing else moved.** Cooldown, Retry hint, Reauth, Disabled and Pool-of-one semantics are
   untouched (ADR-0020, ADR-0027), and so is the affinity key and its 1024-conversation bound
   (ADR-0017).

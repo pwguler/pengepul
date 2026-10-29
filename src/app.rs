@@ -777,7 +777,7 @@ fn warn_unknown_priority_accounts(provider_id: &str, manager: &AccountManager) {
         tracing::warn!(
             provider = %provider_id,
             account = %email,
-            "priority names an account this pool does not hold; a restart that loads it applies it"
+            "priority names an account this pool does not hold; a reload or restart that adds it applies it"
         );
     }
 }
@@ -4811,6 +4811,67 @@ mod tests {
             })
             .map(Vec::as_slice)
             .collect()
+    }
+
+    /// AC-1's operator-visible half: a `priority:` entry that names nothing is a warning and
+    /// never a refusal. The accessor it is built on is unit-tested in `tests/accounts.rs`;
+    /// what this pins is that the startup path actually emits it, so deleting the wiring
+    /// fails a test instead of silently deciding nothing.
+    #[test]
+    fn a_priority_entry_that_names_nothing_is_warned_about_at_startup() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        save_token(
+            tmp.path(),
+            &token(
+                "alice@example.com",
+                "anthropic-access-alice",
+                "2030-01-01T00:00:00Z",
+            ),
+        )
+        .expect("save alice");
+        let mut config = test_config(tmp.path().to_path_buf());
+        config.priority.insert(
+            "anthropic".to_string(),
+            std::collections::BTreeMap::from([
+                ("alice@example.com".to_string(), 1),
+                ("ghost@example.com".to_string(), 2),
+            ]),
+        );
+        config.priority.insert(
+            "mystery".to_string(),
+            std::collections::BTreeMap::from([("x@example.com".to_string(), 1)]),
+        );
+
+        let captured = capture();
+        // The managers are what the relay serves from; the warning is a side effect of
+        // building them, so they are kept alive for the capture to be complete.
+        let managers = super::build_account_managers(&config);
+        drop(managers);
+
+        let events = captured.lock().expect("capture lock");
+        let ghost = events
+            .iter()
+            .filter(|fields| field_is(fields, "account", "ghost@example.com"))
+            .count();
+        assert_eq!(
+            ghost, 1,
+            "the unknown account key was not warned about once"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|fields| field_is(fields, "provider", "mystery")
+                    && field_of(fields, "message").contains("priority names a provider")),
+            "the unknown provider was not warned about: {events:?}"
+        );
+        // The key that names a real Account stays quiet, so the warning is not noise on
+        // every start.
+        assert!(
+            !events
+                .iter()
+                .any(|fields| field_is(fields, "account", "alice@example.com")),
+            "a configured Account was warned about"
+        );
     }
 
     /// The line Rotation logs is the only place that says which account a conversation

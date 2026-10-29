@@ -487,14 +487,21 @@ impl Config {
         self.priority.get(provider_id).cloned().unwrap_or_default()
     }
 
-    /// The Provider ids a `priority:` entry can name: the three built-in Pools plus every
-    /// configured one.
+    /// The Provider ids a `priority:` entry can name: the built-in Pools plus every
+    /// configured one. The built-ins come from [`ProviderKind`], so a fourth kind cannot be
+    /// forgotten here while it serves.
     #[must_use]
     pub fn known_providers(&self) -> HashSet<&str> {
-        ["anthropic", "codex", "grok"]
-            .into_iter()
-            .chain(self.providers.keys().map(String::as_str))
-            .collect()
+        let mut known: HashSet<&str> = [
+            ProviderKind::Anthropic,
+            ProviderKind::Codex,
+            ProviderKind::Grok,
+        ]
+        .into_iter()
+        .map(ProviderKind::canonical_id)
+        .collect();
+        known.extend(self.providers.keys().map(String::as_str));
+        known
     }
 }
 

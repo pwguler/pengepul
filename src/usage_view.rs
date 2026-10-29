@@ -171,8 +171,9 @@ pub(crate) fn print_accounts(payload: &Value, output: &mut Output, now: f64, ver
             }
             let last_ok = last_ok_age(account, now).unwrap_or_else(|| "never".to_string());
             write!(line, " last_ok={last_ok}").expect("write to String cannot fail");
-            if let Some(priority) = priority_text(account) {
-                write!(line, " priority={priority}").expect("write to String cannot fail");
+            if let Some((priority, source)) = priority_pair(account) {
+                write!(line, " priority={priority} source={source}")
+                    .expect("write to String cannot fail");
             }
             output.line(&line);
             let detail = format!(
@@ -923,17 +924,21 @@ pub(crate) fn account_row(account: &Value, pool_total: i64, now: f64) -> String 
     .join(" ")
 }
 
-/// An Account's effective Priority and where the number came from: `1 (config)`, `0
-/// (default)`. `None` for a payload that predates the field, so no number is invented
-/// (ADR-0024) — the relay and the CLI are versioned together, and an old relay holds every
-/// Account at the same Priority, which is what an empty line would have to guess at.
-pub(crate) fn priority_text(account: &Value) -> Option<String> {
+/// An Account's effective Priority and where the number came from, the pair both styles
+/// print: the rich fact row as `1 (config)`, the plain line as `priority=1 source=config`, so
+/// every fact on that line stays a labelled one and no script has to parse a value for its
+/// source. `None` unless the payload carries both fields: a relay that predates them holds
+/// every Account at the same Priority, and a source guessed here would be the CLI's, not the
+/// relay's (ADR-0024).
+pub(crate) fn priority_pair(account: &Value) -> Option<(i64, &str)> {
     let priority = account.get("priority").and_then(Value::as_i64)?;
-    let source = account
-        .get("prioritySource")
-        .and_then(Value::as_str)
-        .unwrap_or("default");
-    Some(format!("{priority} ({source})"))
+    let source = account.get("prioritySource").and_then(Value::as_str)?;
+    Some((priority, source))
+}
+
+/// The pair as the rich account block prints it: `1 (config)`.
+pub(crate) fn priority_text(account: &Value) -> Option<String> {
+    priority_pair(account).map(|(priority, source)| format!("{priority} ({source})"))
 }
 
 /// `part` as a rounded percentage of `whole`, or `None` when there is no whole to divide by.

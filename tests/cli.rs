@@ -973,18 +973,19 @@ fn accounts_detail_prints_usage_and_cooldown_per_account() {
     // "on cooldown" with remaining time, not "unavailable" (AC-6).
     assert!(stdout.contains("anthropic: 3 accounts\n"));
     // AC-7: each Account names its effective Priority and where the number came from, so
-    // the operator can tell a configured number from the default one.
-    assert!(
-        stdout.contains(
-            "  a@x.com available failures=0 plan=max last_ok=never priority=1 (config)\n"
-        )
-    );
+    // the operator can tell a configured number from the default one. The source is its own
+    // labelled field: every fact on this line is `label=value`, so a script never parses
+    // punctuation out of one value to find another fact.
     assert!(stdout.contains(
-        "  b@x.com on cooldown 3m10s failures=2 plan=pro last_ok=never priority=0 (default)\n"
+        "  a@x.com available failures=0 plan=max last_ok=never priority=1 source=config\n"
+    ));
+    assert!(stdout.contains(
+        "  b@x.com on cooldown 3m10s failures=2 plan=pro last_ok=never priority=0 source=default\n"
     ));
     // An unavailable snapshot with no future cooldownUntil keeps the old word.
     assert!(
-        stdout.contains("  c@x.com unavailable failures=5 last_ok=never priority=-2 (config)\n")
+        stdout
+            .contains("  c@x.com unavailable failures=5 last_ok=never priority=-2 source=config\n")
     );
     // Detail line under each account: requests (ok) plus the token block,
     // in the same words and order as the panel (ADR-0024). reasoning prints
@@ -5582,7 +5583,8 @@ fn instant_from_now(seconds: i64) -> String {
     (chrono::Utc::now() + chrono::Duration::seconds(seconds)).to_rfc3339()
 }
 
-/// last-ok: one pool whose accounts cover every shape `lastSuccessAt` takes.
+/// last-ok: one pool whose accounts cover every shape `lastSuccessAt` takes, and the
+/// Priority pair the relay sends on every record (account-priority AC-7).
 fn last_ok_pool() -> Value {
     json!({
         "providers": {
@@ -5592,11 +5594,15 @@ fn last_ok_pool() -> Value {
                     // 3h5m10s ago renders `3h5m`, and cannot tick into another
                     // minute in the time the test takes.
                     {"email": "served@x.com", "available": true,
-                     "lastSuccessAt": instant_from_now(-11_110), "planType": "max"},
-                    {"email": "never@x.com", "available": true, "lastSuccessAt": null},
+                     "lastSuccessAt": instant_from_now(-11_110), "planType": "max",
+                     "priority": 1, "prioritySource": "config"},
+                    {"email": "never@x.com", "available": true, "lastSuccessAt": null,
+                     "priority": 0, "prioritySource": "default"},
                     {"email": "ahead@x.com", "available": true,
-                     "lastSuccessAt": instant_from_now(86_400)},
-                    {"email": "garbled@x.com", "available": true, "lastSuccessAt": "yesterday"}
+                     "lastSuccessAt": instant_from_now(86_400),
+                     "priority": 0, "prioritySource": "default"},
+                    {"email": "garbled@x.com", "available": true, "lastSuccessAt": "yesterday",
+                     "priority": 0, "prioritySource": "default"}
                 ]
             }
         }
@@ -5651,17 +5657,25 @@ fn last_ok_is_the_first_row_of_the_rich_account_block() {
         };
         assert_eq!(
             value_at(&lines[served + 1], "last ok"),
-            value_at(&lines[served + 2], "input"),
+            value_at(&lines[served + 2], "priority"),
             "last ok off the label column:\n{}\n{}",
             lines[served + 1],
             lines[served + 2]
         );
+        assert_eq!(
+            value_at(&lines[served + 2], "priority"),
+            value_at(&lines[served + 3], "input"),
+            "priority off the label column:\n{}\n{}",
+            lines[served + 2],
+            lines[served + 3]
+        );
     }
 }
 
-/// last-ok AC-6, AC-7, AC-8: plain appends it to the account line.
+/// last-ok AC-6, AC-7, AC-8: plain appends it to the account line, which the Priority pair
+/// then closes (account-priority AC-7).
 #[test]
-fn last_ok_ends_the_plain_account_line() {
+fn last_ok_and_the_priority_pair_end_the_plain_account_line() {
     for argv in [&["accounts"][..], &["accounts", "-v"][..]] {
         let lines = last_ok_lines(argv, Style::Plain);
         let line = |email: &str| -> &str {
@@ -5672,13 +5686,19 @@ fn last_ok_ends_the_plain_account_line() {
         };
         assert_eq!(
             line("served@x.com"),
-            "  served@x.com available failures=0 plan=max last_ok=3h5m",
+            "  served@x.com available failures=0 plan=max last_ok=3h5m priority=1 source=config",
             "{argv:?}"
         );
-        assert!(line("never@x.com").ends_with(" last_ok=never"), "{argv:?}");
-        assert!(line("ahead@x.com").ends_with(" last_ok=0s"), "{argv:?}");
         assert!(
-            line("garbled@x.com").ends_with(" last_ok=never"),
+            line("never@x.com").ends_with(" last_ok=never priority=0 source=default"),
+            "{argv:?}"
+        );
+        assert!(
+            line("ahead@x.com").ends_with(" last_ok=0s priority=0 source=default"),
+            "{argv:?}"
+        );
+        assert!(
+            line("garbled@x.com").ends_with(" last_ok=never priority=0 source=default"),
             "{argv:?}"
         );
     }

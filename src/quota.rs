@@ -300,7 +300,7 @@ fn number(value: &Value, field: &str) -> Option<f64> {
     clippy::cast_possible_truncation,
     reason = "a reset instant is kept in whole seconds; the fraction is sub-second noise"
 )]
-fn epoch_seconds(seconds: f64) -> i64 {
+pub(crate) fn epoch_seconds(seconds: f64) -> i64 {
     seconds as i64
 }
 
