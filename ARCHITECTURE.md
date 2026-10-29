@@ -186,8 +186,9 @@ in files.
 - **Priority orders new conversations inside one Pool, and decides nothing else.** Each
   Account carries an integer (`priority:` in the config, keyed by Provider and Account key,
   default `0`); a new conversation takes the serving Account of smallest one, then the soonest
-  weekly quota reset, then the Account key. It never compares across Pools, never reads quota
-  utilization, and never overrides cache affinity or availability: an Account leaves the
+  weekly quota reset, then the Account key. The `accounts` views list each Pool in that same
+  order, so the page reads as the policy it shows. It never compares across Pools, never reads
+  quota utilization, and never overrides cache affinity or availability: an Account leaves the
   serving set only on Cooldown, Disabled or a missing credential, and a conversation with
   affinity keeps its Account while that Account can serve (ADR-0031).
 - **Rotation prefers the Account holding the cache, and never waits for it.**
