@@ -4,8 +4,9 @@ Run your own API relay for your AI subscriptions. Log in your Claude, ChatGPT/Co
 accounts once and every request is served from the pool, so your harness runs on your
 subscription instead of a per-token key.
 
-- Pools several subscription accounts per provider and ranks them, so a plan's better account
-  takes the new conversations and a running one keeps the account holding its cache.
+- Pools several subscription accounts per provider and orders them by a `priority:` of your
+  choosing, so the preferred account takes the new conversations while a running one keeps the
+  account holding its cache.
 - Serves your subscription inside openclaw and hermes, with no API key.
 - Relays any OpenAI-compatible API (groq, openrouter, deepseek, ...) through the pool.
 - Exposes the pool as a REST API, local or networked, for your own tools.
@@ -32,8 +33,9 @@ pengepul serve --host 0.0.0.0 --port 8317 # reachable across your network
 
 Log in more than once per provider to pool accounts; each new conversation goes to the
 account of smallest `priority:` (default `0`, smaller is preferred), then to the one whose
-weekly quota resets soonest, and a conversation already running stays on the account that
-holds its cache while that account can serve. A grok
+weekly quota resets soonest — an account with no reading sorts last, and the account key breaks
+the final tie — and a conversation already running stays on the account that holds its cache
+while that account can serve. A grok
 account serves `grok-4.6` and `grok-4.5`, each with a 500k context window, named bare or
 as `grok/grok-4.6`. Credentials live in `~/.pengepul` (`0600`); a running relay picks up a
 fresh login on restart or `pengepul accounts --reload`. Read the key clients use with
@@ -67,10 +69,6 @@ Editing the file by hand works too: one entry per endpoint, then `pengepul login
 
 ```sh
 # ~/.pengepul/config.yaml
-priority: # optional, per provider and account id; smaller is preferred, default 0
-  anthropic:
-    you@example.com: 1 # demoted below the pool's unranked accounts
-    work@example.com: -1 # takes new conversations ahead of them
 providers:
   groq:
     base-url: https://api.groq.com/openai/v1
@@ -248,6 +246,9 @@ port: 8317
 auth-dir: ~/.pengepul
 api-keys:
   - sk-local-example
+priority: # optional, per provider and account key; smaller is preferred, default 0
+  anthropic:
+    you@example.com: 1 # below the accounts the config leaves at the default
 providers:
   groq:
     base-url: https://api.groq.com/openai/v1

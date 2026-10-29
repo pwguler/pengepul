@@ -1,6 +1,6 @@
 # pengepul
 
-pengepul pools several AI-vendor accounts behind one local API and spreads client requests across them. This glossary fixes the vocabulary an operator of that pool uses, so the same concept is not called three things across the README, the CLI and the source.
+pengepul pools several AI-vendor accounts behind one local API and hands each conversation to one of them. This glossary fixes the vocabulary an operator of that pool uses, so the same concept is not called three things across the README, the CLI and the source.
 
 ## Language
 
@@ -71,7 +71,7 @@ Re-serving one client request on a different account of the same provider after 
 _Avoid_: retry, fallback, attempt budget
 
 **Pool**:
-The set of Accounts of one Provider behind the relay, spread across by Rotation.
+The set of Accounts of one Provider behind the relay, ordered by **Priority** and handed each new conversation by **Rotation**.
 _Avoid_: account list, fleet, grouping
 
 **Panel**:

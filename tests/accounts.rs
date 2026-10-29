@@ -2441,7 +2441,7 @@ async fn enable_puts_a_disabled_account_back_in_rotation() {
             .join("a@example.com.json.disabled")
             .exists()
     );
-    // Back in the Pool means the next selection ranks it with its sibling, and here it
+    // Back in the Pool means the next selection orders it with its sibling, and here it
     // wins the tie on the Account key (AC-2), so `b` serves only while `a` cannot.
     assert_eq!(served(&mut manager, 2), ["a@example.com"; 2]);
     manager.record_billing_cooldown("a@example.com", "insufficient credits");
@@ -2624,7 +2624,7 @@ async fn a_fresh_login_enables_a_disabled_account() {
     );
     manager.reload().expect("reload");
     assert_eq!(record(&mut manager, "a@example.com")["disabled"], false);
-    // The login put it back in the Pool, ranked with its sibling and ahead of it on the
+    // The login put it back in the Pool, ordered with its sibling and ahead of it on the
     // Account key (AC-2); only a Cooldown moves the request to `b`.
     assert_eq!(served(&mut manager, 2), ["a@example.com"; 2]);
     manager.record_billing_cooldown("a@example.com", "insufficient credits");
@@ -2869,7 +2869,7 @@ async fn a_retry_hint_that_outlasts_a_reauth_keeps_the_reauth_reason() {
 
 /// A loaded `commandcode` Pool holding `emails`, with `priorities` keyed by Account key.
 /// Every one of them is a static key, so no refresh callback ever runs.
-fn ranked_pool(auth_dir: &Path, emails: &[&str], priorities: &[(&str, i64)]) -> AccountManager {
+fn priority_pool(auth_dir: &Path, emails: &[&str], priorities: &[(&str, i64)]) -> AccountManager {
     for email in emails {
         save_token(auth_dir, &static_token(email)).expect("save token");
     }
@@ -2915,10 +2915,10 @@ fn in_days(days: i64) -> i64 {
 
 #[tokio::test]
 async fn a_new_conversation_takes_the_smallest_priority() {
-    // AC-2, AC-6. Nothing else is configured, so the ranking alone decides: the unranked
-    // account holds Priority 0, and 1 is below it.
+    // AC-2, AC-6. Nothing else is configured, so the order alone decides: the account the
+    // config leaves out holds Priority 0, and 1 is below it.
     let tmp = tempdir().expect("tempdir");
-    let mut manager = ranked_pool(
+    let mut manager = priority_pool(
         tmp.path(),
         &["a@example.com", "b@example.com"],
         &[("b@example.com", 1)],
@@ -2927,7 +2927,7 @@ async fn a_new_conversation_takes_the_smallest_priority() {
 
     // Smaller is preferred, not larger: a negative number outranks the default.
     let tmp = tempdir().expect("tempdir");
-    let mut promoted = ranked_pool(
+    let mut promoted = priority_pool(
         tmp.path(),
         &["a@example.com", "b@example.com"],
         &[("b@example.com", -1)],
@@ -2939,7 +2939,7 @@ async fn a_new_conversation_takes_the_smallest_priority() {
 async fn within_one_priority_the_soonest_weekly_reset_serves_first() {
     // AC-2. Both accounts sit in the same tier, so the vendor's own weekly reset decides.
     let tmp = tempdir().expect("tempdir");
-    let mut manager = ranked_pool(
+    let mut manager = priority_pool(
         tmp.path(),
         &["a@example.com", "b@example.com"],
         &[("a@example.com", 1), ("b@example.com", 1)],
@@ -2960,7 +2960,7 @@ async fn an_account_with_no_weekly_reading_sorts_last_within_its_tier() {
     // AC-2. No quota data is not a reason to prefer an account, and it is not a reason to
     // skip it either — it only loses the tie.
     let tmp = tempdir().expect("tempdir");
-    let mut manager = ranked_pool(
+    let mut manager = priority_pool(
         tmp.path(),
         &["a@example.com", "b@example.com"],
         &[("a@example.com", 1), ("b@example.com", 1)],
@@ -2974,7 +2974,7 @@ async fn an_account_with_no_weekly_reading_sorts_last_within_its_tier() {
 async fn a_tie_on_priority_and_reset_breaks_by_account_key() {
     // AC-2. Deterministic, not a cursor: the same Pool answers the same account every time.
     let tmp = tempdir().expect("tempdir");
-    let mut manager = ranked_pool(tmp.path(), &["b@example.com", "a@example.com"], &[]);
+    let mut manager = priority_pool(tmp.path(), &["b@example.com", "a@example.com"], &[]);
     manager.record_quota("a@example.com", weekly("2026-10-28T09:00:00Z", in_days(3)));
     manager.record_quota("b@example.com", weekly("2026-10-28T09:00:00Z", in_days(3)));
 
@@ -2986,7 +2986,7 @@ async fn near_exhausted_quota_never_moves_a_request_to_a_lower_priority() {
     // AC-3. Quota is a display figure, not a selection input: only an Account that cannot
     // serve drops the request a tier.
     let tmp = tempdir().expect("tempdir");
-    let mut manager = ranked_pool(
+    let mut manager = priority_pool(
         tmp.path(),
         &["a@example.com", "b@example.com"],
         &[("b@example.com", 1)],
@@ -3015,7 +3015,7 @@ async fn near_exhausted_quota_never_moves_a_request_to_a_lower_priority() {
 async fn a_cooling_or_disabled_account_hands_the_request_to_the_next_priority() {
     // AC-3. Cooldown and Disabled are the two states that drop a tier.
     let tmp = tempdir().expect("tempdir");
-    let mut manager = ranked_pool(
+    let mut manager = priority_pool(
         tmp.path(),
         &["a@example.com", "b@example.com"],
         &[("b@example.com", 1)],
@@ -3024,7 +3024,7 @@ async fn a_cooling_or_disabled_account_hands_the_request_to_the_next_priority() 
     assert_eq!(served(&mut manager, 2), ["b@example.com"; 2]);
 
     let tmp = tempdir().expect("tempdir");
-    let mut manager = ranked_pool(
+    let mut manager = priority_pool(
         tmp.path(),
         &["a@example.com", "b@example.com"],
         &[("b@example.com", 1)],
@@ -3038,7 +3038,7 @@ async fn a_sticky_conversation_stays_put_when_a_higher_priority_account_recovers
     // AC-4. Cache affinity outranks Priority: the conversation keeps its Account while that
     // Account can serve, even after the preferred one is back.
     let tmp = tempdir().expect("tempdir");
-    let mut manager = ranked_pool(
+    let mut manager = priority_pool(
         tmp.path(),
         &["a@example.com", "b@example.com"],
         &[("b@example.com", 1)],
@@ -3070,7 +3070,7 @@ async fn the_soonest_reset_decides_new_conversations_not_the_round_robin_cursor(
     // AC-6. With no Priority configured anywhere, the AC-2 order decides: every new
     // conversation starts on the soonest-resetting Account instead of walking the Pool.
     let tmp = tempdir().expect("tempdir");
-    let mut manager = ranked_pool(tmp.path(), &["a@example.com", "b@example.com"], &[]);
+    let mut manager = priority_pool(tmp.path(), &["a@example.com", "b@example.com"], &[]);
     manager.record_quota("a@example.com", weekly("2026-10-28T09:00:00Z", in_days(5)));
     manager.record_quota("b@example.com", weekly("2026-10-28T09:00:00Z", in_days(2)));
 
@@ -3092,7 +3092,7 @@ async fn the_payload_names_each_accounts_effective_priority_and_where_it_came_fr
     // AC-7. The payload is what the CLI and the tray both read, so the effective number and
     // its source are one field pair on every record.
     let tmp = tempdir().expect("tempdir");
-    let mut manager = ranked_pool(
+    let mut manager = priority_pool(
         tmp.path(),
         &["a@example.com", "b@example.com"],
         &[("b@example.com", 2)],
@@ -3112,7 +3112,7 @@ async fn a_record_without_a_credential_carries_the_same_priority_pair() {
     // ADR-0026: a removed credential leaves an Account of the Pool. It is listed with the
     // one shape every record has, so its Priority is resolved the same way.
     let tmp = tempdir().expect("tempdir");
-    let mut manager = ranked_pool(
+    let mut manager = priority_pool(
         tmp.path(),
         &["a@example.com", "b@example.com"],
         &[("b@example.com", 2)],
@@ -3131,7 +3131,7 @@ async fn a_record_without_a_credential_carries_the_same_priority_pair() {
 async fn an_unknown_priority_key_is_reported_and_the_pool_still_loads() {
     // AC-1. A typo in the config must not stop the relay, and it must not be silent either.
     let tmp = tempdir().expect("tempdir");
-    let manager = ranked_pool(
+    let manager = priority_pool(
         tmp.path(),
         &["a@example.com"],
         &[("a@example.com", 1), ("ghost@example.com", 2)],
@@ -3150,7 +3150,7 @@ async fn an_unknown_priority_key_is_reported_and_the_pool_still_loads() {
 async fn the_demo_pool_lands_on_the_soonest_reset_tier_then_holds_its_sticky_conversation() {
     // The spec's demo fixture: Priorities 1, 1, 2 and different weekly resets.
     let tmp = tempdir().expect("tempdir");
-    let mut manager = ranked_pool(
+    let mut manager = priority_pool(
         tmp.path(),
         &["p@example.com", "q@example.com", "r@example.com"],
         &[

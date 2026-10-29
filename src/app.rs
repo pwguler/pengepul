@@ -4865,8 +4865,8 @@ mod tests {
             super::next_provider_account(&state, ProviderId::anthropic(), "conversation-a")
                 .await
                 .expect("conversation-a, second");
-        // A new conversation is handed the best-ranked account that can serve, and with no
-        // Priority and no quota reading that is the same one alice's is. The only thing that
+        // A new conversation is handed the serving account of smallest Priority, and with
+        // no Priority and no quota reading that is the same one alice's is. The only thing that
         // moves it is a state the account cannot serve in, so park alice the way an upstream
         // billing rejection does and let the log line follow the move (AC-2, AC-3).
         {

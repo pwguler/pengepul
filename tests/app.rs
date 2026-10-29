@@ -922,7 +922,7 @@ async fn messages_route_hands_new_conversations_to_the_configured_priority() {
         .expect("save token");
     }
     let upstream = Arc::new(FakeUpstream::default());
-    // Bob is ranked ahead of the default 0, so every new conversation starts on him no
+    // Bob carries a smaller Priority than the default 0, so every new conversation starts on him no
     // matter which prefix it carries (AC-2). The config is the only place the number comes
     // from: this is also the wiring check that `build_account_managers` hands it down.
     let mut cfg = config(tmp.path().to_path_buf());
@@ -933,7 +933,7 @@ async fn messages_route_hands_new_conversations_to_the_configured_priority() {
     let app = create_app_with_upstream(cfg, upstream.clone());
 
     // Two conversations, so two different cacheable prefixes. Neither alternates to the
-    // default-ranked account: the ranking decides, not a rotation cursor (AC-6).
+    // default-Priority account: the order decides, not a rotation cursor (AC-6).
     for system in ["you are a poet", "you are a lawyer"] {
         let (status, _) = json_response(
             app.clone(),

@@ -13,13 +13,13 @@ could say so.
 
 The vendor now states each account's quota windows (ADR-0030), including the weekly one's reset
 instant, which is the only per-account fact that says "this account's cycle is about to
-refresh". The operator asked for a rank that uses it, and settled five points before any code
+refresh". The operator asked for a Priority that uses it, and settled five points before any code
 was written:
 
 - Priority is per **Account**, inside one Pool. Nothing compares across Pools or Providers: one
   model id still resolves to one Provider, so there is no Pool to compare it with.
 - Smaller is preferred, and every Account the config leaves out shares one default, so a
-  partial config ranks relative to that default rather than to nothing.
+  partial config is ordered relative to that default rather than to nothing.
 - Within equal Priority, the Account whose weekly (`7d`) window resets soonest; one with no
   usable reading last; the Account key as the final tie.
 - No round-robin inside a tier. Equal Priorities are not interleaved.
@@ -53,7 +53,7 @@ longer decides, and the Account key is the deterministic last word.
 
 ## Considered options
 
-- **A separate `accounts.rank` file.** Rejected: the config is already the operator's one place
+- **A separate priority file.** Rejected: the config is already the operator's one place
   for policy, and a second file is a second thing to keep in sync with the auth directory.
 - **Priority as a share (weights).** Rejected by the operator: the request was an order, and a
   share reintroduces the interleaving within a tier that the tie-break exists to remove.
@@ -75,7 +75,7 @@ longer decides, and the Account key is the deterministic last word.
   conversations all land on the lowest Account key until it cannot serve. This is the settled
   design, not an oversight: `a_tie_on_priority_and_reset_breaks_by_account_key` and
   `without_a_configured_priority_new_conversations_do_not_alternate` pin it. The mitigation is
-  the operator's to apply — rank the accounts — or the weekly reset's: on a Provider that
+  the operator's to apply — set `priority:` — or the weekly reset's: on a Provider that
   reports `7d`, the preferred Account's reset passes, its window reads `n/a`, it sorts last and
   the next tier takes new work.
 - **Two tests that asserted the old fairness were rewritten, not weakened.**

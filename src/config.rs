@@ -83,8 +83,8 @@ pub struct Config {
     pub priority: BTreeMap<String, BTreeMap<String, i64>>,
 }
 
-/// The Priority of an Account the config does not rank. Every unranked Account shares it, so
-/// a positive number demotes an Account below them and a negative one promotes it.
+/// The Priority of an Account the config does not list. Every such Account shares it, so a
+/// positive number demotes an Account below them and a negative one promotes it.
 pub const DEFAULT_PRIORITY: i64 = 0;
 
 /// The largest request body the relay will read, resolved once at config load.
@@ -481,7 +481,7 @@ impl Drop for FileLock {
 
 impl Config {
     /// The Priorities configured for one Provider's Pool, keyed by Account key. A Provider
-    /// the config does not rank gets an empty map, so every Account of it holds the default.
+    /// the config does not name gets an empty map, so every Account of it holds the default.
     #[must_use]
     pub fn priority_for(&self, provider_id: &str) -> BTreeMap<String, i64> {
         self.priority.get(provider_id).cloned().unwrap_or_default()

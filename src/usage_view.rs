@@ -925,8 +925,8 @@ pub(crate) fn account_row(account: &Value, pool_total: i64, now: f64) -> String 
 
 /// An Account's effective Priority and where the number came from: `1 (config)`, `0
 /// (default)`. `None` for a payload that predates the field, so no number is invented
-/// (ADR-0024) — the relay and the CLI are versioned together, and an old relay ranks every
-/// Account alike, which is what an empty line would have to guess at.
+/// (ADR-0024) — the relay and the CLI are versioned together, and an old relay holds every
+/// Account at the same Priority, which is what an empty line would have to guess at.
 pub(crate) fn priority_text(account: &Value) -> Option<String> {
     let priority = account.get("priority").and_then(Value::as_i64)?;
     let source = account

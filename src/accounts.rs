@@ -709,7 +709,7 @@ impl AccountManager {
         }
     }
 
-    /// Drop an account from the rotation order: the next selection ranks whatever is left.
+    /// Drop an account from the rotation order: the next selection orders whatever is left.
     fn leave_rotation(&mut self, email: &str) {
         self.order.retain(|held| held != email);
     }
@@ -1143,7 +1143,7 @@ impl AccountManager {
         self.next_account_result().account
     }
 
-    /// The Priority this Pool ranks an Account by: the number the config gives it, or
+    /// The Priority this Pool orders an Account by: the number the config gives it, or
     /// [`DEFAULT_PRIORITY`] for an Account the config leaves out.
     #[must_use]
     pub fn priority(&self, email: &str) -> i64 {
@@ -1214,12 +1214,12 @@ impl AccountManager {
             .then_with(|| left.cmp(right))
     }
 
-    /// The Account a new conversation is handed: the best-ranked Account that can serve, or
-    /// `None` when every Account is on Cooldown.
+    /// The Account a new conversation is handed: the best Account that can serve by
+    /// [`Self::prefer`], or `None` when every Account is on Cooldown.
     ///
     /// The rotation order holds exactly the Accounts that can serve on state — one with a
     /// credential, not Disabled — so a Cooldown is the only thing left to filter. Should a
-    /// tier's Accounts all be cooling, the next tier is ranked the same way, which is what
+    /// tier's Accounts all be cooling, the next tier is ordered the same way, which is what
     /// makes Priority an order over the serving set rather than a pin (AC-3).
     fn best_serving(&self, now: f64) -> Option<&String> {
         self.order

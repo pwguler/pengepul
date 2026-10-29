@@ -973,7 +973,7 @@ fn accounts_detail_prints_usage_and_cooldown_per_account() {
     // "on cooldown" with remaining time, not "unavailable" (AC-6).
     assert!(stdout.contains("anthropic: 3 accounts\n"));
     // AC-7: each Account names its effective Priority and where the number came from, so
-    // the operator can tell a configured rank from the default one.
+    // the operator can tell a configured number from the default one.
     assert!(
         stdout.contains(
             "  a@x.com available failures=0 plan=max last_ok=never priority=1 (config)\n"
@@ -5697,7 +5697,7 @@ fn accounts_panel_names_each_accounts_priority() {
                 "anthropic": {
                     "account_count": 2,
                     "accounts": [
-                        {"email": "ranked@x.com", "available": true,
+                        {"email": "set@x.com", "available": true,
                          "priority": 1, "prioritySource": "config"},
                         {"email": "default@x.com", "available": true,
                          "priority": 0, "prioritySource": "default"}
@@ -5723,7 +5723,7 @@ fn accounts_panel_names_each_accounts_priority() {
             .collect::<Vec<_>>()
             .join(" ")
     };
-    assert_eq!(fact("ranked@x.com"), "priority 1 (config)", "{rich}");
+    assert_eq!(fact("set@x.com"), "priority 1 (config)", "{rich}");
     assert_eq!(fact("default@x.com"), "priority 0 (default)", "{rich}");
 }
 

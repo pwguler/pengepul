@@ -52,13 +52,16 @@ in the same project.
 Rejected: keying on the client credential. It is stable and trivially available,
 and it makes every request from one API key a single conversation — which does not
 preserve a cache so much as switch Rotation off for that client. The prefix hash
-groups what actually shares a cache and still spreads unrelated work.
+groups what actually shares a cache, and unrelated conversations still reached
+different accounts, because plain Rotation moved to the next one on every request.
 
 ## Consequences
 
 - **Two identical requests no longer alternate accounts.** They share a prefix, so
-  they share an account. `messages_route_rotates_available_anthropic_accounts` now
-  sends two different system prompts to assert the pool is still spread across.
+  they share an account. The route test now sends two different system prompts, to
+  assert that a second conversation is still handed an account at all. (That test was
+  later rewritten again: ADR-0031 replaced the cursor's spreading with a Priority
+  order, so two new conversations now share the preferred account on purpose.)
   (The Context table counts the `commandcode` pool at two keys and this amendment at
   three: a third key was added between the two measurements. The request figures are
   reconciled in ADR-0020; the account count is simply a later snapshot.)
@@ -253,3 +256,14 @@ upstream whose cache is per Account — the property that makes the switch expen
 and asserts that a failure on one conversation's Account leaves a sibling
 conversation's prefix cached. Removing either the `prompt_cache_key` rule or the
 message opening from `conversation_key` makes it fail.
+
+## Amendment: the cursor under Rotation is gone
+
+ADR-0031 deletes the modulo cursor this ADR's fall-through relied on and replaces it
+with a **Priority** order: a new conversation goes to the serving Account of smallest
+Priority, then the soonest weekly quota reset, then the Account key. Everything this
+ADR decided about the cache stands unchanged — a conversation keeps the Account that
+holds its prefix while that Account can serve, availability still outranks cache
+locality, and Failover still re-pins — but the sentence above that says unrelated
+conversations "spread" no longer describes Rotation: equal Priorities are not
+interleaved, so new work of one Pool shares whichever Account comes first in that order.
