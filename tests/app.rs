@@ -6583,9 +6583,11 @@ impl UpstreamClient for ToolUseUpstream {
                     Ok(Bytes::from_static(
                         b"event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
                     )),
+                    // Split inside the tool name: the restore must see the event whole.
                     Ok(Bytes::from_static(
-                        b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"DelegateTask\",\"input\":{}}}\n\n",
+                        b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"Deleg",
                     )),
+                    Ok(Bytes::from_static(b"ateTask\",\"input\":{}}}\n\n")),
                     Ok(Bytes::from_static(
                         b"event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n",
                     )),

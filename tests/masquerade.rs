@@ -474,11 +474,13 @@ fn already_native_server_tool_keeps_its_configuration() {
 fn custom_typed_tools_are_masked_like_untyped_ones() {
     // `type: "custom"` is Anthropic's explicit marker for a client tool, which
     // LiteLLM's anthropic provider stamps on every tool Hermes sends. It names no
-    // server tool, so the request must be masked exactly as the untyped form is.
+    // server tool, so the request must be masked exactly as the untyped form is,
+    // while a versioned server tool beside it stays as the client configured it.
     let tool =
         |name: &str| json!({"type": "custom", "name": name, "input_schema": {"type": "object"}});
+    let server_tool = json!({"type": "bash_20250124", "name": "bash"});
     let body = json!({
-        "tools": [tool("delegate_task"), tool("web_search")],
+        "tools": [tool("delegate_task"), server_tool],
         "tool_choice": {"type": "tool", "name": "delegate_task"},
         "messages": [
             {"role": "user", "content": "go"},
@@ -494,10 +496,43 @@ fn custom_typed_tools_are_masked_like_untyped_ones() {
         out["tools"][0],
         json!({"type": "custom", "name": "DelegateTask", "input_schema": {"type": "object"}})
     );
-    assert_eq!(out["tools"][1]["type"], "web_search_20250305");
+    assert_eq!(out["tools"][1], server_tool);
     assert_eq!(out["tool_choice"]["name"], "DelegateTask");
     assert_eq!(out["messages"][1]["content"][0]["name"], "DelegateTask");
-    assert_eq!(rev["DelegateTask"], "delegate_task");
+    assert_eq!(
+        rev,
+        std::collections::BTreeMap::from([(
+            "DelegateTask".to_string(),
+            "delegate_task".to_string()
+        )])
+    );
+}
+
+#[test]
+fn custom_typed_web_tools_stay_client_tools() {
+    // LiteLLM turns a `server_tool_use` in the reply into an OpenAI tool call, so
+    // Hermes would run a search Anthropic already ran and send back a
+    // `tool_result` for a server-tool id. A client that types its web tools
+    // `custom` keeps running them itself: renamed, never swapped.
+    let tool =
+        |name: &str| json!({"type": "custom", "name": name, "input_schema": {"type": "object"}});
+    let body = json!({
+        "tools": [tool("web_search"), tool("web_fetch")],
+        "tool_choice": {"type": "tool", "name": "web_search"},
+        "messages": [{"role": "user", "content": "go"}]
+    });
+
+    let (out, rev) = masquerade_request(&body);
+    assert_eq!(
+        out["tools"],
+        json!([
+            {"type": "custom", "name": "WebSearch", "input_schema": {"type": "object"}},
+            {"type": "custom", "name": "WebFetch", "input_schema": {"type": "object"}}
+        ])
+    );
+    assert_eq!(out["tool_choice"]["name"], "WebSearch");
+    assert_eq!(rev["WebSearch"], "web_search");
+    assert_eq!(rev["WebFetch"], "web_fetch");
 }
 
 /// pi's system prompt, verbatim from its `buildSystemPrompt`. The rewrites are
