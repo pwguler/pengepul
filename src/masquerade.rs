@@ -9,7 +9,7 @@
 //! openclaw's `snake_case` ones (verified against the live classifier — `Exec`,
 //! `CreateGoal`, `Subagents` all pass; `exec`, `create_goal` all trip). So each
 //! tool name is `PascalCase`, preserving its meaning, and the bot-identity sections
-//! are stripped from the system prompt. Server tools (a `type` field, e.g.
+//! are stripped from the system prompt. Server tools (any `type` but `custom`, e.g.
 //! `web_search_20250305`) are left untouched so Anthropic still executes them. The
 //! mapping is deterministic so multi-turn history stays consistent, and the reverse
 //! map is returned to restore `tool_use` names in the response before openclaw
@@ -98,7 +98,7 @@ fn pseudo_for(name: &str, taken: &BTreeSet<String>) -> String {
         .unwrap_or(base)
 }
 
-/// openclaw ships its own custom `web_search`/`web_fetch` tools that it executes
+/// openclaw ships its own untyped `web_search`/`web_fetch` tools that it executes
 /// itself. Swap them for Anthropic's native server tools so the upstream runs them
 /// and folds the results into the turn; the name is kept (no client dispatch), so
 /// these are excluded from the `PascalCase` map. `web_fetch` also needs the
@@ -107,8 +107,15 @@ fn pseudo_for(name: &str, taken: &BTreeSet<String>) -> String {
 /// (`WebFetch` is a client tool there), so this swap is the only web-fetch
 /// implementation openclaw's requests have (ADR-0008). Returns the native tool
 /// definition, or `None` for tools with no native equivalent.
-fn native_replacement(name: &str) -> Option<Value> {
-    match name {
+///
+/// A typed tool is never swapped. `custom` is the client declaring the tool its
+/// own, and `LiteLLM`, which types every tool that way, turns the `server_tool_use`
+/// in the reply into a tool call that its client runs a second time.
+fn native_replacement(tool: &Value) -> Option<Value> {
+    if tool.get("type").is_some() {
+        return None;
+    }
+    match tool.get("name").and_then(Value::as_str)? {
         "web_search" => Some(serde_json::json!({
             "type": "web_search_20250305",
             "name": "web_search",
@@ -123,18 +130,25 @@ fn native_replacement(name: &str) -> Option<Value> {
     }
 }
 
-/// Map every custom tool name to its `PascalCase` pseudo-name. Skipped: server tools
-/// (a `type` field, already Anthropic-native) and tools with a native replacement
-/// (handled separately, keep their real name).
+/// Any `type` but `custom` marks an Anthropic server tool (`web_search_20250305`,
+/// `bash_20250124`). `custom` names a client tool: the `anthropic/` provider of
+/// `LiteLLM` stamps it on every tool, so Hermes's tools arrive that way.
+fn is_server_tool(tool: &Value) -> bool {
+    tool.get("type")
+        .is_some_and(|kind| kind.as_str() != Some("custom"))
+}
+
+/// Map every client tool name to its `PascalCase` pseudo-name. Skipped: server tools
+/// (already Anthropic-native) and tools with a native replacement (handled
+/// separately, keep their real name).
 fn build_tool_map(tools: &[Value]) -> BTreeMap<String, String> {
     let mut taken = BTreeSet::new();
     let mut map = BTreeMap::new();
     for tool in tools {
-        if tool.get("type").is_some() {
+        if is_server_tool(tool) || native_replacement(tool).is_some() {
             continue;
         }
         if let Some(name) = tool.get("name").and_then(Value::as_str)
-            && native_replacement(name).is_none()
             && !map.contains_key(name)
         {
             let pseudo = pseudo_for(name, &taken);
@@ -347,18 +361,18 @@ pub fn masquerade_request(body: &Value) -> (Value, BTreeMap<String, String>) {
 
     if let Some(tools) = object.get_mut("tools").and_then(Value::as_array_mut) {
         for tool in tools {
-            // A tool carrying `type` is already an Anthropic server tool; replacing
-            // it would discard the caller's own configuration.
-            let already_native = tool.get("type").is_some();
+            // Replacing a server tool would discard the caller's own configuration.
+            if is_server_tool(tool) {
+                continue;
+            }
+            if let Some(native) = native_replacement(tool) {
+                *tool = native;
+                continue;
+            }
             let Some(name) = tool.get("name").and_then(Value::as_str) else {
                 continue;
             };
-            if already_native {
-                continue;
-            }
-            if let Some(native) = native_replacement(name) {
-                *tool = native;
-            } else if let Some(pseudo) = tool_map.get(name) {
+            if let Some(pseudo) = tool_map.get(name) {
                 tool["name"] = Value::String(pseudo.clone());
             }
         }

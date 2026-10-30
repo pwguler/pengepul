@@ -6535,3 +6535,135 @@ async fn headers_response(
     let response = app.oneshot(request).await.expect("response");
     (response.status().as_u16(), response.headers().clone())
 }
+
+/// Answers every Messages call with a `tool_use` of the masked name the sanitizer
+/// gives Hermes's `delegate_task`, as the upstream would.
+#[derive(Default)]
+struct ToolUseUpstream {
+    calls: Mutex<Vec<UpstreamRequest>>,
+}
+
+impl UpstreamClient for ToolUseUpstream {
+    fn generic_chat(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("generic chat not used in tool-use tests")
+    }
+
+    fn generic_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!("generic stream not used in tool-use tests")
+    }
+
+    fn anthropic_messages(&self, request: UpstreamRequest) -> UpstreamFuture {
+        self.calls.lock().expect("calls lock").push(request);
+        Box::pin(async {
+            Ok(UpstreamJsonResponse {
+                quota: None,
+                retry_hint: None,
+                status: axum::http::StatusCode::OK,
+                body: json!({
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "tool_use", "id": "tu_1", "name": "DelegateTask", "input": {}}],
+                    "stop_reason": "tool_use",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }),
+            })
+        })
+    }
+
+    fn anthropic_messages_stream(&self, request: UpstreamRequest) -> UpstreamSseFuture {
+        self.calls.lock().expect("calls lock").push(request);
+        Box::pin(async {
+            Ok(UpstreamSseResponse {
+                quota: None,
+                retry_hint: None,
+                status: axum::http::StatusCode::OK,
+                body: Box::pin(futures_util::stream::iter([
+                    Ok(Bytes::from_static(
+                        b"event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+                    )),
+                    // Split inside the tool name: the restore must see the event whole.
+                    Ok(Bytes::from_static(
+                        b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"Deleg",
+                    )),
+                    Ok(Bytes::from_static(b"ateTask\",\"input\":{}}}\n\n")),
+                    Ok(Bytes::from_static(
+                        b"event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n",
+                    )),
+                    Ok(Bytes::from_static(b"event: message_stop\ndata: {}\n\n")),
+                ])),
+            })
+        })
+    }
+
+    fn anthropic_count_tokens(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("count_tokens not used in tool-use tests")
+    }
+
+    fn codex_responses(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("codex not used in tool-use tests")
+    }
+
+    fn codex_responses_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!("codex stream not used in tool-use tests")
+    }
+
+    fn fetch_models(
+        &self,
+        _kind: ProviderKind,
+        _account: AvailableAccount,
+        _config: Arc<Config>,
+    ) -> ModelsFuture {
+        Box::pin(async { Ok(FetchedModels::new(Vec::new())) })
+    }
+}
+
+fn custom_tool_messages_request(stream: bool) -> axum::http::Request<Body> {
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "stream": stream,
+        "tools": [{"type": "custom", "name": "delegate_task", "input_schema": {"type": "object"}}],
+        "messages": [{"role": "user", "content": "hand it off"}]
+    })
+    .to_string();
+    axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("authorization", "Bearer sk-test")
+        .header("content-type", "application/json")
+        .header("content-length", body.len().to_string())
+        .body(Body::from(body))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn messages_route_masks_custom_typed_tools_and_restores_them_in_a_reply() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    anthropic_account(tmp.path());
+    let upstream = Arc::new(ToolUseUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, body) = json_response(app, custom_tool_messages_request(false)).await;
+
+    assert_eq!(status, 200);
+    let calls = upstream.calls.lock().expect("calls lock").clone();
+    assert_eq!(calls[0].body["tools"][0]["name"], "DelegateTask");
+    assert_eq!(body["content"][0]["name"], "delegate_task");
+}
+
+#[tokio::test]
+async fn messages_route_masks_custom_typed_tools_and_restores_them_in_a_stream() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    anthropic_account(tmp.path());
+    let upstream = Arc::new(ToolUseUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, _, body) = raw_response(app, custom_tool_messages_request(true)).await;
+
+    assert_eq!(status, 200);
+    let calls = upstream.calls.lock().expect("calls lock").clone();
+    assert_eq!(calls[0].body["tools"][0]["name"], "DelegateTask");
+    assert!(body.contains("\"name\":\"delegate_task\""), "{body}");
+    assert!(!body.contains("DelegateTask"), "{body}");
+}
