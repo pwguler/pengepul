@@ -66,7 +66,7 @@ vendor identity.
   the plain one. The vendor bills neither. A vendor fault on a continue costs the same two
   before it fails over, and an overloaded vendor (529) is never sent the second.
 - Tokens are billed as for a whole request: the vendor reads the whole conversation and
-  counts the held part as a cache read. What shrinks is the request body.
+  counts the held part as Cached input. What shrinks is the request body.
 - A Thread pays inside a Harness's tool loop. A turn that arrives more than 270 seconds
   after the last reply is sent whole.
 - A Harness that rewrites its earlier messages between turns never continues, and every

@@ -4,9 +4,9 @@
 
 An anthropic conversation continues on the vendor as a message thread instead of resending
 itself. No caller sees a thread: a harness sends the whole conversation on every turn and
-receives the answer a plain request would get. Nothing about a thread can fail a request or
-hurt a Pool: it stays on its Account, and a turn the vendor declines as a thread is sent
-again without the caller knowing.
+receives the answer a plain request would get. A thread stays on its Account, and one the
+vendor declines fails no request and costs no Account its health: the turn is sent again
+without the caller knowing.
 
 ## Non-goals
 
@@ -82,7 +82,7 @@ again without the caller knowing.
 - AC-14 A tool call in the reply to a continue comes back under the caller's tool name.
 - AC-15 With threads and without them, a caller receives the same status, headers and body.
 - AC-16 With `cloaking.message-threads: false` every request goes out plain. The relay
-  writes the key into a config only when an operator set it.
+  writes the key into a config only when it is `false`.
 
 ## Verification
 
@@ -186,5 +186,5 @@ again without the caller knowing.
   shape of a threaded request is the vendor CLI's own. A thread changes what the relay
   sends and never what a caller receives, and every declined thread ends in a plain
   request. A build without the key refuses a config that carries it, so the relay writes
-  the key only when an operator set it, and a config it writes still loads on the build
-  before.
+  the key only when it is `false`, and a config it writes otherwise still loads on the
+  build before.

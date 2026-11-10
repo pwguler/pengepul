@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::upstream::{Threading, meter_only_block};
+use crate::upstream::{Threading, header_alone_block};
 use crate::utils::sha256_hex;
 
 /// How long a reply stays continuable. The vendor drops a thread five minutes after its
@@ -78,8 +78,7 @@ pub struct Turn {
 
 impl Turn {
     /// `body` is the request as it would go upstream whole, after the Cloaking sanitizer.
-    /// `beta` is the
-    /// beta set it earns.
+    /// `beta` is the beta set it earns.
     #[must_use]
     pub fn of(body: &Value, beta: &str) -> Self {
         let fixed: Vec<&Value> = FIXED
@@ -87,15 +86,15 @@ impl Turn {
             .map(|field| body.get(*field).unwrap_or(&Value::Null))
             .collect();
         // Claude Code writes a new billing-header block for every request. It names the
-        // request to the vendor's meter and says nothing to the model, so it is no part of
+        // request to the Classifier and says nothing to the model, so it is no part of
         // what a thread's `system` is.
         let system: Vec<&Value> = match body.get("system") {
             Some(Value::Array(blocks)) => {
-                let meter_only = meter_only_block(blocks);
+                let header_alone = header_alone_block(blocks);
                 blocks
                     .iter()
                     .enumerate()
-                    .filter(|(index, _)| Some(*index) != meter_only)
+                    .filter(|(index, _)| Some(*index) != header_alone)
                     .map(|(_, block)| block)
                     .collect()
             }
@@ -1053,10 +1052,7 @@ mod tests {
         }
         assert!(Stored::of(&reply(Some("tool_use"), &call)).is_some());
         for (what, unstored) in [
-            (
-                "the model declining to answer",
-                reply(Some("refusal"), &text),
-            ),
+            ("a `refusal` stop", reply(Some("refusal"), &text)),
             ("an unknown stop", reply(Some("pause_turn"), &text)),
             ("no stop", reply(None, &text)),
             ("a cut tool call", reply(Some("max_tokens"), &call)),
@@ -1153,7 +1149,7 @@ mod tests {
         for (what, events) in [
             ("no message_stop", without("message_stop")),
             ("no stop reason", without("message_delta")),
-            ("the model declining to answer", unanswered),
+            ("a `refusal` stop", unanswered),
             (
                 "an error event",
                 with(json!({"type": "error", "error": {"type": "overloaded_error"}})),

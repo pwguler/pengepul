@@ -2265,14 +2265,14 @@ async fn route_anthropic_request(
     // session keeps its threads apart from every other session's; one that names none is
     // told apart by what it sends, because Rotation's key for it moves as its opening grows
     // and a thread must not move with it.
-    let conversation = threaded.then(|| {
+    let ledger_turn = threaded.then(|| {
         let beta = resolve_beta(model, &masked, &headers_to_map(headers));
         (
             named_session(headers, body).unwrap_or_default(),
             Turn::of(&masked, &beta),
         )
     });
-    let mut threading = conversation
+    let mut threading = ledger_turn
         .as_ref()
         .map_or(Threading::Plain, |(session, turn)| {
             threads.plan(session, account_key, turn, Instant::now())
@@ -2285,7 +2285,7 @@ async fn route_anthropic_request(
         if threaded {
             tracing::debug!(
                 conversation = %request.conversation,
-                thread = threading.label(),
+                threading = threading.label(),
                 "message thread"
             );
         }
@@ -2306,7 +2306,7 @@ async fn route_anthropic_request(
         if answer.status().is_client_error() {
             tracing::debug!(
                 conversation = %request.conversation,
-                thread = threading.label(),
+                threading = threading.label(),
                 vendor,
                 "message thread declined"
             );
@@ -2314,7 +2314,7 @@ async fn route_anthropic_request(
         } else {
             tracing::debug!(
                 conversation = %request.conversation,
-                thread = threading.label(),
+                threading = threading.label(),
                 vendor,
                 "message thread failed"
             );
@@ -2324,13 +2324,13 @@ async fn route_anthropic_request(
     // The vendor declined the thread and then took the turn plain, so it was the thread it
     // declined. Had it declined that too, the error would be the caller's own, and would
     // say nothing about threads.
-    if let (Some(vendor), Some((session, turn))) = (&declined, &conversation)
+    if let (Some(vendor), Some((session, turn))) = (&declined, &ledger_turn)
         && threading == Threading::Plain
         && answer.status().is_success()
     {
         threads.go_plain(session, account_key, turn, Instant::now(), vendor);
     }
-    let noted = conversation.filter(|_| threading != Threading::Plain);
+    let noted = ledger_turn.filter(|_| threading != Threading::Plain);
     anthropic_response(state, account, request, route, answer, tool_reverse, noted).await
 }
 
@@ -2340,9 +2340,9 @@ enum Answer {
     Stream(UpstreamSseResponse),
 }
 
-/// The most of a declined stream that is read for the vendor's error, which is a short
+/// The most of a stream that is read for the vendor's error, which is a short
 /// JSON document.
-const DECLINE_LIMIT: usize = 64 * 1024;
+const ERROR_LIMIT: usize = 64 * 1024;
 
 impl Answer {
     fn status(&self) -> StatusCode {
@@ -2359,7 +2359,7 @@ impl Answer {
             Self::Whole(response) => response.body.clone(),
             Self::Stream(response) => {
                 let mut read = Vec::new();
-                while read.len() <= DECLINE_LIMIT
+                while read.len() <= ERROR_LIMIT
                     && let Some(Ok(chunk)) = response.body.next().await
                 {
                     read.extend_from_slice(&chunk);
@@ -2371,7 +2371,8 @@ impl Answer {
 }
 
 /// One anthropic Messages call, whole or streamed as the caller asked. `body` is the
-/// conversation whole; `thread` tells the Upstream client how much of it the vendor holds.
+/// conversation whole; `threading` tells the Upstream client how much of it the vendor
+/// holds.
 async fn send_anthropic(
     state: &AppState,
     headers: &HeaderMap,

@@ -945,7 +945,7 @@ impl ThreadUpstream {
     }
 
     /// How each call went out: `create`, `continue`, or `plain`.
-    fn kinds(&self) -> Vec<&'static str> {
+    fn labels(&self) -> Vec<&'static str> {
         self.calls()
             .iter()
             .map(|call| call.threading.label())
@@ -1339,7 +1339,7 @@ async fn a_caller_that_names_no_session_continues_from_its_second_turn() {
         assert_eq!(harness_with(&app, None, body, &[]).await.0, 200);
     }
 
-    assert_eq!(upstream.kinds(), ["create", "continue", "continue"]);
+    assert_eq!(upstream.labels(), ["create", "continue", "continue"]);
 }
 
 /// A stream arrives in pieces that end anywhere. The reply is the same reply.
@@ -1364,7 +1364,7 @@ async fn a_reply_streamed_in_small_pieces_is_continued_from() {
             200
         );
 
-        assert_eq!(upstream.kinds(), ["create", "continue"], "size={size}");
+        assert_eq!(upstream.labels(), ["create", "continue"], "size={size}");
     }
 }
 
@@ -1418,7 +1418,7 @@ async fn a_thread_changes_nothing_a_caller_receives() {
                 answers.push(raw_response(app.clone(), request).await);
             }
             let expected = if threads { "continue" } else { "plain" };
-            assert_eq!(upstream.kinds()[1..], [expected, expected]);
+            assert_eq!(upstream.labels()[1..], [expected, expected]);
             received.push(answers);
         }
         assert_eq!(received[0], received[1], "stream={stream}");
@@ -1467,7 +1467,7 @@ async fn a_create_the_vendor_declines_is_sent_again_plain() {
                 first, 200,
                 "the caller must not see the relay's own thread: {body}"
             );
-            assert_eq!(upstream.kinds(), ["create", "plain"], "stream={stream}");
+            assert_eq!(upstream.labels(), ["create", "plain"], "stream={stream}");
             assert_eq!(upstream.calls()[1].body["messages"], conversation(1));
 
             // The conversation stays plain: the vendor is not offered what it declined.
@@ -1477,7 +1477,7 @@ async fn a_create_the_vendor_declines_is_sent_again_plain() {
                     .0,
                 200
             );
-            assert_eq!(upstream.kinds(), ["create", "plain", "plain"]);
+            assert_eq!(upstream.labels(), ["create", "plain", "plain"]);
             // Two turns, two outcomes: the declined attempt is no request of the caller's.
             assert_eq!(record(&app).await, (2, 2, 0, false), "status={status}");
         }
@@ -1500,7 +1500,7 @@ async fn a_vendor_that_stopped_taking_threads_is_not_asked_for_every_conversatio
     }
 
     assert_eq!(
-        upstream.kinds(),
+        upstream.labels(),
         [
             "create", "plain", "create", "plain", "create", "plain", "plain", "plain"
         ]
@@ -1612,7 +1612,7 @@ async fn a_continue_whose_thread_is_gone_is_sent_again_as_a_create() {
             // turn continues it.
             let calls = upstream.calls();
             assert_eq!(
-                upstream.kinds(),
+                upstream.labels(),
                 ["create", "continue", "create", "continue"],
                 "{code}"
             );
@@ -1674,7 +1674,7 @@ async fn a_continue_declined_for_what_it_carries_leaves_the_conversation_plain()
                 assert_eq!(status, 200, "{body}");
             }
 
-            assert_eq!(upstream.kinds(), ["create", "continue", "plain", "plain"]);
+            assert_eq!(upstream.labels(), ["create", "continue", "plain", "plain"]);
             assert_eq!(upstream.calls()[2].body["messages"], conversation(2));
             assert_eq!(record(&app).await, (3, 3, 0, false), "status={status}");
         }
@@ -1705,7 +1705,7 @@ async fn a_vendor_fault_on_a_continue_is_answered_plain_and_held_against_nothing
         }
 
         assert_eq!(
-            upstream.kinds(),
+            upstream.labels(),
             ["create", "continue", "plain", "create", "continue", "plain"],
             "stream={stream}"
         );
@@ -1755,7 +1755,7 @@ async fn a_rate_limit_on_a_continue_is_the_accounts_and_fails_over() {
         let calls = upstream.calls();
         let owner = calls[0].account.token.email.clone();
         assert_eq!(
-            upstream.kinds(),
+            upstream.labels(),
             ["create", "continue", "create"],
             "stream={stream}"
         );
@@ -1786,7 +1786,7 @@ async fn an_error_that_is_the_callers_reaches_it_and_ends_nothing() {
         // Four errors of the caller's rested nothing and marked nothing plain: each turn
         // is still offered as a thread first.
         assert_eq!(
-            upstream.kinds(),
+            upstream.labels(),
             ["create", "plain"].repeat(4),
             "stream={stream}"
         );
@@ -1836,7 +1836,7 @@ async fn a_callers_own_error_on_a_later_turn_does_not_end_threading() {
         assert_eq!(harness(&app, "conv", asking(smaller, stream)).await.0, 200);
 
         assert_eq!(
-            upstream.kinds(),
+            upstream.labels(),
             [
                 "create", "continue", "plain", "create", "plain", "create", "plain", "create"
             ]
@@ -1892,7 +1892,7 @@ async fn a_reply_repeated_with_or_without_its_thinking_continues() {
         assert_eq!(harness(&app, "conv", asking(second, true)).await.0, 200);
 
         assert_eq!(
-            upstream.kinds(),
+            upstream.labels(),
             ["create", "continue"],
             "keeps_thinking={keeps_thinking}"
         );
@@ -1900,7 +1900,7 @@ async fn a_reply_repeated_with_or_without_its_thinking_continues() {
 }
 
 /// Claude Code writes a billing-header block of its own into `system`, a new one for every
-/// request. It names the request to the vendor's meter and says nothing to the model, so
+/// request. It names the request to the Classifier and says nothing to the model, so
 /// it is no change of `system`.
 #[tokio::test]
 async fn a_billing_block_that_changes_every_request_does_not_end_the_thread() {
@@ -1919,7 +1919,7 @@ async fn a_billing_block_that_changes_every_request_does_not_end_the_thread() {
         assert_eq!(harness(&app, "conv", body).await.0, 200);
     }
 
-    assert_eq!(upstream.kinds(), ["create", "continue"]);
+    assert_eq!(upstream.labels(), ["create", "continue"]);
 }
 
 /// One edit to a harness body.
@@ -2003,7 +2003,7 @@ async fn a_changed_conversation_creates_instead_of_continuing() {
             assert_eq!(harness(&app, "other", streamed(altered)).await.0, 200);
 
             assert_eq!(
-                upstream.kinds(),
+                upstream.labels(),
                 ["create", "continue", "create", "create"],
                 "changed {what}, stream={stream}"
             );
@@ -2061,7 +2061,7 @@ async fn a_tool_call_on_a_continue_comes_back_under_the_callers_name() {
         let (status, second) = harness(&app, "conv", with_tools(grown)).await;
 
         assert_eq!(status, 200);
-        assert_eq!(upstream.kinds(), ["create", "continue"], "stream={stream}");
+        assert_eq!(upstream.labels(), ["create", "continue"], "stream={stream}");
         assert!(
             second.contains("get_weather") && !second.contains(&masked),
             "a continue's tool call leaked the masked name: {second}"
@@ -2073,7 +2073,7 @@ async fn a_tool_call_on_a_continue_comes_back_under_the_callers_name() {
 async fn a_turn_the_vendor_did_not_store_is_not_continued() {
     let unstored: [(&str, Spoil); 5] = [
         (
-            "the model declining to answer",
+            "a `refusal` stop",
             Box::new(|message| message["stop_reason"] = json!("refusal")),
         ),
         (
@@ -2127,7 +2127,7 @@ async fn a_turn_the_vendor_did_not_store_is_not_continued() {
             assert_eq!(harness(&app, "conv", asking(second, stream)).await.0, 200);
 
             assert_eq!(
-                upstream.kinds(),
+                upstream.labels(),
                 ["create", "create"],
                 "{what}, stream={stream}"
             );
@@ -2155,7 +2155,7 @@ async fn a_request_that_adds_no_user_message_after_the_reply_is_not_continued() 
         let _ = harness(&app, "conv", asking(conversation(1), false)).await;
         let _ = harness(&app, "conv", asking(Value::Array(messages), false)).await;
 
-        assert_eq!(upstream.kinds(), ["create", "create"]);
+        assert_eq!(upstream.labels(), ["create", "create"]);
     }
 }
 
@@ -2174,7 +2174,7 @@ async fn a_message_that_only_looks_like_the_reply_is_not_skipped() {
     let _ = harness(&app, "conv", asking(conversation(1), false)).await;
     let _ = harness(&app, "conv", asking(second.clone(), false)).await;
 
-    assert_eq!(upstream.kinds(), ["create", "create"]);
+    assert_eq!(upstream.labels(), ["create", "create"]);
     assert_eq!(upstream.calls()[1].body["messages"], second);
 }
 
@@ -2209,7 +2209,7 @@ async fn two_conversations_in_one_session_never_cross() {
 
     let calls = upstream.calls();
     assert_eq!(
-        upstream.kinds(),
+        upstream.labels(),
         ["create", "create", "continue", "continue"]
     );
     assert_eq!(calls[2].threading, continuing("msg_1", 2));
@@ -2240,7 +2240,7 @@ async fn a_side_request_in_the_same_session_does_not_end_the_thread() {
         200
     );
 
-    assert_eq!(upstream.kinds(), ["create", "create", "continue"]);
+    assert_eq!(upstream.labels(), ["create", "create", "continue"]);
     assert_eq!(upstream.calls()[2].threading, continuing("msg_1", 2));
 }
 
@@ -2276,7 +2276,7 @@ async fn a_thread_does_not_follow_its_conversation_to_another_account() {
 
     let calls = upstream.calls();
     assert_ne!(calls[1].account.token.email, owner);
-    assert_eq!(upstream.kinds(), ["create", "create"]);
+    assert_eq!(upstream.labels(), ["create", "create"]);
     assert_eq!(calls[1].body["messages"], conversation(2));
 }
 
@@ -2300,7 +2300,7 @@ async fn a_changed_beta_set_creates_instead_of_continuing() {
         assert_eq!(harness_with(&app, Some("cli"), body, betas).await.0, 200);
     }
 
-    assert_eq!(upstream.kinds(), ["create", "continue", "create"]);
+    assert_eq!(upstream.labels(), ["create", "continue", "create"]);
 }
 
 #[tokio::test]
@@ -2320,7 +2320,7 @@ async fn threads_off_sends_every_conversation_plain() {
             200
         );
     }
-    assert_eq!(upstream.kinds(), ["plain", "plain"]);
+    assert_eq!(upstream.labels(), ["plain", "plain"]);
 }
 
 #[tokio::test]
@@ -2348,7 +2348,7 @@ async fn a_request_translated_onto_anthropic_is_never_threaded() {
     .await;
 
     assert_eq!(status, 200, "{body}");
-    assert_eq!(upstream.kinds(), ["plain"]);
+    assert_eq!(upstream.labels(), ["plain"]);
 }
 
 #[tokio::test]

@@ -494,7 +494,7 @@ fn requests_long_retention(body: &Value) -> bool {
 }
 
 /// What a billing-header block starts with: the line that names the client and the
-/// conversation to the vendor's meter.
+/// conversation to the Classifier.
 const BILLING_HEADER: &str = "x-anthropic-billing-header:";
 
 /// Whether a system block is a billing-header block: its text starts with the header. A
@@ -517,7 +517,7 @@ fn billing_position(system: &[Value]) -> Option<usize> {
 /// new one for every request, so a thread's `system` is compared without it. A block that
 /// goes on after the fields tells the model something, and is compared like any other.
 #[must_use]
-pub fn meter_only_block(system: &[Value]) -> Option<usize> {
+pub fn header_alone_block(system: &[Value]) -> Option<usize> {
     let at = billing_position(system)?;
     let fields = system[at]
         .get("text")
@@ -594,7 +594,7 @@ impl Threading {
 }
 
 /// The headers and the body an anthropic Messages call goes out with. `body` is the
-/// conversation whole, before Cloaking, whatever `thread` says: the vendor identity of a
+/// conversation whole, before Cloaking, whatever `threading` says: the vendor identity of a
 /// request is the conversation's, not that of the part being sent.
 ///
 /// A continue therefore names the beta set its whole conversation earns, tools included,
