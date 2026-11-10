@@ -337,6 +337,7 @@ fn config(auth_dir: PathBuf) -> Config {
             cli_version: "2.1.88".to_string(),
             entrypoint: "cli".to_string(),
             codex: BTreeMap::default(),
+            message_threads: true,
         },
         timeouts: TimeoutConfig {
             messages_ms: 120_000,
@@ -1012,6 +1013,234 @@ async fn messages_route_refuses_message_threads_before_any_account() {
         );
     }
     assert!(upstream.calls().is_empty());
+}
+
+/// An upstream that answers the way a thread turn is answered: an id, a reply, and — for
+/// the conversation the relay should stop continuing — a thread rejection first.
+#[derive(Default)]
+struct ThreadGoneUpstream {
+    calls: Mutex<Vec<UpstreamRequest>>,
+}
+
+impl ThreadGoneUpstream {
+    fn calls(&self) -> Vec<UpstreamRequest> {
+        self.calls.lock().expect("calls lock").clone()
+    }
+}
+
+impl UpstreamClient for ThreadGoneUpstream {
+    fn anthropic_messages(&self, request: UpstreamRequest) -> UpstreamFuture {
+        let continued =
+            request.body.pointer("/thread/type").and_then(Value::as_str) == Some("continue");
+        self.calls.lock().expect("calls lock").push(request);
+        Box::pin(async move {
+            let body = if continued {
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "not_found_error",
+                        "message": "No thread state was found for the requested `previous_message_id`.",
+                        "details": {"error_code": "thread_not_found"}
+                    }
+                })
+            } else {
+                json!({
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "pong"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                })
+            };
+            let status = if continued {
+                axum::http::StatusCode::NOT_FOUND
+            } else {
+                axum::http::StatusCode::OK
+            };
+            Ok(UpstreamJsonResponse {
+                quota: None,
+                retry_hint: None,
+                status,
+                body,
+            })
+        })
+    }
+
+    fn anthropic_messages_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!("not exercised")
+    }
+    fn anthropic_count_tokens(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("not exercised")
+    }
+    fn codex_responses(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("not exercised")
+    }
+    fn codex_responses_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!("not exercised")
+    }
+    fn generic_chat(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("not exercised")
+    }
+    fn generic_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!("not exercised")
+    }
+    fn fetch_models(
+        &self,
+        _kind: ProviderKind,
+        _account: AvailableAccount,
+        _config: Arc<Config>,
+    ) -> ModelsFuture {
+        unreachable!("not exercised")
+    }
+    fn fetch_cli_versions(&self) -> CliVersionsFuture {
+        unreachable!("not exercised")
+    }
+}
+
+/// One anthropic Account serving `app`, with the session header that identifies a
+/// conversation for it.
+async fn post_turn(app: axum::Router, session: &str, messages: Value) -> (u16, Value) {
+    json_response(
+        app,
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .header("x-claude-code-session-id", session)
+            .body(Body::from(
+                json!({"model": "claude-sonnet-4-6", "messages": messages}).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await
+}
+
+fn one_anthropic_account() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(
+        tmp.path(),
+        &TokenData {
+            access_token: "anthropic-access".to_string(),
+            refresh_token: "anthropic-refresh".to_string(),
+            email: "anthropic@example.com".to_string(),
+            expires_at: "2030-01-01T00:00:00Z".to_string(),
+            account_uuid: "acct-anthropic".to_string(),
+            provider: ProviderId::anthropic(),
+            id_token: None,
+            last_refresh_at: None,
+            plan_type: None,
+        },
+    )
+    .expect("save token");
+    tmp
+}
+
+#[tokio::test]
+async fn a_conversation_creates_a_thread_then_continues_it() {
+    let tmp = one_anthropic_account();
+    let upstream = Arc::new(FakeUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, _) = post_turn(
+        app.clone(),
+        "conv-thread",
+        json!([{"role": "user", "content": "one"}]),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let (status, _) = post_turn(
+        app.clone(),
+        "conv-thread",
+        json!([
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "pong"},
+            {"role": "user", "content": "two"}
+        ]),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let calls = upstream.calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].body["thread"], json!({"type": "create"}));
+    assert_eq!(
+        calls[1].body["thread"],
+        json!({"type": "continue", "previous_message_id": "msg_1"})
+    );
+    // Only what the vendor does not hold, and no tools: the thread keeps the create's.
+    assert_eq!(
+        calls[1].body["messages"],
+        json!([{"role": "user", "content": "two"}])
+    );
+    assert!(calls[1].body.get("tools").is_none());
+}
+
+#[tokio::test]
+async fn a_thread_the_vendor_lost_is_replayed_as_a_create() {
+    let tmp = one_anthropic_account();
+    let upstream = Arc::new(ThreadGoneUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, _) = post_turn(
+        app.clone(),
+        "conv-lost",
+        json!([{"role": "user", "content": "one"}]),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let (status, body) = post_turn(
+        app.clone(),
+        "conv-lost",
+        json!([
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "pong"},
+            {"role": "user", "content": "two"}
+        ]),
+    )
+    .await;
+
+    // The caller gets the replayed answer, not the vendor's complaint.
+    assert_eq!(status, 200, "{body}");
+    let kinds: Vec<String> = upstream
+        .calls()
+        .iter()
+        .map(|call| {
+            call.body["thread"]["type"]
+                .as_str()
+                .unwrap_or("none")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(kinds, ["create", "continue", "create"]);
+    let account = listed(app, "anthropic", "anthropic@example.com").await;
+    assert_eq!(
+        account["cooldownUntil"], 0.0,
+        "a lost thread cooled the account"
+    );
+}
+
+#[tokio::test]
+async fn threads_off_sends_the_conversation_unthreaded() {
+    let tmp = one_anthropic_account();
+    let upstream = Arc::new(FakeUpstream::default());
+    let mut settings = config(tmp.path().to_path_buf());
+    settings.cloaking.message_threads = false;
+    let app = create_app_with_upstream(settings, upstream.clone());
+
+    let (status, _) = post_turn(
+        app.clone(),
+        "conv-off",
+        json!([{"role": "user", "content": "one"}]),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(upstream.calls()[0].body.get("thread").is_none());
 }
 
 #[tokio::test]

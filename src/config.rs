@@ -54,6 +54,10 @@ pub struct CloakingConfig {
     pub cli_version: String,
     pub entrypoint: String,
     pub codex: std::collections::BTreeMap<String, String>,
+    /// Whether an anthropic conversation may continue on the vendor as a message thread
+    /// instead of resending itself. On by default: it changes what the relay sends, never
+    /// what a client receives.
+    pub message_threads: bool,
 }
 
 /// Whether and how often the relay asks the vendors' own usage endpoints for
@@ -191,6 +195,8 @@ struct RawCloaking {
     cli_version: String,
     entrypoint: String,
     codex: std::collections::BTreeMap<String, String>,
+    #[serde(rename = "message-threads")]
+    message_threads: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,6 +258,7 @@ impl Default for RawCloaking {
             cli_version: "2.1.88".to_string(),
             entrypoint: "cli".to_string(),
             codex: std::collections::BTreeMap::new(),
+            message_threads: true,
         }
     }
 }
@@ -412,6 +419,7 @@ pub fn load_config(
             cli_version: raw.cloaking.cli_version,
             entrypoint: raw.cloaking.entrypoint,
             codex: raw.cloaking.codex,
+            message_threads: raw.cloaking.message_threads,
         },
         timeouts: TimeoutConfig {
             messages_ms: raw.timeouts.messages,

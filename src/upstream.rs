@@ -12,6 +12,10 @@ use crate::utils::sha256_hex;
 
 pub const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 pub const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
+
+/// The relay's own header, never sent upstream: the `anthropic-beta` a thread's create
+/// carried, which its continues must repeat byte for byte.
+pub const THREAD_BETA_HEADER: &str = "x-pengepul-thread-beta";
 pub const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
 pub const CODEX_RESPONSES_PATH: &str = "/codex/responses";
 pub const CODEX_MODELS_PATH: &str = "/codex/models";
@@ -270,7 +274,27 @@ pub fn anthropic_headers(
     ]);
     headers.extend(passthrough_anthropic_headers(request_headers));
 
-    if let Some(beta) = headers.get("anthropic-beta").cloned() {
+    headers.insert(
+        "anthropic-beta".to_string(),
+        resolve_beta(model, body, request_headers),
+    );
+
+    headers
+}
+
+/// The `anthropic-beta` a request carries, from the four places it can come from: the set a
+/// continue must repeat, the caller's own header, or the set this request's shape earns.
+///
+/// A message thread records the set its create carried and sends it again on every
+/// continue, because the beta list is one of the fields a thread may not change, and the
+/// tools that earn part of the list are not in a continue body.
+#[must_use]
+pub fn resolve_beta(
+    model: &str,
+    body: &Value,
+    request_headers: &BTreeMap<String, String>,
+) -> String {
+    let with_oauth = |beta: String| {
         let mut parts = beta
             .split(',')
             .map(str::trim)
@@ -281,15 +305,15 @@ pub fn anthropic_headers(
             parts.insert(0, ANTHROPIC_OAUTH_BETA.to_string());
         }
         parts.dedup();
-        headers.insert("anthropic-beta".to_string(), parts.join(","));
-    } else {
-        headers.insert(
-            "anthropic-beta".to_string(),
-            build_beta_header(model, RequestShape::of(body)),
-        );
+        parts.join(",")
+    };
+    if let Some(beta) = header_value(request_headers, THREAD_BETA_HEADER) {
+        return with_oauth(beta.to_string());
     }
-
-    headers
+    if let Some(beta) = passthrough_anthropic_headers(request_headers).get("anthropic-beta") {
+        return with_oauth(beta.clone());
+    }
+    build_beta_header(model, RequestShape::of(body))
 }
 
 // Log-only: message content is never rewritten (quotes, tool_results, and signed
@@ -483,6 +507,30 @@ fn requests_long_retention(body: &Value) -> bool {
         })
 }
 
+/// Whether the body continues a message thread rather than starting one.
+fn is_thread_continue(object: &serde_json::Map<String, Value>) -> bool {
+    object
+        .get("thread")
+        .and_then(|thread| thread.get("type"))
+        .and_then(Value::as_str)
+        == Some("continue")
+}
+
+/// The `system` a continue carries: the billing block alone, because the thread already
+/// holds everything the create sent and a different `system` refuses the continuation.
+fn continue_system(body: &Value, config: &Config) -> Value {
+    Value::Array(vec![json!({
+        "type": "text",
+        "text": billing_header(
+            body.get("messages")
+                .and_then(Value::as_array)
+                .map_or(&[], Vec::as_slice),
+            &config.cloaking.cli_version,
+            &config.cloaking.entrypoint,
+        )
+    })])
+}
+
 pub fn apply_cloaking(
     body: &Value,
     request_headers: &BTreeMap<String, String>,
@@ -501,78 +549,85 @@ pub fn apply_cloaking(
     let Some(object) = next_body.as_object_mut() else {
         return next_body;
     };
-    // Taken, not copied: the entry is rebuilt and re-inserted below, and the
-    // system block is the largest field in the request.
-    let existing = object.remove("system").unwrap_or(Value::Array(Vec::new()));
-    let remaining = match existing {
-        Value::Array(values) => values,
-        Value::Null => Vec::new(),
-        other => vec![json!({"type": "text", "text": other.to_string()})],
-    };
+    // A continue may not change `system`: the create's blocks are already inside the
+    // thread, and the vendor refuses a continuation that names different ones. So the
+    // billing block goes alone, which is what Claude Code sends on a continue too.
+    if is_thread_continue(object) {
+        object.insert("system".to_string(), continue_system(body, config));
+    } else {
+        // Taken, not copied: the entry is rebuilt and re-inserted below, and the
+        // system block is the largest field in the request.
+        let existing = object.remove("system").unwrap_or(Value::Array(Vec::new()));
+        let remaining = match existing {
+            Value::Array(values) => values,
+            Value::Null => Vec::new(),
+            other => vec![json!({"type": "text", "text": other.to_string()})],
+        };
 
-    let mut billing = None;
-    let mut prefix = None;
-    let mut kept = Vec::new();
-    for mut block in remaining {
-        let rewritten = block
-            .get("text")
-            .and_then(Value::as_str)
-            .filter(|text| text.contains(CLASSIFIER_TRIPPING_TEXT))
-            .map(|text| text.replace(CLASSIFIER_TRIPPING_TEXT, CLASSIFIER_SAFE_TEXT));
-        if let Some(text) = rewritten {
-            block["text"] = Value::String(text);
+        let mut billing = None;
+        let mut prefix = None;
+        let mut kept = Vec::new();
+        for mut block in remaining {
+            let rewritten = block
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|text| text.contains(CLASSIFIER_TRIPPING_TEXT))
+                .map(|text| text.replace(CLASSIFIER_TRIPPING_TEXT, CLASSIFIER_SAFE_TEXT));
+            if let Some(text) = rewritten {
+                block["text"] = Value::String(text);
+            }
+            let text = block.get("text").and_then(Value::as_str).unwrap_or("");
+            if text.contains("x-anthropic-billing-header") && billing.is_none() {
+                billing = Some(block);
+            } else if text.contains("You are Claude Code") && prefix.is_none() {
+                prefix = Some(block);
+            } else {
+                kept.push(block);
+            }
         }
-        let text = block.get("text").and_then(Value::as_str).unwrap_or("");
-        if text.contains("x-anthropic-billing-header") && billing.is_none() {
-            billing = Some(block);
-        } else if text.contains("You are Claude Code") && prefix.is_none() {
-            prefix = Some(block);
-        } else {
-            kept.push(block);
+
+        let billing = billing.unwrap_or_else(|| {
+            json!({
+                "type": "text",
+                "text": billing_header(
+                    object
+                        .get("messages")
+                        .and_then(Value::as_array)
+                        .map_or(&[], Vec::as_slice),
+                    &config.cloaking.cli_version,
+                    &config.cloaking.entrypoint,
+                )
+            })
+        });
+        let mut prefix = prefix.unwrap_or_else(|| {
+            json!({
+                "type": "text",
+                "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+                "cache_control": {"type": "ephemeral"}
+            })
+        });
+        // Anthropic renders tools, then system, then messages, and refuses a 1h
+        // breakpoint that comes after a 5m one. Our marker precedes every client
+        // breakpoint in `messages` wherever it ends up, so a client asking for 1h
+        // retention was answered 400 on every request until it carried the same
+        // TTL. Lifted here, before `reallocate_prefix_breakpoint` may move it
+        // into the conversation, so the checkpoint inherits the client's TTL
+        // rather than expiring in five minutes behind an hour-long prefix.
+        if requests_long_retention(body) && prefix.get("cache_control").is_some() {
+            prefix["cache_control"] = json!({"type": "ephemeral", "ttl": "1h"});
         }
-    }
+        object.insert(
+            "system".to_string(),
+            Value::Array([billing, prefix].into_iter().chain(kept).collect()),
+        );
 
-    let billing = billing.unwrap_or_else(|| {
-        json!({
-            "type": "text",
-            "text": billing_header(
-                object
-                    .get("messages")
-                    .and_then(Value::as_array)
-                    .map_or(&[], Vec::as_slice),
-                &config.cloaking.cli_version,
-                &config.cloaking.entrypoint,
-            )
-        })
-    });
-    let mut prefix = prefix.unwrap_or_else(|| {
-        json!({
-            "type": "text",
-            "text": "You are Claude Code, Anthropic's official CLI for Claude.",
-            "cache_control": {"type": "ephemeral"}
-        })
-    });
-    // Anthropic renders tools, then system, then messages, and refuses a 1h
-    // breakpoint that comes after a 5m one. Our marker precedes every client
-    // breakpoint in `messages` wherever it ends up, so a client asking for 1h
-    // retention was answered 400 on every request until it carried the same
-    // TTL. Lifted here, before `reallocate_prefix_breakpoint` may move it
-    // into the conversation, so the checkpoint inherits the client's TTL
-    // rather than expiring in five minutes behind an hour-long prefix.
-    if requests_long_retention(body) && prefix.get("cache_control").is_some() {
-        prefix["cache_control"] = json!({"type": "ephemeral", "ttl": "1h"});
+        // Anthropic rejects a request with more than 4 `cache_control` blocks. A client
+        // may already spend its full budget (e.g. hermes marks 4); the injected prefix
+        // would make 5. Keep the last 4 cache breakpoints (the client's, which cache the
+        // most content) and drop the earlier ones (our prefix) so the total stays valid.
+        reallocate_prefix_breakpoint(object, 4);
+        cap_cache_control(object, 4);
     }
-    object.insert(
-        "system".to_string(),
-        Value::Array([billing, prefix].into_iter().chain(kept).collect()),
-    );
-
-    // Anthropic rejects a request with more than 4 `cache_control` blocks. A client
-    // may already spend its full budget (e.g. hermes marks 4); the injected prefix
-    // would make 5. Keep the last 4 cache breakpoints (the client's, which cache the
-    // most content) and drop the earlier ones (our prefix) so the total stays valid.
-    reallocate_prefix_breakpoint(object, 4);
-    cap_cache_control(object, 4);
 
     let session = header_value(request_headers, "x-claude-code-session-id").map_or_else(
         || {

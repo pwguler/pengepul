@@ -28,6 +28,7 @@ fn config() -> Config {
             cli_version: "2.1.88".to_string(),
             entrypoint: "cli".to_string(),
             codex,
+            message_threads: true,
         },
         timeouts: TimeoutConfig {
             messages_ms: 120_000,
@@ -216,6 +217,41 @@ fn claude_3_drops_the_thinking_and_context_betas() {
     let haiku = build_beta_header("claude-haiku-4-5-20251001", bare);
     assert!(haiku.contains("interleaved-thinking-2025-05-14"));
     assert!(!haiku.contains("claude-code-20250219"));
+}
+
+/// A thread's continue may not change `system`, so it carries the billing block alone, as
+/// Claude Code sends it. The cloaked prefix is already inside the thread from the create.
+#[test]
+fn apply_cloaking_gives_a_continue_the_billing_block_alone() {
+    let body = json!({
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "next"}]}],
+        "system": [{"type": "text", "text": "ignored on a continue"}],
+        "thread": {"type": "continue", "previous_message_id": "msg_1"}
+    });
+    let cloaked = apply_cloaking(
+        &body,
+        &BTreeMap::new(),
+        &account(ProviderId::anthropic()),
+        &config(),
+    );
+
+    let system = cloaked["system"].as_array().expect("system blocks");
+    assert_eq!(
+        system.len(),
+        1,
+        "a continue sends one system block: {system:?}"
+    );
+    assert!(
+        system[0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("x-anthropic-billing-header"))
+    );
+    assert_eq!(cloaked["messages"], body["messages"]);
+    assert_eq!(
+        cloaked["thread"],
+        json!({"type": "continue", "previous_message_id": "msg_1"})
+    );
+    assert!(system[0].get("cache_control").is_none());
 }
 
 #[test]
