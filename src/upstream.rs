@@ -516,19 +516,44 @@ fn is_thread_continue(object: &serde_json::Map<String, Value>) -> bool {
         == Some("continue")
 }
 
-/// The `system` a continue carries: the billing block alone, because the thread already
-/// holds everything the create sent and a different `system` refuses the continuation.
-fn continue_system(body: &Value, config: &Config) -> Value {
-    Value::Array(vec![json!({
-        "type": "text",
-        "text": billing_header(
-            body.get("messages")
-                .and_then(Value::as_array)
-                .map_or(&[], Vec::as_slice),
-            &config.cloaking.cli_version,
-            &config.cloaking.entrypoint,
-        )
-    })])
+/// What marks the system block that names the client and the conversation to the vendor's
+/// meter.
+const BILLING_HEADER: &str = "x-anthropic-billing-header";
+
+/// Whether a system block is the billing block. Claude Code writes a new one for every
+/// request, so it is not part of what a conversation's `system` says.
+#[must_use]
+pub fn is_billing_block(block: &Value) -> bool {
+    block
+        .get("text")
+        .and_then(Value::as_str)
+        .is_some_and(|text| text.contains(BILLING_HEADER))
+}
+
+/// The billing block of the conversation in `body`: the caller's own when it sent one, as
+/// Claude Code does, or the one its first message derives.
+///
+/// A continue carries this block and no other `system`. The thread already holds what the
+/// create sent, and the block has to be the conversation's: derived from the few messages
+/// a continue carries, it would name another conversation on every turn.
+#[must_use]
+pub fn billing_block(body: &Value, config: &Config) -> Value {
+    let own = body
+        .get("system")
+        .and_then(Value::as_array)
+        .and_then(|blocks| blocks.iter().find(|block| is_billing_block(block)));
+    own.cloned().unwrap_or_else(|| {
+        json!({
+            "type": "text",
+            "text": billing_header(
+                body.get("messages")
+                    .and_then(Value::as_array)
+                    .map_or(&[], Vec::as_slice),
+                &config.cloaking.cli_version,
+                &config.cloaking.entrypoint,
+            )
+        })
+    })
 }
 
 pub fn apply_cloaking(
@@ -553,7 +578,10 @@ pub fn apply_cloaking(
     // thread, and the vendor refuses a continuation that names different ones. So the
     // billing block goes alone, which is what Claude Code sends on a continue too.
     if is_thread_continue(object) {
-        object.insert("system".to_string(), continue_system(body, config));
+        object.insert(
+            "system".to_string(),
+            Value::Array(vec![billing_block(body, config)]),
+        );
     } else {
         // Taken, not copied: the entry is rebuilt and re-inserted below, and the
         // system block is the largest field in the request.
@@ -577,7 +605,7 @@ pub fn apply_cloaking(
                 block["text"] = Value::String(text);
             }
             let text = block.get("text").and_then(Value::as_str).unwrap_or("");
-            if text.contains("x-anthropic-billing-header") && billing.is_none() {
+            if text.contains(BILLING_HEADER) && billing.is_none() {
                 billing = Some(block);
             } else if text.contains("You are Claude Code") && prefix.is_none() {
                 prefix = Some(block);

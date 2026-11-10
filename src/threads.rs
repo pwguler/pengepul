@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use crate::upstream::is_billing_block;
 use crate::utils::sha256_hex;
 
 /// The beta a request must name for the vendor to accept `thread` at all.
@@ -28,10 +29,16 @@ const IDLE: Duration = Duration::from_secs(270);
 /// How many threads are remembered, and how many conversations are remembered as plain.
 const CAPACITY: usize = 4096;
 
-/// The top-level fields a thread may not change between its turns.
-const FIXED: [&str; 10] = [
+/// How many refusals in a row, with no thread taken in between, mean the vendor has stopped
+/// taking threads, and how long nobody is asked again. A beta is retired one day; without
+/// this every new conversation would pay a refused request for as long as nobody noticed.
+const REFUSALS_BEFORE_REST: u32 = 3;
+const REST: Duration = Duration::from_hours(1);
+
+/// The top-level fields a thread may not change between its turns, `system` aside: that
+/// one is compared without its billing block.
+const FIXED: [&str; 9] = [
     "model",
-    "system",
     "tools",
     "thinking",
     "tool_choice",
@@ -105,8 +112,20 @@ impl Turn {
             .iter()
             .map(|field| body.get(*field).unwrap_or(&Value::Null))
             .collect();
+        // Claude Code writes a new billing block for every request. It names the request to
+        // the vendor's meter and says nothing to the model, so it is no part of what a
+        // thread's `system` is.
+        let system: Vec<&Value> = match body.get("system") {
+            Some(Value::Array(blocks)) => blocks
+                .iter()
+                .filter(|block| !is_billing_block(block))
+                .collect(),
+            Some(other) => vec![other],
+            None => Vec::new(),
+        };
         // Serialized by reference: `system` and `tools` are the largest fields of a request.
-        let fingerprint = sha256_hex(&serde_json::to_string(&(&fixed, beta)).unwrap_or_default());
+        let fingerprint =
+            sha256_hex(&serde_json::to_string(&(&system, &fixed, beta)).unwrap_or_default());
 
         let messages: Vec<Message> = body
             .get("messages")
@@ -334,6 +353,8 @@ pub struct ThreadLedger {
     // vendor refuses pays one refused request; key it by Account and model if a log shows
     // that happening.
     plain: Mutex<BTreeSet<String>>,
+    /// Refusals since the last thread the vendor took, and when asking starts again.
+    refused: Mutex<(u32, Option<Instant>)>,
 }
 
 /// The lock, whatever became of the last request that held it: the maps are valid after
@@ -346,7 +367,8 @@ impl ThreadLedger {
     /// How this turn of `conversation` goes out on `account`.
     pub fn plan(&self, conversation: &str, account: &str, turn: &Turn, now: Instant) -> Plan {
         let key = format!("{conversation}\n{}", turn.key);
-        if held(&self.plain).contains(&key) {
+        let resting = held(&self.refused).1.is_some_and(|until| now < until);
+        if resting || held(&self.plain).contains(&key) {
             return Plan::Plain;
         }
         // Taken, not read. A reply is continued once, and a thread that fails a check below
@@ -355,27 +377,34 @@ impl ThreadLedger {
             return Plan::Create;
         };
         let sent = entry.sent;
+        let repeated = turn.messages.get(sent).is_some_and(|message| {
+            message.role == Role::Assistant && message.hash == entry.reply.hash
+        });
+        let adds = turn
+            .messages
+            .get(sent + 1)
+            .is_some_and(|message| message.role == Role::User);
         // The caller repeats the reply where the vendor's copy of it stands, and adds a
         // message of its own after it. Anything else is a conversation the vendor does not
         // hold: an edited reply, a dropped one, a request that only repeats it.
-        let continues = entry.account == account
-            && now.saturating_duration_since(entry.noted_at) < IDLE
-            && turn.prefixes.get(sent) == Some(&entry.prefix)
-            && turn.messages.get(sent).is_some_and(|message| {
-                message.role == Role::Assistant && message.hash == entry.reply.hash
-            })
-            && turn
-                .messages
-                .get(sent + 1)
-                .is_some_and(|message| message.role == Role::User);
-        if continues {
-            Plan::Continue {
+        let doubt = if entry.account != account {
+            "another account"
+        } else if now.saturating_duration_since(entry.noted_at) >= IDLE {
+            "idle"
+        } else if turn.prefixes.get(sent) != Some(&entry.prefix) {
+            "earlier messages changed"
+        } else if !repeated {
+            "the reply is not repeated"
+        } else if !adds {
+            "no user message after the reply"
+        } else {
+            return Plan::Continue {
                 previous_message_id: entry.reply.id,
                 from: sent + 1,
-            }
-        } else {
-            Plan::Create
-        }
+            };
+        };
+        tracing::debug!(conversation, doubt, "message thread not continued");
+        Plan::Create
     }
 
     /// The vendor answered `turn` with `reply` and stored both.
@@ -387,6 +416,7 @@ impl ThreadLedger {
         reply: Stored,
         now: Instant,
     ) {
+        *held(&self.refused) = (0, None);
         let mut entries = held(&self.entries);
         if entries.len() >= CAPACITY {
             entries.retain(|_, entry| now.saturating_duration_since(entry.noted_at) < IDLE);
@@ -406,15 +436,28 @@ impl ThreadLedger {
         );
     }
 
-    /// The vendor refused a thread for `turn`. Its conversation goes out plain from now on.
-    pub fn go_plain(&self, conversation: &str, turn: &Turn) {
+    /// The vendor refused a thread for `turn`. Its conversation goes out plain from now on,
+    /// and enough refusals in a row rest every conversation.
+    pub fn go_plain(&self, conversation: &str, turn: &Turn, now: Instant) {
         let key = format!("{conversation}\n{}", turn.key);
         held(&self.entries).remove(&key);
-        let mut plain = held(&self.plain);
-        if plain.len() >= CAPACITY {
-            plain.clear();
+        {
+            let mut plain = held(&self.plain);
+            if plain.len() >= CAPACITY {
+                plain.clear();
+            }
+            plain.insert(key);
         }
-        plain.insert(key);
+        let mut refused = held(&self.refused);
+        refused.0 += 1;
+        if refused.0 >= REFUSALS_BEFORE_REST {
+            tracing::warn!(
+                refusals = refused.0,
+                minutes = REST.as_secs() / 60,
+                "the vendor keeps refusing message threads; sending without them for a while"
+            );
+            *refused = (0, Some(now + REST));
+        }
     }
 }
 
@@ -584,6 +627,39 @@ mod tests {
     }
 
     #[test]
+    fn a_changed_system_creates_and_a_changed_billing_block_does_not() {
+        let talk = |turns: usize, billing: &str, persona: &str| {
+            let mut body = conversation(turns);
+            body["system"] = json!([
+                {"type": "text", "text": format!("x-anthropic-billing-header: cch={billing};")},
+                {"type": "text", "text": persona}
+            ]);
+            body
+        };
+        let ledger = ThreadLedger::default();
+        let now = Instant::now();
+        ledger.note_reply(
+            "c",
+            ACCOUNT,
+            &turn(&talk(1, "00001", "be brief")),
+            pong(1),
+            now,
+        );
+        let plan = ledger.plan("c", ACCOUNT, &turn(&talk(2, "00002", "be brief")), now);
+        assert_eq!(plan, continues(1, 2));
+
+        ledger.note_reply(
+            "c",
+            ACCOUNT,
+            &turn(&talk(1, "00001", "be brief")),
+            pong(1),
+            now,
+        );
+        let plan = ledger.plan("c", ACCOUNT, &turn(&talk(2, "00001", "be thorough")), now);
+        assert_eq!(plan, Plan::Create);
+    }
+
+    #[test]
     fn a_side_request_under_the_same_session_leaves_the_thread_alone() {
         // A harness asks a small model for a title under its conversation's session.
         let (ledger, now) = answered(1);
@@ -710,9 +786,57 @@ mod tests {
     }
 
     #[test]
+    fn refusals_in_a_row_rest_every_conversation_for_a_while() {
+        let ledger = ThreadLedger::default();
+        let now = Instant::now();
+        let talk = |opening: &str| json!({"model": "m", "messages": [{"role": "user", "content": opening}]});
+        // A vendor that has stopped taking threads refuses each conversation's first one.
+        for opening in ["one", "two"] {
+            ledger.go_plain("c", &turn(&talk(opening)), now);
+        }
+        assert_eq!(
+            ledger.plan("c", ACCOUNT, &turn(&talk("still asked")), now),
+            Plan::Create
+        );
+        ledger.go_plain("c", &turn(&talk("three")), now);
+
+        // Nobody is asked again until the rest is over.
+        assert_eq!(
+            ledger.plan("c", ACCOUNT, &turn(&talk("four")), now),
+            Plan::Plain
+        );
+        let rested = now + REST;
+        assert_eq!(
+            ledger.plan("c", ACCOUNT, &turn(&talk("four")), rested),
+            Plan::Create
+        );
+        // The conversations that were refused themselves stay plain.
+        assert_eq!(
+            ledger.plan("c", ACCOUNT, &turn(&talk("one")), rested),
+            Plan::Plain
+        );
+    }
+
+    #[test]
+    fn a_thread_the_vendor_takes_ends_the_count_of_refusals() {
+        let ledger = ThreadLedger::default();
+        let now = Instant::now();
+        let talk = |opening: &str| json!({"model": "m", "messages": [{"role": "user", "content": opening}]});
+        // One shape of request the vendor will not thread, among others it will.
+        for opening in ["one", "two", "three", "four"] {
+            ledger.go_plain("c", &turn(&talk(opening)), now);
+            ledger.note_reply("c", ACCOUNT, &turn(&conversation(1)), pong(1), now);
+        }
+        assert_eq!(
+            ledger.plan("c", ACCOUNT, &turn(&talk("five")), now),
+            Plan::Create
+        );
+    }
+
+    #[test]
     fn a_refused_conversation_stays_plain_and_others_do_not() {
         let (ledger, now) = answered(1);
-        ledger.go_plain("c", &turn(&conversation(1)));
+        ledger.go_plain("c", &turn(&conversation(1)), now);
         for turns in 1..=3 {
             let plan = ledger.plan("c", ACCOUNT, &turn(&conversation(turns)), now);
             assert_eq!(plan, Plan::Plain);

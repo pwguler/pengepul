@@ -1365,6 +1365,35 @@ async fn a_create_the_vendor_refuses_is_sent_again_without_a_thread() {
     }
 }
 
+/// The beta a thread needs is retired one day. After that, a vendor refuses every
+/// conversation's first request, and the relay stops asking.
+#[tokio::test]
+async fn a_vendor_that_stopped_taking_threads_is_not_asked_for_every_conversation() {
+    let upstream = ThreadUpstream::new(|request, call| {
+        if request.body.get("thread").is_some() {
+            (400, no_threads())
+        } else {
+            (200, reply(call))
+        }
+    });
+    let (app, _tmp) = threaded_app(upstream.clone());
+    let opening = |text: &str| asking(json!([{"role": "user", "content": text}]), true);
+
+    for session in ["one", "two", "three"] {
+        assert_eq!(harness(&app, session, opening(session)).await.0, 200);
+    }
+    for session in ["four", "five"] {
+        assert_eq!(harness(&app, session, opening(session)).await.0, 200);
+    }
+
+    assert_eq!(
+        upstream.kinds(),
+        [
+            "create", "plain", "create", "plain", "create", "plain", "plain", "plain"
+        ]
+    );
+}
+
 #[tokio::test]
 async fn a_continue_the_vendor_refuses_is_replayed_as_a_create() {
     let refusals = [
@@ -1476,6 +1505,77 @@ async fn an_error_that_is_the_callers_reaches_it_once() {
         assert!(body.contains("max_tokens: Field required"), "{body}");
         assert_eq!(upstream.kinds(), ["create"], "a real error was sent twice");
     }
+}
+
+/// The billing block names a conversation by its first message, and Claude Code sends the
+/// same one on every request of it. A continue holds only the latest messages, so its block
+/// has to come from the conversation, not from what the continue carries.
+#[tokio::test]
+async fn a_continue_carries_the_billing_block_of_its_whole_conversation() {
+    let billing = |call: &UpstreamRequest| {
+        let cloaked = pengepul::upstream::apply_cloaking(
+            &call.body,
+            &call.request_headers,
+            &call.account,
+            &call.config,
+        );
+        cloaked["system"][0]["text"]
+            .as_str()
+            .expect("billing text")
+            .to_string()
+    };
+    // Two messages that the billing block would name differently.
+    let grown = json!([
+        {"role": "user", "content": "alpha bravo charlie delta echo foxtrot"},
+        {"role": "assistant", "content": "pong"},
+        {"role": "user", "content": "zulu yankee xray whiskey victor uniform"}
+    ]);
+    let opening = json!([grown[0]]);
+
+    let threaded = ThreadUpstream::answering();
+    let (app, _tmp) = threaded_app(threaded.clone());
+    assert_eq!(harness(&app, "conv", asking(opening, false)).await.0, 200);
+    assert_eq!(
+        harness(&app, "conv", asking(grown.clone(), false)).await.0,
+        200
+    );
+    // The same turn through a relay that has no thread for it, sent whole.
+    let whole = ThreadUpstream::answering();
+    let (app, _tmp) = threaded_app(whole.clone());
+    assert_eq!(harness(&app, "conv", asking(grown, false)).await.0, 200);
+
+    let (continued, created) = (&threaded.calls()[1], &whole.calls()[0]);
+    assert_eq!(
+        (kind(continued), kind(created)),
+        ("continue".into(), "create".into())
+    );
+    assert_eq!(billing(continued), billing(created));
+    assert_eq!(billing(continued), billing(&threaded.calls()[0]));
+    assert_eq!(continued.body["system"].as_array().map(Vec::len), Some(1));
+}
+
+/// Claude Code writes its own billing block, and the relay passes it on. A continue passes
+/// on the one that came with its turn, alone.
+#[tokio::test]
+async fn a_continue_passes_on_the_callers_own_billing_block() {
+    let own = |n: usize| {
+        json!({"type": "text", "text": format!(
+            "x-anthropic-billing-header: cc_version=2.1.322.6ba; cc_entrypoint=cli; cch=0000{n};"
+        )})
+    };
+    let persona = json!({"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."});
+    let upstream = ThreadUpstream::answering();
+    let (app, _tmp) = threaded_app(upstream.clone());
+
+    for turns in 1..=2 {
+        let mut body = asking(conversation(turns), true);
+        body["system"] = json!([own(turns), persona]);
+        assert_eq!(harness(&app, "conv", body).await.0, 200);
+    }
+
+    // The block differs from request to request, and the thread goes on all the same.
+    assert_eq!(upstream.kinds(), ["create", "continue"]);
+    assert_eq!(upstream.calls()[1].body["system"], json!([own(2)]));
 }
 
 #[tokio::test]

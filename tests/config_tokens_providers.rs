@@ -120,6 +120,22 @@ fn write_config_with(
     (tmp, home, config_path)
 }
 
+/// The switch an operator reaches for when threads misbehave: on unless the config says
+/// otherwise, and off under the key the docs name.
+#[test]
+fn message_threads_are_on_until_the_config_turns_them_off() {
+    let (_tmp, home, config_path) = write_config_with("api-keys:\n  - sk-local\n");
+    let config = load_config(Some(&config_path), Some(&home), &home).expect("load config");
+    assert!(config.cloaking.message_threads);
+
+    let (_tmp, home, config_path) =
+        write_config_with("api-keys:\n  - sk-local\ncloaking:\n  message-threads: false\n");
+    let config = load_config(Some(&config_path), Some(&home), &home).expect("load config");
+    assert!(!config.cloaking.message_threads);
+    // The other cloaking keys keep their defaults when only the switch is named.
+    assert!(!config.cloaking.cli_version.is_empty());
+}
+
 #[test]
 fn configured_providers_load_with_base_urls() {
     let (_tmp, home, config_path) = write_config_with(

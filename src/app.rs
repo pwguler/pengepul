@@ -51,9 +51,9 @@ use crate::types::{AvailableAccount, ProviderId, ProviderKind, UsageData};
 use crate::upstream::{
     ANTHROPIC_BASE_URL, CODEX_BASE_URL, CODEX_DEFAULT_CLI_VERSION, CODEX_MODELS_PATH,
     CODEX_RESPONSES_PATH, GROK_CHAT_BASE_URL, anthropic_headers, anthropic_usage_headers,
-    apply_cloaking, codex_headers, generic_base_url, generic_chat_headers, generic_headers,
-    grok_chat_headers, learn_grok_client_version, normalize_codex_responses_body, resolve_beta,
-    with_beta,
+    apply_cloaking, billing_block, codex_headers, generic_base_url, generic_chat_headers,
+    generic_headers, grok_chat_headers, learn_grok_client_version, normalize_codex_responses_body,
+    resolve_beta, with_beta,
 };
 use crate::utils::now_iso;
 use crate::utils::sha256_hex;
@@ -2283,6 +2283,7 @@ async fn route_anthropic_request(
 
     let beta = thread_beta(model, &masked, headers);
     let turn = Turn::of(&masked, &beta);
+    let config = cloaked_config(state);
     let conversation = request.conversation.as_str();
     let mut plan = state
         .threads
@@ -2292,7 +2293,7 @@ async fn route_anthropic_request(
     // error: the turn is sent again one step plainer, down to no thread at all.
     let answer = loop {
         tracing::debug!(conversation, plan = plan.label(), "message thread");
-        let outbound = thread_body(&plan, &mut whole, || masked_body().0);
+        let outbound = thread_body(&plan, &mut whole, || masked_body().0, &config);
         let named = (plan != Plan::Plain).then(|| beta.clone());
         let mut answer = match send_anthropic(state, headers, account, request, outbound, named)
             .await
@@ -2313,7 +2314,7 @@ async fn route_anthropic_request(
             "message thread refused"
         );
         if plainer == Plan::Plain {
-            state.threads.go_plain(conversation, &turn);
+            state.threads.go_plain(conversation, &turn, Instant::now());
         }
         plan = plainer;
     };
@@ -2471,7 +2472,12 @@ fn thread_beta(model: &str, body: &Value, headers: &HeaderMap) -> String {
 
 /// The body a plan sends. `whole` is the conversation as it goes upstream unthreaded. A
 /// plan that sends all of it takes it, and the rare attempt after that builds it again.
-fn thread_body(plan: &Plan, whole: &mut Option<Value>, rebuild: impl Fn() -> Value) -> Value {
+fn thread_body(
+    plan: &Plan,
+    whole: &mut Option<Value>,
+    rebuild: impl Fn() -> Value,
+    config: &Config,
+) -> Value {
     match plan {
         Plan::Plain => whole.take().unwrap_or_else(rebuild),
         Plan::Create => {
@@ -2486,7 +2492,8 @@ fn thread_body(plan: &Plan, whole: &mut Option<Value>, rebuild: impl Fn() -> Val
             from,
         } => {
             // Only what the vendor does not hold. The thread keeps the create's `tools`
-            // and `system`, and refuses a continue that names others.
+            // and `system`, and refuses a continue that names others. Of `system` the
+            // billing block alone goes again, and it is the whole conversation's.
             let held = ["tools", "system", "messages"];
             let whole = whole.get_or_insert_with(rebuild);
             let mut body: serde_json::Map<String, Value> = whole
@@ -2502,6 +2509,10 @@ fn thread_body(plan: &Plan, whole: &mut Option<Value>, rebuild: impl Fn() -> Val
                 .and_then(|messages| messages.get(*from..))
                 .unwrap_or_default();
             body.insert("messages".to_string(), Value::Array(new.to_vec()));
+            body.insert(
+                "system".to_string(),
+                Value::Array(vec![billing_block(whole, config)]),
+            );
             body.insert(
                 "thread".to_string(),
                 json!({"type": "continue", "previous_message_id": previous_message_id}),

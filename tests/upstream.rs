@@ -254,6 +254,27 @@ fn apply_cloaking_gives_a_continue_the_billing_block_alone() {
     assert!(system[0].get("cache_control").is_none());
 }
 
+/// The billing block names the conversation by its first message. A continue carries only
+/// the latest ones, so the route hands it the block of the whole conversation, and Cloaking
+/// keeps that block instead of deriving another from what is left.
+#[test]
+fn apply_cloaking_keeps_the_billing_block_a_continue_was_given() {
+    let given = "x-anthropic-billing-header: cc_version=2.1.322.6ba; cc_entrypoint=cli; cch=00000;";
+    let body = json!({
+        "messages": [{"role": "user", "content": "a later message of the conversation"}],
+        "system": [{"type": "text", "text": given}],
+        "thread": {"type": "continue", "previous_message_id": "msg_1"}
+    });
+    let cloaked = apply_cloaking(
+        &body,
+        &BTreeMap::new(),
+        &account(ProviderId::anthropic()),
+        &config(),
+    );
+
+    assert_eq!(cloaked["system"], json!([{"type": "text", "text": given}]));
+}
+
 #[test]
 fn apply_cloaking_injects_billing_prefix_and_metadata() {
     let body = json!({
