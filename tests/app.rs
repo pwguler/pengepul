@@ -898,6 +898,66 @@ async fn messages_route_forwards_anthropic_account_with_resolved_model() {
     assert_eq!(calls[0].account.token.access_token, "anthropic-access");
 }
 
+/// A message thread cannot cross the relay intact: Cloaking rewrites `system`
+/// and tool names, and the thread lives on whichever account served its create
+/// request. The relay answers with the API's own code for "send it without
+/// `thread`", which the SDK thread helper and tool runner fall back on.
+#[tokio::test]
+async fn messages_route_refuses_message_threads_before_any_account() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(
+        tmp.path(),
+        &TokenData {
+            access_token: "anthropic-access".to_string(),
+            refresh_token: "anthropic-refresh".to_string(),
+            email: "anthropic@example.com".to_string(),
+            expires_at: "2030-01-01T00:00:00Z".to_string(),
+            account_uuid: "acct-anthropic".to_string(),
+            provider: ProviderId::anthropic(),
+            id_token: None,
+            last_refresh_at: None,
+            plan_type: None,
+        },
+    )
+    .expect("save token");
+    let upstream = Arc::new(FakeUpstream::default());
+
+    for thread in [
+        json!({"type": "create"}),
+        json!({"type": "continue", "previous_message_id": "msg_1"}),
+    ] {
+        let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+        let (status, body) = json_response(
+            app,
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("authorization", "Bearer sk-test")
+                .header("content-type", "application/json")
+                .header("content-length", "1")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-sonnet-4-6",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "thread": thread
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(status, 400);
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            body["error"]["details"]["error_code"],
+            "thread_unsupported_request"
+        );
+    }
+    assert!(upstream.calls().is_empty());
+}
+
 #[tokio::test]
 async fn messages_route_hands_new_conversations_to_the_configured_priority() {
     let tmp = tempfile::tempdir().expect("tempdir");

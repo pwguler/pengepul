@@ -1787,6 +1787,9 @@ async fn route_provider_request(
     body: &Value,
     route: RequestRoute,
 ) -> Response {
+    if route == RequestRoute::Messages && body.get("thread").is_some() {
+        return thread_unsupported_response();
+    }
     let request = match resolve_route_request(state, headers, body, route) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
@@ -1856,6 +1859,28 @@ async fn route_provider_request(
         )
         .into_response()
     })
+}
+
+/// A Messages request carrying `thread` (message threads, `message-threads-2026-08-12`),
+/// answered before any account is chosen. A thread cannot cross the relay intact: it
+/// lives on the account that served its create request, a continue carries no `system`
+/// or `tools` for Cloaking to rebuild, and the tool-name reverse map comes from `tools`.
+/// This is the API's own code for "send it without `thread`", which the SDK thread
+/// helper and tool runner fall back on.
+fn thread_unsupported_response() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "thread: message threads are not supported through this relay; \
+                            send the full conversation without `thread`",
+                "details": {"error_code": "thread_unsupported_request"}
+            }
+        })),
+    )
+        .into_response()
 }
 
 /// A dialect the provider cannot serve. A Refusal is an outcome: it counts
