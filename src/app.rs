@@ -2245,11 +2245,7 @@ async fn route_anthropic_request(
         let (masked, reverse) = masquerade_request(&body);
         (masked, Arc::new(reverse))
     };
-    // A streamed turn is not threaded yet: the reply id it continues from arrives inside
-    // the stream, and nothing records it.
-    let threaded = route == RequestRoute::Messages
-        && !client_wants_stream
-        && state.config.cloaking.message_threads;
+    let threaded = route == RequestRoute::Messages && state.config.cloaking.message_threads;
     let mut plan = if threaded {
         let messages = masked
             .get("messages")
@@ -2272,6 +2268,7 @@ async fn route_anthropic_request(
     };
 
     if client_wants_stream {
+        let turn = threaded.then(|| ThreadTurn::new(account, request, &masked, beta.clone()));
         return stream_anthropic(
             state,
             headers,
@@ -2280,6 +2277,7 @@ async fn route_anthropic_request(
             route,
             outbound,
             tool_reverse,
+            turn,
         )
         .await;
     }
@@ -2328,6 +2326,7 @@ async fn route_anthropic_request(
 }
 
 /// A streamed anthropic turn, read whole as it arrives and passed on unchanged otherwise.
+#[allow(clippy::too_many_arguments)]
 async fn stream_anthropic(
     state: &AppState,
     headers: &HeaderMap,
@@ -2336,19 +2335,28 @@ async fn stream_anthropic(
     route: RequestRoute,
     body: Value,
     tool_reverse: Arc<BTreeMap<String, String>>,
+    turn: Option<ThreadTurn>,
 ) -> Response {
-    match state
-        .upstream
-        .anthropic_messages_stream(UpstreamRequest {
-            body,
-            request_headers: headers_to_map(headers),
-            account: account.clone(),
-            config: cloaked_config(state),
-            conversation: request.conversation.clone(),
-        })
-        .await
-    {
-        Ok(response) => {
+    let mut sent = send_anthropic_stream(state, headers, account, request, body).await;
+    let mut turn = turn;
+    let rejected =
+        matches!(&sent, Ok(reply) if matches!(reply.status.as_u16(), 400 | 404)) && turn.is_some();
+    if rejected {
+        // A streamed reply is a status line and a body, so a thread rejection reads like any
+        // other error. Send the turn again from the relay's copy.
+        let open = turn.take().expect("a turn is present");
+        let Ok(reply) = sent else {
+            unreachable!("a reply is present")
+        };
+        let (replayed, next) = replay_stream(state, headers, account, request, reply, &open).await;
+        sent = replayed;
+        turn = next;
+    }
+    match sent {
+        Ok(mut response) => {
+            if let Some(turn) = turn {
+                response.body = capture_thread_reply(response.body, state.threads.clone(), turn);
+            }
             let accounting = stream_accounting(
                 state,
                 account.provider.clone(),
@@ -2459,6 +2467,168 @@ fn thread_unsupported(body: &Value) -> bool {
 fn thread_error_code(body: &Value) -> Option<&str> {
     body.pointer("/error/details/error_code")
         .and_then(Value::as_str)
+}
+
+/// One threaded turn, and what its reply must record once the vendor names it.
+struct ThreadTurn {
+    conversation: String,
+    account: String,
+    /// Messages of the conversation the vendor held before this turn.
+    sent: usize,
+    /// Hash of the conversation this turn sends, for the next turn to match.
+    prefix: String,
+    fingerprint: String,
+    /// The beta set the create carried, which a continue repeats.
+    beta: Option<String>,
+    /// The conversation as the relay would send it whole, for a replay.
+    masked: Value,
+}
+
+impl ThreadTurn {
+    fn new(
+        account: &AvailableAccount,
+        request: &ResolvedRequest,
+        masked: &Value,
+        beta: Option<String>,
+    ) -> Self {
+        let sent = masked
+            .get("messages")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        let beta = beta.or_else(|| {
+            Some(crate::upstream::resolve_beta(
+                &request.model,
+                &thread_body(masked.clone(), &Plan::Create, true),
+                &headers_to_map(&HeaderMap::new()),
+            ))
+        });
+        Self {
+            conversation: request.conversation.clone(),
+            account: account.token.email.clone(),
+            sent,
+            prefix: ThreadLedger::prefix(masked, sent),
+            fingerprint: ThreadLedger::fingerprint(masked),
+            beta,
+            masked: masked.clone(),
+        }
+    }
+}
+
+/// One anthropic streaming call. Kept apart from `stream_anthropic` so a rejected continue
+/// can be sent again.
+async fn send_anthropic_stream(
+    state: &AppState,
+    headers: &HeaderMap,
+    account: &AvailableAccount,
+    request: &ResolvedRequest,
+    body: Value,
+) -> Result<UpstreamSseResponse, anyhow::Error> {
+    state
+        .upstream
+        .anthropic_messages_stream(UpstreamRequest {
+            body,
+            request_headers: headers_to_map(headers),
+            account: account.clone(),
+            config: cloaked_config(state),
+            conversation: request.conversation.clone(),
+        })
+        .await
+}
+
+/// Answer a streamed thread rejection with a create: the same conversation, unthreaded when
+/// the endpoint has no threads, threaded again when only this thread was lost.
+async fn replay_stream(
+    state: &AppState,
+    headers: &HeaderMap,
+    account: &AvailableAccount,
+    request: &ResolvedRequest,
+    mut reply: UpstreamSseResponse,
+    open: &ThreadTurn,
+) -> (
+    Result<UpstreamSseResponse, anyhow::Error>,
+    Option<ThreadTurn>,
+) {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = reply.body.next().await {
+        let Ok(chunk) = chunk else { break };
+        bytes.extend_from_slice(&chunk);
+    }
+    let rejection = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
+    let blocked = thread_unsupported(&rejection);
+    if blocked {
+        state.threads.block(&request.conversation);
+    } else {
+        state.threads.forget(&request.conversation);
+    }
+    let body = thread_body(open.masked.clone(), &Plan::Create, !blocked);
+    let reply = send_anthropic_stream(state, headers, account, request, body).await;
+    let turn = (!blocked).then(|| ThreadTurn::new(account, request, &open.masked, None));
+    (reply, turn)
+}
+
+/// A streamed reply, read far enough to learn the id the next turn continues from, and
+/// passed on unchanged. The id arrives in `message_start`, before the model writes
+/// anything, so the scan is over the first chunk or two.
+fn capture_thread_reply(
+    mut input: UpstreamSseStream,
+    threads: Arc<ThreadLedger>,
+    turn: ThreadTurn,
+) -> UpstreamSseStream {
+    Box::pin(async_stream::try_stream! {
+        let mut scan = Vec::new();
+        let mut recorded = false;
+        while let Some(chunk) = input.next().await {
+            let chunk = chunk?;
+            if !recorded {
+                scan.extend_from_slice(&chunk);
+                match reply_id_in_events(&scan) {
+                    Some(id) => {
+                        threads.note_reply(
+                            &turn.conversation,
+                            crate::threads::Reply {
+                                account: &turn.account,
+                                reply_id: &id,
+                                sent: turn.sent,
+                                prefix: turn.prefix.clone(),
+                                fingerprint: turn.fingerprint.clone(),
+                                beta: turn.beta.clone().unwrap_or_default(),
+                            },
+                            Instant::now(),
+                        );
+                        recorded = true;
+                        scan = Vec::new();
+                    }
+                    // Nothing named the reply: a plain JSON error, or a stream this relay
+                    // cannot read. The next turn creates.
+                    None if scan.len() > 64 * 1024 => {
+                        recorded = true;
+                        scan = Vec::new();
+                    }
+                    None => {}
+                }
+            }
+            yield chunk;
+        }
+    })
+}
+
+/// The reply id a stream has named so far, from its own `message_start` event.
+fn reply_id_in_events(scan: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(scan);
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        if event.get("type").and_then(Value::as_str) == Some("message_start")
+            && let Some(id) = event.pointer("/message/id").and_then(Value::as_str)
+        {
+            return Some(id.to_string());
+        }
+    }
+    None
 }
 
 /// Remember where this conversation can continue from, unless the vendor did not store the

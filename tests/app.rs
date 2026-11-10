@@ -1180,6 +1180,149 @@ async fn a_conversation_creates_a_thread_then_continues_it() {
     assert!(calls[1].body.get("tools").is_none());
 }
 
+/// A streamed reply names its id in `message_start`, and the turn after it must continue
+/// that reply: most harnesses stream, so the id the relay records comes from the stream.
+#[derive(Default)]
+struct StreamingUpstream {
+    calls: Mutex<Vec<UpstreamRequest>>,
+}
+
+impl StreamingUpstream {
+    fn calls(&self) -> Vec<UpstreamRequest> {
+        self.calls.lock().expect("calls lock").clone()
+    }
+}
+
+impl UpstreamClient for StreamingUpstream {
+    fn anthropic_messages(&self, request: UpstreamRequest) -> UpstreamFuture {
+        self.calls.lock().expect("calls lock").push(request);
+        Box::pin(async {
+            Ok(UpstreamJsonResponse {
+                quota: None,
+                retry_hint: None,
+                status: axum::http::StatusCode::OK,
+                body: json!({
+                    "id": "msg_2",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "pong"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }),
+            })
+        })
+    }
+
+    fn anthropic_messages_stream(&self, request: UpstreamRequest) -> UpstreamSseFuture {
+        let started =
+            request.body.pointer("/thread/type").and_then(Value::as_str) == Some("create");
+        self.calls.lock().expect("calls lock").push(request);
+        Box::pin(async move {
+            let reply_id = if started {
+                "msg_stream_1"
+            } else {
+                "msg_stream_2"
+            };
+            let events = [
+                format!(
+                    "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{reply_id}\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-6\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":0}}}}}}\n\n"
+                ),
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
+            ];
+            Ok(UpstreamSseResponse {
+                status: axum::http::StatusCode::OK,
+                retry_hint: None,
+                quota: None,
+                body: Box::pin(futures_util::stream::iter(
+                    events.into_iter().map(|event| Ok(Bytes::from(event))),
+                )),
+            })
+        })
+    }
+
+    fn anthropic_count_tokens(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("not exercised")
+    }
+    fn codex_responses(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("not exercised")
+    }
+    fn codex_responses_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!("not exercised")
+    }
+    fn generic_chat(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("not exercised")
+    }
+    fn generic_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!("not exercised")
+    }
+    fn fetch_models(
+        &self,
+        _kind: ProviderKind,
+        _account: AvailableAccount,
+        _config: Arc<Config>,
+    ) -> ModelsFuture {
+        unreachable!("not exercised")
+    }
+    fn fetch_cli_versions(&self) -> CliVersionsFuture {
+        unreachable!("not exercised")
+    }
+}
+
+#[tokio::test]
+async fn a_streamed_reply_names_the_thread_the_next_turn_continues() {
+    let tmp = one_anthropic_account();
+    let upstream = Arc::new(StreamingUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, _, streamed) = raw_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .header("x-claude-code-session-id", "conv-stream")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "one"}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(streamed.contains("msg_stream_1"), "{streamed}");
+
+    let (status, _) = post_turn(
+        app,
+        "conv-stream",
+        json!([
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "pong"},
+            {"role": "user", "content": "two"}
+        ]),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let calls = upstream.calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].body["thread"], json!({"type": "create"}));
+    assert_eq!(
+        calls[1].body["thread"],
+        json!({"type": "continue", "previous_message_id": "msg_stream_1"})
+    );
+    assert_eq!(
+        calls[1].body["messages"],
+        json!([{"role": "user", "content": "two"}])
+    );
+}
+
 #[tokio::test]
 async fn a_thread_the_vendor_lost_is_replayed_as_a_create() {
     let tmp = one_anthropic_account();
