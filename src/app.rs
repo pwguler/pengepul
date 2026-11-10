@@ -3010,12 +3010,14 @@ async fn record_provider_failure(
     detail: Option<&str>,
     retry_hint: Option<Duration>,
 ) {
-    // 400/402 by themselves say nothing about account health — a malformed request is
-    // the client's fault, and a drained balance is recorded by the failover path with
-    // the billing kind instead. Recording both would count the failure twice, widening
-    // one request's cooldown. The request still happened, though: count it as a refusal
-    // so it reaches an outcome without touching the account's health.
-    if status == StatusCode::BAD_REQUEST || status == StatusCode::PAYMENT_REQUIRED {
+    // 4xx by themselves say nothing about account health — a malformed request, a model that
+    // does not exist, or a message thread the API no longer holds is the request's problem, and a
+    // drained balance is recorded by the failover path with the billing kind instead. Recording
+    // any of them would count the failure twice, widening one request's cooldown. The request
+    // still happened, though: count it as a refusal so it reaches an outcome without touching the
+    // account's health. 401, 403 and 429 are the account's: they fail over.
+    let client_error = status.is_client_error() && !matches!(status.as_u16(), 401 | 403 | 429);
+    if client_error {
         // The request reached an outcome here. If the body turns out to be
         // billing-scoped, the failover path adds the cooldown without
         // recording a second outcome (`record_billing_cooldown`).

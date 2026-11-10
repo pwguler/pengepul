@@ -35,6 +35,62 @@ impl FakeUpstream {
 }
 
 #[derive(Default)]
+struct NotFoundUpstream;
+
+impl UpstreamClient for NotFoundUpstream {
+    fn anthropic_messages(
+        &self,
+        _request: UpstreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+        Box::pin(async {
+            Ok(UpstreamJsonResponse {
+                quota: None,
+                retry_hint: None,
+                status: axum::http::StatusCode::NOT_FOUND,
+                body: json!({
+                    "type": "error",
+                    "error": {
+                        "type": "not_found_error",
+                        "message": "No thread state was found for the requested `previous_message_id`.",
+                        "details": {"error_code": "thread_not_found"}
+                    }
+                }),
+            })
+        })
+    }
+
+    fn anthropic_messages_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!("not exercised")
+    }
+    fn anthropic_count_tokens(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("not exercised")
+    }
+    fn codex_responses(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("not exercised")
+    }
+    fn codex_responses_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!("not exercised")
+    }
+    fn generic_chat(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("not exercised")
+    }
+    fn generic_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!("not exercised")
+    }
+    fn fetch_models(
+        &self,
+        _kind: ProviderKind,
+        _account: AvailableAccount,
+        _config: Arc<Config>,
+    ) -> ModelsFuture {
+        unreachable!("not exercised")
+    }
+    fn fetch_cli_versions(&self) -> CliVersionsFuture {
+        unreachable!("not exercised")
+    }
+}
+
+#[derive(Default)]
 struct RetryUpstream {
     calls: Mutex<Vec<UpstreamRequest>>,
 }
@@ -956,6 +1012,67 @@ async fn messages_route_refuses_message_threads_before_any_account() {
         );
     }
     assert!(upstream.calls().is_empty());
+}
+
+#[tokio::test]
+async fn a_not_found_upstream_answer_does_not_cool_the_account() {
+    // The API answers 404 for a request it cannot serve: a thread it no longer holds, a
+    // model that does not exist. That is a fact about the request, not the account's
+    // health, so the account must keep serving the next conversation.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for (email, access_token) in [
+        ("alice@example.com", "anthropic-access-alice"),
+        ("bob@example.com", "anthropic-access-bob"),
+    ] {
+        save_token(
+            tmp.path(),
+            &TokenData {
+                access_token: access_token.to_string(),
+                refresh_token: format!("{access_token}-refresh"),
+                email: email.to_string(),
+                expires_at: "2030-01-01T00:00:00Z".to_string(),
+                account_uuid: email.to_string(),
+                provider: ProviderId::anthropic(),
+                id_token: None,
+                last_refresh_at: None,
+                plan_type: None,
+            },
+        )
+        .expect("save token");
+    }
+    let app =
+        create_app_with_upstream(config(tmp.path().to_path_buf()), Arc::new(NotFoundUpstream));
+
+    let (status, body) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .header("x-claude-code-session-id", "thread-gone")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, 404);
+    assert_eq!(body["error"]["details"]["error_code"], "thread_not_found");
+    for email in ["alice@example.com", "bob@example.com"] {
+        let account = listed(app.clone(), "anthropic", email).await;
+        assert_eq!(
+            account["cooldownUntil"], 0.0,
+            "{email} was cooled: {account}"
+        );
+        assert_eq!(account["failureCount"], 0, "{email} opened a streak");
+    }
 }
 
 #[tokio::test]
