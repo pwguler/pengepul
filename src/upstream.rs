@@ -12,10 +12,6 @@ use crate::utils::sha256_hex;
 
 pub const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 pub const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
-
-/// The relay's own header, never sent upstream: the `anthropic-beta` a thread's create
-/// carried, which its continues must repeat byte for byte.
-pub const THREAD_BETA_HEADER: &str = "x-pengepul-thread-beta";
 pub const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
 pub const CODEX_RESPONSES_PATH: &str = "/codex/responses";
 pub const CODEX_MODELS_PATH: &str = "/codex/models";
@@ -282,38 +278,42 @@ pub fn anthropic_headers(
     headers
 }
 
-/// The `anthropic-beta` a request carries, from the four places it can come from: the set a
-/// continue must repeat, the caller's own header, or the set this request's shape earns.
-///
-/// A message thread records the set its create carried and sends it again on every
-/// continue, because the beta list is one of the fields a thread may not change, and the
-/// tools that earn part of the list are not in a continue body.
+/// The `anthropic-beta` a request carries: a Claude Code caller's own list, or the set the
+/// request's shape earns.
 #[must_use]
 pub fn resolve_beta(
     model: &str,
     body: &Value,
     request_headers: &BTreeMap<String, String>,
 ) -> String {
-    let with_oauth = |beta: String| {
-        let mut parts = beta
-            .split(',')
-            .map(str::trim)
-            .filter(|part| !part.is_empty())
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>();
-        if !parts.iter().any(|part| part == ANTHROPIC_OAUTH_BETA) {
-            parts.insert(0, ANTHROPIC_OAUTH_BETA.to_string());
-        }
-        parts.dedup();
-        parts.join(",")
+    let Some(beta) = passthrough_anthropic_headers(request_headers).remove("anthropic-beta") else {
+        return build_beta_header(model, RequestShape::of(body));
     };
-    if let Some(beta) = header_value(request_headers, THREAD_BETA_HEADER) {
-        return with_oauth(beta.to_string());
+    let mut parts = beta
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if !parts.iter().any(|part| part == ANTHROPIC_OAUTH_BETA) {
+        parts.insert(0, ANTHROPIC_OAUTH_BETA.to_string());
     }
-    if let Some(beta) = passthrough_anthropic_headers(request_headers).get("anthropic-beta") {
-        return with_oauth(beta.clone());
+    parts.dedup();
+    parts.join(",")
+}
+
+/// `headers` with `beta` as their `anthropic-beta`, when a threaded turn names one: a
+/// continue repeats its create's set, and its body no longer has the tools part of that
+/// set is derived from.
+#[must_use]
+pub fn with_beta(
+    mut headers: BTreeMap<String, String>,
+    beta: Option<String>,
+) -> BTreeMap<String, String> {
+    if let Some(beta) = beta {
+        headers.insert("anthropic-beta".to_string(), beta);
     }
-    build_beta_header(model, RequestShape::of(body))
+    headers
 }
 
 // Log-only: message content is never rewritten (quotes, tool_results, and signed

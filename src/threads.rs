@@ -5,655 +5,850 @@
 //! little the next turn needs to say so. Everything here is per process: a restart costs
 //! one `create` per conversation, and nothing about a conversation outlives its traffic.
 //!
-//! State is dropped on the first doubt, never repaired. A `continue` that the vendor
-//! rejects costs one request and falls back to a `create`, so a wrong guess here is
-//! cheap while a wrong continuation is silent.
+//! State is dropped on the first doubt, never repaired. A `continue` the vendor refuses
+//! costs one request and is answered by a `create`, so a wrong guess here is cheap. A
+//! wrong continuation would be silent: the vendor would answer from its own copy of a
+//! conversation the caller has since changed.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
 
 use crate::utils::sha256_hex;
 
-/// How long a thread is continued. The vendor drops a thread five minutes after its last
-/// request, so continuing after that is a create either way.
-const IDLE: Duration = Duration::from_mins(5);
+/// The beta a request must name for the vendor to accept `thread` at all.
+pub const THREAD_BETA: &str = "message-threads-2026-08-12";
 
-/// How many conversations keep thread state before the whole map is dropped, and how many
-/// remember that their endpoint has no threads.
+/// How long a reply stays continuable. The vendor drops a thread five minutes after its
+/// last request; the margin keeps a turn that arrives at the edge from being refused.
+const IDLE: Duration = Duration::from_secs(270);
+
+/// How many threads are remembered, and how many conversations are remembered as plain.
 const CAPACITY: usize = 4096;
+
+/// The top-level fields a thread may not change between its turns.
+const FIXED: [&str; 10] = [
+    "model",
+    "system",
+    "tools",
+    "thinking",
+    "tool_choice",
+    "output_config",
+    "mcp_servers",
+    "context_management",
+    "container",
+    "cache_control",
+];
+
+/// The stop reasons after which the vendor holds the reply. Anything else, a stop this
+/// relay has never seen included, leaves the turn unstored as far as it knows.
+const STORED_STOPS: [&str; 4] = ["end_turn", "tool_use", "stop_sequence", "max_tokens"];
 
 /// What the next request of a conversation sends.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Plan {
+    /// The whole conversation and no thread: the vendor refused one for it.
+    Plain,
     /// The whole conversation, as a new thread.
     Create,
-    /// Only `messages[from..]`, continuing `previous_message_id` with the beta set its
-    /// create carried.
+    /// Only `messages[from..]`, continuing the reply `previous_message_id`.
     Continue {
         previous_message_id: String,
         from: usize,
-        beta: String,
     },
 }
 
-/// What the vendor answered, as far as the next turn needs it.
-pub struct Reply<'a> {
-    /// The Account that served the turn. A thread never leaves it.
-    pub account: &'a str,
-    pub reply_id: &'a str,
-    /// How many messages of the conversation the vendor now holds.
-    pub sent: usize,
-    pub prefix: String,
-    pub fingerprint: String,
-    pub beta: String,
-    /// The reply the vendor stored, as the caller received it. Absent for a streamed reply,
-    /// whose body this relay passes on without keeping.
-    pub reply_hash: Option<String>,
-}
-
-struct Entry {
-    account: String,
-    reply_id: String,
-    /// How many messages of the conversation the vendor holds, once `reply_id` is counted.
-    sent: usize,
-    /// Hash of those messages as they went upstream, which is what the next turn must repeat.
-    prefix: String,
-    /// Hash of the fields a thread cannot change, as they went upstream.
-    fingerprint: String,
-    /// Hash of the reply the vendor stored, as the caller saw it, when this process knows it.
-    reply_hash: Option<String>,
-    /// The `anthropic-beta` the create carried. A continue must carry the same set, and it
-    /// cannot be recomputed: the tools the set is derived from are not in a continue body.
-    beta: String,
-    idle_at: Instant,
-}
-
-#[derive(Default)]
-pub struct ThreadLedger {
-    entries: Mutex<BTreeMap<String, Entry>>,
-    /// Conversations whose endpoint answered without threads. They stay unthreaded for the
-    /// life of the process: a beta the vendor refuses will be refused again.
-    stateless: Mutex<BTreeSet<String>>,
-}
-
-impl ThreadLedger {
-    /// How the conversation's next request goes out. `messages` is the whole conversation
-    /// as it would be sent upstream, after masking; `account` is the Account serving it.
-    ///
-    /// # Panics
-    /// If a thread lock was poisoned by a panic in another request.
-    pub fn plan(
-        &self,
-        conversation: &str,
-        account: &str,
-        messages: &[Value],
-        fingerprint: &str,
-        now: Instant,
-    ) -> Plan {
-        if self
-            .stateless
-            .lock()
-            .expect("stateless lock is poisoned")
-            .contains(conversation)
-        {
-            return Plan::Create;
-        }
-        let mut entries = self.entries.lock().expect("thread lock is poisoned");
-        let Some(entry) = entries.get(conversation) else {
-            return Plan::Create;
-        };
-        // A thread lives on one Account. Moving it, or continuing a turn the vendor did not
-        // finish, is a create.
-        let same_account = entry.account == account;
-        let fresh = now.duration_since(entry.idle_at) < IDLE;
-        let grew = messages.len() > entry.sent;
-        let same_prefix = grew
-            && sha256_hex(&Value::Array(messages[..entry.sent].to_vec()).to_string())
-                == entry.prefix;
-        // The caller repeats the reply it received where the vendor's copy of it sits. When
-        // this process knows that reply's content, the copy must match it: a caller that
-        // rewrote the reply would otherwise be served the vendor's version while believing
-        // its own.
-        let reply_unchanged = match (&entry.reply_hash, messages.get(entry.sent)) {
-            (Some(held), Some(their_copy)) => held == &Self::reply_hash(their_copy),
-            _ => true,
-        };
-        if !(same_account
-            && fresh
-            && grew
-            && same_prefix
-            && reply_unchanged
-            && entry.fingerprint == fingerprint)
-        {
-            entries.remove(conversation);
-            return Plan::Create;
-        }
-        // Each reply can be continued once. Taking the entry here keeps a second request
-        // from racing the same reply into `thread_already_continued`.
-        let entry = entries.remove(conversation).expect("entry is present");
-        Plan::Continue {
-            previous_message_id: entry.reply_id,
-            from: entry.sent + 1,
-            beta: entry.beta,
-        }
-    }
-
-    /// Remember where the conversation can continue from.
-    ///
-    /// # Panics
-    /// If a thread lock was poisoned by a panic in another request.
-    pub fn note_reply(&self, conversation: &str, reply: Reply, now: Instant) {
-        let mut entries = self.entries.lock().expect("thread lock is poisoned");
-        if entries.len() >= CAPACITY {
-            entries.clear();
-        }
-        entries.insert(
-            conversation.to_string(),
-            Entry {
-                account: reply.account.to_string(),
-                reply_id: reply.reply_id.to_string(),
-                sent: reply.sent,
-                prefix: reply.prefix,
-                fingerprint: reply.fingerprint,
-                reply_hash: reply.reply_hash,
-                beta: reply.beta,
-                idle_at: now,
-            },
-        );
-    }
-
-    /// Drop the conversation's thread, keeping it continuable from scratch on the next turn.
-    ///
-    /// # Panics
-    /// If a thread lock was poisoned by a panic in another request.
-    pub fn forget(&self, conversation: &str) {
-        self.entries
-            .lock()
-            .expect("thread lock is poisoned")
-            .remove(conversation);
-    }
-
-    /// The conversation's endpoint has no threads. Nothing about it is kept or sent again.
-    ///
-    /// # Panics
-    /// If a thread lock was poisoned by a panic in another request.
-    pub fn block(&self, conversation: &str) {
-        self.forget(conversation);
-        let mut stateless = self.stateless.lock().expect("stateless lock is poisoned");
-        if stateless.len() >= CAPACITY {
-            stateless.clear();
-        }
-        stateless.insert(conversation.to_string());
-    }
-
-    /// The conversation, as it stands, for the fingerprint a `create` records: everything a
-    /// thread cannot change between turns.
+impl Plan {
+    /// The plan as one word, for a log line.
     #[must_use]
-    pub fn fingerprint(body: &Value) -> String {
-        sha256_hex(
-            &Value::Array(
-                [
-                    "model",
-                    "system",
-                    "tools",
-                    "thinking",
-                    "tool_choice",
-                    "output_config",
-                    "mcp_servers",
-                ]
-                .into_iter()
-                .map(|field| body.get(field).cloned().unwrap_or(Value::Null))
-                .collect(),
-            )
-            .to_string(),
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::Create => "create",
+            Self::Continue { .. } => "continue",
+        }
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum Role {
+    User,
+    Assistant,
+    Other,
+}
+
+struct Message {
+    role: Role,
+    hash: String,
+}
+
+/// One request of a conversation, reduced to what a thread is checked against.
+pub struct Turn {
+    /// Names the thread this request could belong to: everything a thread may not change
+    /// (the fixed fields and the beta set) and the message the conversation opens with.
+    /// A harness sends side requests under its conversation's session, with another model
+    /// or prompt; under this key they neither end its thread nor continue it.
+    key: String,
+    messages: Vec<Message>,
+    /// `prefixes[n]` is the hash of the first `n` messages.
+    prefixes: Vec<String>,
+}
+
+impl Turn {
+    /// `body` is the request as it would go upstream whole, after masking. `beta` is the
+    /// `anthropic-beta` a thread of it carries.
+    #[must_use]
+    pub fn of(body: &Value, beta: &str) -> Self {
+        let fixed: Vec<&Value> = FIXED
+            .iter()
+            .map(|field| body.get(*field).unwrap_or(&Value::Null))
+            .collect();
+        // Serialized by reference: `system` and `tools` are the largest fields of a request.
+        let fingerprint = sha256_hex(&serde_json::to_string(&(&fixed, beta)).unwrap_or_default());
+
+        let messages: Vec<Message> = body
+            .get("messages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|message| Message {
+                role: match message.get("role").and_then(Value::as_str) {
+                    Some("user") => Role::User,
+                    Some("assistant") => Role::Assistant,
+                    _ => Role::Other,
+                },
+                hash: message_hash(message),
+            })
+            .collect();
+        let mut prefixes = Vec::with_capacity(messages.len() + 1);
+        prefixes.push(sha256_hex(""));
+        for message in &messages {
+            let last = prefixes.last().map_or("", String::as_str);
+            prefixes.push(sha256_hex(&format!("{last}{}", message.hash)));
+        }
+        let opening = messages.first().map_or("", |message| message.hash.as_str());
+        Self {
+            key: sha256_hex(&format!("{fingerprint}{opening}")),
+            messages,
+            prefixes,
+        }
+    }
+
+    /// The whole conversation of this turn, as one hash.
+    fn whole(&self) -> &str {
+        self.prefixes.last().map_or("", String::as_str)
+    }
+}
+
+/// A reply the vendor stored, as the next turn must repeat it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stored {
+    id: String,
+    hash: String,
+}
+
+impl Stored {
+    /// From a whole reply. `None` when the vendor did not store the turn, or this relay
+    /// cannot tell that it did.
+    #[must_use]
+    pub fn of(reply: &Value) -> Option<Self> {
+        Self::new(
+            reply.get("id").and_then(Value::as_str)?,
+            reply.get("stop_reason").and_then(Value::as_str),
+            reply.get("content")?,
+            reply.get("usage"),
         )
     }
 
-    /// One reply as a hash the caller's copy can be compared with. Only what both sides can
-    /// agree on counts: the text and the tool calls, with a cache marker dropped, because it
-    /// moves between turns, and thinking left out, because a caller may keep or drop it.
-    #[must_use]
-    pub fn reply_hash(message: &Value) -> String {
-        let blocks = message
-            .get("content")
-            .map_or(Value::Null, |content| match content {
-                Value::String(text) => json!([{"type": "text", "text": text}]),
-                other => {
-                    let kept: Vec<Value> = other
-                        .as_array()
-                        .map(|blocks| {
-                            blocks
-                                .iter()
-                                .filter(|block| {
-                                    matches!(
-                                        block.get("type").and_then(Value::as_str),
-                                        Some("text" | "tool_use")
-                                    )
-                                })
-                                .cloned()
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    Value::Array(kept)
-                }
-            });
-        sha256_hex(&blocks.to_string())
-    }
-
-    /// The messages of `body` as one hash, for the prefix a `continue` must repeat.
-    #[must_use]
-    pub fn prefix(body: &Value, sent: usize) -> String {
-        let messages = body
-            .get("messages")
+    fn new(id: &str, stop: Option<&str>, content: &Value, usage: Option<&Value>) -> Option<Self> {
+        let stop = stop?;
+        let blocks = content.as_array()?;
+        // A tool call the output limit cut is not a turn: its input is half a document.
+        let cut_tool_call = stop == "max_tokens"
+            && blocks
+                .iter()
+                .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"));
+        // A fallback model answered in place of the thread's own.
+        let fell_back = usage
+            .and_then(|usage| usage.get("iterations"))
             .and_then(Value::as_array)
-            .map_or(&[][..], Vec::as_slice);
-        let held = messages.get(..sent).unwrap_or(messages);
-        sha256_hex(&Value::Array(held.to_vec()).to_string())
+            .is_some_and(|iterations| {
+                iterations
+                    .iter()
+                    .any(|iteration| iteration.get("fallback_message").is_some())
+            });
+        if id.is_empty() || !STORED_STOPS.contains(&stop) || cut_tool_call || fell_back {
+            return None;
+        }
+        Some(Self {
+            id: id.to_string(),
+            hash: message_hash(&json!({"role": "assistant", "content": content})),
+        })
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    fn messages(n: usize) -> Vec<Value> {
-        (0..n)
-            .map(|turn| json!({"role": "user", "content": format!("turn {turn}")}))
-            .collect()
-    }
-
-    /// A conversation after `sent` messages and the reply the caller repeats back.
-    fn with_reply(sent: usize, total: usize) -> Vec<Value> {
-        let mut list = messages(sent);
-        list.push(json!({"role": "assistant", "content": "reply"}));
-        list.extend(messages(total).into_iter().skip(sent));
-        list
-    }
-
-    fn reply_hash_of(text: &str) -> String {
-        ThreadLedger::reply_hash(&json!({"role": "assistant", "content": text}))
-    }
-
-    fn ledger_with_reply(sent: usize) -> (ThreadLedger, Instant) {
-        let ledger = ThreadLedger::default();
-        let now = Instant::now();
-        let body = json!({"messages": messages(sent), "model": "m"});
-        ledger.note_reply(
-            "c",
-            Reply {
-                account: "a@example.com",
-                reply_id: "msg_1",
-                sent,
-                prefix: ThreadLedger::prefix(&body, sent),
-                fingerprint: ThreadLedger::fingerprint(&body),
-                beta: "beta".to_string(),
-                reply_hash: Some(reply_hash_of("reply")),
-            },
-            now,
-        );
-        (ledger, now)
-    }
-
-    #[test]
-    fn a_conversation_with_no_thread_creates() {
-        let ledger = ThreadLedger::default();
-        let body = json!({"messages": messages(2)});
-        assert_eq!(
-            ledger.plan(
-                "c",
-                "a@example.com",
-                &messages(2),
-                &ThreadLedger::fingerprint(&body),
-                Instant::now()
-            ),
-            Plan::Create
-        );
-    }
-
-    #[test]
-    fn a_grown_conversation_continues_from_its_reply() {
-        let (ledger, now) = ledger_with_reply(3);
-        let body = json!({"messages": messages(5), "model": "m"});
-        assert_eq!(
-            ledger.plan(
-                "c",
-                "a@example.com",
-                &with_reply(3, 5),
-                &ThreadLedger::fingerprint(&body),
-                now + Duration::from_secs(1)
-            ),
-            Plan::Continue {
-                previous_message_id: "msg_1".to_string(),
-                from: 4,
-                beta: "beta".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn a_reply_is_continued_once() {
-        let (ledger, now) = ledger_with_reply(3);
-        let body = json!({"messages": messages(5), "model": "m"});
-        let fingerprint = ThreadLedger::fingerprint(&body);
-        let _ = ledger.plan("c", "a@example.com", &with_reply(3, 5), &fingerprint, now);
-        assert_eq!(
-            ledger.plan("c", "a@example.com", &with_reply(3, 5), &fingerprint, now),
-            Plan::Create
-        );
-    }
-
-    #[test]
-    fn a_rewritten_prefix_creates() {
-        let (ledger, now) = ledger_with_reply(3);
-        let mut rewritten = with_reply(3, 5);
-        rewritten[1] = json!({"role": "user", "content": "edited"});
-        let body = json!({"messages": messages(5), "model": "m"});
-        assert_eq!(
-            ledger.plan(
-                "c",
-                "a@example.com",
-                &rewritten,
-                &ThreadLedger::fingerprint(&body),
-                now
-            ),
-            Plan::Create
-        );
-    }
-
-    #[test]
-    fn an_edited_reply_creates() {
-        let (ledger, now) = ledger_with_reply(3);
-        let mut edited = with_reply(3, 5);
-        edited[3] = json!({"role": "assistant", "content": "rewritten"});
-        let body = json!({"messages": messages(5), "model": "m"});
-        assert_eq!(
-            ledger.plan(
-                "c",
-                "a@example.com",
-                &edited,
-                &ThreadLedger::fingerprint(&body),
-                now
-            ),
-            Plan::Create
-        );
-    }
-
-    #[test]
-    fn a_changed_system_creates() {
-        let (ledger, now) = ledger_with_reply(3);
-        let body = json!({"messages": messages(5), "model": "m", "system": "new instruction"});
-        let stored = json!({"messages": messages(5), "model": "m", "system": "old instruction"});
-        assert_ne!(
-            ThreadLedger::fingerprint(&body),
-            ThreadLedger::fingerprint(&stored)
-        );
-        assert_eq!(
-            ledger.plan(
-                "c",
-                "a@example.com",
-                &with_reply(3, 5),
-                &ThreadLedger::fingerprint(&body),
-                now
-            ),
-            Plan::Create
-        );
-    }
-
-    #[test]
-    fn another_account_creates() {
-        let (ledger, now) = ledger_with_reply(3);
-        let body = json!({"messages": messages(5), "model": "m"});
-        assert_eq!(
-            ledger.plan(
-                "c",
-                "b@example.com",
-                &with_reply(3, 5),
-                &ThreadLedger::fingerprint(&body),
-                now
-            ),
-            Plan::Create
-        );
-    }
-
-    #[test]
-    fn a_changed_fixed_field_creates() {
-        let (ledger, now) = ledger_with_reply(3);
-        let body = json!({"messages": messages(5), "model": "other"});
-        assert_eq!(
-            ledger.plan(
-                "c",
-                "a@example.com",
-                &with_reply(3, 5),
-                &ThreadLedger::fingerprint(&body),
-                now
-            ),
-            Plan::Create
-        );
-    }
-
-    #[test]
-    fn an_idle_thread_creates() {
-        let (ledger, now) = ledger_with_reply(3);
-        let body = json!({"messages": messages(5), "model": "m"});
-        assert_eq!(
-            ledger.plan(
-                "c",
-                "a@example.com",
-                &messages(5),
-                &ThreadLedger::fingerprint(&body),
-                now + IDLE
-            ),
-            Plan::Create
-        );
-    }
-
-    #[test]
-    fn a_blocked_conversation_never_continues() {
-        let (ledger, now) = ledger_with_reply(3);
-        ledger.block("c");
-        let body = json!({"messages": messages(5), "model": "m"});
-        assert_eq!(
-            ledger.plan(
-                "c",
-                "a@example.com",
-                &with_reply(3, 5),
-                &ThreadLedger::fingerprint(&body),
-                now
-            ),
-            Plan::Create
-        );
-    }
-}
-
-#[cfg(test)]
-mod reply_hash_tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn the_same_reply_hashes_alike() {
-        let vendor = json!({"role": "assistant", "content": [
-            {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Paris"}}
-        ]});
-        let caller = json!({"role": "assistant", "content": [
-            {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Paris"}}
-        ]});
-        assert_eq!(
-            ThreadLedger::reply_hash(&vendor),
-            ThreadLedger::reply_hash(&caller)
-        );
-    }
-
-    #[test]
-    fn a_reply_with_thinking_still_matches() {
-        let vendor = json!({"role": "assistant", "content": [
-            {"type": "thinking", "thinking": "hmm", "signature": "sig"},
-            {"type": "text", "text": "hi"}
-        ]});
-        let caller = json!({"role": "assistant", "content": [{"type": "text", "text": "hi"}]});
-        assert_eq!(
-            ThreadLedger::reply_hash(&vendor),
-            ThreadLedger::reply_hash(&caller)
-        );
-    }
-}
-
-/// A reply rebuilt from its own stream, to the shape [`ThreadLedger::reply_hash`] compares.
-///
-/// Only what the hash keeps is rebuilt: text and tool calls, with a tool call's input put
-/// back into an object, because that is how the caller holds it.
+/// A reply as it arrives in a stream, kept as far as the next turn is checked against it.
 #[derive(Default)]
 pub struct StreamingReply {
-    blocks: BTreeMap<usize, Value>,
-    partial: BTreeMap<usize, String>,
-    pub id: Option<String>,
-    pub stopped: bool,
+    id: String,
+    blocks: BTreeMap<u64, Value>,
+    /// A tool call's input arrives as JSON text, piece by piece.
+    inputs: BTreeMap<u64, String>,
+    stop: Option<String>,
+    usage: Option<Value>,
+    finished: bool,
+    /// The stream held something this reader cannot rebuild, so the reply is not known.
+    unreadable: bool,
 }
 
 impl StreamingReply {
-    /// Feed one parsed SSE event. Unknown events are ignored.
+    /// Take one event of the stream.
     pub fn feed(&mut self, event: &Value) {
+        let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
         match event.get("type").and_then(Value::as_str) {
             Some("message_start") => {
                 self.id = event
                     .pointer("/message/id")
                     .and_then(Value::as_str)
-                    .map(ToOwned::to_owned);
+                    .unwrap_or_default()
+                    .to_string();
             }
             Some("content_block_start") => {
-                let Some(index) = event.get("index").and_then(Value::as_u64) else {
-                    return;
-                };
-                let index = usize::try_from(index).unwrap_or(usize::MAX);
-                let Some(block) = event.get("content_block").and_then(Value::as_object) else {
-                    return;
-                };
-                match block.get("type").and_then(Value::as_str) {
+                match event.pointer("/content_block/type").and_then(Value::as_str) {
                     Some("text") => {
-                        self.blocks
-                            .insert(index, json!({"type": "text", "text": ""}));
+                        let text = event.pointer("/content_block/text").and_then(Value::as_str);
+                        self.blocks.insert(
+                            index,
+                            json!({"type": "text", "text": text.unwrap_or_default()}),
+                        );
                     }
                     Some("tool_use") => {
                         self.blocks.insert(
                             index,
                             json!({
                                 "type": "tool_use",
-                                "id": block.get("id").cloned().unwrap_or(Value::Null),
-                                "name": block.get("name").cloned().unwrap_or(Value::Null),
-                                "input": Value::Null
+                                "id": event.pointer("/content_block/id"),
+                                "name": event.pointer("/content_block/name"),
+                                "input": {}
                             }),
                         );
-                        self.partial.insert(index, String::new());
+                        self.inputs.insert(index, String::new());
                     }
-                    _ => {}
+                    // The vendor keeps its own thinking, and no turn is checked against it.
+                    Some("thinking" | "redacted_thinking") => {}
+                    _ => self.unreadable = true,
                 }
             }
             Some("content_block_delta") => {
-                let Some(index) = event.get("index").and_then(Value::as_u64) else {
-                    return;
-                };
-                let index = usize::try_from(index).unwrap_or(usize::MAX);
-                let delta = event.get("delta").and_then(Value::as_object);
-                match delta
-                    .and_then(|delta| delta.get("type"))
-                    .and_then(Value::as_str)
-                {
+                match event.pointer("/delta/type").and_then(Value::as_str) {
                     Some("text_delta") => {
-                        let text = delta
-                            .and_then(|delta| delta.get("text"))
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        if let Some(block) = self.blocks.get_mut(&index)
-                            && let Some(held) = block.get_mut("text")
+                        let piece = event.pointer("/delta/text").and_then(Value::as_str);
+                        if let Some(Value::String(text)) = self
+                            .blocks
+                            .get_mut(&index)
+                            .and_then(|block| block.get_mut("text"))
                         {
-                            let joined = format!("{}{text}", held.as_str().unwrap_or_default());
-                            *held = Value::String(joined);
+                            text.push_str(piece.unwrap_or_default());
                         }
                     }
                     Some("input_json_delta") => {
-                        let piece = delta
-                            .and_then(|delta| delta.get("partial_json"))
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        self.partial.entry(index).or_default().push_str(piece);
+                        let piece = event.pointer("/delta/partial_json").and_then(Value::as_str);
+                        if let Some(input) = self.inputs.get_mut(&index) {
+                            input.push_str(piece.unwrap_or_default());
+                        }
                     }
                     _ => {}
                 }
             }
             Some("content_block_stop") => {
-                let Some(index) = event.get("index").and_then(Value::as_u64) else {
-                    return;
-                };
-                let index = usize::try_from(index).unwrap_or(usize::MAX);
-                // A tool call's input arrives as JSON text and goes back in as an object,
-                // which is the shape the caller repeats.
-                if let Some(mut json_text) = self.partial.remove(&index) {
-                    if json_text.trim().is_empty() {
-                        json_text = "{}".to_string();
-                    }
-                    let input = serde_json::from_str::<Value>(&json_text).unwrap_or(Value::Null);
-                    if let Some(block) = self.blocks.get_mut(&index) {
-                        block["input"] = input;
+                if let Some(input) = self.inputs.remove(&index) {
+                    let input = if input.trim().is_empty() {
+                        "{}"
+                    } else {
+                        input.as_str()
+                    };
+                    match (
+                        serde_json::from_str::<Value>(input),
+                        self.blocks.get_mut(&index),
+                    ) {
+                        (Ok(input), Some(block)) => block["input"] = input,
+                        _ => self.unreadable = true,
                     }
                 }
             }
-            Some("message_stop") => self.stopped = true,
+            Some("message_delta") => {
+                if let Some(stop) = event.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                    self.stop = Some(stop.to_string());
+                }
+                if let Some(usage) = event.get("usage") {
+                    self.usage = Some(usage.clone());
+                }
+            }
+            Some("message_stop") => self.finished = true,
+            Some("error") => self.unreadable = true,
             _ => {}
         }
     }
 
-    /// The reply as a hash, when the stream finished and named itself.
+    /// Whether the vendor has said the message is over.
     #[must_use]
-    pub fn reply_hash(&self) -> Option<String> {
-        if !self.stopped || self.id.is_none() {
+    pub fn finished(&self) -> bool {
+        self.finished
+    }
+
+    /// The reply, once it is finished, readable and stored.
+    #[must_use]
+    pub fn stored(&self) -> Option<Stored> {
+        if !self.finished || self.unreadable {
             return None;
         }
         let content = Value::Array(self.blocks.values().cloned().collect());
-        Some(ThreadLedger::reply_hash(
-            &json!({"role": "assistant", "content": content}),
-        ))
+        Stored::new(
+            &self.id,
+            self.stop.as_deref(),
+            &content,
+            self.usage.as_ref(),
+        )
+    }
+}
+
+struct Entry {
+    /// The Account that holds the thread. A thread never leaves it.
+    account: String,
+    reply: Stored,
+    /// How many messages the vendor held before `reply`.
+    sent: usize,
+    /// Hash of those messages, which the next turn must repeat.
+    prefix: String,
+    noted_at: Instant,
+}
+
+#[derive(Default)]
+pub struct ThreadLedger {
+    entries: Mutex<BTreeMap<String, Entry>>,
+    /// Conversations the vendor refused a thread for. They stay unthreaded for the life of
+    /// the process: what was refused once would be refused again, one request each time.
+    // shortcut: remembered per conversation, so every new conversation of a shape the
+    // vendor refuses pays one refused request; key it by Account and model if a log shows
+    // that happening.
+    plain: Mutex<BTreeSet<String>>,
+}
+
+/// The lock, whatever became of the last request that held it: the maps are valid after
+/// any single operation on them.
+fn held<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl ThreadLedger {
+    /// How this turn of `conversation` goes out on `account`.
+    pub fn plan(&self, conversation: &str, account: &str, turn: &Turn, now: Instant) -> Plan {
+        let key = format!("{conversation}\n{}", turn.key);
+        if held(&self.plain).contains(&key) {
+            return Plan::Plain;
+        }
+        // Taken, not read. A reply is continued once, and a thread that fails a check below
+        // is not kept for a later turn to try.
+        let Some(entry) = held(&self.entries).remove(&key) else {
+            return Plan::Create;
+        };
+        let sent = entry.sent;
+        // The caller repeats the reply where the vendor's copy of it stands, and adds a
+        // message of its own after it. Anything else is a conversation the vendor does not
+        // hold: an edited reply, a dropped one, a request that only repeats it.
+        let continues = entry.account == account
+            && now.saturating_duration_since(entry.noted_at) < IDLE
+            && turn.prefixes.get(sent) == Some(&entry.prefix)
+            && turn.messages.get(sent).is_some_and(|message| {
+                message.role == Role::Assistant && message.hash == entry.reply.hash
+            })
+            && turn
+                .messages
+                .get(sent + 1)
+                .is_some_and(|message| message.role == Role::User);
+        if continues {
+            Plan::Continue {
+                previous_message_id: entry.reply.id,
+                from: sent + 1,
+            }
+        } else {
+            Plan::Create
+        }
+    }
+
+    /// The vendor answered `turn` with `reply` and stored both.
+    pub fn note_reply(
+        &self,
+        conversation: &str,
+        account: &str,
+        turn: &Turn,
+        reply: Stored,
+        now: Instant,
+    ) {
+        let mut entries = held(&self.entries);
+        if entries.len() >= CAPACITY {
+            entries.retain(|_, entry| now.saturating_duration_since(entry.noted_at) < IDLE);
+        }
+        if entries.len() >= CAPACITY {
+            entries.clear();
+        }
+        entries.insert(
+            format!("{conversation}\n{}", turn.key),
+            Entry {
+                account: account.to_string(),
+                reply,
+                sent: turn.messages.len(),
+                prefix: turn.whole().to_string(),
+                noted_at: now,
+            },
+        );
+    }
+
+    /// The vendor refused a thread for `turn`. Its conversation goes out plain from now on.
+    pub fn go_plain(&self, conversation: &str, turn: &Turn) {
+        let key = format!("{conversation}\n{}", turn.key);
+        held(&self.entries).remove(&key);
+        let mut plain = held(&self.plain);
+        if plain.len() >= CAPACITY {
+            plain.clear();
+        }
+        plain.insert(key);
+    }
+}
+
+/// A message as a hash that its two holders agree on.
+///
+/// The vendor holds what it was sent and what it answered; the caller holds what it sent
+/// and what it kept of the answer. They differ where a harness is free to differ: a cache
+/// marker moves every turn, thinking is kept or dropped, an empty text block is dropped,
+/// a text-only message is a string or one block. None of that changes what was said.
+fn message_hash(message: &Value) -> String {
+    let role = message
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let assistant = role == "assistant";
+    let content: Vec<Value> = match message.get("content") {
+        Some(Value::String(text)) if !text.is_empty() => {
+            vec![json!({"type": "text", "text": text})]
+        }
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|block| said(block, assistant))
+            .collect(),
+        _ => Vec::new(),
+    };
+    sha256_hex(&json!({"role": role, "content": content}).to_string())
+}
+
+/// One content block, reduced to what it says.
+fn said(block: &Value, assistant: bool) -> Option<Value> {
+    match block.get("type").and_then(Value::as_str) {
+        Some("text") => {
+            let text = block
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            (!text.is_empty()).then(|| json!({"type": "text", "text": text}))
+        }
+        Some("thinking" | "redacted_thinking") if assistant => None,
+        Some("tool_use") if assistant => Some(json!({
+            "type": "tool_use",
+            "id": block.get("id"),
+            "name": block.get("name"),
+            "input": block.get("input")
+        })),
+        _ => {
+            let mut block = block.clone();
+            unmark(&mut block);
+            if let Some(nested) = block.get_mut("content").and_then(Value::as_array_mut) {
+                nested.iter_mut().for_each(unmark);
+            }
+            Some(block)
+        }
+    }
+}
+
+fn unmark(block: &mut Value) {
+    if let Some(object) = block.as_object_mut() {
+        object.remove("cache_control");
     }
 }
 
 #[cfg(test)]
-mod streaming_reply_tests {
+mod tests {
     use super::*;
-    use serde_json::json;
 
-    #[test]
-    fn a_streamed_reply_hashes_like_the_same_reply_sent_whole() {
-        let mut reply = StreamingReply::default();
-        for event in [
-            json!({"type": "message_start", "message": {"id": "msg_1"}}),
-            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
-            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "po"}}),
-            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "ng"}}),
-            json!({"type": "content_block_stop", "index": 0}),
-            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "toolu_1", "name": "Bash"}}),
-            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"cmd\":"}}),
-            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "\"ls\"}"}}),
-            json!({"type": "content_block_stop", "index": 1}),
-            json!({"type": "message_stop"}),
-        ] {
-            reply.feed(&event);
+    const ACCOUNT: &str = "a@example.com";
+
+    /// A conversation as a harness resends it: `turns` user messages, each earlier one
+    /// followed by the `pong` the vendor answered.
+    fn conversation(turns: usize) -> Value {
+        let mut messages = Vec::new();
+        for turn in 1..=turns {
+            if turn > 1 {
+                messages.push(json!({"role": "assistant", "content": "pong"}));
+            }
+            messages.push(json!({"role": "user", "content": format!("turn {turn}")}));
         }
-        assert_eq!(reply.id.as_deref(), Some("msg_1"));
-        let whole = json!({"role": "assistant", "content": [
-            {"type": "text", "text": "pong"},
-            {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"cmd": "ls"}}
-        ]});
-        assert_eq!(reply.reply_hash(), Some(ThreadLedger::reply_hash(&whole)));
+        json!({"model": "m", "messages": messages})
+    }
+
+    fn turn(body: &Value) -> Turn {
+        Turn::of(body, "beta")
+    }
+
+    fn pong(n: usize) -> Stored {
+        Stored::of(&json!({
+            "id": format!("msg_{n}"),
+            "content": [{"type": "text", "text": "pong"}],
+            "stop_reason": "end_turn"
+        }))
+        .expect("a stored reply")
+    }
+
+    /// A ledger whose vendor answered the first `turns` turns of the conversation.
+    fn answered(turns: usize) -> (ThreadLedger, Instant) {
+        let ledger = ThreadLedger::default();
+        let now = Instant::now();
+        ledger.note_reply("c", ACCOUNT, &turn(&conversation(turns)), pong(turns), now);
+        (ledger, now)
+    }
+
+    fn continues(n: usize, from: usize) -> Plan {
+        Plan::Continue {
+            previous_message_id: format!("msg_{n}"),
+            from,
+        }
     }
 
     #[test]
-    fn a_stream_without_its_end_has_no_reply_hash() {
+    fn a_conversation_with_no_thread_creates() {
+        let ledger = ThreadLedger::default();
+        let plan = ledger.plan("c", ACCOUNT, &turn(&conversation(1)), Instant::now());
+        assert_eq!(plan, Plan::Create);
+    }
+
+    #[test]
+    fn a_grown_conversation_continues_after_its_reply_and_only_once() {
+        let (ledger, now) = answered(1);
+        let next = turn(&conversation(2));
+        assert_eq!(ledger.plan("c", ACCOUNT, &next, now), continues(1, 2));
+        assert_eq!(ledger.plan("c", ACCOUNT, &next, now), Plan::Create);
+    }
+
+    #[test]
+    fn a_continued_thread_continues_again() {
+        let (ledger, now) = answered(1);
+        let second = turn(&conversation(2));
+        assert_eq!(ledger.plan("c", ACCOUNT, &second, now), continues(1, 2));
+        ledger.note_reply("c", ACCOUNT, &second, pong(2), now);
+        let third = turn(&conversation(3));
+        assert_eq!(ledger.plan("c", ACCOUNT, &third, now), continues(2, 4));
+    }
+
+    #[test]
+    fn an_idle_thread_creates() {
+        let (ledger, now) = answered(1);
+        let late = now + Duration::from_mins(5);
+        assert_eq!(
+            ledger.plan("c", ACCOUNT, &turn(&conversation(2)), late),
+            Plan::Create
+        );
+    }
+
+    #[test]
+    fn another_account_creates() {
+        let (ledger, now) = answered(1);
+        let plan = ledger.plan("c", "b@example.com", &turn(&conversation(2)), now);
+        assert_eq!(plan, Plan::Create);
+    }
+
+    #[test]
+    fn a_changed_fixed_field_or_beta_creates() {
+        for field in FIXED {
+            let (ledger, now) = answered(1);
+            let mut changed = conversation(2);
+            changed[field] = json!("changed");
+            assert_eq!(
+                ledger.plan("c", ACCOUNT, &turn(&changed), now),
+                Plan::Create,
+                "{field}"
+            );
+        }
+        let (ledger, now) = answered(1);
+        let wider = Turn::of(&conversation(2), "beta,another-beta");
+        assert_eq!(ledger.plan("c", ACCOUNT, &wider, now), Plan::Create);
+    }
+
+    #[test]
+    fn a_side_request_under_the_same_session_leaves_the_thread_alone() {
+        // A harness asks a small model for a title under its conversation's session.
+        let (ledger, now) = answered(1);
+        let side = json!({"model": "small", "messages": [{"role": "user", "content": "title?"}]});
+        assert_eq!(ledger.plan("c", ACCOUNT, &turn(&side), now), Plan::Create);
+        ledger.note_reply("c", ACCOUNT, &turn(&side), pong(9), now);
+
+        assert_eq!(
+            ledger.plan("c", ACCOUNT, &turn(&conversation(2)), now),
+            continues(1, 2)
+        );
+    }
+
+    #[test]
+    fn two_conversations_under_one_session_keep_their_own_threads() {
+        let ledger = ThreadLedger::default();
+        let now = Instant::now();
+        let talk = |opening: &str, grown: bool| {
+            let mut messages = vec![json!({"role": "user", "content": opening})];
+            if grown {
+                messages.push(json!({"role": "assistant", "content": "pong"}));
+                messages.push(json!({"role": "user", "content": "more"}));
+            }
+            json!({"model": "m", "messages": messages})
+        };
+        ledger.note_reply("c", ACCOUNT, &turn(&talk("alpha", false)), pong(1), now);
+        ledger.note_reply("c", ACCOUNT, &turn(&talk("beta", false)), pong(2), now);
+
+        assert_eq!(
+            ledger.plan("c", ACCOUNT, &turn(&talk("alpha", true)), now),
+            continues(1, 2)
+        );
+        assert_eq!(
+            ledger.plan("c", ACCOUNT, &turn(&talk("beta", true)), now),
+            continues(2, 2)
+        );
+    }
+
+    #[test]
+    fn a_rewritten_message_or_reply_creates() {
+        for (index, content) in [(0, "turn 1, edited"), (1, "not what the vendor said")] {
+            let (ledger, now) = answered(1);
+            let mut edited = conversation(2);
+            edited["messages"][index]["content"] = json!(content);
+            assert_eq!(
+                ledger.plan("c", ACCOUNT, &turn(&edited), now),
+                Plan::Create,
+                "{index}"
+            );
+        }
+    }
+
+    #[test]
+    fn what_a_harness_is_free_to_change_does_not_end_the_thread() {
+        let mark = json!({"type": "ephemeral"});
+        let variants = [
+            // The reply as blocks instead of a string, with a cache marker on it.
+            json!([{"type": "text", "text": "pong", "cache_control": mark}]),
+            // The reply with the thinking the vendor sent, and an empty text block.
+            json!([
+                {"type": "thinking", "thinking": "hm", "signature": "s"},
+                {"type": "text", "text": ""},
+                {"type": "text", "text": "pong"}
+            ]),
+        ];
+        for reply in variants {
+            let (ledger, now) = answered(1);
+            let mut next = conversation(2);
+            next["messages"][1]["content"] = reply;
+            // The first message, now as a block with a marker it did not have before.
+            next["messages"][0]["content"] =
+                json!([{"type": "text", "text": "turn 1", "cache_control": mark}]);
+            assert_eq!(
+                ledger.plan("c", ACCOUNT, &turn(&next), now),
+                continues(1, 2)
+            );
+        }
+    }
+
+    #[test]
+    fn a_cache_marker_inside_a_tool_result_does_not_end_the_thread() {
+        let talk = |marked: bool, grown: bool| {
+            let mut result = json!({"type": "tool_result", "tool_use_id": "t", "content": [
+                {"type": "text", "text": "out"}
+            ]});
+            if marked {
+                result["cache_control"] = json!({"type": "ephemeral"});
+                result["content"][0]["cache_control"] = json!({"type": "ephemeral"});
+            }
+            let mut messages = vec![json!({"role": "user", "content": [result]})];
+            if grown {
+                messages.push(json!({"role": "assistant", "content": "pong"}));
+                messages.push(json!({"role": "user", "content": "more"}));
+            }
+            json!({"model": "m", "messages": messages})
+        };
+        let ledger = ThreadLedger::default();
+        let now = Instant::now();
+        ledger.note_reply("c", ACCOUNT, &turn(&talk(true, false)), pong(1), now);
+        assert_eq!(
+            ledger.plan("c", ACCOUNT, &turn(&talk(false, true)), now),
+            continues(1, 2)
+        );
+    }
+
+    #[test]
+    fn a_user_message_with_the_replys_words_is_not_the_reply() {
+        let (ledger, now) = answered(1);
+        let mut next = conversation(2);
+        next["messages"][1]["role"] = json!("user");
+        assert_eq!(ledger.plan("c", ACCOUNT, &turn(&next), now), Plan::Create);
+    }
+
+    #[test]
+    fn a_turn_with_no_user_message_after_the_reply_creates() {
+        for after in [json!([]), json!([{"role": "assistant", "content": "more"}])] {
+            let (ledger, now) = answered(1);
+            let mut next = conversation(2);
+            let messages = next["messages"].as_array_mut().expect("messages");
+            messages.truncate(2);
+            messages.extend(after.as_array().cloned().unwrap_or_default());
+            assert_eq!(ledger.plan("c", ACCOUNT, &turn(&next), now), Plan::Create);
+        }
+    }
+
+    #[test]
+    fn a_refused_conversation_stays_plain_and_others_do_not() {
+        let (ledger, now) = answered(1);
+        ledger.go_plain("c", &turn(&conversation(1)));
+        for turns in 1..=3 {
+            let plan = ledger.plan("c", ACCOUNT, &turn(&conversation(turns)), now);
+            assert_eq!(plan, Plan::Plain);
+        }
+        let other = json!({"model": "m", "messages": [{"role": "user", "content": "other"}]});
+        assert_eq!(ledger.plan("c", ACCOUNT, &turn(&other), now), Plan::Create);
+        assert_eq!(
+            ledger.plan("d", ACCOUNT, &turn(&conversation(1)), now),
+            Plan::Create
+        );
+    }
+
+    fn reply(stop: Option<&str>, content: &Value) -> Value {
+        json!({"id": "msg_1", "content": content, "stop_reason": stop})
+    }
+
+    #[test]
+    fn only_a_reply_the_vendor_holds_is_stored() {
+        let text = json!([{"type": "text", "text": "pong"}]);
+        let call = json!([{"type": "tool_use", "id": "t", "name": "Bash", "input": {}}]);
+        for stop in STORED_STOPS {
+            assert!(Stored::of(&reply(Some(stop), &text)).is_some(), "{stop}");
+        }
+        assert!(Stored::of(&reply(Some("tool_use"), &call)).is_some());
+        for (what, unstored) in [
+            ("a refusal", reply(Some("refusal"), &text)),
+            ("an unknown stop", reply(Some("pause_turn"), &text)),
+            ("no stop", reply(None, &text)),
+            ("a cut tool call", reply(Some("max_tokens"), &call)),
+            ("no id", json!({"content": text, "stop_reason": "end_turn"})),
+            (
+                "an empty id",
+                json!({"id": "", "content": text, "stop_reason": "end_turn"}),
+            ),
+            (
+                "a fallback model's answer",
+                json!({"id": "msg_1", "content": text, "stop_reason": "end_turn",
+                    "usage": {"iterations": [{"fallback_message": {}}]}}),
+            ),
+        ] {
+            assert_eq!(Stored::of(&unstored), None, "{what}");
+        }
+    }
+
+    fn streamed(events: &[Value]) -> StreamingReply {
         let mut reply = StreamingReply::default();
-        reply.feed(&json!({"type": "message_start", "message": {"id": "msg_1"}}));
-        reply.feed(&json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}));
-        assert_eq!(reply.id.as_deref(), Some("msg_1"));
-        assert_eq!(reply.reply_hash(), None);
+        for event in events {
+            reply.feed(event);
+        }
+        reply
+    }
+
+    fn stream_of_pong_and_a_tool_call() -> Vec<Value> {
+        vec![
+            json!({"type": "message_start", "message": {"id": "msg_1"}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "hm"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "po"}}),
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "ng"}}),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({"type": "content_block_start", "index": 2, "content_block": {"type": "tool_use", "id": "t", "name": "Bash", "input": {}}}),
+            json!({"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": "{\"cmd\":"}}),
+            json!({"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": "\"ls\"}"}}),
+            json!({"type": "content_block_stop", "index": 2}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 3}}),
+            json!({"type": "message_stop"}),
+        ]
+    }
+
+    #[test]
+    fn a_streamed_reply_is_the_reply_it_would_be_whole() {
+        let whole = Stored::of(&reply(
+            Some("tool_use"),
+            &json!([
+                {"type": "text", "text": "pong"},
+                {"type": "tool_use", "id": "t", "name": "Bash", "input": {"cmd": "ls"}}
+            ]),
+        ));
+        assert!(whole.is_some());
+        assert_eq!(streamed(&stream_of_pong_and_a_tool_call()).stored(), whole);
+    }
+
+    #[test]
+    fn a_tool_call_with_no_input_text_has_an_empty_input() {
+        let events = [
+            json!({"type": "message_start", "message": {"id": "msg_1"}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "t", "name": "Bash", "input": {}}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}}),
+            json!({"type": "message_stop"}),
+        ];
+        let whole = Stored::of(&reply(
+            Some("tool_use"),
+            &json!([{"type": "tool_use", "id": "t", "name": "Bash", "input": {}}]),
+        ));
+        assert_eq!(streamed(&events).stored(), whole);
+    }
+
+    #[test]
+    fn a_stream_the_vendor_did_not_finish_or_store_is_no_reply() {
+        let whole = stream_of_pong_and_a_tool_call();
+        let without = |kind: &str| -> Vec<Value> {
+            whole
+                .iter()
+                .filter(|event| event["type"] != kind)
+                .cloned()
+                .collect()
+        };
+        let with = |extra: Value| -> Vec<Value> {
+            let mut events = whole.clone();
+            events.insert(1, extra);
+            events
+        };
+        let mut refused = whole.clone();
+        refused[12]["delta"]["stop_reason"] = json!("refusal");
+        let mut garbled = whole.clone();
+        garbled[10]["delta"]["partial_json"] = json!("\"ls\"");
+        for (what, events) in [
+            ("no message_stop", without("message_stop")),
+            ("no stop reason", without("message_delta")),
+            ("a refusal", refused),
+            (
+                "an error event",
+                with(json!({"type": "error", "error": {"type": "overloaded_error"}})),
+            ),
+            (
+                "a block this reader does not know",
+                with(
+                    json!({"type": "content_block_start", "index": 7, "content_block": {"type": "server_tool_use"}}),
+                ),
+            ),
+            ("a tool input that is not JSON", garbled),
+        ] {
+            assert_eq!(streamed(&events).stored(), None, "{what}");
+        }
     }
 }
