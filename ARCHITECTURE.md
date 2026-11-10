@@ -55,8 +55,8 @@ in files.
   conversation can leave as the continuation of a **Thread**, and holds the little the
   next turn is checked against: the Account, the last stored reply, and what the
   conversation said up to it. In memory only, taken on use and dropped on the first
-  doubt. It knows nothing of HTTP, Accounts' health or what a request looks like on
-  the wire.
+  doubt. It knows nothing of HTTP or of an Account's health, and it writes no request:
+  what a threaded turn sends is the Upstream client's.
 - **Cloaking sanitizer** (`masquerade.rs`) — strips a harness's bot-identity
   system sections, `PascalCase`s its tool names, and rewrites the literal phrases
   that trip the Classifier (openclaw sections and tool names; pi and opencode
@@ -141,10 +141,10 @@ in files.
 
 - **`UpstreamClient`** — the test seam: which vendor wire is spoken and whether
   any HTTP happens at all. `apply_cloaking` runs *below* it inside the HTTP
-  client, so a test double sees the pre-cloak body and headers. A **Thread** crosses
-  it as a fact beside the whole conversation, never as a shorter body: a double sees
-  every turn whole, and what a continue looks like on the wire is tested where it is
-  written. Model metadata
+  client, so a test double sees the pre-cloak body and headers. How a turn is
+  threaded crosses it as a fact beside the whole conversation, never as a shorter
+  body: a double sees every turn whole, and what a continue looks like on the wire
+  is tested where it is written. Model metadata
   ranking runs below it too, operator tier included, so a test double's models
   are advertised as it returns them (ADR-0029). So do a stream's Silence limit
   and the Retry hint's parse: a test double hands back a parsed hint, and only a
@@ -346,13 +346,13 @@ in files.
   earlier messages, and nothing changed that the vendor holds fixed. Anything else is
   sent whole (ADR-0032).
 - **A Declined thread is decided by status, never by words.** Any 4xx to a threaded
-  turn but 401 and 429 may be the Thread's doing, and so may a vendor fault on a
-  continue, the one request that asks the vendor for what it holds. The turn is sent
-  again without that Thread, as a new one when the old is gone or busy and Plain
-  otherwise, and the answer to the last attempt is the one that is recorded and
-  returned. A conversation the vendor took Plain after declining stays Plain on that
-  Account, and three in a row rest the Account for an hour. A 401 or a 429 is the
-  Account's, as for any request (ADR-0032).
+  turn but 401 and 429 may be the Thread's doing. The turn is sent again without
+  that Thread, as a new one when the old is gone or busy and Plain otherwise, and the
+  answer to the last attempt is the one that is recorded and returned. A conversation
+  the vendor took Plain after declining stays Plain on that Account, and three in a
+  row rest the Account for an hour. A vendor fault on a continue, other than a 529,
+  is sent again Plain too and is held against nothing. A 401, a 429, a 529 and a
+  fault on a create are the Account's, as for any request (ADR-0032).
 - **A Thread lives and dies with the process.** Nothing about one is written to
   disk: the vendor drops a Thread five minutes after its last request, so a restart
   costs one whole request per conversation.

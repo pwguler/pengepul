@@ -50,10 +50,10 @@ use crate::translate::{
 use crate::types::{AvailableAccount, ProviderId, ProviderKind, UsageData};
 use crate::upstream::{
     ANTHROPIC_BASE_URL, CODEX_BASE_URL, CODEX_DEFAULT_CLI_VERSION, CODEX_MODELS_PATH,
-    CODEX_RESPONSES_PATH, GROK_CHAT_BASE_URL, Thread, anthropic_headers, anthropic_messages_wire,
-    anthropic_usage_headers, codex_headers, generic_base_url, generic_chat_headers,
-    generic_headers, grok_chat_headers, learn_grok_client_version, normalize_codex_responses_body,
-    resolve_beta,
+    CODEX_RESPONSES_PATH, GROK_CHAT_BASE_URL, Threading, anthropic_headers,
+    anthropic_messages_wire, anthropic_usage_headers, codex_headers, generic_base_url,
+    generic_chat_headers, generic_headers, grok_chat_headers, learn_grok_client_version,
+    normalize_codex_responses_body, resolve_beta,
 };
 use crate::utils::now_iso;
 use crate::utils::sha256_hex;
@@ -82,8 +82,8 @@ pub struct UpstreamRequest {
     pub conversation: String,
     /// How an anthropic Messages request uses a message thread. `body` is the conversation
     /// whole either way; what is sent of it, and under which beta set, is the Upstream
-    /// client's to write. Every other call is [`Thread::Plain`].
-    pub thread: Thread,
+    /// client's to write. Every other call is [`Threading::Plain`].
+    pub threading: Threading,
 }
 
 #[derive(Debug, Clone)]
@@ -335,7 +335,7 @@ impl UpstreamClient for HttpUpstreamClient {
             };
             let (headers, body) = anthropic_messages_wire(
                 &request.body,
-                &request.thread,
+                &request.threading,
                 &request.request_headers,
                 &request.account,
                 &request.config,
@@ -359,7 +359,7 @@ impl UpstreamClient for HttpUpstreamClient {
             let timeout_ms = request.config.timeouts.stream_messages_ms;
             let (headers, body) = anthropic_messages_wire(
                 &request.body,
-                &request.thread,
+                &request.threading,
                 &request.request_headers,
                 &request.account,
                 &request.config,
@@ -1680,7 +1680,7 @@ async fn count_tokens(State(state): State<AppState>, headers: HeaderMap, body: B
             account: account.clone(),
             config: cloaked_config(&state),
             conversation,
-            thread: Thread::Plain,
+            threading: Threading::Plain,
         })
         .await
     {
@@ -2019,7 +2019,7 @@ async fn route_generic_chat_request(
                 account: account.clone(),
                 config: cloaked_config(state),
                 conversation: request.conversation.clone(),
-                thread: Thread::Plain,
+                threading: Threading::Plain,
             })
             .await
         {
@@ -2056,7 +2056,7 @@ async fn route_generic_chat_request(
             account: account.clone(),
             config: cloaked_config(state),
             conversation: request.conversation.clone(),
-            thread: Thread::Plain,
+            threading: Threading::Plain,
         })
         .await
     {
@@ -2095,7 +2095,7 @@ async fn route_grok_request(
                 account: account.clone(),
                 config: cloaked_config(state),
                 conversation: request.conversation.clone(),
-                thread: Thread::Plain,
+                threading: Threading::Plain,
             })
             .await
         {
@@ -2132,7 +2132,7 @@ async fn route_grok_request(
             account: account.clone(),
             config: cloaked_config(state),
             conversation: request.conversation.clone(),
-            thread: Thread::Plain,
+            threading: Threading::Plain,
         })
         .await
     {
@@ -2166,7 +2166,7 @@ async fn route_codex_request(
                 account: account.clone(),
                 config: cloaked_config(state),
                 conversation: request.conversation.clone(),
-                thread: Thread::Plain,
+                threading: Threading::Plain,
             })
             .await
         {
@@ -2203,7 +2203,7 @@ async fn route_codex_request(
             account: account.clone(),
             config: cloaked_config(state),
             conversation: request.conversation.clone(),
-            thread: Thread::Plain,
+            threading: Threading::Plain,
         })
         .await
     {
@@ -2272,25 +2272,25 @@ async fn route_anthropic_request(
             Turn::of(&masked, &beta),
         )
     });
-    let mut thread = conversation
+    let mut threading = conversation
         .as_ref()
-        .map_or(Thread::Plain, |(session, turn)| {
+        .map_or(Threading::Plain, |(session, turn)| {
             threads.plan(session, account_key, turn, Instant::now())
         });
     let mut whole = Some(masked);
-    let mut vendor_said = None;
+    let mut declined = None;
     // A thread is the relay's own doing, so the vendor declining one is never the caller's
     // error: the turn is sent again without that thread, down to no thread at all.
     let answer = loop {
         if threaded {
             tracing::debug!(
                 conversation = %request.conversation,
-                thread = thread.label(),
+                thread = threading.label(),
                 "message thread"
             );
         }
         let body = whole.take().unwrap_or_else(|| masked_body().0);
-        let sent = send_anthropic(state, headers, account, request, body, thread.clone()).await;
+        let sent = send_anthropic(state, headers, account, request, body, threading.clone()).await;
         let mut answer = match sent {
             Ok(answer) => answer,
             Err(error) => {
@@ -2298,28 +2298,39 @@ async fn route_anthropic_request(
                     .await;
             }
         };
-        let Some((again, vendor)) = declined_thread(&thread, &mut answer).await else {
+        let Some((again, vendor)) = sent_again_as(&threading, &mut answer).await else {
             break answer;
         };
-        tracing::debug!(
-            conversation = %request.conversation,
-            thread = thread.label(),
-            vendor,
-            "message thread declined"
-        );
-        vendor_said = Some(vendor);
-        thread = again;
+        // A fault is not the vendor declining: it says nothing of what the vendor takes,
+        // so only a declined thread is held against the conversation.
+        if answer.status().is_client_error() {
+            tracing::debug!(
+                conversation = %request.conversation,
+                thread = threading.label(),
+                vendor,
+                "message thread declined"
+            );
+            declined = Some(vendor);
+        } else {
+            tracing::debug!(
+                conversation = %request.conversation,
+                thread = threading.label(),
+                vendor,
+                "message thread failed"
+            );
+        }
+        threading = again;
     };
     // The vendor declined the thread and then took the turn plain, so it was the thread it
     // declined. Had it declined that too, the error would be the caller's own, and would
     // say nothing about threads.
-    if let (Some(vendor), Some((session, turn))) = (&vendor_said, &conversation)
-        && thread == Thread::Plain
+    if let (Some(vendor), Some((session, turn))) = (&declined, &conversation)
+        && threading == Threading::Plain
         && answer.status().is_success()
     {
         threads.go_plain(session, account_key, turn, Instant::now(), vendor);
     }
-    let noted = conversation.filter(|_| thread != Thread::Plain);
+    let noted = conversation.filter(|_| threading != Threading::Plain);
     anthropic_response(state, account, request, route, answer, tool_reverse, noted).await
 }
 
@@ -2367,7 +2378,7 @@ async fn send_anthropic(
     account: &AvailableAccount,
     request: &ResolvedRequest,
     body: Value,
-    thread: Thread,
+    threading: Threading,
 ) -> anyhow::Result<Answer> {
     let upstream_request = UpstreamRequest {
         body,
@@ -2375,7 +2386,7 @@ async fn send_anthropic(
         account: account.clone(),
         config: cloaked_config(state),
         conversation: request.conversation.clone(),
-        thread,
+        threading,
     };
     if request.client_wants_stream {
         state
@@ -2450,12 +2461,12 @@ async fn anthropic_response(
     }
 }
 
-/// Whether the vendor declined the thread of a turn it was sent: then what the turn is sent
-/// again as, and what the vendor said, for the operator. Nothing when its answer stands.
+/// What a threaded turn is sent again as when the vendor's answer may be its thread's
+/// doing, with what the vendor said, for the operator. Nothing when the answer stands.
 ///
 /// The vendor says why in words that change, so the words decide nothing. The status
 /// does, and for a continue the vendor's code for a thread that is gone or busy.
-async fn declined_thread(thread: &Thread, answer: &mut Answer) -> Option<(Thread, String)> {
+async fn sent_again_as(threading: &Threading, answer: &mut Answer) -> Option<(Threading, String)> {
     let status = answer.status();
     // An expired token and a rate limit are the Account's whatever the request carried,
     // as for any request. Any other 4xx may be the thread's doing.
@@ -2464,12 +2475,12 @@ async fn declined_thread(thread: &Thread, answer: &mut Answer) -> Option<(Thread
     // vendor for what it holds. A 529 is the vendor saying it is overloaded, which another
     // request would only add to. A fault on a create fails over as for any request.
     let vendor_fault = status.is_server_error() && status.as_u16() != 529;
-    let declined = match thread {
-        Thread::Plain => false,
-        Thread::Create => client_error,
-        Thread::Continue { .. } => client_error || vendor_fault,
+    let the_threads = match threading {
+        Threading::Plain => false,
+        Threading::Create => client_error,
+        Threading::Continue { .. } => client_error || vendor_fault,
     };
-    if !declined {
+    if !the_threads {
         return None;
     }
     let error = answer.error().await;
@@ -2492,10 +2503,10 @@ async fn declined_thread(thread: &Thread, answer: &mut Answer) -> Option<(Thread
         .pointer("/error/details/error_code")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let again = if matches!(thread, Thread::Continue { .. }) && gone.contains(&code) {
-        Thread::Create
+    let again = if matches!(threading, Threading::Continue { .. }) && gone.contains(&code) {
+        Threading::Create
     } else {
-        Thread::Plain
+        Threading::Plain
     };
     Some((again, format!("{} {message}", status.as_u16())))
 }
@@ -4544,9 +4555,9 @@ mod tests {
     /// that is gone or busy.
     #[tokio::test]
     async fn only_some_answers_send_a_threaded_turn_again() {
-        use super::{Answer, Thread, declined_thread};
+        use super::{Answer, Threading, sent_again_as};
 
-        async fn again(thread: &Thread, status: u16, code: &str) -> Option<Thread> {
+        async fn again(threading: &Threading, status: u16, code: &str) -> Option<Threading> {
             let mut answer = Answer::Whole(UpstreamJsonResponse {
                 quota: None,
                 retry_hint: None,
@@ -4557,22 +4568,22 @@ mod tests {
                     "details": {"error_code": code}
                 }}),
             });
-            let declined = declined_thread(thread, &mut answer).await;
-            if let Some((_, vendor)) = &declined {
+            let sent_again = sent_again_as(threading, &mut answer).await;
+            if let Some((_, vendor)) = &sent_again {
                 assert_eq!(vendor, &format!("{status} thread: no"));
             }
-            declined.map(|(again, _)| again)
+            sent_again.map(|(again, _)| again)
         }
-        let continuing = Thread::Continue {
+        let continuing = Threading::Continue {
             previous_message_id: "msg_1".to_string(),
             from: 2,
         };
         // A success, an expired token, a rate limit and an overloaded vendor are never the
         // thread's, whatever the body says.
         for status in [200, 401, 429, 529] {
-            for thread in [Thread::Create, continuing.clone()] {
+            for threading in [Threading::Create, continuing.clone()] {
                 assert_eq!(
-                    again(&thread, status, "thread_not_found").await,
+                    again(&threading, status, "thread_not_found").await,
                     None,
                     "{status}"
                 );
@@ -4581,25 +4592,28 @@ mod tests {
         // Any other 4xx may be: a create goes plain, and so does a continue, unless its
         // thread is only gone or busy.
         for status in [400, 403, 404, 413, 422] {
-            assert_eq!(again(&Thread::Plain, status, "").await, None);
+            assert_eq!(again(&Threading::Plain, status, "").await, None);
             assert_eq!(
-                again(&Thread::Create, status, "").await,
-                Some(Thread::Plain)
+                again(&Threading::Create, status, "").await,
+                Some(Threading::Plain)
             );
-            assert_eq!(again(&continuing, status, "").await, Some(Thread::Plain));
+            assert_eq!(again(&continuing, status, "").await, Some(Threading::Plain));
             for code in [
                 "thread_not_found",
                 "thread_already_continued",
                 "thread_continue_in_flight",
             ] {
-                assert_eq!(again(&continuing, status, code).await, Some(Thread::Create));
+                assert_eq!(
+                    again(&continuing, status, code).await,
+                    Some(Threading::Create)
+                );
             }
         }
         // A vendor fault is the thread's only where the thread was asked for.
         for status in [500, 502, 503] {
-            assert_eq!(again(&Thread::Plain, status, "").await, None);
-            assert_eq!(again(&Thread::Create, status, "").await, None);
-            assert_eq!(again(&continuing, status, "").await, Some(Thread::Plain));
+            assert_eq!(again(&Threading::Plain, status, "").await, None);
+            assert_eq!(again(&Threading::Create, status, "").await, None);
+            assert_eq!(again(&continuing, status, "").await, Some(Threading::Plain));
         }
     }
 
@@ -5682,7 +5696,7 @@ mod tests {
             account: generic_account(name),
             config: Arc::clone(&config),
             conversation: conversation.to_string(),
-            thread: super::Thread::Plain,
+            threading: super::Threading::Plain,
         };
 
         client

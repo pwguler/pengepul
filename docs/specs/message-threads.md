@@ -63,19 +63,22 @@ again without the caller knowing.
   continues it, two conversations in one session keep their own threads, and a caller that
   names no session continues from its second turn.
 - AC-10 A thread the vendor declines never reaches the caller. A create answered with a 4xx
-  other than 401 and 429 is sent again plain. A continue answered so, or with a vendor
-  fault other than 529, is sent again as a create when its thread is gone or busy
-  (`thread_not_found`, `thread_already_continued`, `thread_continue_in_flight`), and plain
-  otherwise. One request records one outcome, whatever was sent for it.
+  other than 401 and 429 is sent again plain. A continue answered so is sent again as a
+  create when its thread is gone or busy (`thread_not_found`, `thread_already_continued`,
+  `thread_continue_in_flight`), and plain otherwise. One request records one outcome,
+  whatever was sent for it.
 - AC-11 An error that is the caller's own reaches it unchanged, after one plain try. It
   ends threading for no conversation, marks none plain and counts toward no rest.
 - AC-12 A 401 or a 429 to a threaded turn is the Account's: it costs the Account its health
   and fails over as for any request, and the turn is not sent again to that Account. So is
-  a 529, and a vendor fault on a create.
+  a 529, and a vendor fault on a create. A vendor fault other than 529 on a continue is
+  sent again plain, and is held against nothing: the next turn is offered as a thread.
 - AC-13 A conversation the vendor took plain after declining its thread stays plain on that
   Account. Three in a row on one Account, with no thread taken there between them, rest that
   Account for an hour: it is not asked for a thread, and another Account still is. A reply
-  that was on its way when a rest began does not end it.
+  that was on its way when a rest began does not end it. The ledger holds at most 4096
+  threads and 4096 plain conversations; one that is full is emptied, and the conversations
+  in it start over.
 - AC-14 A tool call in the reply to a continue comes back under the caller's tool name.
 - AC-15 With threads and without them, a caller receives the same status, headers and body.
 - AC-16 With `cloaking.message-threads: false` every request goes out plain. The relay
@@ -105,7 +108,8 @@ again without the caller knowing.
     `a_thread_does_not_follow_its_conversation_to_another_account`,
     `a_request_that_adds_no_user_message_after_the_reply_is_not_continued`,
     `a_message_that_only_looks_like_the_reply_is_not_skipped`;
-    `a_changed_fixed_field_or_beta_creates`, `an_idle_thread_creates` in `src/threads.rs`;
+    `a_changed_fixed_field_or_beta_creates`, `an_idle_thread_creates`,
+    `a_message_changed_between_the_opening_and_the_reply_creates` in `src/threads.rs`;
     `whatever_a_continue_leaves_out_the_ledger_compares` in `tests/upstream.rs`
   - AC-7: `a_cache_marker_that_moved_does_not_end_the_thread`,
     `a_reply_repeated_with_or_without_its_thinking_continues`;
@@ -124,7 +128,8 @@ again without the caller knowing.
     `only_some_answers_send_a_threaded_turn_again` in `src/app.rs`
   - AC-11: `an_error_that_is_the_callers_reaches_it_and_ends_nothing`,
     `a_callers_own_error_on_a_later_turn_does_not_end_threading`
-  - AC-12: `a_rate_limit_on_a_continue_is_the_accounts_and_fails_over`;
+  - AC-12: `a_rate_limit_on_a_continue_is_the_accounts_and_fails_over`,
+    `a_vendor_fault_on_a_continue_is_answered_plain_and_held_against_nothing`;
     `only_some_answers_send_a_threaded_turn_again` in `src/app.rs`
   - AC-13: `a_vendor_that_stopped_taking_threads_is_not_asked_for_every_conversation`,
     `what_one_account_declines_is_not_held_against_another`;
@@ -145,8 +150,8 @@ again without the caller knowing.
 
 - [Who threads]: the relay. A thread is bound to the Account that opened it, and the relay
   is the only party that knows which Account serves a conversation.
-- [What crosses the seam]: the conversation whole and a `Thread` saying how much of it the
-  vendor holds. What leaves is the Upstream client's to write: the beta set, the
+- [What crosses the seam]: the conversation whole and a `Threading` saying how much of it
+  the vendor holds. What leaves is the Upstream client's to write: the beta set, the
   billing-header block and the shape of a continue are vendor identity, and vendor identity
   is decided below `UpstreamClient`. A test double therefore sees the pre-cloak conversation
   on every turn.
@@ -162,11 +167,13 @@ again without the caller knowing.
   seconds after its reply.
 - [Declined threads]: decided by status, never by the words of an error, which change. Any
   4xx to a threaded turn but 401 and 429 may be the thread's doing, so the turn is sent
-  again plain and the answer to that is the one that counts. A vendor fault counts the same
-  on a continue, the one request that asks the vendor for what it holds; on a create it
-  fails over as for any request, and a 529 is never answered with another request. Only a
-  thread that is gone or busy opens another: anything else would be declined the same way
-  on the next continue, two requests a turn.
+  again plain and the answer to that is the one that counts. Only a thread that is gone or
+  busy opens another: anything else would be declined the same way on the next continue,
+  two requests a turn.
+- [Vendor faults]: a fault on a continue is sent again plain too, because a continue is the
+  one request that asks the vendor for what it holds. It is not the vendor declining, so it
+  marks nothing: one bad answer does not cost a long conversation its thread. A fault on a
+  create fails over as for any request, and a 529 is never answered with another request.
 - [Going plain]: a conversation goes plain only once the vendor has taken the same turn
   plain, so a caller's own error marks nothing. It is held against the Account the thread
   was declined on: a Pool can hold an Account the vendor takes no thread for beside one it

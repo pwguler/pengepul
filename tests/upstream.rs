@@ -9,9 +9,9 @@ use pengepul::config::{
 use pengepul::threads::{Stored, ThreadLedger, Turn};
 use pengepul::types::{AvailableAccount, ProviderId, ProviderKind, TokenData};
 use pengepul::upstream::{
-    RequestShape, THREAD_BETA, Thread, anthropic_headers, anthropic_messages_wire, apply_cloaking,
-    build_beta_header, codex_headers, generic_base_url, generic_chat_headers, generic_headers,
-    normalize_codex_responses_body,
+    RequestShape, THREAD_BETA, Threading, anthropic_headers, anthropic_messages_wire,
+    apply_cloaking, build_beta_header, codex_headers, generic_base_url, generic_chat_headers,
+    generic_headers, normalize_codex_responses_body,
 };
 use serde_json::{Value, json};
 
@@ -225,7 +225,7 @@ fn claude_3_drops_the_thinking_and_context_betas() {
 /// One anthropic Messages call as it leaves, for the conversation `body` holds whole.
 fn wire(
     body: &Value,
-    thread: &Thread,
+    threading: &Threading,
     request_headers: &[(&str, &str)],
 ) -> (BTreeMap<String, String>, Value) {
     let request_headers = request_headers
@@ -234,7 +234,7 @@ fn wire(
         .collect();
     anthropic_messages_wire(
         body,
-        thread,
+        threading,
         &request_headers,
         &account(ProviderId::anthropic()),
         &config(),
@@ -268,8 +268,8 @@ fn conversation() -> Value {
     })
 }
 
-fn continuing() -> Thread {
-    Thread::Continue {
+fn continuing() -> Threading {
+    Threading::Continue {
         previous_message_id: "msg_1".to_string(),
         from: 2,
     }
@@ -277,7 +277,7 @@ fn continuing() -> Thread {
 
 #[test]
 fn a_plain_request_leaves_as_cloaking_writes_it() {
-    let (headers, body) = wire(&conversation(), &Thread::Plain, &[]);
+    let (headers, body) = wire(&conversation(), &Threading::Plain, &[]);
 
     let cloaked = apply_cloaking(
         &conversation(),
@@ -292,8 +292,8 @@ fn a_plain_request_leaves_as_cloaking_writes_it() {
 
 #[test]
 fn a_create_is_the_plain_request_with_a_thread_and_its_beta() {
-    let (plain_headers, plain) = wire(&conversation(), &Thread::Plain, &[]);
-    let (headers, mut body) = wire(&conversation(), &Thread::Create, &[]);
+    let (plain_headers, plain) = wire(&conversation(), &Threading::Plain, &[]);
+    let (headers, mut body) = wire(&conversation(), &Threading::Create, &[]);
 
     assert_eq!(body["thread"], json!({"type": "create"}));
     body.as_object_mut().expect("object").remove("thread");
@@ -311,7 +311,7 @@ fn a_create_is_the_plain_request_with_a_thread_and_its_beta() {
 #[test]
 fn a_continue_carries_what_is_new_under_its_conversations_identity() {
     let whole = conversation();
-    let (create_headers, create) = wire(&whole, &Thread::Create, &[]);
+    let (create_headers, create) = wire(&whole, &Threading::Create, &[]);
     let (headers, body) = wire(&whole, &continuing(), &[]);
 
     assert_eq!(body["messages"], json!([whole["messages"][2]]));
@@ -374,7 +374,7 @@ fn a_prompt_that_mentions_the_billing_header_is_not_the_billing_block() {
     let mut whole = conversation();
     whole["system"] = json!([prompt]);
 
-    let (_, created) = wire(&whole, &Thread::Create, &[]);
+    let (_, created) = wire(&whole, &Threading::Create, &[]);
     let (_, continued) = wire(&whole, &continuing(), &[]);
 
     let system = created["system"].as_array().expect("system blocks");
@@ -414,7 +414,7 @@ fn whatever_a_continue_leaves_out_the_ledger_compares() {
     ] {
         whole[field] = value;
     }
-    let (_, created) = wire(&whole, &Thread::Create, &[]);
+    let (_, created) = wire(&whole, &Threading::Create, &[]);
     let (_, continued) = wire(&whole, &continuing(), &[]);
     let left_out: Vec<&str> = created
         .as_object()
@@ -453,7 +453,7 @@ fn whatever_a_continue_leaves_out_the_ledger_compares() {
     for (pointer, value) in changes {
         let mut next = whole.clone();
         *next.pointer_mut(pointer).expect("the field") = value;
-        assert_eq!(plan(&next), Thread::Create, "{pointer}");
+        assert_eq!(plan(&next), Threading::Create, "{pointer}");
     }
 }
 
@@ -468,8 +468,8 @@ fn the_thread_beta_joins_the_set_the_request_already_carries() {
             "first-beta-2026-01-01,second-beta-2026-01-02",
         ),
     ];
-    for thread in [Thread::Create, continuing()] {
-        let (headers, _) = wire(&conversation(), &thread, &cli);
+    for threading in [Threading::Create, continuing()] {
+        let (headers, _) = wire(&conversation(), &threading, &cli);
         assert_eq!(
             headers["anthropic-beta"],
             format!("oauth-2025-04-20,first-beta-2026-01-01,second-beta-2026-01-02,{THREAD_BETA}")
@@ -480,7 +480,7 @@ fn the_thread_beta_joins_the_set_the_request_already_carries() {
         ("user-agent", "Anthropic/Python 2.2.0"),
         ("anthropic-beta", "evil-beta"),
     ];
-    let (headers, _) = wire(&conversation(), &Thread::Create, &sdk);
+    let (headers, _) = wire(&conversation(), &Threading::Create, &sdk);
     let beta = &headers["anthropic-beta"];
     assert!(
         beta.ends_with(THREAD_BETA) && !beta.contains("evil-beta"),

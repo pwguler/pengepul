@@ -31,10 +31,11 @@ client that names a `thread` of its own is answered with the vendor's
 by sending the conversation whole.
 
 **A Declined thread is decided by status, never by the words of the error.** Any 4xx to a
-threaded turn but 401 and 429, and a vendor fault on a continue, is answered by sending the
-same turn again without that Thread: as a new one when the old is gone or busy, **Plain**
-otherwise. The answer to the last attempt is the one that is recorded and returned. What
-the vendor declines is held against the Account it declined on, and against no other.
+threaded turn but 401 and 429 is answered by sending the same turn again without that
+Thread: as a new one when the old is gone or busy, **Plain** otherwise. The answer to the
+last attempt is the one that is recorded and returned. What the vendor declines is held
+against the Account it declined on, and against no other. A vendor fault on a continue,
+other than a 529, is sent again Plain as well, and is held against nothing.
 
 **The Relay hands the Upstream client a fact, not a body.** The conversation crosses
 `UpstreamClient` whole beside how much of it the vendor holds, and the Upstream client
@@ -63,13 +64,15 @@ vendor identity.
 
 - A client's own 4xx on a threaded turn costs two Upstream requests, the threaded one and
   the plain one. The vendor bills neither. A vendor fault on a continue costs the same two
-  before it fails over.
+  before it fails over, and an overloaded vendor (529) is never sent the second.
 - Tokens are billed as for a whole request: the vendor reads the whole conversation and
   counts the held part as a cache read. What shrinks is the request body.
-- A Thread pays inside an agent's tool loop. A turn that arrives more than 270 seconds after
-  the last reply is sent whole.
+- A Thread pays inside a Harness's tool loop. A turn that arrives more than 270 seconds
+  after the last reply is sent whole.
 - A Harness that rewrites its earlier messages between turns never continues, and every
-  turn of it is sent whole. The relay names the reason in a debug line.
+  turn of it is sent whole. A debug line names the reason when it is the messages, the
+  Account or the idle time. A changed `system`, tool list, fixed field or opening message
+  makes the turn a conversation the ledger has not seen, and the line says only `create`.
 - A Pool can hold an Account the vendor takes no thread for. Three conversations in a row
   that go Plain there rest that Account for an hour, and the other Accounts are still asked.
 - `cloaking.message-threads: false` sends every request Plain.

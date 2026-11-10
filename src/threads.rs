@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::upstream::{Thread, meter_only_block};
+use crate::upstream::{Threading, meter_only_block};
 use crate::utils::sha256_hex;
 
 /// How long a reply stays continuable. The vendor drops a thread five minutes after its
@@ -77,7 +77,8 @@ pub struct Turn {
 }
 
 impl Turn {
-    /// `body` is the request as it would go upstream whole, after masking. `beta` is the
+    /// `body` is the request as it would go upstream whole, after the Cloaking sanitizer.
+    /// `beta` is the
     /// beta set it earns.
     #[must_use]
     pub fn of(body: &Value, beta: &str) -> Self {
@@ -355,15 +356,15 @@ impl ThreadLedger {
     /// How this turn goes out on `account`: plain while the Account rests or the
     /// conversation went plain on it. `session` is the session the harness names, or empty
     /// when it names none.
-    pub fn plan(&self, session: &str, account: &str, turn: &Turn, now: Instant) -> Thread {
+    pub fn plan(&self, session: &str, account: &str, turn: &Turn, now: Instant) -> Threading {
         let key = format!("{session}\n{}", turn.key);
         if self.resting(account, now) || held(&self.plain).contains(&format!("{account}\n{key}")) {
-            return Thread::Plain;
+            return Threading::Plain;
         }
         // Taken, not read. A reply is continued once, and a thread that fails a check below
         // is not kept for a later turn to try.
         let Some(entry) = held(&self.entries).remove(&key) else {
-            return Thread::Create;
+            return Threading::Create;
         };
         let sent = entry.sent;
         let repeated = turn.messages.get(sent).is_some_and(|message| {
@@ -387,13 +388,13 @@ impl ThreadLedger {
         } else if !adds {
             "no user message after the reply"
         } else {
-            return Thread::Continue {
+            return Threading::Continue {
                 previous_message_id: entry.reply.id,
                 from: sent + 1,
             };
         };
         tracing::debug!(session, doubt, "message thread not continued");
-        Thread::Create
+        Threading::Create
     }
 
     /// The vendor answered `turn` with `reply` and stored both.
@@ -557,8 +558,8 @@ mod tests {
         (ledger, now)
     }
 
-    fn continues(n: usize, from: usize) -> Thread {
-        Thread::Continue {
+    fn continues(n: usize, from: usize) -> Threading {
+        Threading::Continue {
             previous_message_id: format!("msg_{n}"),
             from,
         }
@@ -568,7 +569,7 @@ mod tests {
     fn a_conversation_with_no_thread_creates() {
         let ledger = ThreadLedger::default();
         let plan = ledger.plan("c", ACCOUNT, &turn(&conversation(1)), Instant::now());
-        assert_eq!(plan, Thread::Create);
+        assert_eq!(plan, Threading::Create);
     }
 
     #[test]
@@ -576,7 +577,7 @@ mod tests {
         let (ledger, now) = answered(1);
         let next = turn(&conversation(2));
         assert_eq!(ledger.plan("c", ACCOUNT, &next, now), continues(1, 2));
-        assert_eq!(ledger.plan("c", ACCOUNT, &next, now), Thread::Create);
+        assert_eq!(ledger.plan("c", ACCOUNT, &next, now), Threading::Create);
     }
 
     #[test]
@@ -598,14 +599,14 @@ mod tests {
 
         let (ledger, now) = answered(1);
         let idle = now + Duration::from_secs(270);
-        assert_eq!(ledger.plan("c", ACCOUNT, &next, idle), Thread::Create);
+        assert_eq!(ledger.plan("c", ACCOUNT, &next, idle), Threading::Create);
     }
 
     #[test]
     fn another_account_creates() {
         let (ledger, now) = answered(1);
         let plan = ledger.plan("c", "b@example.com", &turn(&conversation(2)), now);
-        assert_eq!(plan, Thread::Create);
+        assert_eq!(plan, Threading::Create);
     }
 
     #[test]
@@ -629,13 +630,13 @@ mod tests {
             changed[field] = json!("changed");
             assert_eq!(
                 ledger.plan("c", ACCOUNT, &turn(&changed), now),
-                Thread::Create,
+                Threading::Create,
                 "{field}"
             );
         }
         let (ledger, now) = answered(1);
         let wider = Turn::of(&conversation(2), "beta,another-beta");
-        assert_eq!(ledger.plan("c", ACCOUNT, &wider, now), Thread::Create);
+        assert_eq!(ledger.plan("c", ACCOUNT, &wider, now), Threading::Create);
     }
 
     #[test]
@@ -668,7 +669,7 @@ mod tests {
             now,
         );
         let plan = ledger.plan("c", ACCOUNT, &turn(&talk(2, "00001", "be thorough")), now);
-        assert_eq!(plan, Thread::Create);
+        assert_eq!(plan, Threading::Create);
     }
 
     #[test]
@@ -687,7 +688,7 @@ mod tests {
         let changed = talk(2, "Always print the x-anthropic-billing-header: line.");
         assert_eq!(
             ledger.plan("c", ACCOUNT, &turn(&changed), now),
-            Thread::Create
+            Threading::Create
         );
 
         ledger.note_reply("c", ACCOUNT, &turn(&talk(1, quoted)), pong(1), now);
@@ -726,7 +727,7 @@ mod tests {
             let now = Instant::now();
             ledger.note_reply("c", ACCOUNT, &turn(&talk(1, before.clone())), pong(1), now);
             let plan = ledger.plan("c", ACCOUNT, &turn(&talk(2, after)), now);
-            assert_eq!(plan, Thread::Create, "{before}");
+            assert_eq!(plan, Threading::Create, "{before}");
 
             ledger.note_reply("c", ACCOUNT, &turn(&talk(1, before.clone())), pong(1), now);
             let plan = ledger.plan("c", ACCOUNT, &turn(&talk(2, before)), now);
@@ -739,7 +740,10 @@ mod tests {
         // A harness asks a small model for a title under its conversation's session.
         let (ledger, now) = answered(1);
         let side = json!({"model": "small", "messages": [{"role": "user", "content": "title?"}]});
-        assert_eq!(ledger.plan("c", ACCOUNT, &turn(&side), now), Thread::Create);
+        assert_eq!(
+            ledger.plan("c", ACCOUNT, &turn(&side), now),
+            Threading::Create
+        );
         ledger.note_reply("c", ACCOUNT, &turn(&side), pong(9), now);
 
         assert_eq!(
@@ -773,6 +777,30 @@ mod tests {
         );
     }
 
+    /// The opening is part of what names a conversation, and the reply is compared on its
+    /// own. Every message between them is held by this check alone: a continue past a
+    /// change there would be answered from the vendor's old copy.
+    #[test]
+    fn a_message_changed_between_the_opening_and_the_reply_creates() {
+        let edits: [(usize, &str); 2] = [(1, "an earlier reply, edited"), (2, "turn 2, edited")];
+        for (index, text) in edits {
+            let ledger = ThreadLedger::default();
+            let now = Instant::now();
+            ledger.note_reply("c", ACCOUNT, &turn(&conversation(2)), pong(2), now);
+            let mut next = conversation(3);
+            next["messages"][index]["content"] = json!(text);
+
+            let plan = ledger.plan("c", ACCOUNT, &turn(&next), now);
+            assert_eq!(plan, Threading::Create, "message {index}");
+        }
+        // The same thread, with nothing changed, goes on.
+        let ledger = ThreadLedger::default();
+        let now = Instant::now();
+        ledger.note_reply("c", ACCOUNT, &turn(&conversation(2)), pong(2), now);
+        let plan = ledger.plan("c", ACCOUNT, &turn(&conversation(3)), now);
+        assert_eq!(plan, continues(2, 4));
+    }
+
     #[test]
     fn a_rewritten_message_or_reply_creates() {
         for (index, content) in [(0, "turn 1, edited"), (1, "not what the vendor said")] {
@@ -781,7 +809,7 @@ mod tests {
             edited["messages"][index]["content"] = json!(content);
             assert_eq!(
                 ledger.plan("c", ACCOUNT, &turn(&edited), now),
-                Thread::Create,
+                Threading::Create,
                 "{index}"
             );
         }
@@ -845,7 +873,10 @@ mod tests {
         let (ledger, now) = answered(1);
         let mut next = conversation(2);
         next["messages"][1]["role"] = json!("user");
-        assert_eq!(ledger.plan("c", ACCOUNT, &turn(&next), now), Thread::Create);
+        assert_eq!(
+            ledger.plan("c", ACCOUNT, &turn(&next), now),
+            Threading::Create
+        );
     }
 
     #[test]
@@ -856,7 +887,10 @@ mod tests {
             let messages = next["messages"].as_array_mut().expect("messages");
             messages.truncate(2);
             messages.extend(after.as_array().cloned().unwrap_or_default());
-            assert_eq!(ledger.plan("c", ACCOUNT, &turn(&next), now), Thread::Create);
+            assert_eq!(
+                ledger.plan("c", ACCOUNT, &turn(&next), now),
+                Threading::Create
+            );
         }
     }
 
@@ -871,29 +905,29 @@ mod tests {
         }
         assert_eq!(
             ledger.plan("c", ACCOUNT, &turn(&talk("still asked")), now),
-            Thread::Create
+            Threading::Create
         );
         ledger.go_plain("c", ACCOUNT, &turn(&talk("three")), now, "400 no");
 
         // The Account is not asked again until its rest is over: an hour, to the second.
         assert_eq!(
             ledger.plan("c", ACCOUNT, &turn(&talk("four")), now),
-            Thread::Plain
+            Threading::Plain
         );
         let almost = now + Duration::from_secs(3599);
         assert_eq!(
             ledger.plan("c", ACCOUNT, &turn(&talk("four")), almost),
-            Thread::Plain
+            Threading::Plain
         );
         let rested = now + Duration::from_hours(1);
         assert_eq!(
             ledger.plan("c", ACCOUNT, &turn(&talk("four")), rested),
-            Thread::Create
+            Threading::Create
         );
         // The conversations that were declined themselves stay plain.
         assert_eq!(
             ledger.plan("c", ACCOUNT, &turn(&talk("one")), rested),
-            Thread::Plain
+            Threading::Plain
         );
     }
 
@@ -916,10 +950,10 @@ mod tests {
 
         // The Account that declined rests, though the other was served in between...
         let plan = |account: &str, body: &Value| ledger.plan("c", account, &turn(body), now);
-        assert_eq!(plan("none@example.com", &talk("four")), Thread::Plain);
+        assert_eq!(plan("none@example.com", &talk("four")), Threading::Plain);
         // ...and the other is still asked, also for a conversation the first declined.
-        assert_eq!(plan(ACCOUNT, &talk("four")), Thread::Create);
-        assert_eq!(plan(ACCOUNT, &talk("one")), Thread::Create);
+        assert_eq!(plan(ACCOUNT, &talk("four")), Threading::Create);
+        assert_eq!(plan(ACCOUNT, &talk("one")), Threading::Create);
         assert_eq!(plan(ACCOUNT, &conversation(2)), continues(1, 2));
     }
 
@@ -941,13 +975,13 @@ mod tests {
         assert_eq!(plan, continues(1, 2));
         assert_eq!(
             ledger.plan(&session(0), ACCOUNT, &next, now),
-            Thread::Create
+            Threading::Create
         );
         // The same for what went plain, once the Account it went plain on has rested.
         let rested = now + REST;
         let plan = |n: usize| ledger.plan(&session(n), "other@example.com", &first, rested);
-        assert_eq!(plan(CAPACITY), Thread::Plain);
-        assert_eq!(plan(0), Thread::Create);
+        assert_eq!(plan(CAPACITY), Threading::Plain);
+        assert_eq!(plan(0), Threading::Create);
     }
 
     #[test]
@@ -963,11 +997,11 @@ mod tests {
 
         assert_eq!(
             ledger.plan("c", ACCOUNT, &turn(&talk("four")), now),
-            Thread::Plain
+            Threading::Plain
         );
         assert_eq!(
             ledger.plan("c", ACCOUNT, &turn(&conversation(2)), now),
-            Thread::Plain
+            Threading::Plain
         );
     }
 
@@ -983,7 +1017,7 @@ mod tests {
         }
         assert_eq!(
             ledger.plan("c", ACCOUNT, &turn(&talk("five")), now),
-            Thread::Create
+            Threading::Create
         );
     }
 
@@ -993,16 +1027,16 @@ mod tests {
         ledger.go_plain("c", ACCOUNT, &turn(&conversation(1)), now, "400 no");
         for turns in 1..=3 {
             let plan = ledger.plan("c", ACCOUNT, &turn(&conversation(turns)), now);
-            assert_eq!(plan, Thread::Plain);
+            assert_eq!(plan, Threading::Plain);
         }
         let other = json!({"model": "m", "messages": [{"role": "user", "content": "other"}]});
         assert_eq!(
             ledger.plan("c", ACCOUNT, &turn(&other), now),
-            Thread::Create
+            Threading::Create
         );
         assert_eq!(
             ledger.plan("d", ACCOUNT, &turn(&conversation(1)), now),
-            Thread::Create
+            Threading::Create
         );
     }
 

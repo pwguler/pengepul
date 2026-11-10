@@ -568,7 +568,7 @@ pub const THREAD_BETA: &str = "message-threads-2026-08-12";
 /// How an anthropic Messages request uses a message thread: how much of its conversation
 /// the vendor already holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Thread {
+pub enum Threading {
     /// None of it, and it is not asked to keep any: the conversation whole, as a request
     /// that has never heard of threads.
     Plain,
@@ -581,8 +581,8 @@ pub enum Thread {
     },
 }
 
-impl Thread {
-    /// The thread as one word, for a log line.
+impl Threading {
+    /// How the request is threaded, as one word for a log line.
     #[must_use]
     pub fn label(&self) -> &'static str {
         match self {
@@ -605,7 +605,7 @@ impl Thread {
 #[must_use]
 pub fn anthropic_messages_wire(
     body: &Value,
-    thread: &Thread,
+    threading: &Threading,
     request_headers: &BTreeMap<String, String>,
     account: &AvailableAccount,
     config: &Config,
@@ -625,7 +625,7 @@ pub fn anthropic_messages_wire(
         request_headers,
         body,
     );
-    if *thread != Thread::Plain
+    if *threading != Threading::Plain
         && let Some(beta) = headers.get_mut("anthropic-beta")
         && !beta.split(',').any(|part| part.trim() == THREAD_BETA)
     {
@@ -633,13 +633,13 @@ pub fn anthropic_messages_wire(
         beta.push_str(THREAD_BETA);
     }
 
-    let Thread::Continue {
+    let Threading::Continue {
         previous_message_id,
         from,
-    } = thread
+    } = threading
     else {
         let mut whole = apply_cloaking(body, request_headers, account, config);
-        if *thread == Thread::Create
+        if *threading == Threading::Create
             && let Some(object) = whole.as_object_mut()
         {
             object.insert("thread".to_string(), json!({"type": "create"}));

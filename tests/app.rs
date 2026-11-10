@@ -20,7 +20,7 @@ use pengepul::models::{FetchedModels, ModelMetadata, ModelPricing};
 use pengepul::quota::{QuotaSnapshot, QuotaWindow};
 use pengepul::tokens::save_token;
 use pengepul::types::{AvailableAccount, ProviderId, ProviderKind, TokenData};
-use pengepul::upstream::Thread;
+use pengepul::upstream::Threading;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -932,7 +932,7 @@ impl ThreadUpstream {
     /// told of.
     fn without_threads() -> Arc<Self> {
         Self::new(|request, call| {
-            if request.thread == Thread::Plain {
+            if request.threading == Threading::Plain {
                 (200, reply(call))
             } else {
                 (400, no_threads())
@@ -948,7 +948,7 @@ impl ThreadUpstream {
     fn kinds(&self) -> Vec<&'static str> {
         self.calls()
             .iter()
-            .map(|call| call.thread.label())
+            .map(|call| call.threading.label())
             .collect()
     }
 
@@ -1196,8 +1196,8 @@ fn conversation(turns: usize) -> Value {
 }
 
 /// The reply `id` continued, and the index of the first message the vendor does not hold.
-fn continuing(id: &str, from: usize) -> Thread {
-    Thread::Continue {
+fn continuing(id: &str, from: usize) -> Threading {
+    Threading::Continue {
         previous_message_id: id.to_string(),
         from,
     }
@@ -1309,10 +1309,10 @@ async fn a_conversation_opens_a_thread_then_continues_it() {
         assert_eq!(
             calls
                 .iter()
-                .map(|call| call.thread.clone())
+                .map(|call| call.threading.clone())
                 .collect::<Vec<_>>(),
             [
-                Thread::Create,
+                Threading::Create,
                 continuing("msg_1", 2),
                 continuing("msg_2", 4)
             ],
@@ -1454,7 +1454,7 @@ async fn a_create_the_vendor_declines_is_sent_again_plain() {
         for stream in [false, true] {
             let error = error.clone();
             let upstream = ThreadUpstream::new(move |request, call| {
-                if request.thread == Thread::Plain {
+                if request.threading == Threading::Plain {
                     (200, reply(call))
                 } else {
                     (status, error.clone())
@@ -1513,7 +1513,7 @@ async fn a_vendor_that_stopped_taking_threads_is_not_asked_for_every_conversatio
 async fn what_one_account_declines_is_not_held_against_another() {
     let upstream = ThreadUpstream::new(|request, call| {
         let without = request.account.token.email == "alice@example.com";
-        if without && request.thread != Thread::Plain {
+        if without && request.threading != Threading::Plain {
             (
                 403,
                 vendor_error(
@@ -1561,7 +1561,7 @@ async fn what_one_account_declines_is_not_held_against_another() {
     let calls = upstream.calls();
     let served: Vec<(&str, &str)> = calls
         .iter()
-        .map(|call| (&call.account.token.email[..1], call.thread.label()))
+        .map(|call| (&call.account.token.email[..1], call.threading.label()))
         .collect();
     assert_eq!(
         served,
@@ -1617,7 +1617,7 @@ async fn a_continue_whose_thread_is_gone_is_sent_again_as_a_create() {
                 "{code}"
             );
             assert_eq!(calls[2].body["messages"], conversation(2));
-            assert_eq!(calls[3].thread, continuing("msg_3", 4));
+            assert_eq!(calls[3].threading, continuing("msg_3", 4));
             assert_eq!(record(&app).await, (3, 3, 0, false));
         }
     }
@@ -1655,17 +1655,12 @@ async fn a_continue_declined_for_what_it_carries_leaves_the_conversation_plain()
             ),
         ),
         (403, vendor_error("permission_error", "not allowed", None)),
-        // A fault of the vendor's own, where only a continue asks it for what it holds.
-        (
-            500,
-            vendor_error("api_error", "Internal server error", None),
-        ),
     ];
     for (status, error) in declines {
         for stream in [false, true] {
             let error = error.clone();
             let upstream = ThreadUpstream::new(move |request, call| {
-                if matches!(request.thread, Thread::Continue { .. }) {
+                if matches!(request.threading, Threading::Continue { .. }) {
                     (status, error.clone())
                 } else {
                     (200, reply(call))
@@ -1686,6 +1681,39 @@ async fn a_continue_declined_for_what_it_carries_leaves_the_conversation_plain()
     }
 }
 
+/// Only a continue asks the vendor for what it holds, so a fault of the vendor's on one may
+/// be the thread's: the turn is sent again plain. A fault is not the vendor declining,
+/// though, and says nothing of the next turn, which is offered as a thread again.
+#[tokio::test]
+async fn a_vendor_fault_on_a_continue_is_answered_plain_and_held_against_nothing() {
+    for stream in [false, true] {
+        let upstream = ThreadUpstream::new(|request, call| {
+            if matches!(request.threading, Threading::Continue { .. }) {
+                (
+                    500,
+                    vendor_error("api_error", "Internal server error", None),
+                )
+            } else {
+                (200, reply(call))
+            }
+        });
+        let (app, _tmp) = threaded_app(upstream.clone());
+
+        for turns in 1..=4 {
+            let (status, body) = harness(&app, "conv", asking(conversation(turns), stream)).await;
+            assert_eq!(status, 200, "{body}");
+        }
+
+        assert_eq!(
+            upstream.kinds(),
+            ["create", "continue", "plain", "create", "continue", "plain"],
+            "stream={stream}"
+        );
+        assert_eq!(upstream.calls()[2].body["messages"], conversation(2));
+        assert_eq!(record(&app).await, (4, 4, 0, false));
+    }
+}
+
 /// A rate limit is the Account's, whatever the request carried. It costs the Account its
 /// health and moves the request to the next one, as for any request; it is not answered by
 /// sending the turn again to the Account that is limited.
@@ -1693,7 +1721,7 @@ async fn a_continue_declined_for_what_it_carries_leaves_the_conversation_plain()
 async fn a_rate_limit_on_a_continue_is_the_accounts_and_fails_over() {
     for stream in [false, true] {
         let upstream = ThreadUpstream::new(|request, call| {
-            if matches!(request.thread, Thread::Continue { .. }) {
+            if matches!(request.threading, Threading::Continue { .. }) {
                 (
                     429,
                     vendor_error(
@@ -1833,7 +1861,7 @@ async fn a_cache_marker_that_moved_does_not_end_the_thread() {
     assert_eq!(harness(&app, "conv", asking(first, false)).await.0, 200);
     assert_eq!(harness(&app, "conv", asking(second, false)).await.0, 200);
 
-    assert_eq!(upstream.calls()[1].thread, continuing("msg_1", 2));
+    assert_eq!(upstream.calls()[1].threading, continuing("msg_1", 2));
 }
 
 #[tokio::test]
@@ -2184,9 +2212,9 @@ async fn two_conversations_in_one_session_never_cross() {
         upstream.kinds(),
         ["create", "create", "continue", "continue"]
     );
-    assert_eq!(calls[2].thread, continuing("msg_1", 2));
+    assert_eq!(calls[2].threading, continuing("msg_1", 2));
     assert_eq!(calls[2].body["messages"], grown("alpha"));
-    assert_eq!(calls[3].thread, continuing("msg_2", 2));
+    assert_eq!(calls[3].threading, continuing("msg_2", 2));
 }
 
 /// A harness asks a small model for a title in its conversation's session, between the
@@ -2213,7 +2241,7 @@ async fn a_side_request_in_the_same_session_does_not_end_the_thread() {
     );
 
     assert_eq!(upstream.kinds(), ["create", "create", "continue"]);
-    assert_eq!(upstream.calls()[2].thread, continuing("msg_1", 2));
+    assert_eq!(upstream.calls()[2].threading, continuing("msg_1", 2));
 }
 
 #[tokio::test]
