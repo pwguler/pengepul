@@ -493,39 +493,72 @@ fn requests_long_retention(body: &Value) -> bool {
         })
 }
 
-/// What a billing block starts with: the one line that names the client and the conversation
-/// to the vendor's meter.
+/// What a billing-header block starts with: the line that names the client and the
+/// conversation to the vendor's meter.
 const BILLING_HEADER: &str = "x-anthropic-billing-header:";
 
-/// Whether a system block is a billing block: its text is the header line and nothing
-/// before it. A prompt that only mentions the header is a prompt.
-#[must_use]
-pub fn is_billing_block(block: &Value) -> bool {
+/// Whether a system block is a billing-header block: its text starts with the header. A
+/// prompt that mentions the header further on is a prompt.
+fn is_billing_block(block: &Value) -> bool {
     block
         .get("text")
         .and_then(Value::as_str)
         .is_some_and(|text| text.trim_start().starts_with(BILLING_HEADER))
 }
 
-/// The billing block of the conversation in `body`: the caller's own when it sent one, as
-/// Claude Code does, or the one its first message derives. It is the block Cloaking puts
-/// first on a whole request.
-fn billing_block(body: &Value, config: &Config) -> Value {
-    let own = body
-        .get("system")
-        .and_then(Value::as_array)
-        .and_then(|blocks| blocks.iter().find(|block| is_billing_block(block)));
-    own.cloned().unwrap_or_else(|| {
-        json!({
-            "type": "text",
-            "text": billing_header(
-                body.get("messages")
-                    .and_then(Value::as_array)
-                    .map_or(&[], Vec::as_slice),
-                &config.cloaking.cli_version,
-                &config.cloaking.entrypoint,
-            )
+/// Where the billing-header block of a `system` stands: the first one, which is the one
+/// Cloaking puts in front. A later one is `system` like any other block.
+fn billing_position(system: &[Value]) -> Option<usize> {
+    system.iter().position(is_billing_block)
+}
+
+/// The `system` block that says nothing to the model: the billing-header block, when its
+/// text is the header and its `name=value;` fields and nothing more. Claude Code writes a
+/// new one for every request, so a thread's `system` is compared without it. A block that
+/// goes on after the fields tells the model something, and is compared like any other.
+#[must_use]
+pub fn meter_only_block(system: &[Value]) -> Option<usize> {
+    let at = billing_position(system)?;
+    let fields = system[at]
+        .get("text")
+        .and_then(Value::as_str)?
+        .trim()
+        .strip_prefix(BILLING_HEADER)?;
+    fields
+        .split(';')
+        .map(str::trim)
+        .all(|field| {
+            field.is_empty() || (field.contains('=') && !field.contains(char::is_whitespace))
         })
+        .then_some(at)
+}
+
+/// The billing-header block the relay writes when a caller sent none: derived from the
+/// conversation's first message.
+fn derived_billing_block(messages: &[Value], config: &Config) -> Value {
+    json!({
+        "type": "text",
+        "text": billing_header(
+            messages,
+            &config.cloaking.cli_version,
+            &config.cloaking.entrypoint,
+        )
+    })
+}
+
+/// The billing-header block of the conversation in `body`: the caller's own when it sent
+/// one, as Claude Code does, or the derived one. It is the block Cloaking puts first on a
+/// whole request.
+fn billing_block(body: &Value, config: &Config) -> Value {
+    let system = body.get("system").and_then(Value::as_array);
+    let own = system.and_then(|blocks| Some(&blocks[billing_position(blocks)?]));
+    own.cloned().unwrap_or_else(|| {
+        derived_billing_block(
+            body.get("messages")
+                .and_then(Value::as_array)
+                .map_or(&[], Vec::as_slice),
+            config,
+        )
     })
 }
 
@@ -566,7 +599,7 @@ impl Thread {
 ///
 /// A continue therefore names the beta set its whole conversation earns, tools included,
 /// though it carries none of them, and its one `system` block is the conversation's
-/// billing block. Derived from the few messages a continue carries, both would differ
+/// billing-header block. Derived from the few messages a continue carries, both would differ
 /// from its create's on every turn, and the vendor holds a thread to the set it opened
 /// with.
 #[must_use]
@@ -696,17 +729,13 @@ pub fn apply_cloaking(
     }
 
     let billing = billing.unwrap_or_else(|| {
-        json!({
-            "type": "text",
-            "text": billing_header(
-                object
-                    .get("messages")
-                    .and_then(Value::as_array)
-                    .map_or(&[], Vec::as_slice),
-                &config.cloaking.cli_version,
-                &config.cloaking.entrypoint,
-            )
-        })
+        derived_billing_block(
+            object
+                .get("messages")
+                .and_then(Value::as_array)
+                .map_or(&[], Vec::as_slice),
+            config,
+        )
     });
     let mut prefix = prefix.unwrap_or_else(|| {
         json!({

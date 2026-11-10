@@ -3,10 +3,10 @@
 ## Goal
 
 An anthropic conversation continues on the vendor as a message thread instead of resending
-itself. No caller sees a thread: a harness sends the whole conversation as it always has and
-receives the answer it always would. Nothing about a thread can fail a request or hurt a
-Pool: it stays on its Account, and a turn the vendor declines as a thread is sent again
-without the caller knowing.
+itself. No caller sees a thread: a harness sends the whole conversation on every turn and
+receives the answer a plain request would get. Nothing about a thread can fail a request or
+hurt a Pool: it stays on its Account, and a turn the vendor declines as a thread is sent
+again without the caller knowing.
 
 ## Non-goals
 
@@ -29,7 +29,8 @@ without the caller knowing.
   `400` with `error.details.error_code == "thread_unsupported_request"`. No Account is
   chosen, nothing is sent upstream, and nothing is recorded.
 - AC-2 The same request without `thread`, or with `"thread": null`, is served as any other
-  request. A `thread` bound for another Provider is left as it is.
+  request. A request bound for another Provider is served whether it names a `thread` or
+  not.
 - AC-3 The first turn of a conversation goes out whole as `thread: {"type": "create"}`, and
   its `anthropic-beta` names `message-threads-2026-08-12` after the beta set the request
   carries anyway: the relay's own, or a Claude Code caller's.
@@ -38,16 +39,19 @@ without the caller knowing.
   after the reply, no `tools`, one `system` block, and the beta set its whole conversation
   earns, which is its create's. This holds for a whole reply and for a streamed one, and
   for a continue of a continue.
-- AC-5 The one `system` block of a continue is the conversation's billing block: the
+- AC-5 The one `system` block of a continue is the conversation's billing-header block: the
   caller's own when it sent one, otherwise the block a create of the same conversation
-  carries. Only a block whose text is the header line is a billing block; a prompt that
-  mentions the header is `system`.
+  carries. A billing-header block is the first `system` block whose text starts with the
+  header; a prompt that mentions the header further on, and a later block that starts with
+  it, are `system`.
 - AC-6 A turn continues only when the Account is the thread's, the reply is under 270
   seconds old, the earlier messages and the reply are repeated, a user message follows the
-  reply, and nothing fixed has changed: `model`, `system` without its billing block,
-  `tools`, `thinking`, `tool_choice`, `output_config`, `mcp_servers`, `context_management`,
-  `container`, top-level `cache_control`, and the beta set. Any other turn goes out as a
-  create.
+  reply, and nothing fixed has changed: `model`, `system`, `tools`, `thinking`,
+  `tool_choice`, `output_config`, `mcp_servers`, `context_management`, `container`,
+  top-level `cache_control`, and the beta set. `system` is compared without its
+  billing-header block when that block is the header and its `name=value;` fields alone,
+  which Claude Code writes anew for every request; one that goes on after them is compared
+  like any other block. Any other turn goes out as a create.
 - AC-7 Messages are compared by what they say: a cache marker that moved, thinking kept or
   dropped, an empty text block, and a string in place of one text block change nothing.
 - AC-8 A reply is continued from only when the vendor finished and stored it: it has an id,
@@ -59,20 +63,23 @@ without the caller knowing.
   continues it, two conversations in one session keep their own threads, and a caller that
   names no session continues from its second turn.
 - AC-10 A thread the vendor declines never reaches the caller. A create answered with a 4xx
-  other than 401 and 429 is sent again plain. A continue answered so is sent again as a
-  create when its thread is gone or busy (`thread_not_found`, `thread_already_continued`,
-  `thread_continue_in_flight`), and plain otherwise. When the vendor takes the plain turn,
-  the conversation stays plain. One request records one outcome, whatever was sent for it.
-- AC-11 An error that is the caller's own reaches it unchanged, after one plain try. It does
-  not end threading for the conversation and does not count as a declined thread.
+  other than 401 and 429 is sent again plain. A continue answered so, or with a vendor
+  fault other than 529, is sent again as a create when its thread is gone or busy
+  (`thread_not_found`, `thread_already_continued`, `thread_continue_in_flight`), and plain
+  otherwise. One request records one outcome, whatever was sent for it.
+- AC-11 An error that is the caller's own reaches it unchanged, after one plain try. It
+  ends threading for no conversation, marks none plain and counts toward no rest.
 - AC-12 A 401 or a 429 to a threaded turn is the Account's: it costs the Account its health
-  and fails over as for any request, and the turn is not sent again to that Account.
-- AC-13 Three conversations declined in a row, with no thread taken between them, rest every
-  conversation for an hour. A reply that was on its way when the rest began does not end
-  it.
+  and fails over as for any request, and the turn is not sent again to that Account. So is
+  a 529, and a vendor fault on a create.
+- AC-13 A conversation the vendor took plain after declining its thread stays plain on that
+  Account. Three in a row on one Account, with no thread taken there between them, rest that
+  Account for an hour: it is not asked for a thread, and another Account still is. A reply
+  that was on its way when a rest began does not end it.
 - AC-14 A tool call in the reply to a continue comes back under the caller's tool name.
-- AC-15 With threads and without them, a caller receives the same bytes.
-- AC-16 With `cloaking.message-threads: false` every request goes out plain.
+- AC-15 With threads and without them, a caller receives the same status, headers and body.
+- AC-16 With `cloaking.message-threads: false` every request goes out plain. The relay
+  writes the key into a config only when an operator set it.
 
 ## Verification
 
@@ -90,13 +97,16 @@ without the caller knowing.
   - AC-5: `a_continue_passes_on_the_callers_own_billing_block`,
     `a_prompt_that_mentions_the_billing_header_is_not_the_billing_block` in
     `tests/upstream.rs`; `a_billing_block_that_changes_every_request_does_not_end_the_thread`;
-    `a_prompt_that_mentions_the_billing_header_is_part_of_the_system` in `src/threads.rs`
+    `a_prompt_that_mentions_the_billing_header_is_part_of_the_system`,
+    `only_a_billing_block_that_is_the_header_alone_is_left_out_of_the_system` in
+    `src/threads.rs`
   - AC-6: `a_changed_conversation_creates_instead_of_continuing`,
     `a_changed_beta_set_creates_instead_of_continuing`,
     `a_thread_does_not_follow_its_conversation_to_another_account`,
     `a_request_that_adds_no_user_message_after_the_reply_is_not_continued`,
     `a_message_that_only_looks_like_the_reply_is_not_skipped`;
-    `a_changed_fixed_field_or_beta_creates`, `an_idle_thread_creates` in `src/threads.rs`
+    `a_changed_fixed_field_or_beta_creates`, `an_idle_thread_creates` in `src/threads.rs`;
+    `whatever_a_continue_leaves_out_the_ledger_compares` in `tests/upstream.rs`
   - AC-7: `a_cache_marker_that_moved_does_not_end_the_thread`,
     `a_reply_repeated_with_or_without_its_thinking_continues`;
     `what_a_harness_is_free_to_change_does_not_end_the_thread` in `src/threads.rs`
@@ -116,13 +126,18 @@ without the caller knowing.
     `a_callers_own_error_on_a_later_turn_does_not_end_threading`
   - AC-12: `a_rate_limit_on_a_continue_is_the_accounts_and_fails_over`;
     `only_some_answers_send_a_threaded_turn_again` in `src/app.rs`
-  - AC-13: `a_vendor_that_stopped_taking_threads_is_not_asked_for_every_conversation`;
-    `conversations_declined_in_a_row_rest_every_conversation_for_a_while`,
-    `a_reply_that_was_on_its_way_does_not_end_the_rest` in `src/threads.rs`
+  - AC-13: `a_vendor_that_stopped_taking_threads_is_not_asked_for_every_conversation`,
+    `what_one_account_declines_is_not_held_against_another`;
+    `conversations_gone_plain_in_a_row_rest_their_account_for_an_hour`,
+    `a_rest_and_a_plain_conversation_are_their_accounts_alone`,
+    `a_conversation_gone_plain_stays_plain_and_others_do_not`,
+    `a_reply_that_was_on_its_way_does_not_end_the_rest`,
+    `a_full_ledger_forgets_and_goes_on` in `src/threads.rs`
   - AC-14: `a_tool_call_on_a_continue_comes_back_under_the_callers_name`
   - AC-15: `a_thread_changes_nothing_a_caller_receives`
   - AC-16: `threads_off_sends_every_conversation_plain`;
-    `message_threads_are_on_until_the_config_turns_them_off` in
+    `message_threads_are_on_until_the_config_turns_them_off`,
+    `the_relay_does_not_write_the_thread_switch_unless_the_operator_set_it` in
     `tests/config_tokens_providers.rs`
   - the non-goal on translated routes: `a_request_translated_onto_anthropic_is_never_threaded`
 
@@ -131,11 +146,13 @@ without the caller knowing.
 - [Who threads]: the relay. A thread is bound to the Account that opened it, and the relay
   is the only party that knows which Account serves a conversation.
 - [What crosses the seam]: the conversation whole and a `Thread` saying how much of it the
-  vendor holds. What leaves is the Upstream's to write: the beta set, the billing block and
-  the shape of a continue are vendor identity, and vendor identity is decided below
-  `UpstreamClient`. A test double therefore sees the pre-cloak conversation on every turn.
+  vendor holds. What leaves is the Upstream client's to write: the beta set, the
+  billing-header block and the shape of a continue are vendor identity, and vendor identity
+  is decided below `UpstreamClient`. A test double therefore sees the pre-cloak conversation
+  on every turn.
 - [Continue shape]: what Claude Code sends when it threads on its own: the messages after
-  the reply, no `tools`, the billing block as the only `system`, the create's beta set.
+  the reply, no `tools`, the billing-header block as the only `system`, the create's beta
+  set.
 - [Beta set]: derived from the whole conversation on every turn, so a continue earns what
   its create earned though it carries no tools. The relay compares the set a request earns
   and never writes it.
@@ -145,11 +162,15 @@ without the caller knowing.
   seconds after its reply.
 - [Declined threads]: decided by status, never by the words of an error, which change. Any
   4xx to a threaded turn but 401 and 429 may be the thread's doing, so the turn is sent
-  again plain and the answer to that is the one that counts. Only a thread that is gone or
-  busy opens another: anything else would be declined the same way on the next continue,
-  two requests a turn. A conversation counts as declined only once the vendor has taken the
-  same turn plain, so a caller's own error rests nothing. The rest after three exists
-  because a beta is retired one day.
+  again plain and the answer to that is the one that counts. A vendor fault counts the same
+  on a continue, the one request that asks the vendor for what it holds; on a create it
+  fails over as for any request, and a 529 is never answered with another request. Only a
+  thread that is gone or busy opens another: anything else would be declined the same way
+  on the next continue, two requests a turn.
+- [Going plain]: a conversation goes plain only once the vendor has taken the same turn
+  plain, so a caller's own error marks nothing. It is held against the Account the thread
+  was declined on: a Pool can hold an Account the vendor takes no thread for beside one it
+  does. The rest after three exists because a beta is retired one day.
 - [State]: in memory, one entry per thread, 4096 at most, taken on use and dropped on the
   first doubt; a restart costs one create per conversation.
 - [Why not imitate]: Claude Code computes its billing `cch` in bundled native code that an
@@ -157,4 +178,6 @@ without the caller knowing.
 - [Switch]: `cloaking.message-threads`, on by default. It sits with Cloaking because the
   shape of a threaded request is the vendor CLI's own. A thread changes what the relay
   sends and never what a caller receives, and every declined thread ends in a plain
-  request.
+  request. A build without the key refuses a config that carries it, so the relay writes
+  the key only when an operator set it, and a config it writes still loads on the build
+  before.

@@ -98,6 +98,20 @@ _Avoid_: cache, cache read, cache hit
 Every prompt token no cache served, which includes the tokens a cache write created. Printed without a breakdown.
 _Avoid_: tokens in, in, misses, fresh input
 
+### Threads
+
+**Thread**:
+A conversation the anthropic **Upstream** holds for the relay on one **Account**, so that a turn sends only the messages after the last reply instead of the whole conversation.
+_Avoid_: session, server-side conversation, stateful conversation, cache
+
+**Plain**:
+A request that carries its whole conversation and asks the **Upstream** to hold nothing.
+_Avoid_: unthreaded, stateless, full request, fallback
+
+**Declined thread**:
+A **Thread** the vendor would not open or continue, which the relay answers by sending the same turn again without that **Thread**, as a new one when the old is gone or busy and **Plain** otherwise, without the client knowing; nothing about it is recorded, so it is never a **Refusal**.
+_Avoid_: refusal, rejection, thread error, fallback
+
 ### Clients
 
 **Harness**:
@@ -130,6 +144,10 @@ _Avoid_: billing classifier, detector, filter
 - One client request is served by one **Account** at a time, and **Failover** only moves it between **Accounts** of the same **Provider**.
 - **Cloaking** applies to requests bound for the anthropic and codex **Upstreams**; grok and configured OpenAI-compatible endpoints are never cloaked. The **Local API key** applies to requests arriving from a client.
 - One pengepul endpoint accepts exactly one **Inbound dialect**; one **Provider** accepts exactly one **Dialect** upstream.
+- One **Thread** lives on exactly one **Account** and never moves: when **Rotation** or **Failover** hands a conversation to another **Account**, its turn goes there whole and opens a new **Thread** (ADR-0032).
+- A **Harness** never holds a **Thread**: it sends the whole conversation on every turn, the relay decides how much of it the **Upstream** already holds, and a **Harness** that names a **Thread** of its own is told to send the conversation whole (ADR-0032).
+- One client request records one outcome whatever was sent for it: a **Declined thread** and the request that answers it are one request, and only the answer to the last is counted.
+- A conversation whose **Thread** the vendor declined and whose turn it then took **Plain** stays **Plain** on that **Account**; three such conversations in a row rest the **Account**, which is then not asked for a **Thread** for an hour.
 - A **Harness** reaches the relay through its own configuration, never through a route made for it (ADR-0007). `pengepul launch` writes that configuration into one process instead of onto disk, so it covers only the **Harnesses** that can be redirected per-process.
 - Any **Inbound dialect** may be served by anthropic, codex or grok, and **Translation** is what closes the gap; grok speaks only Chat Completions upstream, and the other two dialects are translated onto it. A configured OpenAI-compatible endpoint speaks only Chat Completions upstream too, so Messages is translated onto it and Responses answers 501. count_tokens is anthropic-only and answers 501 elsewhere.
 
@@ -160,6 +178,8 @@ _Avoid_: billing classifier, detector, filter
 - "backoff", "lockout" and "unavailable" appear across the README, the CLI and the admin output for one mechanism. Resolved: there is one **Cooldown** with three duration policies — an ordinary failure cooldown (up to five minutes), a longer **Reauth** cooldown (24 hours), and a **never-succeeded cooldown** (up to one hour) for an account that has never once served a request (ADR-0020). The never-succeeded ceiling is shorter than the Reauth one, not longer: it bounds how often a dead key is probed, while a Reauth waits for a human. A **Retry hint** on a 429 or 503 stretches the policy's step to the wait the vendor named, up to a day. Say "failure cooldown", "reauth cooldown" and "never-succeeded cooldown" when the durations must be distinguished.
 - "API key" covers two unrelated secrets: the keys clients present to pengepul, and the credentials pengepul presents upstream. Resolved: **Local API key** is what clients present; the upstream credential is what pengepul presents upstream. They point in opposite directions on the wire.
 - "cloaking" and "masquerade" are used interchangeably. Resolved: **Cloaking** is the domain term.
+- "refused" suggests itself for a **Thread** the vendor will not take. Resolved: that is a **Declined thread**. A **Refusal** is a recorded outcome of a client request; a **Declined thread** is an attempt the relay made on its own, answered by another attempt, and recorded nowhere.
+- "session" names what a **Harness** calls its conversation and suggests itself for what the vendor holds. Resolved: a session is the key a **Harness** names for **Rotation**; the vendor holds a **Thread**, and one session may hold several conversations, each with its own.
 - "refresh" names both the secret an account holds and the act of replacing its expiring access token. Resolved: **Refresh** is the act. The secret is the refresh token.
 - "round-robin with sticky windows" survives in `docs/`, contradicting the README. Resolved: **Rotation** is not round-robin and has no stickiness in the sense of a fixed window or a client-level pin. A new conversation goes to the serving Account of smallest **Priority** by the tie-breakers above, not to the account after the one used last; the one thing **Rotation** does remember is which account last served a conversation's cacheable prefix, as a preference that a Cooldown overrides and that **Priority** does not (ADR-0017, ADR-0031). Nothing is keyed on a client or a credential.
 - "pool" and "pooling" name both the whole relay and one provider's accounts. Resolved: **Pool** is one Provider's set of Accounts; the process serving every pool is the relay.

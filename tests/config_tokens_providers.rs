@@ -121,7 +121,7 @@ fn write_config_with(
 }
 
 /// The switch an operator reaches for when threads misbehave: on unless the config says
-/// otherwise, and off under the key the docs name.
+/// otherwise, and off under the key the README names.
 #[test]
 fn message_threads_are_on_until_the_config_turns_them_off() {
     let (_tmp, home, config_path) = write_config_with("api-keys:\n  - sk-local\n");
@@ -134,6 +134,36 @@ fn message_threads_are_on_until_the_config_turns_them_off() {
     assert!(!config.cloaking.message_threads);
     // The other cloaking keys keep their defaults when only the switch is named.
     assert!(!config.cloaking.cli_version.is_empty());
+}
+
+/// A build without the key refuses a config that carries it. So the relay never writes the
+/// key on its own account: a config it generates or rewrites still loads on the build
+/// before, and rolling back needs no edit. An operator's `false` is kept.
+#[test]
+fn the_relay_does_not_write_the_thread_switch_unless_the_operator_set_it() {
+    // A config the relay generates.
+    let tmp = tempdir().expect("tempdir");
+    let home = tmp.path().join("home");
+    let generated = tmp.path().join("generated.yaml");
+    load_config(Some(&generated), Some(&home), tmp.path()).expect("load config");
+    let written = fs::read_to_string(&generated).expect("generated config");
+    assert!(written.contains("cli-version"), "{written}");
+    assert!(!written.contains("message-threads"), "{written}");
+
+    // A config the relay rewrites: once left at the default, once turned off.
+    for (stated, kept) in [("", false), ("cloaking:\n  message-threads: false\n", true)] {
+        let (_tmp, _home, config_path) =
+            write_config_with(&format!("api-keys:\n  - sk-local\n{stated}"));
+        pengepul::config::register_provider(&config_path, "groq", "https://api.groq.com/openai/v1")
+            .expect("register");
+        let rewritten = fs::read_to_string(&config_path).expect("rewritten config");
+        assert_eq!(
+            rewritten.contains("message-threads: false"),
+            kept,
+            "{rewritten}"
+        );
+        assert!(!rewritten.contains("message-threads: true"), "{rewritten}");
+    }
 }
 
 #[test]

@@ -196,8 +196,16 @@ struct RawCloaking {
     cli_version: String,
     entrypoint: String,
     codex: std::collections::BTreeMap<String, String>,
-    #[serde(rename = "message-threads")]
+    // Written only when an operator turned it off. A build without the key refuses a config
+    // that carries it, so a config the relay writes on its own must still load there.
+    #[serde(rename = "message-threads", skip_serializing_if = "is_on")]
     message_threads: bool,
+}
+
+/// Whether a switch that defaults to on is on. A reference, because serde hands one.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_on(switch: &bool) -> bool {
+    *switch
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

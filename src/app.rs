@@ -81,8 +81,8 @@ pub struct UpstreamRequest {
     /// `x-opencode-session`.
     pub conversation: String,
     /// How an anthropic Messages request uses a message thread. `body` is the conversation
-    /// whole either way; what is sent of it, and under which beta set, is the Upstream's
-    /// to write. Every other call is [`Thread::Plain`].
+    /// whole either way; what is sent of it, and under which beta set, is the Upstream
+    /// client's to write. Every other call is [`Thread::Plain`].
     pub thread: Thread,
 }
 
@@ -1866,7 +1866,7 @@ fn thread_unsupported_response() -> Response {
             "error": {
                 "type": "invalid_request_error",
                 "message": "thread: message threads are not supported through this relay; \
-                            send the full conversation without `thread`",
+                            send the whole conversation without `thread`",
                 "details": {"error_code": "thread_unsupported_request"}
             }
         })),
@@ -2240,7 +2240,7 @@ async fn route_anthropic_request(
             model,
         ));
         // A `thread` that names none asks for nothing, and the vendor is not asked to read
-        // it. The relay's own thread crosses to the Upstream as a fact, never in the body.
+        // it. The relay's own thread crosses to the Upstream client as a fact, never in the body.
         if let Some(object) = masked.as_object_mut()
             && object.get("thread").is_some_and(Value::is_null)
         {
@@ -2250,40 +2250,45 @@ async fn route_anthropic_request(
     };
     let (masked, reverse) = masked_body();
     let tool_reverse = Arc::new(reverse);
+    let threads = &state.threads;
+    let account_key = account.token.email.as_str();
 
     // Only a Messages request is threaded. A translated one arrives here as Messages too,
-    // but its reply goes back in another dialect than the one a thread is checked in.
-    if route != RequestRoute::Messages || !state.config.cloaking.message_threads {
-        return match send_anthropic(state, headers, account, request, masked, Thread::Plain).await {
-            Ok(answer) => {
-                anthropic_response(state, account, request, route, answer, tool_reverse, None).await
-            }
-            Err(error) => {
-                upstream_failure_response(state, account.provider.clone(), account, &error).await
-            }
-        };
-    }
-
-    // The beta set is one of the things a thread may not change, so the set this request
-    // earns is part of what names its conversation.
-    let turn = Turn::of(
-        &masked,
-        &resolve_beta(model, &masked, &headers_to_map(headers)),
-    );
-    // A harness that names its session keeps its threads apart from every other session's.
-    // One that names none is told apart by what it sends: Rotation's key for it moves as
-    // its opening grows, and a thread must not move with it.
-    let session = named_session(headers, body).unwrap_or_default();
-    let conversation = request.conversation.as_str();
-    let mut thread = state
-        .threads
-        .plan(&session, &account.token.email, &turn, Instant::now());
+    // but its reply goes back in another dialect than the one a thread is checked in. An
+    // Account the vendor keeps declining threads on is not asked either, and is spared the
+    // reading of the conversation that asking takes.
+    let threaded = route == RequestRoute::Messages
+        && state.config.cloaking.message_threads
+        && !threads.resting(account_key, Instant::now());
+    // What names the conversation to the ledger. The beta set is one of the things a thread
+    // may not change, so the set this request earns is part of it. A harness that names its
+    // session keeps its threads apart from every other session's; one that names none is
+    // told apart by what it sends, because Rotation's key for it moves as its opening grows
+    // and a thread must not move with it.
+    let conversation = threaded.then(|| {
+        let beta = resolve_beta(model, &masked, &headers_to_map(headers));
+        (
+            named_session(headers, body).unwrap_or_default(),
+            Turn::of(&masked, &beta),
+        )
+    });
+    let mut thread = conversation
+        .as_ref()
+        .map_or(Thread::Plain, |(session, turn)| {
+            threads.plan(session, account_key, turn, Instant::now())
+        });
     let mut whole = Some(masked);
-    let mut declined = false;
+    let mut vendor_said = None;
     // A thread is the relay's own doing, so the vendor declining one is never the caller's
-    // error: the turn is sent again one step plainer, down to no thread at all.
+    // error: the turn is sent again without that thread, down to no thread at all.
     let answer = loop {
-        tracing::debug!(conversation, thread = thread.label(), "message thread");
+        if threaded {
+            tracing::debug!(
+                conversation = %request.conversation,
+                thread = thread.label(),
+                "message thread"
+            );
+        }
         let body = whole.take().unwrap_or_else(|| masked_body().0);
         let sent = send_anthropic(state, headers, account, request, body, thread.clone()).await;
         let mut answer = match sent {
@@ -2293,25 +2298,28 @@ async fn route_anthropic_request(
                     .await;
             }
         };
-        let Some(plainer) = plainer_thread(&thread, &mut answer).await else {
+        let Some((again, vendor)) = declined_thread(&thread, &mut answer).await else {
             break answer;
         };
         tracing::debug!(
-            conversation,
+            conversation = %request.conversation,
             thread = thread.label(),
-            status = answer.status().as_u16(),
+            vendor,
             "message thread declined"
         );
-        declined = true;
-        thread = plainer;
+        vendor_said = Some(vendor);
+        thread = again;
     };
     // The vendor declined the thread and then took the turn plain, so it was the thread it
     // declined. Had it declined that too, the error would be the caller's own, and would
     // say nothing about threads.
-    if declined && thread == Thread::Plain && answer.status().is_success() {
-        state.threads.go_plain(&session, &turn, Instant::now());
+    if let (Some(vendor), Some((session, turn))) = (&vendor_said, &conversation)
+        && thread == Thread::Plain
+        && answer.status().is_success()
+    {
+        threads.go_plain(session, account_key, turn, Instant::now(), vendor);
     }
-    let noted = (thread != Thread::Plain).then_some((session, turn));
+    let noted = conversation.filter(|_| thread != Thread::Plain);
     anthropic_response(state, account, request, route, answer, tool_reverse, noted).await
 }
 
@@ -2321,7 +2329,7 @@ enum Answer {
     Stream(UpstreamSseResponse),
 }
 
-/// The most of a declined stream that is read for the vendor's code. Its error is a short
+/// The most of a declined stream that is read for the vendor's error, which is a short
 /// JSON document.
 const DECLINE_LIMIT: usize = 64 * 1024;
 
@@ -2333,11 +2341,10 @@ impl Answer {
         }
     }
 
-    /// The vendor's code for the error it answered with, or nothing. A streamed answer is
-    /// read for it and not put back: the answer whose code is asked for is one the caller
-    /// never receives.
-    async fn error_code(&mut self) -> String {
-        let error = match self {
+    /// The error the vendor answered with, or null. A streamed answer is read for it and
+    /// not put back: the answer whose error is asked for is one the caller never receives.
+    async fn error(&mut self) -> Value {
+        match self {
             Self::Whole(response) => response.body.clone(),
             Self::Stream(response) => {
                 let mut read = Vec::new();
@@ -2348,17 +2355,12 @@ impl Answer {
                 }
                 serde_json::from_slice(&read).unwrap_or(Value::Null)
             }
-        };
-        error
-            .pointer("/error/details/error_code")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string()
+        }
     }
 }
 
 /// One anthropic Messages call, whole or streamed as the caller asked. `body` is the
-/// conversation whole; `thread` tells the Upstream how much of it the vendor holds.
+/// conversation whole; `thread` tells the Upstream client how much of it the vendor holds.
 async fn send_anthropic(
     state: &AppState,
     headers: &HeaderMap,
@@ -2448,36 +2450,54 @@ async fn anthropic_response(
     }
 }
 
-/// What to send instead when the vendor declines a threaded turn, or nothing when its
-/// answer stands.
-async fn plainer_thread(thread: &Thread, answer: &mut Answer) -> Option<Thread> {
+/// Whether the vendor declined the thread of a turn it was sent: then what the turn is sent
+/// again as, and what the vendor said, for the operator. Nothing when its answer stands.
+///
+/// The vendor says why in words that change, so the words decide nothing. The status
+/// does, and for a continue the vendor's code for a thread that is gone or busy.
+async fn declined_thread(thread: &Thread, answer: &mut Answer) -> Option<(Thread, String)> {
     let status = answer.status();
     // An expired token and a rate limit are the Account's whatever the request carried,
-    // and are handled as they always are. Any other 4xx may be the thread's doing.
-    if !status.is_client_error() || matches!(status.as_u16(), 401 | 429) {
+    // as for any request. Any other 4xx may be the thread's doing.
+    let client_error = status.is_client_error() && !matches!(status.as_u16(), 401 | 429);
+    // A vendor fault on a continue may be the thread's too: only a continue asks the
+    // vendor for what it holds. A 529 is the vendor saying it is overloaded, which another
+    // request would only add to. A fault on a create fails over as for any request.
+    let vendor_fault = status.is_server_error() && status.as_u16() != 529;
+    let declined = match thread {
+        Thread::Plain => false,
+        Thread::Create => client_error,
+        Thread::Continue { .. } => client_error || vendor_fault,
+    };
+    if !declined {
         return None;
     }
-    match thread {
-        Thread::Plain => None,
-        // The vendor says why in words that change, so none of them is read: the turn is
-        // sent again plain, and the answer to that is the one that counts.
-        Thread::Create => Some(Thread::Plain),
-        Thread::Continue { .. } => {
-            // A thread that is gone or busy says nothing against the conversation, which
-            // opens another. Anything else the vendor would decline the same way on the
-            // next continue, so the conversation goes on plain.
-            let gone = [
-                "thread_not_found",
-                "thread_already_continued",
-                "thread_continue_in_flight",
-            ];
-            if gone.contains(&answer.error_code().await.as_str()) {
-                Some(Thread::Create)
-            } else {
-                Some(Thread::Plain)
-            }
-        }
-    }
+    let error = answer.error().await;
+    let message: String = error
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .chars()
+        .take(200)
+        .collect();
+    // A thread that is gone or busy says nothing against the conversation, which opens
+    // another. Anything else the vendor would answer the same way on the next continue,
+    // so the conversation goes on plain.
+    let gone = [
+        "thread_not_found",
+        "thread_already_continued",
+        "thread_continue_in_flight",
+    ];
+    let code = error
+        .pointer("/error/details/error_code")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let again = if matches!(thread, Thread::Continue { .. }) && gone.contains(&code) {
+        Thread::Create
+    } else {
+        Thread::Plain
+    };
+    Some((again, format!("{} {message}", status.as_u16())))
 }
 
 /// A streamed reply, read as it passes so that the turn after it can continue from it.
@@ -4524,10 +4544,10 @@ mod tests {
     /// that is gone or busy.
     #[tokio::test]
     async fn only_some_answers_send_a_threaded_turn_again() {
-        use super::{Answer, Thread, plainer_thread};
+        use super::{Answer, Thread, declined_thread};
 
-        let answer = |status: u16, code: &str| {
-            Answer::Whole(UpstreamJsonResponse {
+        async fn again(thread: &Thread, status: u16, code: &str) -> Option<Thread> {
+            let mut answer = Answer::Whole(UpstreamJsonResponse {
                 quota: None,
                 retry_hint: None,
                 status: StatusCode::from_u16(status).expect("status"),
@@ -4536,42 +4556,50 @@ mod tests {
                     "message": "thread: no",
                     "details": {"error_code": code}
                 }}),
-            })
-        };
+            });
+            let declined = declined_thread(thread, &mut answer).await;
+            if let Some((_, vendor)) = &declined {
+                assert_eq!(vendor, &format!("{status} thread: no"));
+            }
+            declined.map(|(again, _)| again)
+        }
         let continuing = Thread::Continue {
             previous_message_id: "msg_1".to_string(),
             from: 2,
         };
-        // An expired token, a rate limit, a vendor fault and a success are never the
+        // A success, an expired token, a rate limit and an overloaded vendor are never the
         // thread's, whatever the body says.
-        for status in [200, 401, 429, 500, 529] {
+        for status in [200, 401, 429, 529] {
             for thread in [Thread::Create, continuing.clone()] {
-                let mut gone = answer(status, "thread_not_found");
-                assert_eq!(plainer_thread(&thread, &mut gone).await, None, "{status}");
+                assert_eq!(
+                    again(&thread, status, "thread_not_found").await,
+                    None,
+                    "{status}"
+                );
             }
         }
+        // Any other 4xx may be: a create goes plain, and so does a continue, unless its
+        // thread is only gone or busy.
         for status in [400, 403, 404, 413, 422] {
-            let mut any = answer(status, "");
-            assert_eq!(plainer_thread(&Thread::Plain, &mut any).await, None);
+            assert_eq!(again(&Thread::Plain, status, "").await, None);
             assert_eq!(
-                plainer_thread(&Thread::Create, &mut any).await,
+                again(&Thread::Create, status, "").await,
                 Some(Thread::Plain)
             );
-            assert_eq!(
-                plainer_thread(&continuing, &mut any).await,
-                Some(Thread::Plain)
-            );
+            assert_eq!(again(&continuing, status, "").await, Some(Thread::Plain));
             for code in [
                 "thread_not_found",
                 "thread_already_continued",
                 "thread_continue_in_flight",
             ] {
-                let mut gone = answer(status, code);
-                assert_eq!(
-                    plainer_thread(&continuing, &mut gone).await,
-                    Some(Thread::Create)
-                );
+                assert_eq!(again(&continuing, status, code).await, Some(Thread::Create));
             }
+        }
+        // A vendor fault is the thread's only where the thread was asked for.
+        for status in [500, 502, 503] {
+            assert_eq!(again(&Thread::Plain, status, "").await, None);
+            assert_eq!(again(&Thread::Create, status, "").await, None);
+            assert_eq!(again(&continuing, status, "").await, Some(Thread::Plain));
         }
     }
 

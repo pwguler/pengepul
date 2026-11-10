@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use pengepul::config::{
     BodyLimit, CloakingConfig, Config, DEFAULT_BODY_LIMIT_BYTES, DebugMode, QuotaConfig,
     TimeoutConfig,
 };
+use pengepul::threads::{Stored, ThreadLedger, Turn};
 use pengepul::types::{AvailableAccount, ProviderId, ProviderKind, TokenData};
 use pengepul::upstream::{
     RequestShape, THREAD_BETA, Thread, anthropic_headers, anthropic_messages_wire, apply_cloaking,
@@ -242,7 +244,7 @@ fn wire(
 }
 
 /// A conversation as a harness resends it, with a tool that earns a beta of its own and
-/// two user messages the billing block would name differently.
+/// two user messages the billing-header block would name differently.
 fn conversation() -> Value {
     json!({
         "model": "claude-sonnet-4-6",
@@ -305,7 +307,7 @@ fn a_create_is_the_plain_request_with_a_thread_and_its_beta() {
 
 /// A continue carries only what the vendor does not hold, and says who it is the way its
 /// whole conversation would: the same beta set, tools included though it carries none, and
-/// the conversation's billing block as its only `system`.
+/// the conversation's billing-header block as its only `system`.
 #[test]
 fn a_continue_carries_what_is_new_under_its_conversations_identity() {
     let whole = conversation();
@@ -341,7 +343,7 @@ fn a_continue_carries_what_is_new_under_its_conversations_identity() {
     );
 }
 
-/// Claude Code writes its own billing block, and the relay passes it on. A continue passes
+/// Claude Code writes its own billing-header block, and the relay passes it on. A continue passes
 /// on the one that came with its turn, alone.
 #[test]
 fn a_continue_passes_on_the_callers_own_billing_block() {
@@ -360,8 +362,8 @@ fn a_continue_passes_on_the_callers_own_billing_block() {
     assert_eq!(body["system"], json!([own]));
 }
 
-/// Only a block that is the header line is a billing block. A prompt that mentions the
-/// header is what the model is told: it stays in `system`, behind a billing block of the
+/// Only a block that is the header line is a billing-header block. A prompt that mentions the
+/// header is what the model is told: it stays in `system`, behind a billing-header block of the
 /// relay's own, and is never the block a continue carries.
 #[test]
 fn a_prompt_that_mentions_the_billing_header_is_not_the_billing_block() {
@@ -383,9 +385,76 @@ fn a_prompt_that_mentions_the_billing_header_is_not_the_billing_block() {
     );
     assert!(
         system.contains(&prompt),
-        "the prompt was taken for the billing block"
+        "the prompt was taken for the billing-header block"
     );
     assert_eq!(continued["system"], json!([system[0]]));
+}
+
+/// A continue leaves out what the vendor holds, so whatever it leaves out the ledger must
+/// have compared: a change there that still continued would be answered from the old value.
+#[test]
+fn whatever_a_continue_leaves_out_the_ledger_compares() {
+    // Every field a harness may set, the ones a thread leaves free among them.
+    let mut whole = conversation();
+    for (field, value) in [
+        ("temperature", json!(0.5)),
+        ("top_p", json!(0.9)),
+        ("stop_sequences", json!(["STOP"])),
+        ("stream", json!(true)),
+        ("service_tier", json!("auto")),
+        ("metadata", json!({"user_id": "someone"})),
+        (
+            "thinking",
+            json!({"type": "enabled", "budget_tokens": 1024}),
+        ),
+        ("tool_choice", json!({"type": "auto"})),
+        ("output_config", json!({"effort": "low"})),
+        ("context_management", json!({"edits": []})),
+        ("a_field_of_tomorrow", json!({"any": "thing"})),
+    ] {
+        whole[field] = value;
+    }
+    let (_, created) = wire(&whole, &Thread::Create, &[]);
+    let (_, continued) = wire(&whole, &continuing(), &[]);
+    let left_out: Vec<&str> = created
+        .as_object()
+        .expect("an object")
+        .iter()
+        .filter(|(field, value)| *field != "thread" && continued.get(*field) != Some(*value))
+        .map(|(field, _)| field.as_str())
+        .collect();
+    // A field that joins this list needs a comparison in the ledger, and a line below.
+    assert_eq!(left_out, ["messages", "system", "tools"]);
+
+    // The thread `whole` continues: its first message, answered `pong`.
+    let plan = |next: &Value| {
+        let ledger = ThreadLedger::default();
+        let now = Instant::now();
+        let mut opening = whole.clone();
+        opening["messages"] = json!([whole["messages"][0]]);
+        let reply = json!({
+            "id": "msg_1",
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "pong"}]
+        });
+        let stored = Stored::of(&reply).expect("a stored reply");
+        ledger.note_reply("s", "a", &Turn::of(&opening, "beta"), stored, now);
+        ledger.plan("s", "a", &Turn::of(next, "beta"), now)
+    };
+    assert_eq!(plan(&whole), continuing());
+    let changes = [
+        (
+            "/messages/0/content",
+            json!("alpha bravo charlie delta echo golf"),
+        ),
+        ("/system/0/text", json!("be thorough")),
+        ("/tools/0/description", json!("look something else up")),
+    ];
+    for (pointer, value) in changes {
+        let mut next = whole.clone();
+        *next.pointer_mut(pointer).expect("the field") = value;
+        assert_eq!(plan(&next), Thread::Create, "{pointer}");
+    }
 }
 
 /// A Claude Code caller names its own beta set, and the relay passes it on with the one

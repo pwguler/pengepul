@@ -928,8 +928,8 @@ impl ThreadUpstream {
         Self::new(|_, call| (200, reply(call)))
     }
 
-    /// A vendor that takes no thread: what the live API answered a `thread` whose beta it
-    /// was not told of.
+    /// A vendor that takes no thread: what it answers a `thread` whose beta it was not
+    /// told of.
     fn without_threads() -> Arc<Self> {
         Self::new(|request, call| {
             if request.thread == Thread::Plain {
@@ -981,7 +981,7 @@ fn vendor_error(kind: &str, message: &str, code: Option<&str>) -> Value {
     json!({"type": "error", "error": error})
 }
 
-/// What the live API answered a `thread` it was not told to expect.
+/// What the vendor answers a `thread` it was not told to expect.
 fn no_threads() -> Value {
     vendor_error(
         "invalid_request_error",
@@ -1318,8 +1318,8 @@ async fn a_conversation_opens_a_thread_then_continues_it() {
             ],
             "stream={stream}"
         );
-        // The conversation crosses to the Upstream whole each time: what is sent of it is
-        // the Upstream's to write.
+        // The conversation crosses the seam whole each time: what is sent of it is the
+        // Upstream client's to write.
         for (call, turns) in calls.iter().zip(1..) {
             assert_eq!(call.body["messages"], conversation(turns));
         }
@@ -1405,7 +1405,17 @@ async fn a_thread_changes_nothing_a_caller_receives() {
             ]}));
             let mut answers = Vec::new();
             for messages in [conversation(1), conversation(2), third] {
-                answers.push(harness(&app, "conv", asking(messages, stream)).await);
+                let request = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("authorization", "Bearer sk-test")
+                    .header("content-type", "application/json")
+                    .header("content-length", "1")
+                    .header("x-claude-code-session-id", "conv")
+                    .body(Body::from(asking(messages, stream).to_string()))
+                    .unwrap();
+                // Status, headers and body: everything a caller can read.
+                answers.push(raw_response(app.clone(), request).await);
             }
             let expected = if threads { "continue" } else { "plain" };
             assert_eq!(upstream.kinds()[1..], [expected, expected]);
@@ -1497,6 +1507,78 @@ async fn a_vendor_that_stopped_taking_threads_is_not_asked_for_every_conversatio
     );
 }
 
+/// A Pool can hold an Account the vendor takes no thread for beside one it does. What the
+/// first declines is the first's: it rests alone, and the other is still asked.
+#[tokio::test]
+async fn what_one_account_declines_is_not_held_against_another() {
+    let upstream = ThreadUpstream::new(|request, call| {
+        let without = request.account.token.email == "alice@example.com";
+        if without && request.thread != Thread::Plain {
+            (
+                403,
+                vendor_error(
+                    "permission_error",
+                    "This beta is not enabled for this account.",
+                    None,
+                ),
+            )
+        } else {
+            (200, reply(call))
+        }
+    });
+    let tmp = tempfile::tempdir().expect("tempdir");
+    pool_account(tmp.path(), "alice@example.com");
+    pool_account(tmp.path(), "bob@example.com");
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    let opening = |text: &str| asking(json!([{"role": "user", "content": text}]), false);
+    let alice = |action: &'static str| {
+        toggle(
+            app.clone(),
+            action,
+            json!({"account": "alice@example.com"}),
+            Some("sk-test"),
+        )
+    };
+
+    // Three conversations open on alice, and each is declined and served plain.
+    for session in ["one", "two", "three"] {
+        assert_eq!(harness(&app, session, opening(session)).await.0, 200);
+    }
+    // With alice out of the Pool, bob is asked, and takes the thread.
+    assert_eq!(alice("disable").await.0, 200);
+    for turns in 1..=2 {
+        assert_eq!(
+            harness(&app, "four", asking(conversation(turns), false))
+                .await
+                .0,
+            200
+        );
+    }
+    // Back in the Pool, alice rests: her next conversation is not offered as a thread.
+    assert_eq!(alice("enable").await.0, 200);
+    assert_eq!(harness(&app, "five", opening("five")).await.0, 200);
+
+    let calls = upstream.calls();
+    let served: Vec<(&str, &str)> = calls
+        .iter()
+        .map(|call| (&call.account.token.email[..1], call.thread.label()))
+        .collect();
+    assert_eq!(
+        served,
+        [
+            ("a", "create"),
+            ("a", "plain"),
+            ("a", "create"),
+            ("a", "plain"),
+            ("a", "create"),
+            ("a", "plain"),
+            ("b", "create"),
+            ("b", "continue"),
+            ("a", "plain"),
+        ]
+    );
+}
+
 /// The thread is gone or busy, which says nothing against the conversation: it is sent
 /// whole and opens another.
 #[tokio::test]
@@ -1563,7 +1645,7 @@ async fn a_continue_declined_for_what_it_carries_leaves_the_conversation_plain()
                 Some("thread_unsupported_request"),
             ),
         ),
-        // Not a thread error by name. A continue is the relay's own shape all the same.
+        // The vendor names no thread in it. A continue is the relay's own shape all the same.
         (
             400,
             vendor_error(
@@ -1573,6 +1655,11 @@ async fn a_continue_declined_for_what_it_carries_leaves_the_conversation_plain()
             ),
         ),
         (403, vendor_error("permission_error", "not allowed", None)),
+        // A fault of the vendor's own, where only a continue asks it for what it holds.
+        (
+            500,
+            vendor_error("api_error", "Internal server error", None),
+        ),
     ];
     for (status, error) in declines {
         for stream in [false, true] {
@@ -1600,7 +1687,7 @@ async fn a_continue_declined_for_what_it_carries_leaves_the_conversation_plain()
 }
 
 /// A rate limit is the Account's, whatever the request carried. It costs the Account its
-/// health and moves the request to the next one, as it always has; it is not answered by
+/// health and moves the request to the next one, as for any request; it is not answered by
 /// sending the turn again to the Account that is limited.
 #[tokio::test]
 async fn a_rate_limit_on_a_continue_is_the_accounts_and_fails_over() {
@@ -1784,7 +1871,7 @@ async fn a_reply_repeated_with_or_without_its_thinking_continues() {
     }
 }
 
-/// Claude Code writes a billing block of its own into `system`, a new one for every
+/// Claude Code writes a billing-header block of its own into `system`, a new one for every
 /// request. It names the request to the vendor's meter and says nothing to the model, so
 /// it is no change of `system`.
 #[tokio::test]
