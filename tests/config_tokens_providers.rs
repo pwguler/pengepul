@@ -137,8 +137,8 @@ fn message_threads_are_on_until_the_config_turns_them_off() {
 }
 
 /// A build without the key refuses a config that carries it. So the relay never writes the
-/// key on its own account: a config it generates or rewrites still loads on the build
-/// before, and rolling back needs no edit. An operator's `false` is kept.
+/// key on its own account: a config it generates or rewrites still loads on such a build,
+/// and rolling back to one needs no edit. An operator's `false` is kept.
 #[test]
 fn the_relay_does_not_write_the_thread_switch_unless_the_operator_set_it() {
     // A config the relay generates.

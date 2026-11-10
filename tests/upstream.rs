@@ -9,9 +9,9 @@ use pengepul::config::{
 use pengepul::threads::{Stored, ThreadLedger, Turn};
 use pengepul::types::{AvailableAccount, ProviderId, ProviderKind, TokenData};
 use pengepul::upstream::{
-    RequestShape, THREAD_BETA, Threading, anthropic_headers, anthropic_messages_wire,
-    apply_cloaking, build_beta_header, codex_headers, generic_base_url, generic_chat_headers,
-    generic_headers, normalize_codex_responses_body,
+    RequestShape, Threading, anthropic_headers, anthropic_messages_wire, apply_cloaking,
+    build_beta_header, codex_headers, generic_base_url, generic_chat_headers, generic_headers,
+    normalize_codex_responses_body,
 };
 use serde_json::{Value, json};
 
@@ -222,6 +222,10 @@ fn claude_3_drops_the_thinking_and_context_betas() {
     assert!(!haiku.contains("claude-code-20250219"));
 }
 
+/// The beta the vendor's documentation names for threads, written out: the relay's own
+/// constant is what these tests check.
+const THREAD_BETA: &str = "message-threads-2026-08-12";
+
 /// One anthropic Messages call as it leaves, for the conversation `body` holds whole.
 fn wire(
     body: &Value,
@@ -346,7 +350,7 @@ fn a_continue_carries_what_is_new_under_its_conversations_identity() {
 /// Claude Code writes its own billing-header block, and the relay passes it on. A continue passes
 /// on the one that came with its turn, alone.
 #[test]
-fn a_continue_passes_on_the_callers_own_billing_block() {
+fn a_continue_passes_on_the_clients_own_billing_block() {
     let own = json!({
         "type": "text",
         "text": "x-anthropic-billing-header: cc_version=2.1.322.6ba; cc_entrypoint=cli; cch=00000;"
@@ -457,8 +461,8 @@ fn whatever_a_continue_leaves_out_the_ledger_compares() {
     }
 }
 
-/// A Claude Code caller names its own beta set, and the relay passes it on with the one
-/// beta a thread adds. No other caller's header reaches the vendor.
+/// A Claude Code client names its own beta set, and the relay passes it on with the one
+/// beta a thread adds. No other client's header reaches the vendor.
 #[test]
 fn the_thread_beta_joins_the_set_the_request_already_carries() {
     let cli = [

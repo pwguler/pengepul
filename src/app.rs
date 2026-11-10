@@ -1855,8 +1855,8 @@ async fn route_provider_request(
 
 /// The answer to a Messages request that names a `thread` of its own on the anthropic
 /// Upstream, given before any Account is chosen. A thread lives on the Account that opened
-/// it, and a caller cannot choose the Account that serves its next turn, so the relay keeps
-/// the threads and a caller sends the conversation whole. This is the vendor's own code for
+/// it, and a client cannot choose the Account that serves its next turn, so the relay keeps
+/// the threads and a client sends the conversation whole. This is the vendor's own code for
 /// that, which its SDK thread helper and tool runner answer by doing exactly so.
 fn thread_unsupported_response() -> Response {
     (
@@ -2257,7 +2257,7 @@ async fn route_anthropic_request(
     // but its reply goes back in another dialect than the one a thread is checked in. An
     // Account the vendor keeps declining threads on is not asked either, and is spared the
     // reading of the conversation that asking takes.
-    let threaded = route == RequestRoute::Messages
+    let may_thread = route == RequestRoute::Messages
         && state.config.cloaking.message_threads
         && !threads.resting(account_key, Instant::now());
     // What names the conversation to the ledger. The beta set is one of the things a thread
@@ -2265,7 +2265,7 @@ async fn route_anthropic_request(
     // session keeps its threads apart from every other session's; one that names none is
     // told apart by what it sends, because Rotation's key for it moves as its opening grows
     // and a thread must not move with it.
-    let ledger_turn = threaded.then(|| {
+    let ledger_turn = may_thread.then(|| {
         let beta = resolve_beta(model, &masked, &headers_to_map(headers));
         (
             named_session(headers, body).unwrap_or_default(),
@@ -2279,10 +2279,10 @@ async fn route_anthropic_request(
         });
     let mut whole = Some(masked);
     let mut declined = None;
-    // A thread is the relay's own doing, so the vendor declining one is never the caller's
+    // A thread is the relay's own doing, so the vendor declining one is never the client's
     // error: the turn is sent again without that thread, down to no thread at all.
     let answer = loop {
-        if threaded {
+        if may_thread {
             tracing::debug!(
                 conversation = %request.conversation,
                 threading = threading.label(),
@@ -2322,7 +2322,7 @@ async fn route_anthropic_request(
         threading = again;
     };
     // The vendor declined the thread and then took the turn plain, so it was the thread it
-    // declined. Had it declined that too, the error would be the caller's own, and would
+    // declined. Had it declined that too, the error would be the client's own, and would
     // say nothing about threads.
     if let (Some(vendor), Some((session, turn))) = (&declined, &ledger_turn)
         && threading == Threading::Plain
@@ -2353,7 +2353,7 @@ impl Answer {
     }
 
     /// The error the vendor answered with, or null. A streamed answer is read for it and
-    /// not put back: the answer whose error is asked for is one the caller never receives.
+    /// not put back: the answer whose error is asked for is one the client never receives.
     async fn error(&mut self) -> Value {
         match self {
             Self::Whole(response) => response.body.clone(),
@@ -2370,7 +2370,7 @@ impl Answer {
     }
 }
 
-/// One anthropic Messages call, whole or streamed as the caller asked. `body` is the
+/// One anthropic Messages call, whole or streamed as the client asked. `body` is the
 /// conversation whole; `threading` tells the Upstream client how much of it the vendor
 /// holds.
 async fn send_anthropic(
@@ -2514,7 +2514,7 @@ async fn sent_again_as(threading: &Threading, answer: &mut Answer) -> Option<(Th
 
 /// A streamed reply, read as it passes so that the turn after it can continue from it.
 /// Every chunk goes on unchanged, and the reply is noted before its last chunk does, so
-/// the caller cannot send the next turn first.
+/// the client cannot send the next turn first.
 fn note_streamed_reply(
     mut input: UpstreamSseStream,
     threads: Arc<ThreadLedger>,

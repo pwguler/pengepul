@@ -6,9 +6,9 @@
 //! one `create` per conversation, and nothing about a conversation outlives its traffic.
 //!
 //! State is dropped on the first doubt, never repaired. A turn the vendor declines as a
-//! thread costs one request and is sent again without the caller knowing, so a wrong guess
+//! thread costs one request and is sent again without the client knowing, so a wrong guess
 //! here is cheap. A wrong continuation would be silent: the vendor would answer from its
-//! own copy of a conversation the caller has since changed.
+//! own copy of a conversation the client has since changed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -373,7 +373,7 @@ impl ThreadLedger {
             .messages
             .get(sent + 1)
             .is_some_and(|message| message.role == Role::User);
-        // The caller repeats the reply where the vendor's copy of it stands, and adds a
+        // The client repeats the reply where the vendor's copy of it stands, and adds a
         // message of its own after it. Anything else is a conversation the vendor does not
         // hold: an edited reply, a dropped one, a request that only repeats it.
         let doubt = if entry.account != account {
@@ -431,8 +431,8 @@ impl ThreadLedger {
 
     /// The vendor declined a thread for `turn` on `account` and then took the turn plain.
     /// The conversation goes out plain there from now on, and enough of them in a row rest
-    /// the Account. `why` is what the vendor answered the thread with, for the operator.
-    pub fn go_plain(&self, session: &str, account: &str, turn: &Turn, now: Instant, why: &str) {
+    /// the Account. `vendor` is what the vendor answered the thread with, for the operator.
+    pub fn go_plain(&self, session: &str, account: &str, turn: &Turn, now: Instant, vendor: &str) {
         let key = format!("{session}\n{}", turn.key);
         held(&self.entries).remove(&key);
         {
@@ -450,7 +450,7 @@ impl ThreadLedger {
                 account,
                 conversations = rest.0,
                 minutes = REST.as_secs() / 60,
-                vendor = why,
+                vendor,
                 "the vendor keeps declining message threads on this Account; its conversations go plain for a while"
             );
             *rest = (0, Some(now + REST));
@@ -460,7 +460,7 @@ impl ThreadLedger {
 
 /// A message as a hash that its two holders agree on.
 ///
-/// The vendor holds what it was sent and what it answered; the caller holds what it sent
+/// The vendor holds what it was sent and what it answered; the client holds what it sent
 /// and what it kept of the answer. They differ where a harness is free to differ: a cache
 /// marker moves every turn, thinking is kept or dropped, an empty text block is dropped,
 /// a text-only message is a string or one block. None of that changes what was said.
@@ -964,6 +964,7 @@ mod tests {
         let session = |n: usize| format!("session {n}");
         // One more conversation than the ledger holds, each gone plain on one Account and
         // then answered on another.
+        assert_eq!(CAPACITY, 4096);
         for n in 0..=CAPACITY {
             ledger.go_plain(&session(n), "other@example.com", &first, now, "400 no");
             ledger.note_reply(&session(n), ACCOUNT, &first, pong(1), now);

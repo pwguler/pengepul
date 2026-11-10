@@ -1216,12 +1216,12 @@ async fn record(app: &axum::Router) -> (i64, i64, i64, bool) {
     )
 }
 
-/// A caller cannot thread through the relay: a thread lives on one Account, and only the
+/// A client cannot thread through the relay: a thread lives on one Account, and only the
 /// relay knows which Account serves a conversation. It is told so in the vendor's own
 /// words, before any Account is chosen, and the SDK helpers that read those words send the
 /// conversation whole.
 #[tokio::test]
-async fn a_callers_own_thread_is_answered_before_any_account() {
+async fn a_clients_own_thread_is_answered_before_any_account() {
     let upstream = ThreadUpstream::answering();
     let (app, _tmp) = threaded_app(upstream.clone());
     let asked = |thread: Value| {
@@ -1327,10 +1327,10 @@ async fn a_conversation_opens_a_thread_then_continues_it() {
     }
 }
 
-/// A caller that names no session is still one conversation: the thread is found by what
+/// A client that names no session is still one conversation: the thread is found by what
 /// the conversation is, not by a key that moves as its opening grows.
 #[tokio::test]
-async fn a_caller_that_names_no_session_continues_from_its_second_turn() {
+async fn a_client_that_names_no_session_continues_from_its_second_turn() {
     let upstream = ThreadUpstream::answering();
     let (app, _tmp) = threaded_app(upstream.clone());
 
@@ -1368,10 +1368,10 @@ async fn a_reply_streamed_in_small_pieces_is_continued_from() {
     }
 }
 
-/// The spec's goal, as one comparison: with threads and without them, a caller receives
+/// The spec's goal, as one comparison: with threads and without them, a client receives
 /// the same thing.
 #[tokio::test]
-async fn a_thread_changes_nothing_a_caller_receives() {
+async fn a_thread_changes_nothing_a_client_receives() {
     let tool_call = |_: &UpstreamRequest, call: usize| {
         let mut message = reply(call);
         if call == 2 {
@@ -1414,7 +1414,7 @@ async fn a_thread_changes_nothing_a_caller_receives() {
                     .header("x-claude-code-session-id", "conv")
                     .body(Body::from(asking(messages, stream).to_string()))
                     .unwrap();
-                // Status, headers and body: everything a caller can read.
+                // Status, headers and body: everything a client can read.
                 answers.push(raw_response(app.clone(), request).await);
             }
             let expected = if threads { "continue" } else { "plain" };
@@ -1427,7 +1427,7 @@ async fn a_thread_changes_nothing_a_caller_receives() {
 
 /// Whatever a vendor answers a create with, short of an expired token or a rate limit, may
 /// be about the thread, in words that change. The relay reads none of them: it sends the
-/// turn plain, and the caller gets the answer to that.
+/// turn plain, and the client gets the answer to that.
 #[tokio::test]
 async fn a_create_the_vendor_declines_is_sent_again_plain() {
     let declines = [
@@ -1465,7 +1465,7 @@ async fn a_create_the_vendor_declines_is_sent_again_plain() {
             let (first, body) = harness(&app, "conv", asking(conversation(1), stream)).await;
             assert_eq!(
                 first, 200,
-                "the caller must not see the relay's own thread: {body}"
+                "the client must not see the relay's own thread: {body}"
             );
             assert_eq!(upstream.labels(), ["create", "plain"], "stream={stream}");
             assert_eq!(upstream.calls()[1].body["messages"], conversation(1));
@@ -1478,7 +1478,7 @@ async fn a_create_the_vendor_declines_is_sent_again_plain() {
                 200
             );
             assert_eq!(upstream.labels(), ["create", "plain", "plain"]);
-            // Two turns, two outcomes: the declined attempt is no request of the caller's.
+            // Two turns, two outcomes: the declined attempt is no request of the client's.
             assert_eq!(record(&app).await, (2, 2, 0, false), "status={status}");
         }
     }
@@ -1604,7 +1604,7 @@ async fn a_continue_whose_thread_is_gone_is_sent_again_as_a_create() {
                     harness(&app, "conv", asking(conversation(turns), stream)).await;
                 assert_eq!(
                     status, 200,
-                    "the caller gets the answer to the create: {body}"
+                    "the client gets the answer to the create: {body}"
                 );
             }
 
@@ -1767,10 +1767,10 @@ async fn a_rate_limit_on_a_continue_is_the_accounts_and_fails_over() {
     }
 }
 
-/// An error the caller made is answered the same however the turn is sent. The caller gets
+/// An error the client made is answered the same however the turn is sent. The client gets
 /// it unchanged after one plain try, and it says nothing against threads.
 #[tokio::test]
-async fn an_error_that_is_the_callers_reaches_it_and_ends_nothing() {
+async fn an_error_that_is_the_clients_reaches_it_and_ends_nothing() {
     for stream in [false, true] {
         let error = vendor_error("invalid_request_error", "max_tokens: Field required", None);
         let sent = error.clone();
@@ -1783,7 +1783,7 @@ async fn an_error_that_is_the_callers_reaches_it_and_ends_nothing() {
             assert_eq!(serde_json::from_str::<Value>(&body).expect("json"), error);
         }
 
-        // Four errors of the caller's rested nothing and marked nothing plain: each turn
+        // Four errors of the client's rested nothing and marked nothing plain: each turn
         // is still offered as a thread first.
         assert_eq!(
             upstream.labels(),
@@ -1795,9 +1795,9 @@ async fn an_error_that_is_the_callers_reaches_it_and_ends_nothing() {
     }
 }
 
-/// The same on a later turn: the error is the caller's, and the next try is threaded again.
+/// The same on a later turn: the error is the client's, and the next try is threaded again.
 #[tokio::test]
-async fn a_callers_own_error_on_a_later_turn_does_not_end_threading() {
+async fn a_clients_own_error_on_a_later_turn_does_not_end_threading() {
     for stream in [false, true] {
         let upstream = ThreadUpstream::new(|request, call| {
             let bad = request.body["messages"]
@@ -1818,7 +1818,7 @@ async fn a_callers_own_error_on_a_later_turn_does_not_end_threading() {
             }
         });
         let (app, _tmp) = threaded_app(upstream.clone());
-        // The second turn as the caller first sends it, and as it sends it again.
+        // The second turn as the client first sends it, and as it sends it again.
         let mut smaller = conversation(2);
         smaller[2]["content"] = json!("turn 2, smaller");
 
@@ -1927,7 +1927,7 @@ type Change = Box<dyn Fn(&mut Value)>;
 /// One way a vendor's reply is not a stored turn.
 type Spoil = Box<dyn Fn(&mut Value) + Send + Sync>;
 
-/// A caller that changed what the thread already holds gets a create, never a continue that
+/// A client that changed what the thread already holds gets a create, never a continue that
 /// would quietly serve the old text or the old instruction.
 #[tokio::test]
 async fn a_changed_conversation_creates_instead_of_continuing() {
@@ -2012,7 +2012,7 @@ async fn a_changed_conversation_creates_instead_of_continuing() {
 }
 
 #[tokio::test]
-async fn a_tool_call_on_a_continue_comes_back_under_the_callers_name() {
+async fn a_tool_call_on_a_continue_comes_back_under_the_clients_name() {
     for stream in [false, true] {
         // The vendor knows the tool by the name the relay masked it to.
         let masked = Arc::new(Mutex::new(String::new()));
@@ -2116,7 +2116,7 @@ async fn a_turn_the_vendor_did_not_store_is_not_continued() {
             let (app, _tmp) = threaded_app(upstream.clone());
 
             let _ = harness(&app, "conv", asking(conversation(1), stream)).await;
-            // Whatever the caller kept of that reply, the next turn starts over.
+            // Whatever the client kept of that reply, the next turn starts over.
             let mut second = conversation(2);
             if what == "a tool call cut by max_tokens" {
                 second[1]["content"] =
@@ -2140,7 +2140,7 @@ async fn a_request_that_adds_no_user_message_after_the_reply_is_not_continued() 
     let after_reply = [
         // The reply alone: nothing new to send.
         json!([]),
-        // An assistant message of the caller's own after it.
+        // An assistant message of the client's own after it.
         json!([{"role": "assistant", "content": "and another thing"}]),
     ];
     for extra in after_reply {
@@ -2161,7 +2161,7 @@ async fn a_request_that_adds_no_user_message_after_the_reply_is_not_continued() 
 
 #[tokio::test]
 async fn a_message_that_only_looks_like_the_reply_is_not_skipped() {
-    // A caller that never kept the reply sends a user message with the same words where
+    // A client that never kept the reply sends a user message with the same words where
     // the reply would stand. Continuing would drop it.
     let upstream = ThreadUpstream::answering();
     let (app, _tmp) = threaded_app(upstream.clone());
@@ -2280,7 +2280,7 @@ async fn a_thread_does_not_follow_its_conversation_to_another_account() {
     assert_eq!(calls[1].body["messages"], conversation(2));
 }
 
-/// A Claude Code caller names its own beta set. A set that changed is a thread that cannot
+/// A Claude Code client names its own beta set. A set that changed is a thread that cannot
 /// go on: the vendor holds a thread to the set it opened with.
 #[tokio::test]
 async fn a_changed_beta_set_creates_instead_of_continuing() {

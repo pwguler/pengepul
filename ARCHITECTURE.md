@@ -338,9 +338,9 @@ in files.
   display) and `web-fetch` stays for the native tool swap — ADR-0014.
 - **A (Inbound dialect, Provider) pair the relay cannot serve is refused 501 at
   routing**, never sent upstream and never retried.
-- **A Thread never changes what a client receives.** A Harness sends the whole
+- **A Thread never changes what the relay hands a client.** A Harness sends the whole
   conversation on every turn and the relay decides how much of it the vendor already
-  holds, so with Threads and without them a client reads the same bytes. A turn
+  holds; the reply is the vendor's, passed on as a Plain request's is. A turn
   continues only when the relay can show the vendor holds what came before: the same
   Account, a stored reply under 270 seconds old that the client repeats, the same
   earlier messages, and nothing changed that the vendor holds fixed. Anything else is
@@ -355,7 +355,7 @@ in files.
   fault on a create are the Account's, as for any request (ADR-0032).
 - **A Thread lives and dies with the process.** Nothing about one is written to
   disk: the vendor drops a Thread five minutes after its last request, so a restart
-  costs one whole request per conversation.
+  costs one create per conversation.
 - **`launch` leaves nothing behind.** A harness is pointed at the relay by the
   environment and the arguments of one process, never by a file: the same
   binary started any other way still resolves its own accounts and its own

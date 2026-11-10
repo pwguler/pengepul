@@ -278,7 +278,7 @@ pub fn anthropic_headers(
     headers
 }
 
-/// The `anthropic-beta` a request carries: a Claude Code caller's own list, or the set the
+/// The `anthropic-beta` a request carries: a Claude Code client's own list, or the set the
 /// request's shape earns.
 #[must_use]
 pub fn resolve_beta(
@@ -533,7 +533,7 @@ pub fn header_alone_block(system: &[Value]) -> Option<usize> {
         .then_some(at)
 }
 
-/// The billing-header block the relay writes when a caller sent none: derived from the
+/// The billing-header block the relay writes when a client sent none: derived from the
 /// conversation's first message.
 fn derived_billing_block(messages: &[Value], config: &Config) -> Value {
     json!({
@@ -546,7 +546,7 @@ fn derived_billing_block(messages: &[Value], config: &Config) -> Value {
     })
 }
 
-/// The billing-header block of the conversation in `body`: the caller's own when it sent
+/// The billing-header block of the conversation in `body`: the client's own when it sent
 /// one, as Claude Code does, or the derived one. It is the block Cloaking puts first on a
 /// whole request.
 fn billing_block(body: &Value, config: &Config) -> Value {
@@ -563,7 +563,7 @@ fn billing_block(body: &Value, config: &Config) -> Value {
 }
 
 /// The beta a request must name for the vendor to accept `thread` at all.
-pub const THREAD_BETA: &str = "message-threads-2026-08-12";
+const THREAD_BETA: &str = "message-threads-2026-08-12";
 
 /// How an anthropic Messages request uses a message thread: how much of its conversation
 /// the vendor already holds.
