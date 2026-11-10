@@ -30,8 +30,9 @@ audit differ on what Claude Code sends, the audit wins.
 - A Harness keeps sending full history. pengepul turns each anthropic-bound request,
   after Translation, masking and Cloaking, into a create or a continue with
   `message-threads-2026-08-12`.
-- A continue carries the full `system` and `tools`, and only the messages after the
-  anchor, as Claude Code's default does.
+- A continue carries only the new messages, no `tools`, and a `system` holding only the
+  billing-header block, as Claude Code 2.1.322 sends it (captured, see the audit). The cache
+  breakpoint goes on the last new block.
 - A request continues a thread only when that thread's stored transcript (every message
   sent, plus the stored response) is an exact prefix of the request's messages, and its
   fingerprint is unchanged. The fingerprint covers `model`, `system`, `tools`, `thinking`,
@@ -59,8 +60,8 @@ conversation.
   `"thread": {"type": "create"}` and `message-threads-2026-08-12` in `anthropic-beta`.
 - AC-3 The next request of that conversation, whose messages extend the first request's
   messages plus the returned response, goes to the same Account with
-  `"thread": {"type": "continue", "previous_message_id": <first response id>}`, the same
-  `system` and `tools`, and only the new messages.
+  `"thread": {"type": "continue", "previous_message_id": <first response id>}`, no `tools`,
+  a `system` holding only the billing-header block, and only the new messages.
 - AC-4 AC-3 holds when the first response was streamed, with the id read from `message_start`.
 - AC-5 A request whose messages differ from the stored transcript anywhere before its tail,
   or whose fingerprint differs, goes out as a create.
@@ -100,7 +101,7 @@ conversation.
 
 - [Approach]: pengepul runs its own thread engine for every Harness, not pass-through of client threads.
 - [Goal]: the upstream request matches Claude Code 2.1.321; pengepul deviates only where pooling or tool-name masking requires it.
-- [Continue body]: full `system` and `tools` plus the new messages, Claude Code's default.
+- [Continue body]: what Claude Code sends, read from captured traffic: billing-header `system` block, no `tools`, new messages only. Supersedes the earlier binary read (full `system` and `tools`).
 - [Off switch]: `cloaking.message-threads`, default on.
 - [Client threads]: refused with `thread_unsupported_request` (commit `8986eb88`).
 - [State]: memory only.
