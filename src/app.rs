@@ -2575,36 +2575,31 @@ fn capture_thread_reply(
     turn: ThreadTurn,
 ) -> UpstreamSseStream {
     Box::pin(async_stream::try_stream! {
-        let mut scan = Vec::new();
-        let mut recorded = false;
+        let mut buffer = Vec::new();
+        let mut reply = crate::threads::StreamingReply::default();
+        let mut named = false;
+        let mut hashed = false;
         while let Some(chunk) = input.next().await {
             let chunk = chunk?;
-            if !recorded {
-                scan.extend_from_slice(&chunk);
-                match reply_id_in_events(&scan) {
-                    Some(id) => {
-                        threads.note_reply(
-                            &turn.conversation,
-                            crate::threads::Reply {
-                                account: &turn.account,
-                                reply_id: &id,
-                                sent: turn.sent,
-                                prefix: turn.prefix.clone(),
-                                fingerprint: turn.fingerprint.clone(),
-                                beta: turn.beta.clone().unwrap_or_default(),
-                            },
-                            Instant::now(),
-                        );
-                        recorded = true;
-                        scan = Vec::new();
-                    }
-                    // Nothing named the reply: a plain JSON error, or a stream this relay
-                    // cannot read. The next turn creates.
-                    None if scan.len() > 64 * 1024 => {
-                        recorded = true;
-                        scan = Vec::new();
-                    }
-                    None => {}
+            buffer.extend_from_slice(&chunk);
+            // Feed whole events only: a chunk can end anywhere inside one.
+            while let Some(end) = find_event_end(&buffer) {
+                let event: Vec<u8> = buffer.drain(..end).collect();
+                let Some(parsed) = parse_sse_event(&event) else {
+                    continue;
+                };
+                reply.feed(&parsed);
+                // The id is recorded as soon as the stream names it, so a stream cut before
+                // its end still leaves the turn continuable; the reply's own hash follows
+                // once `message_stop` says the vendor stored it.
+                if let (false, Some(id)) = (named, reply.id.clone()) {
+                    named = true;
+                    record_streamed_reply(&threads, &turn, &id, None);
+                }
+                if let (true, false, Some(hash)) = (named, hashed, reply.reply_hash()) {
+                    hashed = true;
+                    let id = reply.id.clone().unwrap_or_default();
+                    record_streamed_reply(&threads, &turn, &id, Some(hash));
                 }
             }
             yield chunk;
@@ -2612,23 +2607,58 @@ fn capture_thread_reply(
     })
 }
 
-/// The reply id a stream has named so far, from its own `message_start` event.
-fn reply_id_in_events(scan: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(scan);
+/// Where the next whole SSE event ends, blank line included.
+fn find_event_end(buffer: &[u8]) -> Option<usize> {
+    buffer
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|at| at + 2)
+}
+
+/// One SSE event's `data:` payload as JSON, when it carries one.
+fn parse_sse_event(event: &[u8]) -> Option<Value> {
+    let text = String::from_utf8_lossy(event);
     for line in text.lines() {
-        let Some(data) = line.strip_prefix("data: ") else {
-            continue;
-        };
-        let Ok(event) = serde_json::from_str::<Value>(data) else {
-            continue;
-        };
-        if event.get("type").and_then(Value::as_str) == Some("message_start")
-            && let Some(id) = event.pointer("/message/id").and_then(Value::as_str)
+        if let Some(data) = line.strip_prefix("data: ")
+            && let Ok(parsed) = serde_json::from_str::<Value>(data)
         {
-            return Some(id.to_string());
+            return Some(parsed);
         }
     }
     None
+}
+
+fn record_streamed_reply(
+    threads: &ThreadLedger,
+    turn: &ThreadTurn,
+    reply_id: &str,
+    reply_hash: Option<String>,
+) {
+    threads.note_reply(
+        &turn.conversation,
+        crate::threads::Reply {
+            account: &turn.account,
+            reply_id,
+            sent: turn.sent,
+            prefix: turn.prefix.clone(),
+            fingerprint: turn.fingerprint.clone(),
+            beta: turn.beta.clone().unwrap_or_default(),
+            reply_hash,
+        },
+        Instant::now(),
+    );
+}
+
+/// The reply as the vendor sent it, for the hash the next turn is compared against.
+///
+/// Masked, not restored, because the comparison happens on the masked conversation: the
+/// relay masks the caller's copy of this reply before it looks at it, and both spellings of a
+/// tool name must hash alike only after the same masking.
+fn reply_hash_as_sent(body: &Value) -> String {
+    ThreadLedger::reply_hash(&json!({
+        "role": "assistant",
+        "content": body.get("content").cloned().unwrap_or(Value::Null),
+    }))
 }
 
 /// Remember where this conversation can continue from, unless the vendor did not store the
@@ -2696,6 +2726,7 @@ fn record_thread_reply(
             sent,
             prefix: ThreadLedger::prefix(masked, sent),
             fingerprint: ThreadLedger::fingerprint(masked),
+            reply_hash: Some(reply_hash_as_sent(body)),
             beta,
         },
         Instant::now(),

@@ -9,7 +9,7 @@
 //! rejects costs one request and falls back to a `create`, so a wrong guess here is
 //! cheap while a wrong continuation is silent.
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -48,6 +48,9 @@ pub struct Reply<'a> {
     pub prefix: String,
     pub fingerprint: String,
     pub beta: String,
+    /// The reply the vendor stored, as the caller received it. Absent for a streamed reply,
+    /// whose body this relay passes on without keeping.
+    pub reply_hash: Option<String>,
 }
 
 struct Entry {
@@ -59,6 +62,8 @@ struct Entry {
     prefix: String,
     /// Hash of the fields a thread cannot change, as they went upstream.
     fingerprint: String,
+    /// Hash of the reply the vendor stored, as the caller saw it, when this process knows it.
+    reply_hash: Option<String>,
     /// The `anthropic-beta` the create carried. A continue must carry the same set, and it
     /// cannot be recomputed: the tools the set is derived from are not in a continue body.
     beta: String,
@@ -107,7 +112,21 @@ impl ThreadLedger {
         let same_prefix = grew
             && sha256_hex(&Value::Array(messages[..entry.sent].to_vec()).to_string())
                 == entry.prefix;
-        if !(same_account && fresh && grew && same_prefix && entry.fingerprint == fingerprint) {
+        // The caller repeats the reply it received where the vendor's copy of it sits. When
+        // this process knows that reply's content, the copy must match it: a caller that
+        // rewrote the reply would otherwise be served the vendor's version while believing
+        // its own.
+        let reply_unchanged = match (&entry.reply_hash, messages.get(entry.sent)) {
+            (Some(held), Some(their_copy)) => held == &Self::reply_hash(their_copy),
+            _ => true,
+        };
+        if !(same_account
+            && fresh
+            && grew
+            && same_prefix
+            && reply_unchanged
+            && entry.fingerprint == fingerprint)
+        {
             entries.remove(conversation);
             return Plan::Create;
         }
@@ -138,6 +157,7 @@ impl ThreadLedger {
                 sent: reply.sent,
                 prefix: reply.prefix,
                 fingerprint: reply.fingerprint,
+                reply_hash: reply.reply_hash,
                 beta: reply.beta,
                 idle_at: now,
             },
@@ -176,6 +196,7 @@ impl ThreadLedger {
             &Value::Array(
                 [
                     "model",
+                    "system",
                     "tools",
                     "thinking",
                     "tool_choice",
@@ -188,6 +209,37 @@ impl ThreadLedger {
             )
             .to_string(),
         )
+    }
+
+    /// One reply as a hash the caller's copy can be compared with. Only what both sides can
+    /// agree on counts: the text and the tool calls, with a cache marker dropped, because it
+    /// moves between turns, and thinking left out, because a caller may keep or drop it.
+    #[must_use]
+    pub fn reply_hash(message: &Value) -> String {
+        let blocks = message
+            .get("content")
+            .map_or(Value::Null, |content| match content {
+                Value::String(text) => json!([{"type": "text", "text": text}]),
+                other => {
+                    let kept: Vec<Value> = other
+                        .as_array()
+                        .map(|blocks| {
+                            blocks
+                                .iter()
+                                .filter(|block| {
+                                    matches!(
+                                        block.get("type").and_then(Value::as_str),
+                                        Some("text" | "tool_use")
+                                    )
+                                })
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Value::Array(kept)
+                }
+            });
+        sha256_hex(&blocks.to_string())
     }
 
     /// The messages of `body` as one hash, for the prefix a `continue` must repeat.
@@ -221,6 +273,10 @@ mod tests {
         list
     }
 
+    fn reply_hash_of(text: &str) -> String {
+        ThreadLedger::reply_hash(&json!({"role": "assistant", "content": text}))
+    }
+
     fn ledger_with_reply(sent: usize) -> (ThreadLedger, Instant) {
         let ledger = ThreadLedger::default();
         let now = Instant::now();
@@ -234,6 +290,7 @@ mod tests {
                 prefix: ThreadLedger::prefix(&body, sent),
                 fingerprint: ThreadLedger::fingerprint(&body),
                 beta: "beta".to_string(),
+                reply_hash: Some(reply_hash_of("reply")),
             },
             now,
         );
@@ -307,6 +364,45 @@ mod tests {
     }
 
     #[test]
+    fn an_edited_reply_creates() {
+        let (ledger, now) = ledger_with_reply(3);
+        let mut edited = with_reply(3, 5);
+        edited[3] = json!({"role": "assistant", "content": "rewritten"});
+        let body = json!({"messages": messages(5), "model": "m"});
+        assert_eq!(
+            ledger.plan(
+                "c",
+                "a@example.com",
+                &edited,
+                &ThreadLedger::fingerprint(&body),
+                now
+            ),
+            Plan::Create
+        );
+    }
+
+    #[test]
+    fn a_changed_system_creates() {
+        let (ledger, now) = ledger_with_reply(3);
+        let body = json!({"messages": messages(5), "model": "m", "system": "new instruction"});
+        let stored = json!({"messages": messages(5), "model": "m", "system": "old instruction"});
+        assert_ne!(
+            ThreadLedger::fingerprint(&body),
+            ThreadLedger::fingerprint(&stored)
+        );
+        assert_eq!(
+            ledger.plan(
+                "c",
+                "a@example.com",
+                &with_reply(3, 5),
+                &ThreadLedger::fingerprint(&body),
+                now
+            ),
+            Plan::Create
+        );
+    }
+
+    #[test]
     fn another_account_creates() {
         let (ledger, now) = ledger_with_reply(3);
         let body = json!({"messages": messages(5), "model": "m"});
@@ -369,5 +465,195 @@ mod tests {
             ),
             Plan::Create
         );
+    }
+}
+
+#[cfg(test)]
+mod reply_hash_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn the_same_reply_hashes_alike() {
+        let vendor = json!({"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Paris"}}
+        ]});
+        let caller = json!({"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Paris"}}
+        ]});
+        assert_eq!(
+            ThreadLedger::reply_hash(&vendor),
+            ThreadLedger::reply_hash(&caller)
+        );
+    }
+
+    #[test]
+    fn a_reply_with_thinking_still_matches() {
+        let vendor = json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "hmm", "signature": "sig"},
+            {"type": "text", "text": "hi"}
+        ]});
+        let caller = json!({"role": "assistant", "content": [{"type": "text", "text": "hi"}]});
+        assert_eq!(
+            ThreadLedger::reply_hash(&vendor),
+            ThreadLedger::reply_hash(&caller)
+        );
+    }
+}
+
+/// A reply rebuilt from its own stream, to the shape [`ThreadLedger::reply_hash`] compares.
+///
+/// Only what the hash keeps is rebuilt: text and tool calls, with a tool call's input put
+/// back into an object, because that is how the caller holds it.
+#[derive(Default)]
+pub struct StreamingReply {
+    blocks: BTreeMap<usize, Value>,
+    partial: BTreeMap<usize, String>,
+    pub id: Option<String>,
+    pub stopped: bool,
+}
+
+impl StreamingReply {
+    /// Feed one parsed SSE event. Unknown events are ignored.
+    pub fn feed(&mut self, event: &Value) {
+        match event.get("type").and_then(Value::as_str) {
+            Some("message_start") => {
+                self.id = event
+                    .pointer("/message/id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+            }
+            Some("content_block_start") => {
+                let Some(index) = event.get("index").and_then(Value::as_u64) else {
+                    return;
+                };
+                let index = usize::try_from(index).unwrap_or(usize::MAX);
+                let Some(block) = event.get("content_block").and_then(Value::as_object) else {
+                    return;
+                };
+                match block.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        self.blocks
+                            .insert(index, json!({"type": "text", "text": ""}));
+                    }
+                    Some("tool_use") => {
+                        self.blocks.insert(
+                            index,
+                            json!({
+                                "type": "tool_use",
+                                "id": block.get("id").cloned().unwrap_or(Value::Null),
+                                "name": block.get("name").cloned().unwrap_or(Value::Null),
+                                "input": Value::Null
+                            }),
+                        );
+                        self.partial.insert(index, String::new());
+                    }
+                    _ => {}
+                }
+            }
+            Some("content_block_delta") => {
+                let Some(index) = event.get("index").and_then(Value::as_u64) else {
+                    return;
+                };
+                let index = usize::try_from(index).unwrap_or(usize::MAX);
+                let delta = event.get("delta").and_then(Value::as_object);
+                match delta
+                    .and_then(|delta| delta.get("type"))
+                    .and_then(Value::as_str)
+                {
+                    Some("text_delta") => {
+                        let text = delta
+                            .and_then(|delta| delta.get("text"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if let Some(block) = self.blocks.get_mut(&index)
+                            && let Some(held) = block.get_mut("text")
+                        {
+                            let joined = format!("{}{text}", held.as_str().unwrap_or_default());
+                            *held = Value::String(joined);
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        let piece = delta
+                            .and_then(|delta| delta.get("partial_json"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        self.partial.entry(index).or_default().push_str(piece);
+                    }
+                    _ => {}
+                }
+            }
+            Some("content_block_stop") => {
+                let Some(index) = event.get("index").and_then(Value::as_u64) else {
+                    return;
+                };
+                let index = usize::try_from(index).unwrap_or(usize::MAX);
+                // A tool call's input arrives as JSON text and goes back in as an object,
+                // which is the shape the caller repeats.
+                if let Some(mut json_text) = self.partial.remove(&index) {
+                    if json_text.trim().is_empty() {
+                        json_text = "{}".to_string();
+                    }
+                    let input = serde_json::from_str::<Value>(&json_text).unwrap_or(Value::Null);
+                    if let Some(block) = self.blocks.get_mut(&index) {
+                        block["input"] = input;
+                    }
+                }
+            }
+            Some("message_stop") => self.stopped = true,
+            _ => {}
+        }
+    }
+
+    /// The reply as a hash, when the stream finished and named itself.
+    #[must_use]
+    pub fn reply_hash(&self) -> Option<String> {
+        if !self.stopped || self.id.is_none() {
+            return None;
+        }
+        let content = Value::Array(self.blocks.values().cloned().collect());
+        Some(ThreadLedger::reply_hash(
+            &json!({"role": "assistant", "content": content}),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod streaming_reply_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_streamed_reply_hashes_like_the_same_reply_sent_whole() {
+        let mut reply = StreamingReply::default();
+        for event in [
+            json!({"type": "message_start", "message": {"id": "msg_1"}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "po"}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "ng"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "toolu_1", "name": "Bash"}}),
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"cmd\":"}}),
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "\"ls\"}"}}),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({"type": "message_stop"}),
+        ] {
+            reply.feed(&event);
+        }
+        assert_eq!(reply.id.as_deref(), Some("msg_1"));
+        let whole = json!({"role": "assistant", "content": [
+            {"type": "text", "text": "pong"},
+            {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"cmd": "ls"}}
+        ]});
+        assert_eq!(reply.reply_hash(), Some(ThreadLedger::reply_hash(&whole)));
+    }
+
+    #[test]
+    fn a_stream_without_its_end_has_no_reply_hash() {
+        let mut reply = StreamingReply::default();
+        reply.feed(&json!({"type": "message_start", "message": {"id": "msg_1"}}));
+        reply.feed(&json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}));
+        assert_eq!(reply.id.as_deref(), Some("msg_1"));
+        assert_eq!(reply.reply_hash(), None);
     }
 }

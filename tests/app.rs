@@ -1228,6 +1228,9 @@ impl UpstreamClient for StreamingUpstream {
                 format!(
                     "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{reply_id}\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-6\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":0}}}}}}\n\n"
                 ),
+                "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n".to_string(),
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"pong\"}}\n\n".to_string(),
+                "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_string(),
                 "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
             ];
             Ok(UpstreamSseResponse {
@@ -1366,6 +1369,519 @@ async fn a_thread_the_vendor_lost_is_replayed_as_a_create() {
         account["cooldownUntil"], 0.0,
         "a lost thread cooled the account"
     );
+}
+
+/// A caller that changes what the thread already holds gets a create, never a continue that
+/// would quietly serve the old text or the old instruction.
+#[tokio::test]
+async fn a_changed_system_prompt_creates_instead_of_continuing() {
+    let tmp = one_anthropic_account();
+    let upstream = Arc::new(FakeUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let turn = |system: &str, messages: Value| json!({"model": "claude-sonnet-4-6", "system": system, "messages": messages});
+    let opening = json!([{"role": "user", "content": "one"}]);
+    let grown = json!([
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "pong"},
+        {"role": "user", "content": "two"}
+    ]);
+    // A create, a continue that grows the thread, and then the same growth under a new
+    // instruction: only the last must start over.
+    for (system, messages) in [
+        ("reply in english", opening.clone()),
+        ("reply in english", grown.clone()),
+        ("reply in french", grown.clone()),
+    ] {
+        let (status, _) = json_response(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("authorization", "Bearer sk-test")
+                .header("content-type", "application/json")
+                .header("content-length", "1")
+                .header("x-claude-code-session-id", "conv-system")
+                .body(Body::from(turn(system, messages).to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, 200);
+    }
+    let kinds: Vec<String> = upstream
+        .calls()
+        .iter()
+        .map(|call| {
+            call.body["thread"]["type"]
+                .as_str()
+                .unwrap_or("none")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        ["create", "continue", "create"],
+        "a new system must not be swallowed"
+    );
+}
+
+/// The caller's copy of the reply is what it will send back; when it differs from the reply
+/// the vendor stored, continuing would silently drop the difference.
+#[tokio::test]
+async fn an_edited_reply_creates_instead_of_continuing() {
+    let tmp = one_anthropic_account();
+    let upstream = Arc::new(FakeUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, _) = post_turn(
+        app.clone(),
+        "conv-edited",
+        json!([{"role": "user", "content": "one"}]),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let (status, _) = post_turn(
+        app.clone(),
+        "conv-edited",
+        json!([
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "something else entirely"},
+            {"role": "user", "content": "two"}
+        ]),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let kinds: Vec<String> = upstream
+        .calls()
+        .iter()
+        .map(|call| {
+            call.body["thread"]["type"]
+                .as_str()
+                .unwrap_or("none")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(kinds, ["create", "create"], "an edited reply was continued");
+}
+
+/// A turn the vendor will not store cannot be continued.
+#[tokio::test]
+async fn a_tool_call_cut_by_max_tokens_creates_the_next_turn() {
+    let tmp = one_anthropic_account();
+    let upstream = Arc::new(CutToolCallUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, _) = post_turn(
+        app.clone(),
+        "conv-cut",
+        json!([{"role": "user", "content": "one"}]),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let (status, _) = post_turn(
+        app.clone(),
+        "conv-cut",
+        json!([
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "pong"},
+            {"role": "user", "content": "two"}
+        ]),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let kinds: Vec<String> = upstream
+        .calls()
+        .iter()
+        .map(|call| {
+            call.body["thread"]["type"]
+                .as_str()
+                .unwrap_or("none")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(kinds, ["create", "create"]);
+}
+
+#[derive(Default)]
+struct CutToolCallUpstream {
+    calls: Mutex<Vec<UpstreamRequest>>,
+}
+
+impl CutToolCallUpstream {
+    fn calls(&self) -> Vec<UpstreamRequest> {
+        self.calls.lock().expect("calls lock").clone()
+    }
+}
+
+impl UpstreamClient for CutToolCallUpstream {
+    fn anthropic_messages(&self, request: UpstreamRequest) -> UpstreamFuture {
+        self.calls.lock().expect("calls lock").push(request);
+        Box::pin(async {
+            Ok(UpstreamJsonResponse {
+                quota: None,
+                retry_hint: None,
+                status: axum::http::StatusCode::OK,
+                body: json!({
+                    "id": "msg_cut",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}],
+                    "stop_reason": "max_tokens",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }),
+            })
+        })
+    }
+    fn anthropic_messages_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!("not exercised")
+    }
+    fn anthropic_count_tokens(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("not exercised")
+    }
+    fn codex_responses(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("not exercised")
+    }
+    fn codex_responses_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!("not exercised")
+    }
+    fn generic_chat(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("not exercised")
+    }
+    fn generic_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!("not exercised")
+    }
+    fn fetch_models(
+        &self,
+        _kind: ProviderKind,
+        _account: AvailableAccount,
+        _config: Arc<Config>,
+    ) -> ModelsFuture {
+        unreachable!("not exercised")
+    }
+    fn fetch_cli_versions(&self) -> CliVersionsFuture {
+        unreachable!("not exercised")
+    }
+}
+
+/// A reply whose tool name the relay masked upstream must still continue: the caller holds
+/// the restored name, the vendor holds the masked one, and both must hash alike.
+#[derive(Default)]
+struct ToolReplyUpstream {
+    calls: Mutex<Vec<UpstreamRequest>>,
+}
+
+impl ToolReplyUpstream {
+    fn calls(&self) -> Vec<UpstreamRequest> {
+        self.calls.lock().expect("calls lock").clone()
+    }
+}
+
+impl UpstreamClient for ToolReplyUpstream {
+    fn anthropic_messages(&self, request: UpstreamRequest) -> UpstreamFuture {
+        let masked = request
+            .body
+            .pointer("/tools/0/name")
+            .and_then(Value::as_str)
+            .unwrap_or("none")
+            .to_string();
+        self.calls.lock().expect("calls lock").push(request);
+        Box::pin(async move {
+            Ok(UpstreamJsonResponse {
+                quota: None,
+                retry_hint: None,
+                status: axum::http::StatusCode::OK,
+                body: json!({
+                    "id": "msg_tool",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [
+                        {"type": "tool_use", "id": "toolu_1", "name": masked, "input": {"city": "Paris"}}
+                    ],
+                    "stop_reason": "tool_use",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }),
+            })
+        })
+    }
+    fn anthropic_messages_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!("not exercised")
+    }
+    fn anthropic_count_tokens(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("not exercised")
+    }
+    fn codex_responses(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("not exercised")
+    }
+    fn codex_responses_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!("not exercised")
+    }
+    fn generic_chat(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("not exercised")
+    }
+    fn generic_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!("not exercised")
+    }
+    fn fetch_models(
+        &self,
+        _kind: ProviderKind,
+        _account: AvailableAccount,
+        _config: Arc<Config>,
+    ) -> ModelsFuture {
+        unreachable!("not exercised")
+    }
+    fn fetch_cli_versions(&self) -> CliVersionsFuture {
+        unreachable!("not exercised")
+    }
+}
+
+#[tokio::test]
+async fn a_tool_use_reply_continues_with_the_name_the_caller_holds() {
+    let tmp = one_anthropic_account();
+    let upstream = Arc::new(ToolReplyUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    let tools = json!([{
+        "name": "get_weather",
+        "description": "Weather for a city",
+        "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}
+    }]);
+
+    let (status, first) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .header("x-claude-code-session-id", "conv-tool-reply")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "tools": tools,
+                    "messages": [{"role": "user", "content": "weather in Paris"}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    // The caller is served the name it declared, not the masked one.
+    assert_eq!(first["content"][0]["name"], "get_weather");
+    let tool_id = first["content"][0]["id"].clone();
+
+    let (status, _) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .header("x-claude-code-session-id", "conv-tool-reply")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "tools": tools,
+                    "messages": [
+                        {"role": "user", "content": "weather in Paris"},
+                        {"role": "assistant", "content": [{
+                            "type": "tool_use",
+                            "id": tool_id,
+                            "name": "get_weather",
+                            "input": {"city": "Paris"}
+                        }]},
+                        {"role": "user", "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": tool_id,
+                            "content": "12C cloudy"
+                        }]}
+                    ]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let kinds: Vec<String> = upstream
+        .calls()
+        .iter()
+        .map(|call| {
+            call.body["thread"]["type"]
+                .as_str()
+                .unwrap_or("none")
+                .to_string()
+        })
+        .collect();
+    for call in upstream.calls() {
+        eprintln!(
+            "CALL tools={:?} thread={:?} msgs={:?}",
+            call.body.get("tools").map(|t| t[0]["name"].clone()),
+            call.body.get("thread"),
+            call.body
+                .get("messages")
+                .map(|m| m.as_array().map(Vec::len))
+        );
+    }
+    assert_eq!(kinds, ["create", "continue"], "a tool reply was re-created");
+}
+
+/// A streamed reply is kept as far as its hash needs, so a caller that rewrites it starts
+/// over instead of being served the vendor's version.
+#[tokio::test]
+async fn an_edited_streamed_reply_creates_instead_of_continuing() {
+    let tmp = one_anthropic_account();
+    let upstream = Arc::new(StreamingUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, _, _) = raw_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .header("x-claude-code-session-id", "conv-stream-edit")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "one"}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let (status, _) = post_turn(
+        app,
+        "conv-stream-edit",
+        json!([
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "not what the vendor said"},
+            {"role": "user", "content": "two"}
+        ]),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let kinds: Vec<String> = upstream
+        .calls()
+        .iter()
+        .map(|call| {
+            call.body["thread"]["type"]
+                .as_str()
+                .unwrap_or("none")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        ["create", "create"],
+        "an edited streamed reply was continued"
+    );
+}
+
+/// Two conversations that share one session key must not continue each other's thread.
+#[tokio::test]
+async fn two_conversations_on_one_key_never_cross() {
+    let tmp = one_anthropic_account();
+    let upstream = Arc::new(FakeUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    for first in ["alpha", "beta"] {
+        let (status, _) = post_turn(
+            app.clone(),
+            "shared-key",
+            json!([{"role": "user", "content": first}]),
+        )
+        .await;
+        assert_eq!(status, 200);
+    }
+    // The second conversation comes back, and is not a continuation of the first.
+    let (status, _) = post_turn(
+        app.clone(),
+        "shared-key",
+        json!([
+            {"role": "user", "content": "beta"},
+            {"role": "assistant", "content": "pong"},
+            {"role": "user", "content": "beta again"}
+        ]),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let continued: Vec<bool> = upstream
+        .calls()
+        .iter()
+        .map(|call| call.body.pointer("/thread/type").and_then(Value::as_str) == Some("continue"))
+        .collect();
+    assert_eq!(continued, [false, false, true]);
+    // The continue belongs to beta, not alpha.
+    assert_eq!(
+        upstream.calls()[2].body["messages"],
+        json!([{"role": "user", "content": "beta again"}])
+    );
+}
+
+/// A changed tool list is a changed thread: continuing would keep the create's tools.
+#[tokio::test]
+async fn a_changed_tool_list_creates_instead_of_continuing() {
+    let tmp = one_anthropic_account();
+    let upstream = Arc::new(FakeUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let turn = |tool: &str, messages: Value| {
+        json!({
+            "model": "claude-sonnet-4-6",
+            "tools": [{"name": tool, "description": "d", "input_schema": {"type": "object"}}],
+            "messages": messages
+        })
+    };
+    let opening = json!([{"role": "user", "content": "one"}]);
+    let grown = json!([
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "pong"},
+        {"role": "user", "content": "two"}
+    ]);
+    for (tool, messages) in [
+        ("Bash", opening.clone()),
+        ("Bash", grown.clone()),
+        ("Read", grown.clone()),
+    ] {
+        let (status, _) = json_response(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("authorization", "Bearer sk-test")
+                .header("content-type", "application/json")
+                .header("content-length", "1")
+                .header("x-claude-code-session-id", "conv-tools")
+                .body(Body::from(turn(tool, messages).to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, 200);
+    }
+    let kinds: Vec<String> = upstream
+        .calls()
+        .iter()
+        .map(|call| {
+            call.body["thread"]["type"]
+                .as_str()
+                .unwrap_or("none")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(kinds, ["create", "continue", "create"]);
 }
 
 #[tokio::test]
