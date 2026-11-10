@@ -81,8 +81,8 @@ pub struct UpstreamRequest {
     /// `x-opencode-session`.
     pub conversation: String,
     /// The `anthropic-beta` to send in place of the one the request would earn. A threaded
-    /// turn sets it: a continue must repeat its create's set, and its body no longer has the
-    /// tools part of that set is derived from.
+    /// turn sets it: a continue must repeat its create's set, and cannot earn it again,
+    /// because part of the set is derived from the tools a continue does not carry.
     pub beta: Option<String>,
 }
 

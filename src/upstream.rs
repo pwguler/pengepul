@@ -302,9 +302,9 @@ pub fn resolve_beta(
     parts.join(",")
 }
 
-/// `headers` with `beta` as their `anthropic-beta`, when a threaded turn names one: a
-/// continue repeats its create's set, and its body no longer has the tools part of that
-/// set is derived from.
+/// `headers` with `beta` as their `anthropic-beta`, when a threaded turn names one. A
+/// continue repeats its create's set, and cannot earn it again: part of the set is derived
+/// from the tools, which a continue does not carry.
 #[must_use]
 pub fn with_beta(
     mut headers: BTreeMap<String, String>,
