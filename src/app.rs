@@ -39,7 +39,7 @@ use crate::streaming::{
     drain_complete_sse_events, finish_chat_stream, finish_sse_events, responses_sse_to_anthropic,
     responses_sse_to_chat, responses_sse_to_payload, sse,
 };
-use crate::threads::{Plan, Stored, StreamingReply, THREAD_BETA, ThreadLedger, Turn};
+use crate::threads::{Stored, StreamingReply, ThreadLedger, Turn};
 use crate::tokens::{Peak, load_peak, save_peak};
 use crate::translate::{
     anthropic_to_chat_request, anthropic_to_openai, anthropic_to_responses,
@@ -50,10 +50,10 @@ use crate::translate::{
 use crate::types::{AvailableAccount, ProviderId, ProviderKind, UsageData};
 use crate::upstream::{
     ANTHROPIC_BASE_URL, CODEX_BASE_URL, CODEX_DEFAULT_CLI_VERSION, CODEX_MODELS_PATH,
-    CODEX_RESPONSES_PATH, GROK_CHAT_BASE_URL, anthropic_headers, anthropic_usage_headers,
-    apply_cloaking, billing_block, codex_headers, generic_base_url, generic_chat_headers,
+    CODEX_RESPONSES_PATH, GROK_CHAT_BASE_URL, Thread, anthropic_headers, anthropic_messages_wire,
+    anthropic_usage_headers, codex_headers, generic_base_url, generic_chat_headers,
     generic_headers, grok_chat_headers, learn_grok_client_version, normalize_codex_responses_body,
-    resolve_beta, with_beta,
+    resolve_beta,
 };
 use crate::utils::now_iso;
 use crate::utils::sha256_hex;
@@ -80,10 +80,10 @@ pub struct UpstreamRequest {
     /// prefix. A chat call to an `opencode.ai` host sends a hash of it as
     /// `x-opencode-session`.
     pub conversation: String,
-    /// The `anthropic-beta` to send in place of the one the request would earn. A threaded
-    /// turn sets it: a continue must repeat its create's set, and cannot earn it again,
-    /// because part of the set is derived from the tools a continue does not carry.
-    pub beta: Option<String>,
+    /// How an anthropic Messages request uses a message thread. `body` is the conversation
+    /// whole either way; what is sent of it, and under which beta set, is the Upstream's
+    /// to write. Every other call is [`Thread::Plain`].
+    pub thread: Thread,
 }
 
 #[derive(Debug, Clone)]
@@ -333,28 +333,14 @@ impl UpstreamClient for HttpUpstreamClient {
             } else {
                 request.config.timeouts.messages_ms
             };
-            let model = request
-                .body
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or("claude-sonnet-4-6");
-            let body = apply_cloaking(
+            let (headers, body) = anthropic_messages_wire(
                 &request.body,
+                &request.thread,
                 &request.request_headers,
                 &request.account,
                 &request.config,
-            );
-            let headers = with_beta(
-                anthropic_headers(
-                    &request.account.token.access_token,
-                    stream,
-                    timeout_ms,
-                    model,
-                    &request.config,
-                    &request.request_headers,
-                    &body,
-                ),
-                request.beta,
+                stream,
+                timeout_ms,
             );
             send_json(
                 client,
@@ -371,28 +357,14 @@ impl UpstreamClient for HttpUpstreamClient {
         let client = self.client.clone();
         Box::pin(async move {
             let timeout_ms = request.config.timeouts.stream_messages_ms;
-            let model = request
-                .body
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or("claude-sonnet-4-6");
-            let body = apply_cloaking(
+            let (headers, body) = anthropic_messages_wire(
                 &request.body,
+                &request.thread,
                 &request.request_headers,
                 &request.account,
                 &request.config,
-            );
-            let headers = with_beta(
-                anthropic_headers(
-                    &request.account.token.access_token,
-                    true,
-                    timeout_ms,
-                    model,
-                    &request.config,
-                    &request.request_headers,
-                    &body,
-                ),
-                request.beta,
+                true,
+                timeout_ms,
             );
             send_stream(
                 client,
@@ -1708,7 +1680,7 @@ async fn count_tokens(State(state): State<AppState>, headers: HeaderMap, body: B
             account: account.clone(),
             config: cloaked_config(&state),
             conversation,
-            beta: None,
+            thread: Thread::Plain,
         })
         .await
     {
@@ -1803,13 +1775,17 @@ async fn route_provider_request(
     body: &Value,
     route: RequestRoute,
 ) -> Response {
-    if route == RequestRoute::Messages && body.get("thread").is_some() {
-        return thread_unsupported_response();
-    }
     let request = match resolve_route_request(state, headers, body, route) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
+    let names_a_thread = body.get("thread").is_some_and(|thread| !thread.is_null());
+    if route == RequestRoute::Messages
+        && request.provider.kind == ProviderKind::Anthropic
+        && names_a_thread
+    {
+        return thread_unsupported_response();
+    }
     let ResolvedRequest {
         provider,
         model,
@@ -1877,12 +1853,11 @@ async fn route_provider_request(
     })
 }
 
-/// A Messages request carrying `thread` (message threads, `message-threads-2026-08-12`),
-/// answered before any account is chosen. A thread cannot cross the relay intact: it
-/// lives on the account that served its create request, a continue carries no `system`
-/// or `tools` for Cloaking to rebuild, and the tool-name reverse map comes from `tools`.
-/// This is the API's own code for "send it without `thread`", which the SDK thread
-/// helper and tool runner fall back on.
+/// The answer to a Messages request that names a `thread` of its own on the anthropic
+/// Upstream, given before any Account is chosen. A thread lives on the Account that opened
+/// it, and a caller cannot choose the Account that serves its next turn, so the relay keeps
+/// the threads and a caller sends the conversation whole. This is the vendor's own code for
+/// that, which its SDK thread helper and tool runner answer by doing exactly so.
 fn thread_unsupported_response() -> Response {
     (
         StatusCode::BAD_REQUEST,
@@ -2044,7 +2019,7 @@ async fn route_generic_chat_request(
                 account: account.clone(),
                 config: cloaked_config(state),
                 conversation: request.conversation.clone(),
-                beta: None,
+                thread: Thread::Plain,
             })
             .await
         {
@@ -2081,7 +2056,7 @@ async fn route_generic_chat_request(
             account: account.clone(),
             config: cloaked_config(state),
             conversation: request.conversation.clone(),
-            beta: None,
+            thread: Thread::Plain,
         })
         .await
     {
@@ -2120,7 +2095,7 @@ async fn route_grok_request(
                 account: account.clone(),
                 config: cloaked_config(state),
                 conversation: request.conversation.clone(),
-                beta: None,
+                thread: Thread::Plain,
             })
             .await
         {
@@ -2157,7 +2132,7 @@ async fn route_grok_request(
             account: account.clone(),
             config: cloaked_config(state),
             conversation: request.conversation.clone(),
-            beta: None,
+            thread: Thread::Plain,
         })
         .await
     {
@@ -2191,7 +2166,7 @@ async fn route_codex_request(
                 account: account.clone(),
                 config: cloaked_config(state),
                 conversation: request.conversation.clone(),
-                beta: None,
+                thread: Thread::Plain,
             })
             .await
         {
@@ -2228,7 +2203,7 @@ async fn route_codex_request(
             account: account.clone(),
             config: cloaked_config(state),
             conversation: request.conversation.clone(),
-            beta: None,
+            thread: Thread::Plain,
         })
         .await
     {
@@ -2258,12 +2233,20 @@ async fn route_anthropic_request(
     // sanitizer (ADR-0028). The reverse map restores tool_use names in the
     // response.
     let masked_body = || {
-        masquerade_request(&upstream_request_body(
+        let (mut masked, reverse) = masquerade_request(&upstream_request_body(
             ProviderKind::Anthropic,
             route,
             body,
             model,
-        ))
+        ));
+        // A `thread` that names none asks for nothing, and the vendor is not asked to read
+        // it. The relay's own thread crosses to the Upstream as a fact, never in the body.
+        if let Some(object) = masked.as_object_mut()
+            && object.get("thread").is_some_and(Value::is_null)
+        {
+            object.remove("thread");
+        }
+        (masked, reverse)
     };
     let (masked, reverse) = masked_body();
     let tool_reverse = Arc::new(reverse);
@@ -2271,7 +2254,7 @@ async fn route_anthropic_request(
     // Only a Messages request is threaded. A translated one arrives here as Messages too,
     // but its reply goes back in another dialect than the one a thread is checked in.
     if route != RequestRoute::Messages || !state.config.cloaking.message_threads {
-        return match send_anthropic(state, headers, account, request, masked, None).await {
+        return match send_anthropic(state, headers, account, request, masked, Thread::Plain).await {
             Ok(answer) => {
                 anthropic_response(state, account, request, route, answer, tool_reverse, None).await
             }
@@ -2281,50 +2264,55 @@ async fn route_anthropic_request(
         };
     }
 
-    let beta = thread_beta(model, &masked, headers);
-    let turn = Turn::of(&masked, &beta);
-    let config = cloaked_config(state);
+    // The beta set is one of the things a thread may not change, so the set this request
+    // earns is part of what names its conversation.
+    let turn = Turn::of(
+        &masked,
+        &resolve_beta(model, &masked, &headers_to_map(headers)),
+    );
+    // A harness that names its session keeps its threads apart from every other session's.
+    // One that names none is told apart by what it sends: Rotation's key for it moves as
+    // its opening grows, and a thread must not move with it.
+    let session = named_session(headers, body).unwrap_or_default();
     let conversation = request.conversation.as_str();
-    let mut plan = state
+    let mut thread = state
         .threads
-        .plan(conversation, &account.token.email, &turn, Instant::now());
+        .plan(&session, &account.token.email, &turn, Instant::now());
     let mut whole = Some(masked);
-    let mut refused = false;
-    // A thread is the relay's own doing, so the vendor refusing one is never the caller's
+    let mut declined = false;
+    // A thread is the relay's own doing, so the vendor declining one is never the caller's
     // error: the turn is sent again one step plainer, down to no thread at all.
     let answer = loop {
-        tracing::debug!(conversation, plan = plan.label(), "message thread");
-        let outbound = thread_body(&plan, &mut whole, || masked_body().0, &config);
-        let named = (plan != Plan::Plain).then(|| beta.clone());
-        let mut answer = match send_anthropic(state, headers, account, request, outbound, named)
-            .await
-        {
+        tracing::debug!(conversation, thread = thread.label(), "message thread");
+        let body = whole.take().unwrap_or_else(|| masked_body().0);
+        let sent = send_anthropic(state, headers, account, request, body, thread.clone()).await;
+        let mut answer = match sent {
             Ok(answer) => answer,
             Err(error) => {
                 return upstream_failure_response(state, account.provider.clone(), account, &error)
                     .await;
             }
         };
-        let Some(plainer) = thread_fallback(&plan, &mut answer).await else {
+        let Some(plainer) = plainer_thread(&thread, &mut answer).await else {
             break answer;
         };
         tracing::debug!(
             conversation,
-            refused = plan.label(),
+            thread = thread.label(),
             status = answer.status().as_u16(),
-            "message thread refused"
+            "message thread declined"
         );
-        refused = true;
-        plan = plainer;
+        declined = true;
+        thread = plainer;
     };
-    // The vendor refused the thread and then took the conversation without one, so the
-    // refusal was the thread's. Had it refused that too, the error would be the caller's
-    // own, and would say nothing about threads.
-    if refused && plan == Plan::Plain && answer.status().is_success() {
-        state.threads.go_plain(conversation, &turn, Instant::now());
+    // The vendor declined the thread and then took the turn plain, so it was the thread it
+    // declined. Had it declined that too, the error would be the caller's own, and would
+    // say nothing about threads.
+    if declined && thread == Thread::Plain && answer.status().is_success() {
+        state.threads.go_plain(&session, &turn, Instant::now());
     }
-    let thread = (plan != Plan::Plain).then_some(turn);
-    anthropic_response(state, account, request, route, answer, tool_reverse, thread).await
+    let noted = (thread != Thread::Plain).then_some((session, turn));
+    anthropic_response(state, account, request, route, answer, tool_reverse, noted).await
 }
 
 /// What the vendor answered a Messages call with: whole, or as a stream.
@@ -2333,9 +2321,9 @@ enum Answer {
     Stream(UpstreamSseResponse),
 }
 
-/// The most of a streamed refusal that is read to see what it refuses. A refusal is a
-/// short JSON document; anything longer is passed on unread.
-const REFUSAL_LIMIT: usize = 64 * 1024;
+/// The most of a declined stream that is read for the vendor's code. Its error is a short
+/// JSON document.
+const DECLINE_LIMIT: usize = 64 * 1024;
 
 impl Answer {
     fn status(&self) -> StatusCode {
@@ -2345,44 +2333,39 @@ impl Answer {
         }
     }
 
-    /// The JSON a refusal carries, or null. A streamed one is read whole and put back, so
-    /// the caller can still be sent every byte of it.
-    async fn refusal(&mut self) -> Value {
-        let response = match self {
-            Self::Whole(response) => return response.body.clone(),
-            Self::Stream(response) => response,
-        };
-        let unread: UpstreamSseStream = Box::pin(futures_util::stream::empty());
-        let mut rest = std::mem::replace(&mut response.body, unread).fuse();
-        let mut read = Vec::new();
-        let mut failure = None;
-        while read.len() <= REFUSAL_LIMIT {
-            match rest.next().await {
-                Some(Ok(chunk)) => read.extend_from_slice(&chunk),
-                Some(Err(error)) => {
-                    failure = Some(error);
-                    break;
+    /// The vendor's code for the error it answered with, or nothing. A streamed answer is
+    /// read for it and not put back: the answer whose code is asked for is one the caller
+    /// never receives.
+    async fn error_code(&mut self) -> String {
+        let error = match self {
+            Self::Whole(response) => response.body.clone(),
+            Self::Stream(response) => {
+                let mut read = Vec::new();
+                while read.len() <= DECLINE_LIMIT
+                    && let Some(Ok(chunk)) = response.body.next().await
+                {
+                    read.extend_from_slice(&chunk);
                 }
-                None => break,
+                serde_json::from_slice(&read).unwrap_or(Value::Null)
             }
-        }
-        let refusal = serde_json::from_slice(&read).unwrap_or(Value::Null);
-        let read = (!read.is_empty()).then(|| Ok(Bytes::from(read)));
-        let replayed = futures_util::stream::iter(read.into_iter().chain(failure.map(Err)));
-        response.body = Box::pin(replayed.chain(rest));
-        refusal
+        };
+        error
+            .pointer("/error/details/error_code")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
     }
 }
 
-/// One anthropic Messages call, whole or streamed as the caller asked. `beta` is the set a
-/// threaded turn carries in place of the one the request would earn.
+/// One anthropic Messages call, whole or streamed as the caller asked. `body` is the
+/// conversation whole; `thread` tells the Upstream how much of it the vendor holds.
 async fn send_anthropic(
     state: &AppState,
     headers: &HeaderMap,
     account: &AvailableAccount,
     request: &ResolvedRequest,
     body: Value,
-    beta: Option<String>,
+    thread: Thread,
 ) -> anyhow::Result<Answer> {
     let upstream_request = UpstreamRequest {
         body,
@@ -2390,7 +2373,7 @@ async fn send_anthropic(
         account: account.clone(),
         config: cloaked_config(state),
         conversation: request.conversation.clone(),
-        beta,
+        thread,
     };
     if request.client_wants_stream {
         state
@@ -2407,8 +2390,9 @@ async fn send_anthropic(
     }
 }
 
-/// Pass the vendor's answer on. `thread` is the turn it answers when that turn opened or
-/// continued a thread: a stored reply is then where the next turn continues from.
+/// Pass the vendor's answer on. `noted` is the session and the turn it answers when that
+/// turn opened or continued a thread: a stored reply is then where the next turn
+/// continues from.
 async fn anthropic_response(
     state: &AppState,
     account: &AvailableAccount,
@@ -2416,18 +2400,18 @@ async fn anthropic_response(
     route: RequestRoute,
     answer: Answer,
     tool_reverse: Arc<BTreeMap<String, String>>,
-    thread: Option<Turn>,
+    noted: Option<(String, Turn)>,
 ) -> Response {
     let model = request.model.as_str();
     let provider = account.provider.clone();
     match answer {
         Answer::Whole(response) => {
-            if let Some(turn) = &thread
+            if let Some((session, turn)) = &noted
                 && response.status.is_success()
                 && let Some(reply) = Stored::of(&response.body)
             {
                 state.threads.note_reply(
-                    &request.conversation,
+                    session,
                     &account.token.email,
                     turn,
                     reply,
@@ -2438,13 +2422,13 @@ async fn anthropic_response(
             json_upstream_response(response, &provider, route, model, &tool_reverse)
         }
         Answer::Stream(mut response) => {
-            if let Some(turn) = thread
+            if let Some((session, turn)) = noted
                 && response.status.is_success()
             {
                 response.body = note_streamed_reply(
                     response.body,
                     state.threads.clone(),
-                    request.conversation.clone(),
+                    session,
                     account.token.email.clone(),
                     turn,
                 );
@@ -2464,104 +2448,35 @@ async fn anthropic_response(
     }
 }
 
-/// The `anthropic-beta` a thread of this request carries: the set the request would carry
-/// anyway, and the beta without which the vendor does not know `thread`.
-fn thread_beta(model: &str, body: &Value, headers: &HeaderMap) -> String {
-    let mut beta = resolve_beta(model, body, &headers_to_map(headers));
-    if !beta.split(',').any(|part| part.trim() == THREAD_BETA) {
-        beta.push(',');
-        beta.push_str(THREAD_BETA);
-    }
-    beta
-}
-
-/// The body a plan sends. `whole` is the conversation as it goes upstream unthreaded. A
-/// plan that sends all of it takes it, and the rare attempt after that builds it again.
-fn thread_body(
-    plan: &Plan,
-    whole: &mut Option<Value>,
-    rebuild: impl Fn() -> Value,
-    config: &Config,
-) -> Value {
-    match plan {
-        Plan::Plain => whole.take().unwrap_or_else(rebuild),
-        Plan::Create => {
-            let mut body = whole.take().unwrap_or_else(rebuild);
-            if let Some(object) = body.as_object_mut() {
-                object.insert("thread".to_string(), json!({"type": "create"}));
-            }
-            body
-        }
-        Plan::Continue {
-            previous_message_id,
-            from,
-        } => {
-            // Only what the vendor does not hold. The thread keeps the create's `tools`
-            // and `system`, and refuses a continue that names others. Of `system` the
-            // billing block alone goes again, and it is the whole conversation's.
-            let held = ["tools", "system", "messages"];
-            let whole = whole.get_or_insert_with(rebuild);
-            let mut body: serde_json::Map<String, Value> = whole
-                .as_object()
-                .into_iter()
-                .flatten()
-                .filter(|(field, _)| !held.contains(&field.as_str()))
-                .map(|(field, value)| (field.clone(), value.clone()))
-                .collect();
-            let new = whole
-                .get("messages")
-                .and_then(Value::as_array)
-                .and_then(|messages| messages.get(*from..))
-                .unwrap_or_default();
-            body.insert("messages".to_string(), Value::Array(new.to_vec()));
-            body.insert(
-                "system".to_string(),
-                Value::Array(vec![billing_block(whole, config)]),
-            );
-            body.insert(
-                "thread".to_string(),
-                json!({"type": "continue", "previous_message_id": previous_message_id}),
-            );
-            Value::Object(body)
-        }
-    }
-}
-
-/// What to send instead when the vendor refuses a threaded turn, if the refusal is the
-/// thread's and not the caller's.
-async fn thread_fallback(plan: &Plan, answer: &mut Answer) -> Option<Plan> {
+/// What to send instead when the vendor declines a threaded turn, or nothing when its
+/// answer stands.
+async fn plainer_thread(thread: &Thread, answer: &mut Answer) -> Option<Thread> {
     let status = answer.status();
-    // Auth and rate limits are about the Account, and are handled as they always are.
-    if *plan == Plan::Plain
-        || !status.is_client_error()
-        || matches!(status.as_u16(), 401 | 403 | 429)
-    {
+    // An expired token and a rate limit are the Account's whatever the request carried,
+    // and are handled as they always are. Any other 4xx may be the thread's doing.
+    if !status.is_client_error() || matches!(status.as_u16(), 401 | 429) {
         return None;
     }
-    let refusal = answer.refusal().await;
-    let code = refusal
-        .pointer("/error/details/error_code")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let names_threads = code.starts_with("thread_")
-        || refusal
-            .pointer("/error/message")
-            .and_then(Value::as_str)
-            .is_some_and(|message| message.contains("thread"));
-    // The thread is gone or busy, which says nothing against the conversation.
-    let gone = [
-        "thread_not_found",
-        "thread_already_continued",
-        "thread_continue_in_flight",
-    ];
-    match plan {
-        Plan::Create if names_threads => Some(Plan::Plain),
-        Plan::Continue { .. } if gone.contains(&code) => Some(Plan::Create),
-        // A continue is the relay's own shape, so whatever else the vendor refuses about
-        // one is not the caller's. It would refuse the next continue the same way, so the
-        // conversation goes on without a thread.
-        Plan::Continue { .. } => Some(Plan::Plain),
-        _ => None,
+    match thread {
+        Thread::Plain => None,
+        // The vendor says why in words that change, so none of them is read: the turn is
+        // sent again plain, and the answer to that is the one that counts.
+        Thread::Create => Some(Thread::Plain),
+        Thread::Continue { .. } => {
+            // A thread that is gone or busy says nothing against the conversation, which
+            // opens another. Anything else the vendor would decline the same way on the
+            // next continue, so the conversation goes on plain.
+            let gone = [
+                "thread_not_found",
+                "thread_already_continued",
+                "thread_continue_in_flight",
+            ];
+            if gone.contains(&answer.error_code().await.as_str()) {
+                Some(Thread::Create)
+            } else {
+                Some(Thread::Plain)
+            }
+        }
     }
 }
 
@@ -2571,7 +2486,7 @@ async fn thread_fallback(plan: &Plan, answer: &mut Answer) -> Option<Plan> {
 fn note_streamed_reply(
     mut input: UpstreamSseStream,
     threads: Arc<ThreadLedger>,
-    conversation: String,
+    session: String,
     account: String,
     turn: Turn,
 ) -> UpstreamSseStream {
@@ -2597,7 +2512,7 @@ fn note_streamed_reply(
                     Err(_) => over = true,
                 }
                 if over && let Some(stored) = open.stored() {
-                    threads.note_reply(&conversation, &account, &turn, stored, Instant::now());
+                    threads.note_reply(&session, &account, &turn, stored, Instant::now());
                 }
             }
             if over {
@@ -2860,6 +2775,13 @@ const AFFINITY_MESSAGE_BYTES: usize = 4 * 1024;
 /// payloads sit orders of magnitude below the trigger, and the cost needs a valid API
 /// key, so the unbounded hash is cheaper than the collision. ADR-0017 records it.
 fn conversation_key(headers: &HeaderMap, body: &Value, route: RequestRoute) -> String {
+    named_session(headers, body)
+        .unwrap_or_else(|| format!("prefix:{}", cacheable_prefix_fingerprint(body, route)))
+}
+
+/// The session a harness names for its conversation: a session header, or the
+/// `prompt_cache_key` its body carries.
+fn named_session(headers: &HeaderMap, body: &Value) -> Option<String> {
     // `header_str` treats a blank value as absent. It did not always: a client sending
     // `x-session-id:` with nothing after it collapsed every one of its conversations
     // onto the single key `""`, so one failover moved all of them — the same
@@ -2870,16 +2792,12 @@ fn conversation_key(headers: &HeaderMap, body: &Value, route: RequestRoute) -> S
     if let Some(session) = header_str(headers, "x-claude-code-session-id")
         .or_else(|| header_str(headers, "x-session-id"))
     {
-        return session.to_string();
+        return Some(session.to_string());
     }
-    if let Some(key) = body
-        .get("prompt_cache_key")
+    body.get("prompt_cache_key")
         .and_then(Value::as_str)
         .filter(|key| !key.trim().is_empty())
-    {
-        return key.to_string();
-    }
-    format!("prefix:{}", cacheable_prefix_fingerprint(body, route))
+        .map(ToOwned::to_owned)
 }
 
 /// The bytes a conversation's prompt cache is keyed on, canonicalized: the system
@@ -3320,14 +3238,12 @@ async fn record_provider_failure(
     detail: Option<&str>,
     retry_hint: Option<Duration>,
 ) {
-    // 4xx by themselves say nothing about account health — a malformed request, a model that
-    // does not exist, or a message thread the API no longer holds is the request's problem, and a
-    // drained balance is recorded by the failover path with the billing kind instead. Recording
-    // any of them would count the failure twice, widening one request's cooldown. The request
-    // still happened, though: count it as a refusal so it reaches an outcome without touching the
-    // account's health. 401, 403 and 429 are the account's: they fail over.
-    let client_error = status.is_client_error() && !matches!(status.as_u16(), 401 | 403 | 429);
-    if client_error {
+    // 400/402 by themselves say nothing about account health — a malformed request is
+    // the client's fault, and a drained balance is recorded by the failover path with
+    // the billing kind instead. Recording both would count the failure twice, widening
+    // one request's cooldown. The request still happened, though: count it as a refusal
+    // so it reaches an outcome without touching the account's health.
+    if status == StatusCode::BAD_REQUEST || status == StatusCode::PAYMENT_REQUIRED {
         // The request reached an outcome here. If the body turns out to be
         // billing-scoped, the failover path adds the cooldown without
         // recording a second outcome (`record_billing_cooldown`).
@@ -4603,6 +4519,62 @@ mod tests {
         );
     }
 
+    /// Which answers to a threaded turn send it again, and as what. The words of an answer
+    /// decide nothing; its status does, and for a continue the vendor's code for a thread
+    /// that is gone or busy.
+    #[tokio::test]
+    async fn only_some_answers_send_a_threaded_turn_again() {
+        use super::{Answer, Thread, plainer_thread};
+
+        let answer = |status: u16, code: &str| {
+            Answer::Whole(UpstreamJsonResponse {
+                quota: None,
+                retry_hint: None,
+                status: StatusCode::from_u16(status).expect("status"),
+                body: serde_json::json!({"type": "error", "error": {
+                    "type": "invalid_request_error",
+                    "message": "thread: no",
+                    "details": {"error_code": code}
+                }}),
+            })
+        };
+        let continuing = Thread::Continue {
+            previous_message_id: "msg_1".to_string(),
+            from: 2,
+        };
+        // An expired token, a rate limit, a vendor fault and a success are never the
+        // thread's, whatever the body says.
+        for status in [200, 401, 429, 500, 529] {
+            for thread in [Thread::Create, continuing.clone()] {
+                let mut gone = answer(status, "thread_not_found");
+                assert_eq!(plainer_thread(&thread, &mut gone).await, None, "{status}");
+            }
+        }
+        for status in [400, 403, 404, 413, 422] {
+            let mut any = answer(status, "");
+            assert_eq!(plainer_thread(&Thread::Plain, &mut any).await, None);
+            assert_eq!(
+                plainer_thread(&Thread::Create, &mut any).await,
+                Some(Thread::Plain)
+            );
+            assert_eq!(
+                plainer_thread(&continuing, &mut any).await,
+                Some(Thread::Plain)
+            );
+            for code in [
+                "thread_not_found",
+                "thread_already_continued",
+                "thread_continue_in_flight",
+            ] {
+                let mut gone = answer(status, code);
+                assert_eq!(
+                    plainer_thread(&continuing, &mut gone).await,
+                    Some(Thread::Create)
+                );
+            }
+        }
+    }
+
     #[test]
     fn upstream_request_sends_single_content_type() {
         let headers = BTreeMap::from([
@@ -5682,7 +5654,7 @@ mod tests {
             account: generic_account(name),
             config: Arc::clone(&config),
             conversation: conversation.to_string(),
-            beta: None,
+            thread: super::Thread::Plain,
         };
 
         client

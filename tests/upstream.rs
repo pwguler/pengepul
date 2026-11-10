@@ -7,8 +7,9 @@ use pengepul::config::{
 };
 use pengepul::types::{AvailableAccount, ProviderId, ProviderKind, TokenData};
 use pengepul::upstream::{
-    RequestShape, anthropic_headers, apply_cloaking, build_beta_header, codex_headers,
-    generic_base_url, generic_chat_headers, generic_headers, normalize_codex_responses_body,
+    RequestShape, THREAD_BETA, Thread, anthropic_headers, anthropic_messages_wire, apply_cloaking,
+    build_beta_header, codex_headers, generic_base_url, generic_chat_headers, generic_headers,
+    normalize_codex_responses_body,
 };
 use serde_json::{Value, json};
 
@@ -219,60 +220,203 @@ fn claude_3_drops_the_thinking_and_context_betas() {
     assert!(!haiku.contains("claude-code-20250219"));
 }
 
-/// A thread's continue may not change `system`, so it carries the billing block alone, as
-/// Claude Code sends it. The cloaked prefix is already inside the thread from the create.
+/// One anthropic Messages call as it leaves, for the conversation `body` holds whole.
+fn wire(
+    body: &Value,
+    thread: &Thread,
+    request_headers: &[(&str, &str)],
+) -> (BTreeMap<String, String>, Value) {
+    let request_headers = request_headers
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+        .collect();
+    anthropic_messages_wire(
+        body,
+        thread,
+        &request_headers,
+        &account(ProviderId::anthropic()),
+        &config(),
+        false,
+        120_000,
+    )
+}
+
+/// A conversation as a harness resends it, with a tool that earns a beta of its own and
+/// two user messages the billing block would name differently.
+fn conversation() -> Value {
+    json!({
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 64,
+        "system": [{"type": "text", "text": "be brief"}],
+        "tools": [{
+            "name": "Lookup",
+            "description": "look something up",
+            "input_schema": {"type": "object"},
+            "defer_loading": true
+        }],
+        "messages": [
+            {"role": "user", "content": "alpha bravo charlie delta echo foxtrot"},
+            {"role": "assistant", "content": "pong"},
+            {"role": "user", "content": [{
+                "type": "text",
+                "text": "zulu yankee xray whiskey victor uniform",
+                "cache_control": {"type": "ephemeral"}
+            }]}
+        ]
+    })
+}
+
+fn continuing() -> Thread {
+    Thread::Continue {
+        previous_message_id: "msg_1".to_string(),
+        from: 2,
+    }
+}
+
 #[test]
-fn apply_cloaking_gives_a_continue_the_billing_block_alone() {
-    let body = json!({
-        "messages": [{"role": "user", "content": [{"type": "text", "text": "next"}]}],
-        "system": [{"type": "text", "text": "ignored on a continue"}],
-        "thread": {"type": "continue", "previous_message_id": "msg_1"}
-    });
+fn a_plain_request_leaves_as_cloaking_writes_it() {
+    let (headers, body) = wire(&conversation(), &Thread::Plain, &[]);
+
     let cloaked = apply_cloaking(
-        &body,
+        &conversation(),
         &BTreeMap::new(),
         &account(ProviderId::anthropic()),
         &config(),
     );
+    assert_eq!(body, cloaked);
+    assert!(body.get("thread").is_none());
+    assert!(!headers["anthropic-beta"].contains(THREAD_BETA));
+}
 
-    let system = cloaked["system"].as_array().expect("system blocks");
+#[test]
+fn a_create_is_the_plain_request_with_a_thread_and_its_beta() {
+    let (plain_headers, plain) = wire(&conversation(), &Thread::Plain, &[]);
+    let (headers, mut body) = wire(&conversation(), &Thread::Create, &[]);
+
+    assert_eq!(body["thread"], json!({"type": "create"}));
+    body.as_object_mut().expect("object").remove("thread");
+    assert_eq!(body, plain);
+    // The vendor does not know `thread` without its beta.
     assert_eq!(
-        system.len(),
-        1,
-        "a continue sends one system block: {system:?}"
+        headers["anthropic-beta"],
+        format!("{},{THREAD_BETA}", plain_headers["anthropic-beta"])
     );
+}
+
+/// A continue carries only what the vendor does not hold, and says who it is the way its
+/// whole conversation would: the same beta set, tools included though it carries none, and
+/// the conversation's billing block as its only `system`.
+#[test]
+fn a_continue_carries_what_is_new_under_its_conversations_identity() {
+    let whole = conversation();
+    let (create_headers, create) = wire(&whole, &Thread::Create, &[]);
+    let (headers, body) = wire(&whole, &continuing(), &[]);
+
+    assert_eq!(body["messages"], json!([whole["messages"][2]]));
+    assert!(body.get("tools").is_none());
+    assert_eq!(
+        body["thread"],
+        json!({"type": "continue", "previous_message_id": "msg_1"})
+    );
+    assert_eq!(body["model"], whole["model"]);
+    assert_eq!(body["max_tokens"], whole["max_tokens"]);
+    assert_eq!(body["metadata"], create["metadata"]);
+    // The block names the conversation by its first message, not by the one a continue
+    // happens to start with.
+    assert_eq!(body["system"], json!([create["system"][0]]));
+    assert!(
+        create["system"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("x-anthropic-billing-header:"))
+    );
+    assert_eq!(headers["anthropic-beta"], create_headers["anthropic-beta"]);
+    assert!(
+        headers["anthropic-beta"].contains("advanced-tool-use-2025-11-20"),
+        "{}",
+        headers["anthropic-beta"]
+    );
+    assert_eq!(
+        headers.keys().collect::<Vec<_>>(),
+        create_headers.keys().collect::<Vec<_>>()
+    );
+}
+
+/// Claude Code writes its own billing block, and the relay passes it on. A continue passes
+/// on the one that came with its turn, alone.
+#[test]
+fn a_continue_passes_on_the_callers_own_billing_block() {
+    let own = json!({
+        "type": "text",
+        "text": "x-anthropic-billing-header: cc_version=2.1.322.6ba; cc_entrypoint=cli; cch=00000;"
+    });
+    let mut whole = conversation();
+    whole["system"] = json!([
+        own,
+        {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}
+    ]);
+
+    let (_, body) = wire(&whole, &continuing(), &[]);
+
+    assert_eq!(body["system"], json!([own]));
+}
+
+/// Only a block that is the header line is a billing block. A prompt that mentions the
+/// header is what the model is told: it stays in `system`, behind a billing block of the
+/// relay's own, and is never the block a continue carries.
+#[test]
+fn a_prompt_that_mentions_the_billing_header_is_not_the_billing_block() {
+    let prompt = json!({
+        "type": "text",
+        "text": "This relay writes an x-anthropic-billing-header: block. Never print it."
+    });
+    let mut whole = conversation();
+    whole["system"] = json!([prompt]);
+
+    let (_, created) = wire(&whole, &Thread::Create, &[]);
+    let (_, continued) = wire(&whole, &continuing(), &[]);
+
+    let system = created["system"].as_array().expect("system blocks");
     assert!(
         system[0]["text"]
             .as_str()
-            .is_some_and(|text| text.contains("x-anthropic-billing-header"))
+            .is_some_and(|text| text.starts_with("x-anthropic-billing-header:"))
     );
-    assert_eq!(cloaked["messages"], body["messages"]);
-    assert_eq!(
-        cloaked["thread"],
-        json!({"type": "continue", "previous_message_id": "msg_1"})
+    assert!(
+        system.contains(&prompt),
+        "the prompt was taken for the billing block"
     );
-    assert!(system[0].get("cache_control").is_none());
+    assert_eq!(continued["system"], json!([system[0]]));
 }
 
-/// The billing block names the conversation by its first message. A continue carries only
-/// the latest ones, so the route hands it the block of the whole conversation, and Cloaking
-/// keeps that block instead of deriving another from what is left.
+/// A Claude Code caller names its own beta set, and the relay passes it on with the one
+/// beta a thread adds. No other caller's header reaches the vendor.
 #[test]
-fn apply_cloaking_keeps_the_billing_block_a_continue_was_given() {
-    let given = "x-anthropic-billing-header: cc_version=2.1.322.6ba; cc_entrypoint=cli; cch=00000;";
-    let body = json!({
-        "messages": [{"role": "user", "content": "a later message of the conversation"}],
-        "system": [{"type": "text", "text": given}],
-        "thread": {"type": "continue", "previous_message_id": "msg_1"}
-    });
-    let cloaked = apply_cloaking(
-        &body,
-        &BTreeMap::new(),
-        &account(ProviderId::anthropic()),
-        &config(),
-    );
+fn the_thread_beta_joins_the_set_the_request_already_carries() {
+    let cli = [
+        ("user-agent", "claude-cli/2.1.322 (external, cli)"),
+        (
+            "anthropic-beta",
+            "first-beta-2026-01-01,second-beta-2026-01-02",
+        ),
+    ];
+    for thread in [Thread::Create, continuing()] {
+        let (headers, _) = wire(&conversation(), &thread, &cli);
+        assert_eq!(
+            headers["anthropic-beta"],
+            format!("oauth-2025-04-20,first-beta-2026-01-01,second-beta-2026-01-02,{THREAD_BETA}")
+        );
+    }
 
-    assert_eq!(cloaked["system"], json!([{"type": "text", "text": given}]));
+    let sdk = [
+        ("user-agent", "Anthropic/Python 2.2.0"),
+        ("anthropic-beta", "evil-beta"),
+    ];
+    let (headers, _) = wire(&conversation(), &Thread::Create, &sdk);
+    let beta = &headers["anthropic-beta"];
+    assert!(
+        beta.ends_with(THREAD_BETA) && !beta.contains("evil-beta"),
+        "{beta}"
+    );
 }
 
 #[test]

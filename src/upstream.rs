@@ -302,20 +302,6 @@ pub fn resolve_beta(
     parts.join(",")
 }
 
-/// `headers` with `beta` as their `anthropic-beta`, when a threaded turn names one. A
-/// continue repeats its create's set, and cannot earn it again: part of the set is derived
-/// from the tools, which a continue does not carry.
-#[must_use]
-pub fn with_beta(
-    mut headers: BTreeMap<String, String>,
-    beta: Option<String>,
-) -> BTreeMap<String, String> {
-    if let Some(beta) = beta {
-        headers.insert("anthropic-beta".to_string(), beta);
-    }
-    headers
-}
-
 // Log-only: message content is never rewritten (quotes, tool_results, and signed
 // thinking blocks must stay byte-identical), but a quoted copy of the sentence in
 // conversation history may still trip the classifier — surface it for diagnosis.
@@ -507,37 +493,24 @@ fn requests_long_retention(body: &Value) -> bool {
         })
 }
 
-/// Whether the body continues a message thread rather than starting one.
-fn is_thread_continue(object: &serde_json::Map<String, Value>) -> bool {
-    object
-        .get("thread")
-        .and_then(|thread| thread.get("type"))
-        .and_then(Value::as_str)
-        == Some("continue")
-}
+/// What a billing block starts with: the one line that names the client and the conversation
+/// to the vendor's meter.
+const BILLING_HEADER: &str = "x-anthropic-billing-header:";
 
-/// What marks the system block that names the client and the conversation to the vendor's
-/// meter.
-const BILLING_HEADER: &str = "x-anthropic-billing-header";
-
-/// Whether a system block is the billing block. Claude Code writes a new one for every
-/// request, so it is not part of what a conversation's `system` says.
+/// Whether a system block is a billing block: its text is the header line and nothing
+/// before it. A prompt that only mentions the header is a prompt.
 #[must_use]
 pub fn is_billing_block(block: &Value) -> bool {
     block
         .get("text")
         .and_then(Value::as_str)
-        .is_some_and(|text| text.contains(BILLING_HEADER))
+        .is_some_and(|text| text.trim_start().starts_with(BILLING_HEADER))
 }
 
 /// The billing block of the conversation in `body`: the caller's own when it sent one, as
-/// Claude Code does, or the one its first message derives.
-///
-/// A continue carries this block and no other `system`. The thread already holds what the
-/// create sent, and the block has to be the conversation's: derived from the few messages
-/// a continue carries, it would name another conversation on every turn.
-#[must_use]
-pub fn billing_block(body: &Value, config: &Config) -> Value {
+/// Claude Code does, or the one its first message derives. It is the block Cloaking puts
+/// first on a whole request.
+fn billing_block(body: &Value, config: &Config) -> Value {
     let own = body
         .get("system")
         .and_then(Value::as_array)
@@ -554,6 +527,123 @@ pub fn billing_block(body: &Value, config: &Config) -> Value {
             )
         })
     })
+}
+
+/// The beta a request must name for the vendor to accept `thread` at all.
+pub const THREAD_BETA: &str = "message-threads-2026-08-12";
+
+/// How an anthropic Messages request uses a message thread: how much of its conversation
+/// the vendor already holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Thread {
+    /// None of it, and it is not asked to keep any: the conversation whole, as a request
+    /// that has never heard of threads.
+    Plain,
+    /// None of it yet: the conversation whole, opening a thread.
+    Create,
+    /// Everything before `messages[from]`, ending in the reply `previous_message_id`.
+    Continue {
+        previous_message_id: String,
+        from: usize,
+    },
+}
+
+impl Thread {
+    /// The thread as one word, for a log line.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::Create => "create",
+            Self::Continue { .. } => "continue",
+        }
+    }
+}
+
+/// The headers and the body an anthropic Messages call goes out with. `body` is the
+/// conversation whole, before Cloaking, whatever `thread` says: the vendor identity of a
+/// request is the conversation's, not that of the part being sent.
+///
+/// A continue therefore names the beta set its whole conversation earns, tools included,
+/// though it carries none of them, and its one `system` block is the conversation's
+/// billing block. Derived from the few messages a continue carries, both would differ
+/// from its create's on every turn, and the vendor holds a thread to the set it opened
+/// with.
+#[must_use]
+pub fn anthropic_messages_wire(
+    body: &Value,
+    thread: &Thread,
+    request_headers: &BTreeMap<String, String>,
+    account: &AvailableAccount,
+    config: &Config,
+    stream: bool,
+    timeout_ms: u64,
+) -> (BTreeMap<String, String>, Value) {
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("claude-sonnet-4-6");
+    let mut headers = anthropic_headers(
+        &account.token.access_token,
+        stream,
+        timeout_ms,
+        model,
+        config,
+        request_headers,
+        body,
+    );
+    if *thread != Thread::Plain
+        && let Some(beta) = headers.get_mut("anthropic-beta")
+        && !beta.split(',').any(|part| part.trim() == THREAD_BETA)
+    {
+        beta.push(',');
+        beta.push_str(THREAD_BETA);
+    }
+
+    let Thread::Continue {
+        previous_message_id,
+        from,
+    } = thread
+    else {
+        let mut whole = apply_cloaking(body, request_headers, account, config);
+        if *thread == Thread::Create
+            && let Some(object) = whole.as_object_mut()
+        {
+            object.insert("thread".to_string(), json!({"type": "create"}));
+        }
+        return (headers, whole);
+    };
+    // Only what the vendor does not hold. The thread keeps the create's `tools` and
+    // `system`, and declines a continue that names others.
+    let held = ["tools", "system", "messages"];
+    let mut continued: serde_json::Map<String, Value> = body
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(field, _)| !held.contains(&field.as_str()))
+        .map(|(field, value)| (field.clone(), value.clone()))
+        .collect();
+    let new = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|messages| messages.get(*from..))
+        .unwrap_or_default();
+    if detect_classifier_tripping_in_messages(&json!({"messages": new})) {
+        tracing::warn!(
+            "classifier-tripping sentence found in messages content; passing through unmodified"
+        );
+    }
+    continued.insert("messages".to_string(), Value::Array(new.to_vec()));
+    continued.insert(
+        "system".to_string(),
+        Value::Array(vec![billing_block(body, config)]),
+    );
+    continued.insert(
+        "thread".to_string(),
+        json!({"type": "continue", "previous_message_id": previous_message_id}),
+    );
+    cloak_metadata(&mut continued, request_headers, account);
+    (headers, Value::Object(continued))
 }
 
 pub fn apply_cloaking(
@@ -574,89 +664,89 @@ pub fn apply_cloaking(
     let Some(object) = next_body.as_object_mut() else {
         return next_body;
     };
-    // A continue may not change `system`: the create's blocks are already inside the
-    // thread, and the vendor refuses a continuation that names different ones. So the
-    // billing block goes alone, which is what Claude Code sends on a continue too.
-    if is_thread_continue(object) {
-        object.insert(
-            "system".to_string(),
-            Value::Array(vec![billing_block(body, config)]),
-        );
-    } else {
-        // Taken, not copied: the entry is rebuilt and re-inserted below, and the
-        // system block is the largest field in the request.
-        let existing = object.remove("system").unwrap_or(Value::Array(Vec::new()));
-        let remaining = match existing {
-            Value::Array(values) => values,
-            Value::Null => Vec::new(),
-            other => vec![json!({"type": "text", "text": other.to_string()})],
-        };
+    // Taken, not copied: the entry is rebuilt and re-inserted below, and the
+    // system block is the largest field in the request.
+    let existing = object.remove("system").unwrap_or(Value::Array(Vec::new()));
+    let remaining = match existing {
+        Value::Array(values) => values,
+        Value::Null => Vec::new(),
+        other => vec![json!({"type": "text", "text": other.to_string()})],
+    };
 
-        let mut billing = None;
-        let mut prefix = None;
-        let mut kept = Vec::new();
-        for mut block in remaining {
-            let rewritten = block
-                .get("text")
-                .and_then(Value::as_str)
-                .filter(|text| text.contains(CLASSIFIER_TRIPPING_TEXT))
-                .map(|text| text.replace(CLASSIFIER_TRIPPING_TEXT, CLASSIFIER_SAFE_TEXT));
-            if let Some(text) = rewritten {
-                block["text"] = Value::String(text);
-            }
-            let text = block.get("text").and_then(Value::as_str).unwrap_or("");
-            if text.contains(BILLING_HEADER) && billing.is_none() {
-                billing = Some(block);
-            } else if text.contains("You are Claude Code") && prefix.is_none() {
-                prefix = Some(block);
-            } else {
-                kept.push(block);
-            }
+    let mut billing = None;
+    let mut prefix = None;
+    let mut kept = Vec::new();
+    for mut block in remaining {
+        let rewritten = block
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| text.contains(CLASSIFIER_TRIPPING_TEXT))
+            .map(|text| text.replace(CLASSIFIER_TRIPPING_TEXT, CLASSIFIER_SAFE_TEXT));
+        if let Some(text) = rewritten {
+            block["text"] = Value::String(text);
         }
-
-        let billing = billing.unwrap_or_else(|| {
-            json!({
-                "type": "text",
-                "text": billing_header(
-                    object
-                        .get("messages")
-                        .and_then(Value::as_array)
-                        .map_or(&[], Vec::as_slice),
-                    &config.cloaking.cli_version,
-                    &config.cloaking.entrypoint,
-                )
-            })
-        });
-        let mut prefix = prefix.unwrap_or_else(|| {
-            json!({
-                "type": "text",
-                "text": "You are Claude Code, Anthropic's official CLI for Claude.",
-                "cache_control": {"type": "ephemeral"}
-            })
-        });
-        // Anthropic renders tools, then system, then messages, and refuses a 1h
-        // breakpoint that comes after a 5m one. Our marker precedes every client
-        // breakpoint in `messages` wherever it ends up, so a client asking for 1h
-        // retention was answered 400 on every request until it carried the same
-        // TTL. Lifted here, before `reallocate_prefix_breakpoint` may move it
-        // into the conversation, so the checkpoint inherits the client's TTL
-        // rather than expiring in five minutes behind an hour-long prefix.
-        if requests_long_retention(body) && prefix.get("cache_control").is_some() {
-            prefix["cache_control"] = json!({"type": "ephemeral", "ttl": "1h"});
+        let text = block.get("text").and_then(Value::as_str).unwrap_or("");
+        if billing.is_none() && is_billing_block(&block) {
+            billing = Some(block);
+        } else if text.contains("You are Claude Code") && prefix.is_none() {
+            prefix = Some(block);
+        } else {
+            kept.push(block);
         }
-        object.insert(
-            "system".to_string(),
-            Value::Array([billing, prefix].into_iter().chain(kept).collect()),
-        );
-
-        // Anthropic rejects a request with more than 4 `cache_control` blocks. A client
-        // may already spend its full budget (e.g. hermes marks 4); the injected prefix
-        // would make 5. Keep the last 4 cache breakpoints (the client's, which cache the
-        // most content) and drop the earlier ones (our prefix) so the total stays valid.
-        reallocate_prefix_breakpoint(object, 4);
-        cap_cache_control(object, 4);
     }
 
+    let billing = billing.unwrap_or_else(|| {
+        json!({
+            "type": "text",
+            "text": billing_header(
+                object
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .map_or(&[], Vec::as_slice),
+                &config.cloaking.cli_version,
+                &config.cloaking.entrypoint,
+            )
+        })
+    });
+    let mut prefix = prefix.unwrap_or_else(|| {
+        json!({
+            "type": "text",
+            "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+            "cache_control": {"type": "ephemeral"}
+        })
+    });
+    // Anthropic renders tools, then system, then messages, and refuses a 1h
+    // breakpoint that comes after a 5m one. Our marker precedes every client
+    // breakpoint in `messages` wherever it ends up, so a client asking for 1h
+    // retention was answered 400 on every request until it carried the same
+    // TTL. Lifted here, before `reallocate_prefix_breakpoint` may move it
+    // into the conversation, so the checkpoint inherits the client's TTL
+    // rather than expiring in five minutes behind an hour-long prefix.
+    if requests_long_retention(body) && prefix.get("cache_control").is_some() {
+        prefix["cache_control"] = json!({"type": "ephemeral", "ttl": "1h"});
+    }
+    object.insert(
+        "system".to_string(),
+        Value::Array([billing, prefix].into_iter().chain(kept).collect()),
+    );
+
+    // Anthropic rejects a request with more than 4 `cache_control` blocks. A client
+    // may already spend its full budget (e.g. hermes marks 4); the injected prefix
+    // would make 5. Keep the last 4 cache breakpoints (the client's, which cache the
+    // most content) and drop the earlier ones (our prefix) so the total stays valid.
+    reallocate_prefix_breakpoint(object, 4);
+    cap_cache_control(object, 4);
+
+    cloak_metadata(object, request_headers, account);
+    next_body
+}
+
+/// The account metadata every anthropic Messages body carries, whole or continued.
+fn cloak_metadata(
+    object: &mut serde_json::Map<String, Value>,
+    request_headers: &BTreeMap<String, String>,
+    account: &AvailableAccount,
+) {
     let session = header_value(request_headers, "x-claude-code-session-id").map_or_else(
         || {
             let api_hash = sha256_hex(&extract_api_key(request_headers).unwrap_or_default());
@@ -676,7 +766,6 @@ pub fn apply_cloaking(
         })
         .to_string(),
     );
-    next_body
 }
 
 #[must_use]

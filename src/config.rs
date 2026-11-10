@@ -56,7 +56,8 @@ pub struct CloakingConfig {
     pub codex: std::collections::BTreeMap<String, String>,
     /// Whether an anthropic conversation may continue on the vendor as a message thread
     /// instead of resending itself. On by default: it changes what the relay sends, never
-    /// what a client receives.
+    /// what a client receives. It sits with Cloaking because the shape of a threaded
+    /// request is the vendor CLI's own: what Claude Code sends when it threads.
     pub message_threads: bool,
 }
 
