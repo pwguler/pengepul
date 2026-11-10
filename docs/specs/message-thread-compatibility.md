@@ -53,13 +53,16 @@ knowing, and a 4xx answer never cools an Account.
 - AC-11 A thread belongs to a conversation, its fixed fields and its opening message. A side
   request under the same session neither ends the thread nor continues it, and two
   conversations under one session keep their own threads.
-- AC-12 A thread the vendor refuses never reaches the caller. A refused continue (any 4xx
-  but 401, 403 and 429) is sent again as a create. A refused create, and a continue the
-  vendor has no thread for, is sent again with no thread, and that conversation stays
-  unthreaded. None of it is recorded against the Account.
-- AC-13 An error that is the caller's own is passed on once, unchanged, whole or streamed.
-- AC-14 Three refusals in a row, with no thread taken between them, stop all threading for an
-  hour.
+- AC-12 A thread the vendor refuses never reaches the caller. A continue whose thread is
+  gone or busy (`thread_not_found`, `thread_already_continued`, `thread_continue_in_flight`)
+  is sent again as a create. Any other refused continue (a 4xx but 401, 403 and 429), and a
+  create refused for its thread, is sent again with no thread; when the vendor takes that,
+  the conversation stays unthreaded. None of it is recorded against the Account.
+- AC-13 An error that is the caller's own reaches it unchanged, whole or streamed: at once
+  on a first turn, and after one try without a thread on a later one. It does not end
+  threading for the conversation and is not counted as a refusal.
+- AC-14 Three conversations refused in a row, with no thread taken between them, stop all
+  threading for an hour.
 - AC-15 A tool call in the reply to a continue comes back under the caller's tool name.
 - AC-16 With `cloaking.message-threads: false` no request carries `thread` or its beta.
 
@@ -93,9 +96,11 @@ knowing, and a 4xx answer never cools an Account.
   - AC-11: `two_conversations_on_one_key_never_cross`,
     `a_side_request_under_the_same_session_does_not_end_the_thread`
   - AC-12: `a_create_the_vendor_refuses_is_sent_again_without_a_thread`,
-    `a_continue_the_vendor_refuses_is_replayed_as_a_create`,
+    `a_continue_whose_thread_is_gone_is_replayed_as_a_create`,
+    `a_continue_refused_for_what_it_carries_leaves_the_conversation_plain`,
     `a_continue_the_endpoint_cannot_take_leaves_the_conversation_plain`
-  - AC-13: `an_error_that_is_the_callers_reaches_it_once`
+  - AC-13: `an_error_that_is_the_callers_reaches_it_once`,
+    `a_callers_own_error_on_a_later_turn_does_not_end_threading`
   - AC-14: `a_vendor_that_stopped_taking_threads_is_not_asked_for_every_conversation`
   - AC-15: `a_tool_call_on_a_continue_comes_back_under_the_callers_name`
   - AC-16: `threads_off_sends_the_conversation_unthreaded`;
@@ -127,7 +132,10 @@ knowing, and a 4xx answer never cools an Account.
   after its reply was taken.
 - [Refusals]: a continue is the relay's own shape, so every refusal of one is answered from
   the whole conversation; a create is refused for the thread only when the vendor's answer
-  names threads. The rest after three refusals exists because a beta is retired one day.
+  names threads. A refusal that is not about a lost or busy thread would repeat on the next
+  continue, so it ends threading for that conversation instead of costing two requests a
+  turn. A refusal counts only once the vendor has taken the same turn without a thread. The
+  rest after three refusals exists because a beta is retired one day.
 - [State]: in memory, one entry per thread, 4096 at most, taken on use and dropped on the
   first doubt; a restart costs one create per conversation.
 - [Bodies]: a create or a plain request moves the conversation upstream; only a continue

@@ -2289,6 +2289,7 @@ async fn route_anthropic_request(
         .threads
         .plan(conversation, &account.token.email, &turn, Instant::now());
     let mut whole = Some(masked);
+    let mut refused = false;
     // A thread is the relay's own doing, so the vendor refusing one is never the caller's
     // error: the turn is sent again one step plainer, down to no thread at all.
     let answer = loop {
@@ -2313,11 +2314,15 @@ async fn route_anthropic_request(
             status = answer.status().as_u16(),
             "message thread refused"
         );
-        if plainer == Plan::Plain {
-            state.threads.go_plain(conversation, &turn, Instant::now());
-        }
+        refused = true;
         plan = plainer;
     };
+    // The vendor refused the thread and then took the conversation without one, so the
+    // refusal was the thread's. Had it refused that too, the error would be the caller's
+    // own, and would say nothing about threads.
+    if refused && plan == Plan::Plain && answer.status().is_success() {
+        state.threads.go_plain(conversation, &turn, Instant::now());
+    }
     let thread = (plan != Plan::Plain).then_some(turn);
     anthropic_response(state, account, request, route, answer, tool_reverse, thread).await
 }
@@ -2543,15 +2548,19 @@ async fn thread_fallback(plan: &Plan, answer: &mut Answer) -> Option<Plan> {
             .pointer("/error/message")
             .and_then(Value::as_str)
             .is_some_and(|message| message.contains("thread"));
-    // The vendor has no thread for this request: it says so, or it does not know the field.
-    let no_threads =
-        names_threads && (code == "thread_unsupported_request" || !code.starts_with("thread_"));
+    // The thread is gone or busy, which says nothing against the conversation.
+    let gone = [
+        "thread_not_found",
+        "thread_already_continued",
+        "thread_continue_in_flight",
+    ];
     match plan {
         Plan::Create if names_threads => Some(Plan::Plain),
-        Plan::Continue { .. } if no_threads => Some(Plan::Plain),
-        // A continue is the relay's own shape. Whatever the vendor refuses about one, the
-        // conversation whole is what the caller sent.
-        Plan::Continue { .. } => Some(Plan::Create),
+        Plan::Continue { .. } if gone.contains(&code) => Some(Plan::Create),
+        // A continue is the relay's own shape, so whatever else the vendor refuses about
+        // one is not the caller's. It would refuse the next continue the same way, so the
+        // conversation goes on without a thread.
+        Plan::Continue { .. } => Some(Plan::Plain),
         _ => None,
     }
 }

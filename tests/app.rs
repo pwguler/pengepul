@@ -1394,42 +1394,20 @@ async fn a_vendor_that_stopped_taking_threads_is_not_asked_for_every_conversatio
     );
 }
 
+/// The thread is gone or busy, which says nothing against the conversation: it is sent whole
+/// and opens another.
 #[tokio::test]
-async fn a_continue_the_vendor_refuses_is_replayed_as_a_create() {
-    let refusals = [
-        (
-            404,
-            refusal(
-                "not_found_error",
-                "No thread state was found for the requested `previous_message_id`.",
-                Some("thread_not_found"),
-            ),
-        ),
-        (
-            400,
-            refusal(
-                "invalid_request_error",
-                "thread: the request does not match the thread it continues",
-                Some("thread_fingerprint_mismatch"),
-            ),
-        ),
-        // Not a thread error by name. A continue is the relay's own shape, so any refusal of
-        // one is answered from the copy the relay holds.
-        (
-            400,
-            refusal(
-                "invalid_request_error",
-                "tool_choice: Extra inputs are not permitted",
-                None,
-            ),
-        ),
+async fn a_continue_whose_thread_is_gone_is_replayed_as_a_create() {
+    let gone = [
+        (404, "not_found_error", "thread_not_found"),
+        (400, "invalid_request_error", "thread_already_continued"),
+        (400, "invalid_request_error", "thread_continue_in_flight"),
     ];
-    for (status, error) in refusals {
+    for (status, kind_of_error, code) in gone {
         for stream in [false, true] {
-            let error = error.clone();
             let upstream = ThreadUpstream::new(move |request, call| {
-                if kind(request) == "continue" {
-                    (status, error.clone())
+                if kind(request) == "continue" && call == 2 {
+                    (status, refusal(kind_of_error, "thread: no", Some(code)))
                 } else {
                     (200, reply(call))
                 }
@@ -1441,7 +1419,7 @@ async fn a_continue_the_vendor_refuses_is_replayed_as_a_create() {
             let (second, body) = harness(&app, "conv", asking(conversation(2), stream)).await;
 
             assert_eq!(second, 200, "the caller gets the replayed answer: {body}");
-            assert_eq!(upstream.kinds(), ["create", "continue", "create"]);
+            assert_eq!(upstream.kinds(), ["create", "continue", "create"], "{code}");
             assert_eq!(upstream.calls()[2].body["messages"], conversation(2));
             let account = listed(app.clone(), "anthropic", "anthropic@example.com").await;
             assert_eq!(
@@ -1458,6 +1436,106 @@ async fn a_continue_the_vendor_refuses_is_replayed_as_a_create() {
                 "msg_3"
             );
         }
+    }
+}
+
+/// The vendor took the conversation whole and will not take it continued: a field it holds
+/// fixed that the relay does not, a limit a continue counts differently. The next continue
+/// would be refused the same way, so the conversation goes on without a thread.
+#[tokio::test]
+async fn a_continue_refused_for_what_it_carries_leaves_the_conversation_plain() {
+    let refusals = [
+        refusal(
+            "invalid_request_error",
+            "thread: the request does not match the thread it continues",
+            Some("thread_fingerprint_mismatch"),
+        ),
+        // Not a thread error by name. A continue is the relay's own shape all the same.
+        refusal(
+            "invalid_request_error",
+            "A maximum of 4 blocks with cache_control may be provided. Found 5.",
+            None,
+        ),
+    ];
+    for error in refusals {
+        for stream in [false, true] {
+            let error = error.clone();
+            let upstream = ThreadUpstream::new(move |request, call| {
+                if kind(request) == "continue" {
+                    (400, error.clone())
+                } else {
+                    (200, reply(call))
+                }
+            });
+            let (app, _tmp) = threaded_app(upstream.clone());
+
+            for turns in 1..=3 {
+                let (status, body) =
+                    harness(&app, "conv", asking(conversation(turns), stream)).await;
+                assert_eq!(status, 200, "{body}");
+            }
+
+            assert_eq!(upstream.kinds(), ["create", "continue", "plain", "plain"]);
+            assert_eq!(upstream.calls()[2].body["messages"], conversation(2));
+            let account = listed(app.clone(), "anthropic", "anthropic@example.com").await;
+            assert_eq!(
+                account["cooldownUntil"], 0.0,
+                "a refused continue cooled the account"
+            );
+        }
+    }
+}
+
+/// A turn the vendor refuses however it is sent was the caller's to get wrong. It is passed
+/// on, and it costs the conversation nothing: the caller's next try is threaded again.
+#[tokio::test]
+async fn a_callers_own_error_on_a_later_turn_does_not_end_threading() {
+    for stream in [false, true] {
+        let upstream = ThreadUpstream::new(|request, call| {
+            let bad = request.body["messages"]
+                .as_array()
+                .and_then(|messages| messages.last())
+                .is_some_and(|message| message["content"] == "turn 2");
+            if bad {
+                (
+                    400,
+                    refusal(
+                        "invalid_request_error",
+                        "messages: image exceeds 5 MB",
+                        None,
+                    ),
+                )
+            } else {
+                (200, reply(call))
+            }
+        });
+        let (app, _tmp) = threaded_app(upstream.clone());
+        // The second turn as the caller first sends it, and as it sends it again.
+        let mut fixed = conversation(2);
+        fixed[2]["content"] = json!("turn 2, smaller");
+
+        assert_eq!(
+            harness(&app, "conv", asking(conversation(1), stream))
+                .await
+                .0,
+            200
+        );
+        for _ in 0..3 {
+            let (status, body) = harness(&app, "conv", asking(conversation(2), stream)).await;
+            assert_eq!(status, 400);
+            assert!(body.contains("image exceeds 5 MB"), "{body}");
+        }
+        assert_eq!(harness(&app, "conv", asking(fixed, stream)).await.0, 200);
+
+        // Three errors of the caller's in a row rested nothing, and marked nothing plain.
+        let kinds = upstream.kinds();
+        assert_eq!(kinds[..3], ["create", "continue", "plain"]);
+        assert_eq!(
+            kinds.last().map(String::as_str),
+            Some("create"),
+            "{kinds:?}"
+        );
+        assert!(!kinds[3..].contains(&"continue".to_string()), "{kinds:?}");
     }
 }
 
