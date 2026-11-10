@@ -34,6 +34,10 @@ vendor lost costs one request, and a 4xx answer never cools an Account.
   `message_start` while the stream passed through unchanged.
 - AC-8 A rewritten earlier message, a changed fixed field, an idle thread, another Account or
   a reply already continued all go out as a create.
+- AC-13 A caller that changes its `system`, its tool list, or its copy of the reply goes out as
+  a create, so a new instruction is never swallowed and an edited reply is never served from
+  the vendor's copy. Holds for a streamed reply too, which is rebuilt from its own events for
+  the comparison.
 - AC-9 A continue carries the billing block alone as its `system`, because a thread may not
   change `system` and the create's blocks are already inside it.
 - AC-10 An Upstream thread rejection is answered by one create from the relay's copy: as a new
@@ -55,7 +59,14 @@ vendor lost costs one request, and a 4xx answer never cools an Account.
   `a_conversation_creates_a_thread_then_continues_it`,
   `a_streamed_reply_names_the_thread_the_next_turn_continues`,
   `a_thread_the_vendor_lost_is_replayed_as_a_create`, `threads_off_sends_the_conversation_unthreaded`,
-  `apply_cloaking_gives_a_continue_the_billing_block_alone`, and the `threads` unit tests.
+  `apply_cloaking_gives_a_continue_the_billing_block_alone`,
+  `a_changed_system_prompt_creates_instead_of_continuing`,
+  `a_changed_tool_list_creates_instead_of_continuing`,
+  `an_edited_reply_creates_instead_of_continuing`,
+  `an_edited_streamed_reply_creates_instead_of_continuing`,
+  `a_tool_use_reply_continues_with_the_name_the_caller_holds`,
+  `two_conversations_on_one_key_never_cross`, `a_tool_call_cut_by_max_tokens_creates_the_next_turn`,
+  and the `threads` unit tests.
 
 ## Decisions so far
 
