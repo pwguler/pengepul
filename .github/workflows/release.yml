@@ -58,7 +58,7 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             name: pengepul-linux-x86_64
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             name: pengepul-macos-arm64
 
