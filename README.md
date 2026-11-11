@@ -268,10 +268,24 @@ debug: off # off | errors | verbose
 quota:
   poll: true # read an idle account's quota from the vendor's usage route
   poll-minutes: 15 # how old a snapshot may be before a poll refreshes it
+# optional; on by default. When the relay rewrites this file it keeps the key only when it is
+# false: a build older than the one that added the key refuses a config that carries it.
+cloaking:
+  message-threads: true # continue an anthropic conversation on the vendor instead of resending it
 ```
 
 `stream-messages-ms` is a silence limit, not a deadline: a streamed reply runs as long as it
 keeps sending, and fails once it sends nothing for that long, before it starts or between
 chunks. codex streams every request upstream, so there it is also the deadline of a reply
 the client did not stream.
+
+With `message-threads` on, the relay keeps an anthropic conversation on the vendor as a
+message thread: a harness sends the whole conversation on every turn, and the relay sends
+the vendor only the messages after the last reply while the conversation is unchanged and
+under four and a half minutes idle. Tokens are billed as for a whole request; what shrinks
+is the request. A turn the vendor declines as a thread is sent again plain, and the harness
+never sees the difference. An account the vendor keeps declining threads on is not asked
+for one for an hour. A harness that sends a `thread` of its own is answered
+`thread_unsupported_request`, which the vendor's SDKs answer by sending the conversation
+whole.
 

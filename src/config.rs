@@ -54,6 +54,11 @@ pub struct CloakingConfig {
     pub cli_version: String,
     pub entrypoint: String,
     pub codex: std::collections::BTreeMap<String, String>,
+    /// Whether an anthropic conversation may continue on the vendor as a message thread
+    /// instead of resending itself. On by default: it changes what the relay sends, never
+    /// what a client receives. It sits with Cloaking because the shape of a threaded
+    /// request is the vendor CLI's own: what Claude Code sends when it threads.
+    pub message_threads: bool,
 }
 
 /// Whether and how often the relay asks the vendors' own usage endpoints for
@@ -191,6 +196,16 @@ struct RawCloaking {
     cli_version: String,
     entrypoint: String,
     codex: std::collections::BTreeMap<String, String>,
+    // Written only when an operator turned it off. A build without the key refuses a config
+    // that carries it, so a config the relay writes on its own must still load there.
+    #[serde(rename = "message-threads", skip_serializing_if = "is_on")]
+    message_threads: bool,
+}
+
+/// Whether a switch that defaults to on is on. A reference, because serde hands one.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_on(switch: &bool) -> bool {
+    *switch
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,6 +267,7 @@ impl Default for RawCloaking {
             cli_version: "2.1.88".to_string(),
             entrypoint: "cli".to_string(),
             codex: std::collections::BTreeMap::new(),
+            message_threads: true,
         }
     }
 }
@@ -412,6 +428,7 @@ pub fn load_config(
             cli_version: raw.cloaking.cli_version,
             entrypoint: raw.cloaking.entrypoint,
             codex: raw.cloaking.codex,
+            message_threads: raw.cloaking.message_threads,
         },
         timeouts: TimeoutConfig {
             messages_ms: raw.timeouts.messages,

@@ -270,26 +270,36 @@ pub fn anthropic_headers(
     ]);
     headers.extend(passthrough_anthropic_headers(request_headers));
 
-    if let Some(beta) = headers.get("anthropic-beta").cloned() {
-        let mut parts = beta
-            .split(',')
-            .map(str::trim)
-            .filter(|part| !part.is_empty())
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>();
-        if !parts.iter().any(|part| part == ANTHROPIC_OAUTH_BETA) {
-            parts.insert(0, ANTHROPIC_OAUTH_BETA.to_string());
-        }
-        parts.dedup();
-        headers.insert("anthropic-beta".to_string(), parts.join(","));
-    } else {
-        headers.insert(
-            "anthropic-beta".to_string(),
-            build_beta_header(model, RequestShape::of(body)),
-        );
-    }
+    headers.insert(
+        "anthropic-beta".to_string(),
+        resolve_beta(model, body, request_headers),
+    );
 
     headers
+}
+
+/// The `anthropic-beta` a request carries: a Claude Code client's own list, or the set the
+/// request's shape earns.
+#[must_use]
+pub fn resolve_beta(
+    model: &str,
+    body: &Value,
+    request_headers: &BTreeMap<String, String>,
+) -> String {
+    let Some(beta) = passthrough_anthropic_headers(request_headers).remove("anthropic-beta") else {
+        return build_beta_header(model, RequestShape::of(body));
+    };
+    let mut parts = beta
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if !parts.iter().any(|part| part == ANTHROPIC_OAUTH_BETA) {
+        parts.insert(0, ANTHROPIC_OAUTH_BETA.to_string());
+    }
+    parts.dedup();
+    parts.join(",")
 }
 
 // Log-only: message content is never rewritten (quotes, tool_results, and signed
@@ -483,6 +493,192 @@ fn requests_long_retention(body: &Value) -> bool {
         })
 }
 
+/// What a billing-header block starts with: the line that names the client and the
+/// conversation to the Classifier.
+const BILLING_HEADER: &str = "x-anthropic-billing-header:";
+
+/// Whether a system block is a billing-header block: its text starts with the header. A
+/// prompt that mentions the header further on is a prompt.
+fn is_billing_block(block: &Value) -> bool {
+    block
+        .get("text")
+        .and_then(Value::as_str)
+        .is_some_and(|text| text.trim_start().starts_with(BILLING_HEADER))
+}
+
+/// Where the billing-header block of a `system` stands: the first one, which is the one
+/// Cloaking puts in front. A later one is `system` like any other block.
+fn billing_position(system: &[Value]) -> Option<usize> {
+    system.iter().position(is_billing_block)
+}
+
+/// The `system` block that says nothing to the model: the billing-header block, when its
+/// text is the header and its `name=value;` fields and nothing more. Claude Code writes a
+/// new one for every request, so a thread's `system` is compared without it. A block that
+/// goes on after the fields tells the model something, and is compared like any other.
+#[must_use]
+pub fn header_alone_block(system: &[Value]) -> Option<usize> {
+    let at = billing_position(system)?;
+    let fields = system[at]
+        .get("text")
+        .and_then(Value::as_str)?
+        .trim()
+        .strip_prefix(BILLING_HEADER)?;
+    fields
+        .split(';')
+        .map(str::trim)
+        .all(|field| {
+            field.is_empty() || (field.contains('=') && !field.contains(char::is_whitespace))
+        })
+        .then_some(at)
+}
+
+/// The billing-header block the relay writes when a client sent none: derived from the
+/// conversation's first message.
+fn derived_billing_block(messages: &[Value], config: &Config) -> Value {
+    json!({
+        "type": "text",
+        "text": billing_header(
+            messages,
+            &config.cloaking.cli_version,
+            &config.cloaking.entrypoint,
+        )
+    })
+}
+
+/// The billing-header block of the conversation in `body`: the client's own when it sent
+/// one, as Claude Code does, or the derived one. It is the block Cloaking puts first on a
+/// whole request.
+fn billing_block(body: &Value, config: &Config) -> Value {
+    let system = body.get("system").and_then(Value::as_array);
+    let own = system.and_then(|blocks| Some(&blocks[billing_position(blocks)?]));
+    own.cloned().unwrap_or_else(|| {
+        derived_billing_block(
+            body.get("messages")
+                .and_then(Value::as_array)
+                .map_or(&[], Vec::as_slice),
+            config,
+        )
+    })
+}
+
+/// The beta a request must name for the vendor to accept `thread` at all.
+const THREAD_BETA: &str = "message-threads-2026-08-12";
+
+/// How an anthropic Messages request uses a message thread: how much of its conversation
+/// the vendor already holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Threading {
+    /// None of it, and it is not asked to keep any: the conversation whole, as a request
+    /// that has never heard of threads.
+    Plain,
+    /// None of it yet: the conversation whole, opening a thread.
+    Create,
+    /// Everything before `messages[from]`, ending in the reply `previous_message_id`.
+    Continue {
+        previous_message_id: String,
+        from: usize,
+    },
+}
+
+impl Threading {
+    /// How the request is threaded, as one word for a log line.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::Create => "create",
+            Self::Continue { .. } => "continue",
+        }
+    }
+}
+
+/// The headers and the body an anthropic Messages call goes out with. `body` is the
+/// conversation whole, before Cloaking, whatever `threading` says: the vendor identity of a
+/// request is the conversation's, not that of the part being sent.
+///
+/// A continue therefore names the beta set its whole conversation earns, tools included,
+/// though it carries none of them, and its one `system` block is the conversation's
+/// billing-header block. Derived from the few messages a continue carries, both would differ
+/// from its create's on every turn, and the vendor holds a thread to the set it opened
+/// with.
+#[must_use]
+pub fn anthropic_messages_wire(
+    body: &Value,
+    threading: &Threading,
+    request_headers: &BTreeMap<String, String>,
+    account: &AvailableAccount,
+    config: &Config,
+    stream: bool,
+    timeout_ms: u64,
+) -> (BTreeMap<String, String>, Value) {
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("claude-sonnet-4-6");
+    let mut headers = anthropic_headers(
+        &account.token.access_token,
+        stream,
+        timeout_ms,
+        model,
+        config,
+        request_headers,
+        body,
+    );
+    if *threading != Threading::Plain
+        && let Some(beta) = headers.get_mut("anthropic-beta")
+        && !beta.split(',').any(|part| part.trim() == THREAD_BETA)
+    {
+        beta.push(',');
+        beta.push_str(THREAD_BETA);
+    }
+
+    let Threading::Continue {
+        previous_message_id,
+        from,
+    } = threading
+    else {
+        let mut whole = apply_cloaking(body, request_headers, account, config);
+        if *threading == Threading::Create
+            && let Some(object) = whole.as_object_mut()
+        {
+            object.insert("thread".to_string(), json!({"type": "create"}));
+        }
+        return (headers, whole);
+    };
+    // Only what the vendor does not hold. The thread keeps the create's `tools` and
+    // `system`, and declines a continue that names others.
+    let held = ["tools", "system", "messages"];
+    let mut continued: serde_json::Map<String, Value> = body
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(field, _)| !held.contains(&field.as_str()))
+        .map(|(field, value)| (field.clone(), value.clone()))
+        .collect();
+    let new = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|messages| messages.get(*from..))
+        .unwrap_or_default();
+    if detect_classifier_tripping_in_messages(&json!({"messages": new})) {
+        tracing::warn!(
+            "classifier-tripping sentence found in messages content; passing through unmodified"
+        );
+    }
+    continued.insert("messages".to_string(), Value::Array(new.to_vec()));
+    continued.insert(
+        "system".to_string(),
+        Value::Array(vec![billing_block(body, config)]),
+    );
+    continued.insert(
+        "thread".to_string(),
+        json!({"type": "continue", "previous_message_id": previous_message_id}),
+    );
+    cloak_metadata(&mut continued, request_headers, account);
+    (headers, Value::Object(continued))
+}
+
 pub fn apply_cloaking(
     body: &Value,
     request_headers: &BTreeMap<String, String>,
@@ -523,7 +719,7 @@ pub fn apply_cloaking(
             block["text"] = Value::String(text);
         }
         let text = block.get("text").and_then(Value::as_str).unwrap_or("");
-        if text.contains("x-anthropic-billing-header") && billing.is_none() {
+        if billing.is_none() && is_billing_block(&block) {
             billing = Some(block);
         } else if text.contains("You are Claude Code") && prefix.is_none() {
             prefix = Some(block);
@@ -533,17 +729,13 @@ pub fn apply_cloaking(
     }
 
     let billing = billing.unwrap_or_else(|| {
-        json!({
-            "type": "text",
-            "text": billing_header(
-                object
-                    .get("messages")
-                    .and_then(Value::as_array)
-                    .map_or(&[], Vec::as_slice),
-                &config.cloaking.cli_version,
-                &config.cloaking.entrypoint,
-            )
-        })
+        derived_billing_block(
+            object
+                .get("messages")
+                .and_then(Value::as_array)
+                .map_or(&[], Vec::as_slice),
+            config,
+        )
     });
     let mut prefix = prefix.unwrap_or_else(|| {
         json!({
@@ -574,6 +766,16 @@ pub fn apply_cloaking(
     reallocate_prefix_breakpoint(object, 4);
     cap_cache_control(object, 4);
 
+    cloak_metadata(object, request_headers, account);
+    next_body
+}
+
+/// The account metadata every anthropic Messages body carries, whole or continued.
+fn cloak_metadata(
+    object: &mut serde_json::Map<String, Value>,
+    request_headers: &BTreeMap<String, String>,
+    account: &AvailableAccount,
+) {
     let session = header_value(request_headers, "x-claude-code-session-id").map_or_else(
         || {
             let api_hash = sha256_hex(&extract_api_key(request_headers).unwrap_or_default());
@@ -593,7 +795,6 @@ pub fn apply_cloaking(
         })
         .to_string(),
     );
-    next_body
 }
 
 #[must_use]

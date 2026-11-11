@@ -39,6 +39,7 @@ use crate::streaming::{
     drain_complete_sse_events, finish_chat_stream, finish_sse_events, responses_sse_to_anthropic,
     responses_sse_to_chat, responses_sse_to_payload, sse,
 };
+use crate::threads::{Stored, StreamingReply, ThreadLedger, Turn};
 use crate::tokens::{Peak, load_peak, save_peak};
 use crate::translate::{
     anthropic_to_chat_request, anthropic_to_openai, anthropic_to_responses,
@@ -49,9 +50,10 @@ use crate::translate::{
 use crate::types::{AvailableAccount, ProviderId, ProviderKind, UsageData};
 use crate::upstream::{
     ANTHROPIC_BASE_URL, CODEX_BASE_URL, CODEX_DEFAULT_CLI_VERSION, CODEX_MODELS_PATH,
-    CODEX_RESPONSES_PATH, GROK_CHAT_BASE_URL, anthropic_headers, anthropic_usage_headers,
-    apply_cloaking, codex_headers, generic_base_url, generic_chat_headers, generic_headers,
-    grok_chat_headers, learn_grok_client_version, normalize_codex_responses_body,
+    CODEX_RESPONSES_PATH, GROK_CHAT_BASE_URL, Threading, anthropic_headers,
+    anthropic_messages_wire, anthropic_usage_headers, codex_headers, generic_base_url,
+    generic_chat_headers, generic_headers, grok_chat_headers, learn_grok_client_version,
+    normalize_codex_responses_body, resolve_beta,
 };
 use crate::utils::now_iso;
 use crate::utils::sha256_hex;
@@ -78,6 +80,10 @@ pub struct UpstreamRequest {
     /// prefix. A chat call to an `opencode.ai` host sends a hash of it as
     /// `x-opencode-session`.
     pub conversation: String,
+    /// How an anthropic Messages request uses a message thread. `body` is the conversation
+    /// whole either way; what is sent of it, and under which beta set, is the Upstream
+    /// client's to write. Every other call is [`Threading::Plain`].
+    pub threading: Threading,
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +158,8 @@ struct AppState {
     account_managers: Arc<AccountManagers>,
     rate_limit_buckets: Arc<StdMutex<BTreeMap<String, RateLimitBucket>>>,
     catalog: Arc<StdRwLock<ModelCatalog>>,
+    /// Where each anthropic conversation can continue, instead of resending itself.
+    threads: Arc<crate::threads::ThreadLedger>,
     /// Process start, for the uptime `/admin/status` reports.
     started_at: Instant,
 }
@@ -325,25 +333,14 @@ impl UpstreamClient for HttpUpstreamClient {
             } else {
                 request.config.timeouts.messages_ms
             };
-            let model = request
-                .body
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or("claude-sonnet-4-6");
-            let body = apply_cloaking(
+            let (headers, body) = anthropic_messages_wire(
                 &request.body,
+                &request.threading,
                 &request.request_headers,
                 &request.account,
                 &request.config,
-            );
-            let headers = anthropic_headers(
-                &request.account.token.access_token,
                 stream,
                 timeout_ms,
-                model,
-                &request.config,
-                &request.request_headers,
-                &body,
             );
             send_json(
                 client,
@@ -360,25 +357,14 @@ impl UpstreamClient for HttpUpstreamClient {
         let client = self.client.clone();
         Box::pin(async move {
             let timeout_ms = request.config.timeouts.stream_messages_ms;
-            let model = request
-                .body
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or("claude-sonnet-4-6");
-            let body = apply_cloaking(
+            let (headers, body) = anthropic_messages_wire(
                 &request.body,
+                &request.threading,
                 &request.request_headers,
                 &request.account,
                 &request.config,
-            );
-            let headers = anthropic_headers(
-                &request.account.token.access_token,
                 true,
                 timeout_ms,
-                model,
-                &request.config,
-                &request.request_headers,
-                &body,
             );
             send_stream(
                 client,
@@ -629,6 +615,7 @@ pub fn create_app_with_upstream(config: Config, upstream: Arc<dyn UpstreamClient
         account_managers: Arc::new(account_managers),
         rate_limit_buckets: Arc::new(StdMutex::new(BTreeMap::new())),
         catalog: Arc::new(StdRwLock::new(ModelCatalog::default())),
+        threads: Arc::new(crate::threads::ThreadLedger::default()),
         started_at: Instant::now(),
     };
 
@@ -1693,6 +1680,7 @@ async fn count_tokens(State(state): State<AppState>, headers: HeaderMap, body: B
             account: account.clone(),
             config: cloaked_config(&state),
             conversation,
+            threading: Threading::Plain,
         })
         .await
     {
@@ -1791,6 +1779,13 @@ async fn route_provider_request(
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
+    let names_a_thread = body.get("thread").is_some_and(|thread| !thread.is_null());
+    if route == RequestRoute::Messages
+        && request.provider.kind == ProviderKind::Anthropic
+        && names_a_thread
+    {
+        return thread_unsupported_response();
+    }
     let ResolvedRequest {
         provider,
         model,
@@ -1856,6 +1851,27 @@ async fn route_provider_request(
         )
         .into_response()
     })
+}
+
+/// The answer to a Messages request that names a `thread` of its own on the anthropic
+/// Upstream, given before any Account is chosen. A thread lives on the Account that opened
+/// it, and a client cannot choose the Account that serves its next turn, so the relay keeps
+/// the threads and a client sends the conversation whole. This is the vendor's own code for
+/// that, which its SDK thread helper and tool runner answer by doing exactly so.
+fn thread_unsupported_response() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "thread: message threads are not supported through this relay; \
+                            send the whole conversation without `thread`",
+                "details": {"error_code": "thread_unsupported_request"}
+            }
+        })),
+    )
+        .into_response()
 }
 
 /// A dialect the provider cannot serve. A Refusal is an outcome: it counts
@@ -2003,6 +2019,7 @@ async fn route_generic_chat_request(
                 account: account.clone(),
                 config: cloaked_config(state),
                 conversation: request.conversation.clone(),
+                threading: Threading::Plain,
             })
             .await
         {
@@ -2039,6 +2056,7 @@ async fn route_generic_chat_request(
             account: account.clone(),
             config: cloaked_config(state),
             conversation: request.conversation.clone(),
+            threading: Threading::Plain,
         })
         .await
     {
@@ -2077,6 +2095,7 @@ async fn route_grok_request(
                 account: account.clone(),
                 config: cloaked_config(state),
                 conversation: request.conversation.clone(),
+                threading: Threading::Plain,
             })
             .await
         {
@@ -2113,6 +2132,7 @@ async fn route_grok_request(
             account: account.clone(),
             config: cloaked_config(state),
             conversation: request.conversation.clone(),
+            threading: Threading::Plain,
         })
         .await
     {
@@ -2146,6 +2166,7 @@ async fn route_codex_request(
                 account: account.clone(),
                 config: cloaked_config(state),
                 conversation: request.conversation.clone(),
+                threading: Threading::Plain,
             })
             .await
         {
@@ -2182,6 +2203,7 @@ async fn route_codex_request(
             account: account.clone(),
             config: cloaked_config(state),
             conversation: request.conversation.clone(),
+            threading: Threading::Plain,
         })
         .await
     {
@@ -2204,74 +2226,334 @@ async fn route_anthropic_request(
     account: &AvailableAccount,
 ) -> Response {
     let model = request.model.as_str();
-    let client_wants_stream = request.client_wants_stream;
-    let body = upstream_request_body(ProviderKind::Anthropic, route, body, model);
     // The Cloaking sanitizer rewrites a harness's tool names and bot-persona
     // system prompt so the Classifier reads the request as first-party Claude
     // Code. Every route reaches here as Messages, translated ones included. The
     // Classifier reads the body, not the client's dialect, so no route skips the
     // sanitizer (ADR-0028). The reverse map restores tool_use names in the
     // response.
-    let (body, tool_reverse) = {
-        let (masked, reverse) = masquerade_request(&body);
-        (masked, Arc::new(reverse))
-    };
-    if client_wants_stream {
-        return match state
-            .upstream
-            .anthropic_messages_stream(UpstreamRequest {
-                body,
-                request_headers: headers_to_map(headers),
-                account: account.clone(),
-                config: cloaked_config(state),
-                conversation: request.conversation.clone(),
-            })
-            .await
+    let masked_body = || {
+        let (mut masked, reverse) = masquerade_request(&upstream_request_body(
+            ProviderKind::Anthropic,
+            route,
+            body,
+            model,
+        ));
+        // A `thread` that names none asks for nothing, and the vendor is not asked to read
+        // it. The relay's own thread crosses to the Upstream client as a fact, never in the body.
+        if let Some(object) = masked.as_object_mut()
+            && object.get("thread").is_some_and(Value::is_null)
         {
-            Ok(response) => {
-                let accounting = stream_accounting(
-                    state,
-                    account.provider.clone(),
-                    account,
-                    response.status,
-                    response.retry_hint,
-                    response.quota.clone(),
-                    model,
-                )
-                .await;
-                sse_upstream_response(
-                    response,
-                    account.provider.clone(),
-                    route,
-                    model,
-                    accounting,
-                    tool_reverse,
-                )
-            }
+            object.remove("thread");
+        }
+        (masked, reverse)
+    };
+    let (masked, reverse) = masked_body();
+    let tool_reverse = Arc::new(reverse);
+    let threads = &state.threads;
+    let account_key = account.token.email.as_str();
+
+    // Only a Messages request is threaded. A translated one arrives here as Messages too,
+    // but its reply goes back in another dialect than the one a thread is checked in. An
+    // Account the vendor keeps declining threads on is not asked either, and is spared the
+    // reading of the conversation that asking takes.
+    let may_thread = route == RequestRoute::Messages
+        && state.config.cloaking.message_threads
+        && !threads.resting(account_key, Instant::now());
+    // What names the conversation to the ledger. The beta set is one of the things a thread
+    // may not change, so the set this request earns is part of it. A harness that names its
+    // session keeps its threads apart from every other session's; one that names none is
+    // told apart by what it sends, because Rotation's key for it moves as its opening grows
+    // and a thread must not move with it.
+    let ledger_turn = may_thread.then(|| {
+        let beta = resolve_beta(model, &masked, &headers_to_map(headers));
+        (
+            named_session(headers, body).unwrap_or_default(),
+            Turn::of(&masked, &beta),
+        )
+    });
+    let mut threading = ledger_turn
+        .as_ref()
+        .map_or(Threading::Plain, |(session, turn)| {
+            threads.plan(session, account_key, turn, Instant::now())
+        });
+    let mut whole = Some(masked);
+    let mut declined = None;
+    // A thread is the relay's own doing, so the vendor declining one is never the client's
+    // error: the turn is sent again without that thread, down to no thread at all.
+    let answer = loop {
+        if may_thread {
+            tracing::debug!(
+                conversation = %request.conversation,
+                threading = threading.label(),
+                "message thread"
+            );
+        }
+        let body = whole.take().unwrap_or_else(|| masked_body().0);
+        let sent = send_anthropic(state, headers, account, request, body, threading.clone()).await;
+        let mut answer = match sent {
+            Ok(answer) => answer,
             Err(error) => {
-                upstream_failure_response(state, account.provider.clone(), account, &error).await
+                return upstream_failure_response(state, account.provider.clone(), account, &error)
+                    .await;
             }
         };
-    }
-    match state
-        .upstream
-        .anthropic_messages(UpstreamRequest {
-            body,
-            request_headers: headers_to_map(headers),
-            account: account.clone(),
-            config: cloaked_config(state),
-            conversation: request.conversation.clone(),
-        })
-        .await
+        let Some((again, vendor)) = sent_again_as(&threading, &mut answer).await else {
+            break answer;
+        };
+        // A fault is not the vendor declining: it says nothing of what the vendor takes,
+        // so only a declined thread is held against the conversation.
+        if answer.status().is_client_error() {
+            tracing::debug!(
+                conversation = %request.conversation,
+                threading = threading.label(),
+                vendor,
+                "message thread declined"
+            );
+            declined = Some(vendor);
+        } else {
+            tracing::debug!(
+                conversation = %request.conversation,
+                threading = threading.label(),
+                vendor,
+                "message thread failed"
+            );
+        }
+        threading = again;
+    };
+    // The vendor declined the thread and then took the turn plain, so it was the thread it
+    // declined. Had it declined that too, the error would be the client's own, and would
+    // say nothing about threads.
+    if let (Some(vendor), Some((session, turn))) = (&declined, &ledger_turn)
+        && threading == Threading::Plain
+        && answer.status().is_success()
     {
-        Ok(response) => {
-            record_json_result(state, account.provider.clone(), account, &response, model).await;
-            json_upstream_response(response, &account.provider, route, model, &tool_reverse)
-        }
-        Err(error) => {
-            upstream_failure_response(state, account.provider.clone(), account, &error).await
+        threads.go_plain(session, account_key, turn, Instant::now(), vendor);
+    }
+    let noted = ledger_turn.filter(|_| threading != Threading::Plain);
+    anthropic_response(state, account, request, route, answer, tool_reverse, noted).await
+}
+
+/// What the vendor answered a Messages call with: whole, or as a stream.
+enum Answer {
+    Whole(UpstreamJsonResponse),
+    Stream(UpstreamSseResponse),
+}
+
+/// The most of a stream that is read for the vendor's error, which is a short
+/// JSON document.
+const ERROR_LIMIT: usize = 64 * 1024;
+
+impl Answer {
+    fn status(&self) -> StatusCode {
+        match self {
+            Self::Whole(response) => response.status,
+            Self::Stream(response) => response.status,
         }
     }
+
+    /// The error the vendor answered with, or null. A streamed answer is read for it and
+    /// not put back: the answer whose error is asked for is one the client never receives.
+    async fn error(&mut self) -> Value {
+        match self {
+            Self::Whole(response) => response.body.clone(),
+            Self::Stream(response) => {
+                let mut read = Vec::new();
+                while read.len() <= ERROR_LIMIT
+                    && let Some(Ok(chunk)) = response.body.next().await
+                {
+                    read.extend_from_slice(&chunk);
+                }
+                serde_json::from_slice(&read).unwrap_or(Value::Null)
+            }
+        }
+    }
+}
+
+/// One anthropic Messages call, whole or streamed as the client asked. `body` is the
+/// conversation whole; `threading` tells the Upstream client how much of it the vendor
+/// holds.
+async fn send_anthropic(
+    state: &AppState,
+    headers: &HeaderMap,
+    account: &AvailableAccount,
+    request: &ResolvedRequest,
+    body: Value,
+    threading: Threading,
+) -> anyhow::Result<Answer> {
+    let upstream_request = UpstreamRequest {
+        body,
+        request_headers: headers_to_map(headers),
+        account: account.clone(),
+        config: cloaked_config(state),
+        conversation: request.conversation.clone(),
+        threading,
+    };
+    if request.client_wants_stream {
+        state
+            .upstream
+            .anthropic_messages_stream(upstream_request)
+            .await
+            .map(Answer::Stream)
+    } else {
+        state
+            .upstream
+            .anthropic_messages(upstream_request)
+            .await
+            .map(Answer::Whole)
+    }
+}
+
+/// Pass the vendor's answer on. `noted` is the session and the turn it answers when that
+/// turn opened or continued a thread: a stored reply is then where the next turn
+/// continues from.
+async fn anthropic_response(
+    state: &AppState,
+    account: &AvailableAccount,
+    request: &ResolvedRequest,
+    route: RequestRoute,
+    answer: Answer,
+    tool_reverse: Arc<BTreeMap<String, String>>,
+    noted: Option<(String, Turn)>,
+) -> Response {
+    let model = request.model.as_str();
+    let provider = account.provider.clone();
+    match answer {
+        Answer::Whole(response) => {
+            if let Some((session, turn)) = &noted
+                && response.status.is_success()
+                && let Some(reply) = Stored::of(&response.body)
+            {
+                state.threads.note_reply(
+                    session,
+                    &account.token.email,
+                    turn,
+                    reply,
+                    Instant::now(),
+                );
+            }
+            record_json_result(state, provider.clone(), account, &response, model).await;
+            json_upstream_response(response, &provider, route, model, &tool_reverse)
+        }
+        Answer::Stream(mut response) => {
+            if let Some((session, turn)) = noted
+                && response.status.is_success()
+            {
+                response.body = note_streamed_reply(
+                    response.body,
+                    state.threads.clone(),
+                    session,
+                    account.token.email.clone(),
+                    turn,
+                );
+            }
+            let accounting = stream_accounting(
+                state,
+                provider.clone(),
+                account,
+                response.status,
+                response.retry_hint,
+                response.quota.clone(),
+                model,
+            )
+            .await;
+            sse_upstream_response(response, provider, route, model, accounting, tool_reverse)
+        }
+    }
+}
+
+/// What a threaded turn is sent again as when the vendor's answer may be its thread's
+/// doing, with what the vendor said, for the operator. Nothing when the answer stands.
+///
+/// The vendor says why in words that change, so the words decide nothing. The status
+/// does, and for a continue the vendor's code for a thread that is gone or busy.
+async fn sent_again_as(threading: &Threading, answer: &mut Answer) -> Option<(Threading, String)> {
+    let status = answer.status();
+    // An expired token and a rate limit are the Account's whatever the request carried,
+    // as for any request. Any other 4xx may be the thread's doing.
+    let client_error = status.is_client_error() && !matches!(status.as_u16(), 401 | 429);
+    // A vendor fault on a continue may be the thread's too: only a continue asks the
+    // vendor for what it holds. A 529 is the vendor saying it is overloaded, which another
+    // request would only add to. A fault on a create fails over as for any request.
+    let vendor_fault = status.is_server_error() && status.as_u16() != 529;
+    let the_threads = match threading {
+        Threading::Plain => false,
+        Threading::Create => client_error,
+        Threading::Continue { .. } => client_error || vendor_fault,
+    };
+    if !the_threads {
+        return None;
+    }
+    let error = answer.error().await;
+    let message: String = error
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .chars()
+        .take(200)
+        .collect();
+    // A thread that is gone or busy says nothing against the conversation, which opens
+    // another. Anything else the vendor would answer the same way on the next continue,
+    // so the conversation goes on plain.
+    let gone = [
+        "thread_not_found",
+        "thread_already_continued",
+        "thread_continue_in_flight",
+    ];
+    let code = error
+        .pointer("/error/details/error_code")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let again = if matches!(threading, Threading::Continue { .. }) && gone.contains(&code) {
+        Threading::Create
+    } else {
+        Threading::Plain
+    };
+    Some((again, format!("{} {message}", status.as_u16())))
+}
+
+/// A streamed reply, read as it passes so that the turn after it can continue from it.
+/// Every chunk goes on unchanged, and the reply is noted before its last chunk does, so
+/// the client cannot send the next turn first.
+fn note_streamed_reply(
+    mut input: UpstreamSseStream,
+    threads: Arc<ThreadLedger>,
+    session: String,
+    account: String,
+    turn: Turn,
+) -> UpstreamSseStream {
+    Box::pin(try_stream! {
+        let mut buffer = Vec::new();
+        let mut reply = Some(StreamingReply::default());
+        while let Some(chunk) = input.next().await {
+            let chunk = chunk?;
+            let mut over = false;
+            if let Some(open) = reply.as_mut() {
+                buffer.extend_from_slice(&chunk);
+                // A stream this reader cannot follow is passed on all the same, and the
+                // turn after it starts a new thread.
+                match drain_complete_sse_events(&mut buffer) {
+                    Ok(events) => {
+                        for (_, data) in events {
+                            if let Ok(event) = serde_json::from_str::<Value>(&data) {
+                                open.feed(&event);
+                            }
+                        }
+                        over = open.finished();
+                    }
+                    Err(_) => over = true,
+                }
+                if over && let Some(stored) = open.stored() {
+                    threads.note_reply(&session, &account, &turn, stored, Instant::now());
+                }
+            }
+            if over {
+                reply = None;
+                buffer = Vec::new();
+            }
+            yield chunk;
+        }
+    })
 }
 
 async fn stream_accounting(
@@ -2525,6 +2807,13 @@ const AFFINITY_MESSAGE_BYTES: usize = 4 * 1024;
 /// payloads sit orders of magnitude below the trigger, and the cost needs a valid API
 /// key, so the unbounded hash is cheaper than the collision. ADR-0017 records it.
 fn conversation_key(headers: &HeaderMap, body: &Value, route: RequestRoute) -> String {
+    named_session(headers, body)
+        .unwrap_or_else(|| format!("prefix:{}", cacheable_prefix_fingerprint(body, route)))
+}
+
+/// The session a harness names for its conversation: a session header, or the
+/// `prompt_cache_key` its body carries.
+fn named_session(headers: &HeaderMap, body: &Value) -> Option<String> {
     // `header_str` treats a blank value as absent. It did not always: a client sending
     // `x-session-id:` with nothing after it collapsed every one of its conversations
     // onto the single key `""`, so one failover moved all of them — the same
@@ -2535,16 +2824,12 @@ fn conversation_key(headers: &HeaderMap, body: &Value, route: RequestRoute) -> S
     if let Some(session) = header_str(headers, "x-claude-code-session-id")
         .or_else(|| header_str(headers, "x-session-id"))
     {
-        return session.to_string();
+        return Some(session.to_string());
     }
-    if let Some(key) = body
-        .get("prompt_cache_key")
+    body.get("prompt_cache_key")
         .and_then(Value::as_str)
         .filter(|key| !key.trim().is_empty())
-    {
-        return key.to_string();
-    }
-    format!("prefix:{}", cacheable_prefix_fingerprint(body, route))
+        .map(ToOwned::to_owned)
 }
 
 /// The bytes a conversation's prompt cache is keyed on, canonicalized: the system
@@ -4266,6 +4551,73 @@ mod tests {
         );
     }
 
+    /// Which answers to a threaded turn send it again, and as what. The words of an answer
+    /// decide nothing; its status does, and for a continue the vendor's code for a thread
+    /// that is gone or busy.
+    #[tokio::test]
+    async fn only_some_answers_send_a_threaded_turn_again() {
+        use super::{Answer, Threading, sent_again_as};
+
+        async fn again(threading: &Threading, status: u16, code: &str) -> Option<Threading> {
+            let mut answer = Answer::Whole(UpstreamJsonResponse {
+                quota: None,
+                retry_hint: None,
+                status: StatusCode::from_u16(status).expect("status"),
+                body: serde_json::json!({"type": "error", "error": {
+                    "type": "invalid_request_error",
+                    "message": "thread: no",
+                    "details": {"error_code": code}
+                }}),
+            });
+            let sent_again = sent_again_as(threading, &mut answer).await;
+            if let Some((_, vendor)) = &sent_again {
+                assert_eq!(vendor, &format!("{status} thread: no"));
+            }
+            sent_again.map(|(again, _)| again)
+        }
+        let continuing = Threading::Continue {
+            previous_message_id: "msg_1".to_string(),
+            from: 2,
+        };
+        // A success, an expired token, a rate limit and an overloaded vendor are never the
+        // thread's, whatever the body says.
+        for status in [200, 401, 429, 529] {
+            for threading in [Threading::Create, continuing.clone()] {
+                assert_eq!(
+                    again(&threading, status, "thread_not_found").await,
+                    None,
+                    "{status}"
+                );
+            }
+        }
+        // Any other 4xx may be: a create goes plain, and so does a continue, unless its
+        // thread is only gone or busy.
+        for status in [400, 403, 404, 413, 422] {
+            assert_eq!(again(&Threading::Plain, status, "").await, None);
+            assert_eq!(
+                again(&Threading::Create, status, "").await,
+                Some(Threading::Plain)
+            );
+            assert_eq!(again(&continuing, status, "").await, Some(Threading::Plain));
+            for code in [
+                "thread_not_found",
+                "thread_already_continued",
+                "thread_continue_in_flight",
+            ] {
+                assert_eq!(
+                    again(&continuing, status, code).await,
+                    Some(Threading::Create)
+                );
+            }
+        }
+        // A vendor fault is the thread's only where the thread was asked for.
+        for status in [500, 502, 503] {
+            assert_eq!(again(&Threading::Plain, status, "").await, None);
+            assert_eq!(again(&Threading::Create, status, "").await, None);
+            assert_eq!(again(&continuing, status, "").await, Some(Threading::Plain));
+        }
+    }
+
     #[test]
     fn upstream_request_sends_single_content_type() {
         let headers = BTreeMap::from([
@@ -5345,6 +5697,7 @@ mod tests {
             account: generic_account(name),
             config: Arc::clone(&config),
             conversation: conversation.to_string(),
+            threading: super::Threading::Plain,
         };
 
         client
@@ -5415,6 +5768,7 @@ mod tests {
                 cli_version: "2.1.88".to_string(),
                 entrypoint: "cli".to_string(),
                 codex: std::collections::BTreeMap::new(),
+                message_threads: true,
             },
             timeouts: TimeoutConfig {
                 messages_ms: 120_000,
@@ -5451,6 +5805,7 @@ mod tests {
     fn test_state(tmp: &std::path::Path, upstream: Arc<dyn UpstreamClient>) -> AppState {
         let config = Arc::new(test_config(tmp.to_path_buf()));
         AppState {
+            threads: Arc::new(crate::threads::ThreadLedger::default()),
             cloaking: Arc::new(StdRwLock::new(super::Cloaking::new(
                 &config,
                 crate::cloaking_versions::CliVersions::default(),

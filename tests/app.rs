@@ -20,6 +20,7 @@ use pengepul::models::{FetchedModels, ModelMetadata, ModelPricing};
 use pengepul::quota::{QuotaSnapshot, QuotaWindow};
 use pengepul::tokens::save_token;
 use pengepul::types::{AvailableAccount, ProviderId, ProviderKind, TokenData};
+use pengepul::upstream::Threading;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -281,6 +282,7 @@ fn config(auth_dir: PathBuf) -> Config {
             cli_version: "2.1.88".to_string(),
             entrypoint: "cli".to_string(),
             codex: BTreeMap::default(),
+            message_threads: true,
         },
         timeouts: TimeoutConfig {
             messages_ms: 120_000,
@@ -896,6 +898,1457 @@ async fn messages_route_forwards_anthropic_account_with_resolved_model() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].body["model"], "claude-sonnet-4-6");
     assert_eq!(calls[0].account.token.access_token, "anthropic-access");
+}
+
+/// A vendor that answers each anthropic call from a script, and keeps what it was sent.
+///
+/// The script returns a status and a body. A 200 body is a whole message; when the relay
+/// asked for a stream, it is sent as that message's own events. On the message, `"cut":
+/// true` ends the stream before the vendor says it is finished, and `"chunk": n` sends the
+/// stream `n` bytes at a time instead of one event at a time.
+type Script = dyn Fn(&UpstreamRequest, usize) -> (u16, Value) + Send + Sync;
+
+struct ThreadUpstream {
+    calls: Mutex<Vec<UpstreamRequest>>,
+    script: Box<Script>,
+}
+
+impl ThreadUpstream {
+    fn new(
+        script: impl Fn(&UpstreamRequest, usize) -> (u16, Value) + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            calls: Mutex::new(Vec::new()),
+            script: Box::new(script),
+        })
+    }
+
+    /// A vendor with threads that answers every call `pong`, each reply under its own id.
+    fn answering() -> Arc<Self> {
+        Self::new(|_, call| (200, reply(call)))
+    }
+
+    /// A vendor that takes no thread: what it answers a `thread` whose beta it was not
+    /// told of.
+    fn without_threads() -> Arc<Self> {
+        Self::new(|request, call| {
+            if request.threading == Threading::Plain {
+                (200, reply(call))
+            } else {
+                (400, no_threads())
+            }
+        })
+    }
+
+    fn calls(&self) -> Vec<UpstreamRequest> {
+        self.calls.lock().expect("calls lock").clone()
+    }
+
+    /// How each call went out: `create`, `continue`, or `plain`.
+    fn labels(&self) -> Vec<&'static str> {
+        self.calls()
+            .iter()
+            .map(|call| call.threading.label())
+            .collect()
+    }
+
+    fn answer(&self, request: UpstreamRequest) -> (u16, Value) {
+        let mut calls = self.calls.lock().expect("calls lock");
+        calls.push(request);
+        (self.script)(calls.last().expect("a call"), calls.len())
+    }
+}
+
+/// The `n`th reply of a vendor: `pong`, finished, stored.
+fn reply(n: usize) -> Value {
+    json!({
+        "id": format!("msg_{n}"),
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-6",
+        "content": [{"type": "text", "text": "pong"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    })
+}
+
+/// An error in the shape the vendor's API answers with.
+fn vendor_error(kind: &str, message: &str, code: Option<&str>) -> Value {
+    let mut error = json!({"type": kind, "message": message});
+    if let Some(code) = code {
+        error["details"] = json!({"error_code": code});
+    }
+    json!({"type": "error", "error": error})
+}
+
+/// What the vendor answers a `thread` it was not told to expect.
+fn no_threads() -> Value {
+    vendor_error(
+        "invalid_request_error",
+        "thread: Extra inputs are not permitted",
+        None,
+    )
+}
+
+/// A whole message as the events a stream carries it in.
+fn as_events(message: &Value) -> Vec<String> {
+    let event = |name: &str, data: Value| format!("event: {name}\ndata: {data}\n\n");
+    let mut events = vec![event(
+        "message_start",
+        json!({"type": "message_start", "message": {
+            "id": message["id"], "type": "message", "role": "assistant", "content": [],
+            "model": message["model"], "usage": {"input_tokens": 1, "output_tokens": 0}
+        }}),
+    )];
+    for (index, block) in message["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let (start, delta) = match block["type"].as_str() {
+            Some("tool_use") => (
+                json!({"type": "tool_use", "id": block["id"], "name": block["name"], "input": {}}),
+                json!({"type": "input_json_delta", "partial_json": block["input"].to_string()}),
+            ),
+            Some("thinking") => (
+                json!({"type": "thinking", "thinking": ""}),
+                json!({"type": "thinking_delta", "thinking": block["thinking"]}),
+            ),
+            _ => (
+                json!({"type": "text", "text": ""}),
+                json!({"type": "text_delta", "text": block["text"]}),
+            ),
+        };
+        events.push(event(
+            "content_block_start",
+            json!({"type": "content_block_start", "index": index, "content_block": start}),
+        ));
+        events.push(event(
+            "content_block_delta",
+            json!({"type": "content_block_delta", "index": index, "delta": delta}),
+        ));
+        events.push(event(
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": index}),
+        ));
+    }
+    if message["cut"] != true {
+        events.push(event(
+            "message_delta",
+            json!({"type": "message_delta", "delta": {"stop_reason": message["stop_reason"]},
+                "usage": {"output_tokens": 1}}),
+        ));
+        events.push(event("message_stop", json!({"type": "message_stop"})));
+    }
+    events
+}
+
+impl UpstreamClient for ThreadUpstream {
+    fn anthropic_messages(&self, request: UpstreamRequest) -> UpstreamFuture {
+        let (status, body) = self.answer(request);
+        Box::pin(async move {
+            Ok(UpstreamJsonResponse {
+                quota: None,
+                retry_hint: None,
+                status: axum::http::StatusCode::from_u16(status).expect("status"),
+                body,
+            })
+        })
+    }
+
+    fn anthropic_messages_stream(&self, request: UpstreamRequest) -> UpstreamSseFuture {
+        let (status, body) = self.answer(request);
+        let chunks: Vec<Vec<u8>> = if status != 200 {
+            vec![body.to_string().into_bytes()]
+        } else if let Some(size) = body["chunk"].as_u64() {
+            let size = usize::try_from(size).expect("chunk size");
+            as_events(&body)
+                .concat()
+                .into_bytes()
+                .chunks(size)
+                .map(<[u8]>::to_vec)
+                .collect()
+        } else {
+            as_events(&body)
+                .into_iter()
+                .map(String::into_bytes)
+                .collect()
+        };
+        Box::pin(async move {
+            Ok(UpstreamSseResponse {
+                status: axum::http::StatusCode::from_u16(status).expect("status"),
+                retry_hint: None,
+                quota: None,
+                body: Box::pin(futures_util::stream::iter(
+                    chunks.into_iter().map(|chunk| Ok(Bytes::from(chunk))),
+                )),
+            })
+        })
+    }
+
+    fn anthropic_count_tokens(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("not exercised")
+    }
+    fn codex_responses(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("not exercised")
+    }
+    fn codex_responses_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!("not exercised")
+    }
+    fn generic_chat(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("not exercised")
+    }
+    fn generic_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!("not exercised")
+    }
+    fn fetch_models(
+        &self,
+        _kind: ProviderKind,
+        _account: AvailableAccount,
+        _config: Arc<Config>,
+    ) -> ModelsFuture {
+        Box::pin(async move { Ok(FetchedModels::new(Vec::new())) })
+    }
+    fn fetch_cli_versions(&self) -> CliVersionsFuture {
+        Box::pin(async { anyhow::bail!("no cli version source") })
+    }
+}
+
+fn pool_account(dir: &Path, email: &str) {
+    save_token(
+        dir,
+        &TokenData {
+            access_token: format!("access-{email}"),
+            refresh_token: format!("refresh-{email}"),
+            email: email.to_string(),
+            expires_at: "2030-01-01T00:00:00Z".to_string(),
+            account_uuid: format!("uuid-{email}"),
+            provider: ProviderId::anthropic(),
+            id_token: None,
+            last_refresh_at: None,
+            plan_type: None,
+        },
+    )
+    .expect("save token");
+}
+
+const THE_ACCOUNT: &str = "anthropic@example.com";
+
+/// A relay with one anthropic Account in front of `upstream`.
+fn threaded_app(upstream: Arc<ThreadUpstream>) -> (axum::Router, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    pool_account(tmp.path(), THE_ACCOUNT);
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream);
+    (app, tmp)
+}
+
+/// One request of a harness: the whole body it would send, in the session it names, if
+/// it names one.
+async fn harness_with(
+    app: &axum::Router,
+    session: Option<&str>,
+    body: Value,
+    headers: &[(&str, &str)],
+) -> (u16, String) {
+    let mut request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("authorization", "Bearer sk-test")
+        .header("content-type", "application/json")
+        .header("content-length", "1");
+    if let Some(session) = session {
+        request = request.header("x-claude-code-session-id", session);
+    }
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let (status, _, text) = raw_response(
+        app.clone(),
+        request.body(Body::from(body.to_string())).unwrap(),
+    )
+    .await;
+    (status, text)
+}
+
+async fn harness(app: &axum::Router, session: &str, body: Value) -> (u16, String) {
+    harness_with(app, Some(session), body, &[]).await
+}
+
+/// A harness body: these messages, streamed or not.
+fn asking(messages: Value, stream: bool) -> Value {
+    let mut body = json!({"model": "claude-sonnet-4-6", "stream": stream});
+    body["messages"] = messages;
+    body
+}
+
+/// A conversation as a harness resends it: `turns` user messages, each earlier one
+/// followed by the `pong` the vendor answered.
+fn conversation(turns: usize) -> Value {
+    let mut messages = Vec::new();
+    for turn in 1..=turns {
+        if turn > 1 {
+            messages.push(json!({"role": "assistant", "content": "pong"}));
+        }
+        messages.push(json!({"role": "user", "content": format!("turn {turn}")}));
+    }
+    Value::Array(messages)
+}
+
+/// The reply `id` continued, and the index of the first message the vendor does not hold.
+fn continuing(id: &str, from: usize) -> Threading {
+    Threading::Continue {
+        previous_message_id: id.to_string(),
+        from,
+    }
+}
+
+/// What the Account's record says of its requests: counted, served, failed, and whether
+/// it is on Cooldown.
+async fn record(app: &axum::Router) -> (i64, i64, i64, bool) {
+    let account = listed(app.clone(), "anthropic", THE_ACCOUNT).await;
+    let count = |field: &str| account[field].as_i64().expect("a counter");
+    (
+        count("totalRequests"),
+        count("totalSuccesses"),
+        count("totalFailures"),
+        account["cooldownUntil"] != 0.0,
+    )
+}
+
+/// A client cannot thread through the relay: a thread lives on one Account, and only the
+/// relay knows which Account serves a conversation. It is told so in the vendor's own
+/// words, before any Account is chosen, and the SDK helpers that read those words send the
+/// conversation whole.
+#[tokio::test]
+async fn a_clients_own_thread_is_answered_before_any_account() {
+    let upstream = ThreadUpstream::answering();
+    let (app, _tmp) = threaded_app(upstream.clone());
+    let asked = |thread: Value| {
+        let mut body = asking(conversation(1), false);
+        body["thread"] = thread;
+        body
+    };
+
+    for thread in [
+        json!({"type": "create"}),
+        json!({"type": "continue", "previous_message_id": "msg_1"}),
+    ] {
+        let (status, body) = harness(&app, "conv", asked(thread)).await;
+        let body: Value = serde_json::from_str(&body).expect("json");
+
+        assert_eq!(status, 400);
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            body["error"]["details"]["error_code"],
+            "thread_unsupported_request"
+        );
+    }
+    assert!(upstream.calls().is_empty());
+    assert_eq!(record(&app).await, (0, 0, 0, false));
+
+    // The same request without the field is served, and so is one that names no thread.
+    for body in [asking(conversation(1), false), asked(Value::Null)] {
+        let (status, text) = harness(&app, "conv", body).await;
+        assert_eq!(status, 200, "{text}");
+    }
+    let calls = upstream.calls();
+    assert_eq!(calls.len(), 2);
+    assert!(calls.iter().all(|call| call.body.get("thread").is_none()));
+}
+
+/// Threads are the anthropic Upstream's. A `thread` field bound for any other Provider is
+/// that request's own business.
+#[tokio::test]
+async fn a_thread_field_bound_for_another_provider_is_left_alone() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &groq_key_token()).expect("save groq key");
+    let upstream = Arc::new(GenericUpstream::default());
+    let app =
+        create_app_with_upstream(config_with_groq(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, body) = json_response(
+        app,
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1024")
+            .body(Body::from(
+                json!({
+                    "model": "groq/llama-3.3-70b",
+                    "max_tokens": 16,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "thread": {"type": "create"}
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(upstream.calls().len(), 1);
+}
+
+#[tokio::test]
+async fn a_conversation_opens_a_thread_then_continues_it() {
+    for stream in [false, true] {
+        let upstream = ThreadUpstream::answering();
+        let (app, _tmp) = threaded_app(upstream.clone());
+
+        for turns in 1..=3 {
+            let (status, body) = harness(&app, "conv", asking(conversation(turns), stream)).await;
+            assert_eq!(status, 200, "{body}");
+        }
+
+        let calls = upstream.calls();
+        // Each continue names the reply before it, and says where what is new begins.
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call.threading.clone())
+                .collect::<Vec<_>>(),
+            [
+                Threading::Create,
+                continuing("msg_1", 2),
+                continuing("msg_2", 4)
+            ],
+            "stream={stream}"
+        );
+        // The conversation crosses the seam whole each time: what is sent of it is the
+        // Upstream client's to write.
+        for (call, turns) in calls.iter().zip(1..) {
+            assert_eq!(call.body["messages"], conversation(turns));
+        }
+        assert_eq!(record(&app).await, (3, 3, 0, false));
+    }
+}
+
+/// A client that names no session is still one conversation: the thread is found by what
+/// the conversation is, not by a key that moves as its opening grows.
+#[tokio::test]
+async fn a_client_that_names_no_session_continues_from_its_second_turn() {
+    let upstream = ThreadUpstream::answering();
+    let (app, _tmp) = threaded_app(upstream.clone());
+
+    for turns in 1..=3 {
+        let body = asking(conversation(turns), false);
+        assert_eq!(harness_with(&app, None, body, &[]).await.0, 200);
+    }
+
+    assert_eq!(upstream.labels(), ["create", "continue", "continue"]);
+}
+
+/// A stream arrives in pieces that end anywhere. The reply is the same reply.
+#[tokio::test]
+async fn a_reply_streamed_in_small_pieces_is_continued_from() {
+    for size in [1, 7, 64] {
+        let upstream = ThreadUpstream::new(move |_, call| {
+            let mut message = reply(call);
+            message["chunk"] = json!(size);
+            (200, message)
+        });
+        let (app, _tmp) = threaded_app(upstream.clone());
+
+        let (status, first) = harness(&app, "conv", asking(conversation(1), true)).await;
+        assert_eq!(status, 200);
+        assert!(
+            first.contains("pong") && first.contains("message_stop"),
+            "{first}"
+        );
+        assert_eq!(
+            harness(&app, "conv", asking(conversation(2), true)).await.0,
+            200
+        );
+
+        assert_eq!(upstream.labels(), ["create", "continue"], "size={size}");
+    }
+}
+
+/// The spec's goal, as one comparison: with threads and without them, a client receives
+/// the same thing.
+#[tokio::test]
+async fn a_thread_changes_nothing_a_client_receives() {
+    let tool_call = |_: &UpstreamRequest, call: usize| {
+        let mut message = reply(call);
+        if call == 2 {
+            message["content"] = json!([
+                {"type": "text", "text": "looking"},
+                {"type": "tool_use", "id": "toolu_2", "name": "Bash", "input": {"cmd": "ls"}}
+            ]);
+            message["stop_reason"] = json!("tool_use");
+        }
+        (200, message)
+    };
+    for stream in [false, true] {
+        let mut received = Vec::new();
+        for threads in [true, false] {
+            let upstream = ThreadUpstream::new(tool_call);
+            let tmp = tempfile::tempdir().expect("tempdir");
+            pool_account(tmp.path(), THE_ACCOUNT);
+            let mut settings = config(tmp.path().to_path_buf());
+            settings.cloaking.message_threads = threads;
+            let app = create_app_with_upstream(settings, upstream.clone());
+
+            // The third turn repeats the tool call the second was answered with.
+            let mut third = conversation(2);
+            let messages = third.as_array_mut().expect("messages");
+            messages.push(json!({"role": "assistant", "content": [
+                {"type": "text", "text": "looking"},
+                {"type": "tool_use", "id": "toolu_2", "name": "Bash", "input": {"cmd": "ls"}}
+            ]}));
+            messages.push(json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_2", "content": "a b c"}
+            ]}));
+            let mut answers = Vec::new();
+            for messages in [conversation(1), conversation(2), third] {
+                let request = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("authorization", "Bearer sk-test")
+                    .header("content-type", "application/json")
+                    .header("content-length", "1")
+                    .header("x-claude-code-session-id", "conv")
+                    .body(Body::from(asking(messages, stream).to_string()))
+                    .unwrap();
+                // Status, headers and body: everything a client can read.
+                answers.push(raw_response(app.clone(), request).await);
+            }
+            let expected = if threads { "continue" } else { "plain" };
+            assert_eq!(upstream.labels()[1..], [expected, expected]);
+            received.push(answers);
+        }
+        assert_eq!(received[0], received[1], "stream={stream}");
+    }
+}
+
+/// Whatever a vendor answers a create with, short of an expired token or a rate limit, may
+/// be about the thread, in words that change. The relay reads none of them: it sends the
+/// turn plain, and the client gets the answer to that.
+#[tokio::test]
+async fn a_create_the_vendor_declines_is_sent_again_plain() {
+    let declines = [
+        (400, no_threads()),
+        // No word of it names a thread.
+        (
+            400,
+            vendor_error(
+                "invalid_request_error",
+                "This credential is only authorized for use with Claude Code.",
+                None,
+            ),
+        ),
+        (
+            403,
+            vendor_error(
+                "permission_error",
+                "This beta is not enabled for this account.",
+                None,
+            ),
+        ),
+    ];
+    for (status, error) in declines {
+        for stream in [false, true] {
+            let error = error.clone();
+            let upstream = ThreadUpstream::new(move |request, call| {
+                if request.threading == Threading::Plain {
+                    (200, reply(call))
+                } else {
+                    (status, error.clone())
+                }
+            });
+            let (app, _tmp) = threaded_app(upstream.clone());
+
+            let (first, body) = harness(&app, "conv", asking(conversation(1), stream)).await;
+            assert_eq!(
+                first, 200,
+                "the client must not see the relay's own thread: {body}"
+            );
+            assert_eq!(upstream.labels(), ["create", "plain"], "stream={stream}");
+            assert_eq!(upstream.calls()[1].body["messages"], conversation(1));
+
+            // The conversation stays plain: the vendor is not offered what it declined.
+            assert_eq!(
+                harness(&app, "conv", asking(conversation(2), stream))
+                    .await
+                    .0,
+                200
+            );
+            assert_eq!(upstream.labels(), ["create", "plain", "plain"]);
+            // Two turns, two outcomes: the declined attempt is no request of the client's.
+            assert_eq!(record(&app).await, (2, 2, 0, false), "status={status}");
+        }
+    }
+}
+
+/// The beta a thread needs is retired one day. After that a vendor declines every
+/// conversation's first request, and the relay stops asking.
+#[tokio::test]
+async fn a_vendor_that_stopped_taking_threads_is_not_asked_for_every_conversation() {
+    let upstream = ThreadUpstream::without_threads();
+    let (app, _tmp) = threaded_app(upstream.clone());
+    let opening = |text: &str| asking(json!([{"role": "user", "content": text}]), true);
+
+    for session in ["one", "two", "three"] {
+        assert_eq!(harness(&app, session, opening(session)).await.0, 200);
+    }
+    for session in ["four", "five"] {
+        assert_eq!(harness(&app, session, opening(session)).await.0, 200);
+    }
+
+    assert_eq!(
+        upstream.labels(),
+        [
+            "create", "plain", "create", "plain", "create", "plain", "plain", "plain"
+        ]
+    );
+}
+
+/// A Pool can hold an Account the vendor takes no thread for beside one it does. What the
+/// first declines is the first's: it rests alone, and the other is still asked.
+#[tokio::test]
+async fn what_one_account_declines_is_not_held_against_another() {
+    let upstream = ThreadUpstream::new(|request, call| {
+        let without = request.account.token.email == "alice@example.com";
+        if without && request.threading != Threading::Plain {
+            (
+                403,
+                vendor_error(
+                    "permission_error",
+                    "This beta is not enabled for this account.",
+                    None,
+                ),
+            )
+        } else {
+            (200, reply(call))
+        }
+    });
+    let tmp = tempfile::tempdir().expect("tempdir");
+    pool_account(tmp.path(), "alice@example.com");
+    pool_account(tmp.path(), "bob@example.com");
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    let opening = |text: &str| asking(json!([{"role": "user", "content": text}]), false);
+    let alice = |action: &'static str| {
+        toggle(
+            app.clone(),
+            action,
+            json!({"account": "alice@example.com"}),
+            Some("sk-test"),
+        )
+    };
+
+    // Three conversations open on alice, and each is declined and served plain.
+    for session in ["one", "two", "three"] {
+        assert_eq!(harness(&app, session, opening(session)).await.0, 200);
+    }
+    // With alice out of the Pool, bob is asked, and takes the thread.
+    assert_eq!(alice("disable").await.0, 200);
+    for turns in 1..=2 {
+        assert_eq!(
+            harness(&app, "four", asking(conversation(turns), false))
+                .await
+                .0,
+            200
+        );
+    }
+    // Back in the Pool, alice rests: her next conversation is not offered as a thread.
+    assert_eq!(alice("enable").await.0, 200);
+    assert_eq!(harness(&app, "five", opening("five")).await.0, 200);
+
+    let calls = upstream.calls();
+    let served: Vec<(&str, &str)> = calls
+        .iter()
+        .map(|call| (&call.account.token.email[..1], call.threading.label()))
+        .collect();
+    assert_eq!(
+        served,
+        [
+            ("a", "create"),
+            ("a", "plain"),
+            ("a", "create"),
+            ("a", "plain"),
+            ("a", "create"),
+            ("a", "plain"),
+            ("b", "create"),
+            ("b", "continue"),
+            ("a", "plain"),
+        ]
+    );
+}
+
+/// The thread is gone or busy, which says nothing against the conversation: it is sent
+/// whole and opens another.
+#[tokio::test]
+async fn a_continue_whose_thread_is_gone_is_sent_again_as_a_create() {
+    let gone = [
+        (404, "not_found_error", "thread_not_found"),
+        (400, "invalid_request_error", "thread_already_continued"),
+        (400, "invalid_request_error", "thread_continue_in_flight"),
+    ];
+    for (status, kind, code) in gone {
+        for stream in [false, true] {
+            let upstream = ThreadUpstream::new(move |_, call| {
+                if call == 2 {
+                    (status, vendor_error(kind, "thread: no", Some(code)))
+                } else {
+                    (200, reply(call))
+                }
+            });
+            let (app, _tmp) = threaded_app(upstream.clone());
+
+            for turns in 1..=3 {
+                let (status, body) =
+                    harness(&app, "conv", asking(conversation(turns), stream)).await;
+                assert_eq!(
+                    status, 200,
+                    "the client gets the answer to the create: {body}"
+                );
+            }
+
+            // The create that answered the second turn opened a thread, and the third
+            // turn continues it.
+            let calls = upstream.calls();
+            assert_eq!(
+                upstream.labels(),
+                ["create", "continue", "create", "continue"],
+                "{code}"
+            );
+            assert_eq!(calls[2].body["messages"], conversation(2));
+            assert_eq!(calls[3].threading, continuing("msg_3", 4));
+            assert_eq!(record(&app).await, (3, 3, 0, false));
+        }
+    }
+}
+
+/// The vendor took the conversation whole and will not take it continued: a field it holds
+/// fixed that the relay does not, a limit a continue counts differently. It would decline
+/// the next continue the same way, so the conversation goes on plain.
+#[tokio::test]
+async fn a_continue_declined_for_what_it_carries_leaves_the_conversation_plain() {
+    let declines = [
+        (
+            400,
+            vendor_error(
+                "invalid_request_error",
+                "thread: the request does not match the thread it continues",
+                Some("thread_fingerprint_mismatch"),
+            ),
+        ),
+        (
+            400,
+            vendor_error(
+                "invalid_request_error",
+                "thread: this request cannot be threaded",
+                Some("thread_unsupported_request"),
+            ),
+        ),
+        // The vendor names no thread in it. A continue is the relay's own shape all the same.
+        (
+            400,
+            vendor_error(
+                "invalid_request_error",
+                "A maximum of 4 blocks with cache_control may be provided. Found 5.",
+                None,
+            ),
+        ),
+        (403, vendor_error("permission_error", "not allowed", None)),
+    ];
+    for (status, error) in declines {
+        for stream in [false, true] {
+            let error = error.clone();
+            let upstream = ThreadUpstream::new(move |request, call| {
+                if matches!(request.threading, Threading::Continue { .. }) {
+                    (status, error.clone())
+                } else {
+                    (200, reply(call))
+                }
+            });
+            let (app, _tmp) = threaded_app(upstream.clone());
+
+            for turns in 1..=3 {
+                let (status, body) =
+                    harness(&app, "conv", asking(conversation(turns), stream)).await;
+                assert_eq!(status, 200, "{body}");
+            }
+
+            assert_eq!(upstream.labels(), ["create", "continue", "plain", "plain"]);
+            assert_eq!(upstream.calls()[2].body["messages"], conversation(2));
+            assert_eq!(record(&app).await, (3, 3, 0, false), "status={status}");
+        }
+    }
+}
+
+/// Only a continue asks the vendor for what it holds, so a fault of the vendor's on one may
+/// be the thread's: the turn is sent again plain. A fault is not the vendor declining,
+/// though, and says nothing of the next turn, which is offered as a thread again.
+#[tokio::test]
+async fn a_vendor_fault_on_a_continue_is_answered_plain_and_held_against_nothing() {
+    for stream in [false, true] {
+        let upstream = ThreadUpstream::new(|request, call| {
+            if matches!(request.threading, Threading::Continue { .. }) {
+                (
+                    500,
+                    vendor_error("api_error", "Internal server error", None),
+                )
+            } else {
+                (200, reply(call))
+            }
+        });
+        let (app, _tmp) = threaded_app(upstream.clone());
+
+        for turns in 1..=4 {
+            let (status, body) = harness(&app, "conv", asking(conversation(turns), stream)).await;
+            assert_eq!(status, 200, "{body}");
+        }
+
+        assert_eq!(
+            upstream.labels(),
+            ["create", "continue", "plain", "create", "continue", "plain"],
+            "stream={stream}"
+        );
+        assert_eq!(upstream.calls()[2].body["messages"], conversation(2));
+        assert_eq!(record(&app).await, (4, 4, 0, false));
+    }
+}
+
+/// A rate limit is the Account's, whatever the request carried. It costs the Account its
+/// health and moves the request to the next one, as for any request; it is not answered by
+/// sending the turn again to the Account that is limited.
+#[tokio::test]
+async fn a_rate_limit_on_a_continue_is_the_accounts_and_fails_over() {
+    for stream in [false, true] {
+        let upstream = ThreadUpstream::new(|request, call| {
+            if matches!(request.threading, Threading::Continue { .. }) {
+                (
+                    429,
+                    vendor_error(
+                        "rate_limit_error",
+                        "This request would exceed a limit.",
+                        None,
+                    ),
+                )
+            } else {
+                (200, reply(call))
+            }
+        });
+        let tmp = tempfile::tempdir().expect("tempdir");
+        pool_account(tmp.path(), "alice@example.com");
+        pool_account(tmp.path(), "bob@example.com");
+        let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+        assert_eq!(
+            harness(&app, "conv", asking(conversation(1), stream))
+                .await
+                .0,
+            200
+        );
+        assert_eq!(
+            harness(&app, "conv", asking(conversation(2), stream))
+                .await
+                .0,
+            200
+        );
+
+        let calls = upstream.calls();
+        let owner = calls[0].account.token.email.clone();
+        assert_eq!(
+            upstream.labels(),
+            ["create", "continue", "create"],
+            "stream={stream}"
+        );
+        assert_eq!(calls[1].account.token.email, owner);
+        assert_ne!(calls[2].account.token.email, owner);
+        let limited = listed(app.clone(), "anthropic", &owner).await;
+        assert_ne!(limited["cooldownUntil"], 0.0, "{limited}");
+        assert_eq!(limited["totalFailures"], 1);
+    }
+}
+
+/// An error the client made is answered the same however the turn is sent. The client gets
+/// it unchanged after one plain try, and it says nothing against threads.
+#[tokio::test]
+async fn an_error_that_is_the_clients_reaches_it_and_ends_nothing() {
+    for stream in [false, true] {
+        let error = vendor_error("invalid_request_error", "max_tokens: Field required", None);
+        let sent = error.clone();
+        let upstream = ThreadUpstream::new(move |_, _| (400, sent.clone()));
+        let (app, _tmp) = threaded_app(upstream.clone());
+
+        for _ in 0..4 {
+            let (status, body) = harness(&app, "conv", asking(conversation(1), stream)).await;
+            assert_eq!(status, 400);
+            assert_eq!(serde_json::from_str::<Value>(&body).expect("json"), error);
+        }
+
+        // Four errors of the client's rested nothing and marked nothing plain: each turn
+        // is still offered as a thread first.
+        assert_eq!(
+            upstream.labels(),
+            ["create", "plain"].repeat(4),
+            "stream={stream}"
+        );
+        // One outcome a request, and a malformed request is no fault of the Account's.
+        assert_eq!(record(&app).await, (4, 0, 4, false));
+    }
+}
+
+/// The same on a later turn: the error is the client's, and the next try is threaded again.
+#[tokio::test]
+async fn a_clients_own_error_on_a_later_turn_does_not_end_threading() {
+    for stream in [false, true] {
+        let upstream = ThreadUpstream::new(|request, call| {
+            let bad = request.body["messages"]
+                .as_array()
+                .and_then(|messages| messages.last())
+                .is_some_and(|message| message["content"] == "turn 2");
+            if bad {
+                (
+                    400,
+                    vendor_error(
+                        "invalid_request_error",
+                        "messages: image exceeds 5 MB",
+                        None,
+                    ),
+                )
+            } else {
+                (200, reply(call))
+            }
+        });
+        let (app, _tmp) = threaded_app(upstream.clone());
+        // The second turn as the client first sends it, and as it sends it again.
+        let mut smaller = conversation(2);
+        smaller[2]["content"] = json!("turn 2, smaller");
+
+        assert_eq!(
+            harness(&app, "conv", asking(conversation(1), stream))
+                .await
+                .0,
+            200
+        );
+        for _ in 0..3 {
+            let (status, body) = harness(&app, "conv", asking(conversation(2), stream)).await;
+            assert_eq!(status, 400);
+            assert!(body.contains("image exceeds 5 MB"), "{body}");
+        }
+        assert_eq!(harness(&app, "conv", asking(smaller, stream)).await.0, 200);
+
+        assert_eq!(
+            upstream.labels(),
+            [
+                "create", "continue", "plain", "create", "plain", "create", "plain", "create"
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_cache_marker_that_moved_does_not_end_the_thread() {
+    // A harness marks the end of what it wants cached, and moves the mark every turn.
+    let marked =
+        |text: &str| json!({"type": "text", "text": text, "cache_control": {"type": "ephemeral"}});
+    let upstream = ThreadUpstream::answering();
+    let (app, _tmp) = threaded_app(upstream.clone());
+
+    let first = json!([{"role": "user", "content": [marked("one")]}]);
+    let second = json!([
+        {"role": "user", "content": [{"type": "text", "text": "one"}]},
+        {"role": "assistant", "content": [marked("pong")]},
+        {"role": "user", "content": [marked("two")]}
+    ]);
+    assert_eq!(harness(&app, "conv", asking(first, false)).await.0, 200);
+    assert_eq!(harness(&app, "conv", asking(second, false)).await.0, 200);
+
+    assert_eq!(upstream.calls()[1].threading, continuing("msg_1", 2));
+}
+
+#[tokio::test]
+async fn a_reply_repeated_with_or_without_its_thinking_continues() {
+    let thinking = json!({"type": "thinking", "thinking": "hm", "signature": "sig"});
+    for keeps_thinking in [true, false] {
+        let block = thinking.clone();
+        let upstream = ThreadUpstream::new(move |_, call| {
+            let mut message = reply(call);
+            message["content"] = json!([block, {"type": "text", "text": "pong"}]);
+            (200, message)
+        });
+        let (app, _tmp) = threaded_app(upstream.clone());
+
+        let mut repeated = vec![json!({"type": "text", "text": "pong"})];
+        if keeps_thinking {
+            repeated.insert(0, thinking.clone());
+        }
+        let second = json!([
+            {"role": "user", "content": "turn 1"},
+            {"role": "assistant", "content": repeated},
+            {"role": "user", "content": "turn 2"}
+        ]);
+        assert_eq!(
+            harness(&app, "conv", asking(conversation(1), true)).await.0,
+            200
+        );
+        assert_eq!(harness(&app, "conv", asking(second, true)).await.0, 200);
+
+        assert_eq!(
+            upstream.labels(),
+            ["create", "continue"],
+            "keeps_thinking={keeps_thinking}"
+        );
+    }
+}
+
+/// Claude Code writes a billing-header block of its own into `system`, a new one for every
+/// request. It names the request to the Classifier and says nothing to the model, so
+/// it is no change of `system`.
+#[tokio::test]
+async fn a_billing_block_that_changes_every_request_does_not_end_the_thread() {
+    let own = |n: usize| {
+        json!({"type": "text", "text": format!(
+            "x-anthropic-billing-header: cc_version=2.1.322.6ba; cc_entrypoint=cli; cch=0000{n};"
+        )})
+    };
+    let persona = json!({"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."});
+    let upstream = ThreadUpstream::answering();
+    let (app, _tmp) = threaded_app(upstream.clone());
+
+    for turns in 1..=2 {
+        let mut body = asking(conversation(turns), true);
+        body["system"] = json!([own(turns), persona]);
+        assert_eq!(harness(&app, "conv", body).await.0, 200);
+    }
+
+    assert_eq!(upstream.labels(), ["create", "continue"]);
+}
+
+/// One edit to a harness body.
+type Change = Box<dyn Fn(&mut Value)>;
+/// One way a vendor's reply is not a stored turn.
+type Spoil = Box<dyn Fn(&mut Value) + Send + Sync>;
+
+/// A client that changed what the thread already holds gets a create, never a continue that
+/// would quietly serve the old text or the old instruction.
+#[tokio::test]
+async fn a_changed_conversation_creates_instead_of_continuing() {
+    let grown = |change: &dyn Fn(&mut Value)| {
+        let mut body = asking(conversation(2), false);
+        change(&mut body);
+        body
+    };
+    let tool = |name: &str| json!([{"name": name, "description": "d", "input_schema": {"type": "object"}}]);
+    let changes: [(&str, Change, Change); 7] = [
+        (
+            "system",
+            Box::new(|body| body["system"] = json!("reply in english")),
+            Box::new(|body| body["system"] = json!("reply in french")),
+        ),
+        (
+            "tools",
+            Box::new(move |body| body["tools"] = tool("Bash")),
+            Box::new(move |body| body["tools"] = tool("Read")),
+        ),
+        (
+            "thinking",
+            Box::new(|_| {}),
+            Box::new(|body| body["thinking"] = json!({"type": "enabled", "budget_tokens": 2048})),
+        ),
+        (
+            "context_management",
+            Box::new(|_| {}),
+            Box::new(|body| body["context_management"] = json!({"edits": []})),
+        ),
+        (
+            "the reply",
+            Box::new(|_| {}),
+            Box::new(|body| body["messages"][1]["content"] = json!("something else entirely")),
+        ),
+        (
+            "an earlier message",
+            Box::new(|_| {}),
+            Box::new(|body| body["messages"][0]["content"] = json!("turn 1, edited")),
+        ),
+        (
+            "the model",
+            Box::new(|_| {}),
+            Box::new(|body| body["model"] = json!("claude-opus-4-7")),
+        ),
+    ];
+    for (what, as_created, as_changed) in changes {
+        for stream in [false, true] {
+            let upstream = ThreadUpstream::answering();
+            let (app, _tmp) = threaded_app(upstream.clone());
+            let streamed = |mut body: Value| {
+                body["stream"] = json!(stream);
+                body
+            };
+            let opening = || {
+                let mut body = asking(conversation(1), false);
+                as_created(&mut body);
+                streamed(body)
+            };
+
+            // The same fixed fields on the opening and on its growth continue...
+            assert_eq!(harness(&app, "conv", opening()).await.0, 200);
+            assert_eq!(
+                harness(&app, "conv", streamed(grown(&*as_created))).await.0,
+                200
+            );
+            // ...and the same growth with the change in it starts over.
+            let altered = grown(&|body| {
+                as_created(body);
+                as_changed(body);
+            });
+            assert_eq!(harness(&app, "other", opening()).await.0, 200);
+            assert_eq!(harness(&app, "other", streamed(altered)).await.0, 200);
+
+            assert_eq!(
+                upstream.labels(),
+                ["create", "continue", "create", "create"],
+                "changed {what}, stream={stream}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_tool_call_on_a_continue_comes_back_under_the_clients_name() {
+    for stream in [false, true] {
+        // The vendor knows the tool by the name the relay masked it to.
+        let masked = Arc::new(Mutex::new(String::new()));
+        let seen = masked.clone();
+        let upstream = ThreadUpstream::new(move |request, call| {
+            let name = request.body["tools"][0]["name"].as_str().expect("a tool");
+            *seen.lock().expect("name lock") = name.to_string();
+            let mut message = reply(call);
+            message["content"] = json!([{
+                "type": "tool_use",
+                "id": format!("toolu_{call}"),
+                "name": name,
+                "input": {"city": "Paris"}
+            }]);
+            message["stop_reason"] = json!("tool_use");
+            (200, message)
+        });
+        let (app, _tmp) = threaded_app(upstream.clone());
+        let tools = json!([{
+            "name": "get_weather",
+            "description": "Weather for a city",
+            "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}
+        }]);
+        let with_tools = |messages: Value| {
+            let mut body = asking(messages, stream);
+            body["tools"] = tools.clone();
+            body
+        };
+
+        let opening = json!([{"role": "user", "content": "weather in Paris"}]);
+        let (status, first) = harness(&app, "conv", with_tools(opening)).await;
+        assert_eq!(status, 200);
+        assert!(first.contains("get_weather"), "{first}");
+        let masked = masked.lock().expect("name lock").clone();
+        assert_ne!(masked, "get_weather", "the name was not masked");
+
+        let grown = json!([
+            {"role": "user", "content": "weather in Paris"},
+            {"role": "assistant", "content": [{
+                "type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Paris"}
+            }]},
+            {"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": "toolu_1", "content": "12C cloudy"
+            }]}
+        ]);
+        let (status, second) = harness(&app, "conv", with_tools(grown)).await;
+
+        assert_eq!(status, 200);
+        assert_eq!(upstream.labels(), ["create", "continue"], "stream={stream}");
+        assert!(
+            second.contains("get_weather") && !second.contains(&masked),
+            "a continue's tool call leaked the masked name: {second}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_turn_the_vendor_did_not_store_is_not_continued() {
+    let unstored: [(&str, Spoil); 5] = [
+        (
+            "a `refusal` stop",
+            Box::new(|message| message["stop_reason"] = json!("refusal")),
+        ),
+        (
+            "a tool call cut by max_tokens",
+            Box::new(|message| {
+                message["stop_reason"] = json!("max_tokens");
+                message["content"] =
+                    json!([{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}]);
+            }),
+        ),
+        (
+            "a stop the relay does not know",
+            Box::new(|message| message["stop_reason"] = json!("pause_turn")),
+        ),
+        (
+            "no stop at all",
+            Box::new(|message| message["stop_reason"] = Value::Null),
+        ),
+        (
+            "a stream cut short",
+            Box::new(|message| message["cut"] = json!(true)),
+        ),
+    ];
+    for (what, spoil) in unstored {
+        let spoil = Arc::new(spoil);
+        for stream in [false, true] {
+            if what == "a stream cut short" && !stream {
+                continue;
+            }
+            let upstream = ThreadUpstream::new({
+                let spoil = spoil.clone();
+                move |_, call| {
+                    let mut message = reply(call);
+                    if call == 1 {
+                        spoil(&mut message);
+                    }
+                    (200, message)
+                }
+            });
+            let (app, _tmp) = threaded_app(upstream.clone());
+
+            let _ = harness(&app, "conv", asking(conversation(1), stream)).await;
+            // Whatever the client kept of that reply, the next turn starts over.
+            let mut second = conversation(2);
+            if what == "a tool call cut by max_tokens" {
+                second[1]["content"] =
+                    json!([{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}]);
+                second[2]["content"] =
+                    json!([{"type": "tool_result", "tool_use_id": "toolu_1", "content": "x"}]);
+            }
+            assert_eq!(harness(&app, "conv", asking(second, stream)).await.0, 200);
+
+            assert_eq!(
+                upstream.labels(),
+                ["create", "create"],
+                "{what}, stream={stream}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_request_that_adds_no_user_message_after_the_reply_is_not_continued() {
+    let after_reply = [
+        // The reply alone: nothing new to send.
+        json!([]),
+        // An assistant message of the client's own after it.
+        json!([{"role": "assistant", "content": "and another thing"}]),
+    ];
+    for extra in after_reply {
+        let upstream = ThreadUpstream::answering();
+        let (app, _tmp) = threaded_app(upstream.clone());
+        let mut messages = vec![
+            json!({"role": "user", "content": "turn 1"}),
+            json!({"role": "assistant", "content": "pong"}),
+        ];
+        messages.extend(extra.as_array().cloned().unwrap_or_default());
+
+        let _ = harness(&app, "conv", asking(conversation(1), false)).await;
+        let _ = harness(&app, "conv", asking(Value::Array(messages), false)).await;
+
+        assert_eq!(upstream.labels(), ["create", "create"]);
+    }
+}
+
+#[tokio::test]
+async fn a_message_that_only_looks_like_the_reply_is_not_skipped() {
+    // A client that never kept the reply sends a user message with the same words where
+    // the reply would stand. Continuing would drop it.
+    let upstream = ThreadUpstream::answering();
+    let (app, _tmp) = threaded_app(upstream.clone());
+    let second = json!([
+        {"role": "user", "content": "turn 1"},
+        {"role": "user", "content": "pong"},
+        {"role": "user", "content": "turn 2"}
+    ]);
+
+    let _ = harness(&app, "conv", asking(conversation(1), false)).await;
+    let _ = harness(&app, "conv", asking(second.clone(), false)).await;
+
+    assert_eq!(upstream.labels(), ["create", "create"]);
+    assert_eq!(upstream.calls()[1].body["messages"], second);
+}
+
+#[tokio::test]
+async fn two_conversations_in_one_session_never_cross() {
+    let upstream = ThreadUpstream::answering();
+    let (app, _tmp) = threaded_app(upstream.clone());
+    let opening = |text: &str| json!([{"role": "user", "content": text}]);
+    let grown = |text: &str| {
+        json!([
+            {"role": "user", "content": text},
+            {"role": "assistant", "content": "pong"},
+            {"role": "user", "content": format!("{text} again")}
+        ])
+    };
+
+    for text in ["alpha", "beta"] {
+        assert_eq!(
+            harness(&app, "shared", asking(opening(text), false))
+                .await
+                .0,
+            200
+        );
+    }
+    // Each comes back and continues the reply to its own opening, not the other's.
+    for text in ["alpha", "beta"] {
+        assert_eq!(
+            harness(&app, "shared", asking(grown(text), false)).await.0,
+            200
+        );
+    }
+
+    let calls = upstream.calls();
+    assert_eq!(
+        upstream.labels(),
+        ["create", "create", "continue", "continue"]
+    );
+    assert_eq!(calls[2].threading, continuing("msg_1", 2));
+    assert_eq!(calls[2].body["messages"], grown("alpha"));
+    assert_eq!(calls[3].threading, continuing("msg_2", 2));
+}
+
+/// A harness asks a small model for a title in its conversation's session, between the
+/// conversation's own turns. That request is not the conversation, and does not end its
+/// thread.
+#[tokio::test]
+async fn a_side_request_in_the_same_session_does_not_end_the_thread() {
+    let upstream = ThreadUpstream::answering();
+    let (app, _tmp) = threaded_app(upstream.clone());
+    let side = json!({
+        "model": "claude-haiku-4-5-20251001",
+        "system": "Write a title.",
+        "messages": [{"role": "user", "content": "turn 1"}]
+    });
+
+    assert_eq!(
+        harness(&app, "conv", asking(conversation(1), true)).await.0,
+        200
+    );
+    assert_eq!(harness(&app, "conv", side).await.0, 200);
+    assert_eq!(
+        harness(&app, "conv", asking(conversation(2), true)).await.0,
+        200
+    );
+
+    assert_eq!(upstream.labels(), ["create", "create", "continue"]);
+    assert_eq!(upstream.calls()[2].threading, continuing("msg_1", 2));
+}
+
+#[tokio::test]
+async fn a_thread_does_not_follow_its_conversation_to_another_account() {
+    let upstream = ThreadUpstream::answering();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    pool_account(tmp.path(), "alice@example.com");
+    pool_account(tmp.path(), "bob@example.com");
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    assert_eq!(
+        harness(&app, "conv", asking(conversation(1), false))
+            .await
+            .0,
+        200
+    );
+    let owner = upstream.calls()[0].account.token.email.clone();
+    let (status, body) = toggle(
+        app.clone(),
+        "disable",
+        json!({"account": owner}),
+        Some("sk-test"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        harness(&app, "conv", asking(conversation(2), false))
+            .await
+            .0,
+        200
+    );
+
+    let calls = upstream.calls();
+    assert_ne!(calls[1].account.token.email, owner);
+    assert_eq!(upstream.labels(), ["create", "create"]);
+    assert_eq!(calls[1].body["messages"], conversation(2));
+}
+
+/// A Claude Code client names its own beta set. A set that changed is a thread that cannot
+/// go on: the vendor holds a thread to the set it opened with.
+#[tokio::test]
+async fn a_changed_beta_set_creates_instead_of_continuing() {
+    let upstream = ThreadUpstream::answering();
+    let (app, _tmp) = threaded_app(upstream.clone());
+    let cli = |betas: &'static str| {
+        [
+            ("user-agent", "claude-cli/2.1.322 (external, cli)"),
+            ("anthropic-beta", betas),
+        ]
+    };
+    let one = cli("first-beta-2026-01-01");
+    let two = cli("first-beta-2026-01-01,second-beta-2026-01-02");
+
+    for (turns, betas) in [(1, &one), (2, &one), (3, &two)] {
+        let body = asking(conversation(turns), false);
+        assert_eq!(harness_with(&app, Some("cli"), body, betas).await.0, 200);
+    }
+
+    assert_eq!(upstream.labels(), ["create", "continue", "create"]);
+}
+
+#[tokio::test]
+async fn threads_off_sends_every_conversation_plain() {
+    let upstream = ThreadUpstream::answering();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    pool_account(tmp.path(), THE_ACCOUNT);
+    let mut settings = config(tmp.path().to_path_buf());
+    settings.cloaking.message_threads = false;
+    let app = create_app_with_upstream(settings, upstream.clone());
+
+    for turns in 1..=2 {
+        assert_eq!(
+            harness(&app, "conv", asking(conversation(turns), false))
+                .await
+                .0,
+            200
+        );
+    }
+    assert_eq!(upstream.labels(), ["plain", "plain"]);
+}
+
+#[tokio::test]
+async fn a_request_translated_onto_anthropic_is_never_threaded() {
+    let upstream = ThreadUpstream::answering();
+    let (app, _tmp) = threaded_app(upstream.clone());
+
+    let (status, _, body) = raw_response(
+        app,
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "1")
+            .body(Body::from(
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(upstream.labels(), ["plain"]);
 }
 
 #[tokio::test]

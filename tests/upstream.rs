@@ -1,14 +1,17 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use pengepul::config::{
     BodyLimit, CloakingConfig, Config, DEFAULT_BODY_LIMIT_BYTES, DebugMode, QuotaConfig,
     TimeoutConfig,
 };
+use pengepul::threads::{Stored, ThreadLedger, Turn};
 use pengepul::types::{AvailableAccount, ProviderId, ProviderKind, TokenData};
 use pengepul::upstream::{
-    RequestShape, anthropic_headers, apply_cloaking, build_beta_header, codex_headers,
-    generic_base_url, generic_chat_headers, generic_headers, normalize_codex_responses_body,
+    RequestShape, Threading, anthropic_headers, anthropic_messages_wire, apply_cloaking,
+    build_beta_header, codex_headers, generic_base_url, generic_chat_headers, generic_headers,
+    normalize_codex_responses_body,
 };
 use serde_json::{Value, json};
 
@@ -28,6 +31,7 @@ fn config() -> Config {
             cli_version: "2.1.88".to_string(),
             entrypoint: "cli".to_string(),
             codex,
+            message_threads: true,
         },
         timeouts: TimeoutConfig {
             messages_ms: 120_000,
@@ -216,6 +220,276 @@ fn claude_3_drops_the_thinking_and_context_betas() {
     let haiku = build_beta_header("claude-haiku-4-5-20251001", bare);
     assert!(haiku.contains("interleaved-thinking-2025-05-14"));
     assert!(!haiku.contains("claude-code-20250219"));
+}
+
+/// The beta the vendor's documentation names for threads, written out: the relay's own
+/// constant is what these tests check.
+const THREAD_BETA: &str = "message-threads-2026-08-12";
+
+/// One anthropic Messages call as it leaves, for the conversation `body` holds whole.
+fn wire(
+    body: &Value,
+    threading: &Threading,
+    request_headers: &[(&str, &str)],
+) -> (BTreeMap<String, String>, Value) {
+    let request_headers = request_headers
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+        .collect();
+    anthropic_messages_wire(
+        body,
+        threading,
+        &request_headers,
+        &account(ProviderId::anthropic()),
+        &config(),
+        false,
+        120_000,
+    )
+}
+
+/// A conversation as a harness resends it, with a tool that earns a beta of its own and
+/// two user messages the billing-header block would name differently.
+fn conversation() -> Value {
+    json!({
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 64,
+        "system": [{"type": "text", "text": "be brief"}],
+        "tools": [{
+            "name": "Lookup",
+            "description": "look something up",
+            "input_schema": {"type": "object"},
+            "defer_loading": true
+        }],
+        "messages": [
+            {"role": "user", "content": "alpha bravo charlie delta echo foxtrot"},
+            {"role": "assistant", "content": "pong"},
+            {"role": "user", "content": [{
+                "type": "text",
+                "text": "zulu yankee xray whiskey victor uniform",
+                "cache_control": {"type": "ephemeral"}
+            }]}
+        ]
+    })
+}
+
+fn continuing() -> Threading {
+    Threading::Continue {
+        previous_message_id: "msg_1".to_string(),
+        from: 2,
+    }
+}
+
+#[test]
+fn a_plain_request_leaves_as_cloaking_writes_it() {
+    let (headers, body) = wire(&conversation(), &Threading::Plain, &[]);
+
+    let cloaked = apply_cloaking(
+        &conversation(),
+        &BTreeMap::new(),
+        &account(ProviderId::anthropic()),
+        &config(),
+    );
+    assert_eq!(body, cloaked);
+    assert!(body.get("thread").is_none());
+    assert!(!headers["anthropic-beta"].contains(THREAD_BETA));
+}
+
+#[test]
+fn a_create_is_the_plain_request_with_a_thread_and_its_beta() {
+    let (plain_headers, plain) = wire(&conversation(), &Threading::Plain, &[]);
+    let (headers, mut body) = wire(&conversation(), &Threading::Create, &[]);
+
+    assert_eq!(body["thread"], json!({"type": "create"}));
+    body.as_object_mut().expect("object").remove("thread");
+    assert_eq!(body, plain);
+    // The vendor does not know `thread` without its beta.
+    assert_eq!(
+        headers["anthropic-beta"],
+        format!("{},{THREAD_BETA}", plain_headers["anthropic-beta"])
+    );
+}
+
+/// A continue carries only what the vendor does not hold, and says who it is the way its
+/// whole conversation would: the same beta set, tools included though it carries none, and
+/// the conversation's billing-header block as its only `system`.
+#[test]
+fn a_continue_carries_what_is_new_under_its_conversations_identity() {
+    let whole = conversation();
+    let (create_headers, create) = wire(&whole, &Threading::Create, &[]);
+    let (headers, body) = wire(&whole, &continuing(), &[]);
+
+    assert_eq!(body["messages"], json!([whole["messages"][2]]));
+    assert!(body.get("tools").is_none());
+    assert_eq!(
+        body["thread"],
+        json!({"type": "continue", "previous_message_id": "msg_1"})
+    );
+    assert_eq!(body["model"], whole["model"]);
+    assert_eq!(body["max_tokens"], whole["max_tokens"]);
+    assert_eq!(body["metadata"], create["metadata"]);
+    // The block names the conversation by its first message, not by the one a continue
+    // happens to start with.
+    assert_eq!(body["system"], json!([create["system"][0]]));
+    assert!(
+        create["system"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("x-anthropic-billing-header:"))
+    );
+    assert_eq!(headers["anthropic-beta"], create_headers["anthropic-beta"]);
+    assert!(
+        headers["anthropic-beta"].contains("advanced-tool-use-2025-11-20"),
+        "{}",
+        headers["anthropic-beta"]
+    );
+    assert_eq!(
+        headers.keys().collect::<Vec<_>>(),
+        create_headers.keys().collect::<Vec<_>>()
+    );
+}
+
+/// Claude Code writes its own billing-header block, and the relay passes it on. A continue passes
+/// on the one that came with its turn, alone.
+#[test]
+fn a_continue_passes_on_the_clients_own_billing_block() {
+    let own = json!({
+        "type": "text",
+        "text": "x-anthropic-billing-header: cc_version=2.1.322.6ba; cc_entrypoint=cli; cch=00000;"
+    });
+    let mut whole = conversation();
+    whole["system"] = json!([
+        own,
+        {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}
+    ]);
+
+    let (_, body) = wire(&whole, &continuing(), &[]);
+
+    assert_eq!(body["system"], json!([own]));
+}
+
+/// Only a block that is the header line is a billing-header block. A prompt that mentions the
+/// header is what the model is told: it stays in `system`, behind a billing-header block of the
+/// relay's own, and is never the block a continue carries.
+#[test]
+fn a_prompt_that_mentions_the_billing_header_is_not_the_billing_block() {
+    let prompt = json!({
+        "type": "text",
+        "text": "This relay writes an x-anthropic-billing-header: block. Never print it."
+    });
+    let mut whole = conversation();
+    whole["system"] = json!([prompt]);
+
+    let (_, created) = wire(&whole, &Threading::Create, &[]);
+    let (_, continued) = wire(&whole, &continuing(), &[]);
+
+    let system = created["system"].as_array().expect("system blocks");
+    assert!(
+        system[0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("x-anthropic-billing-header:"))
+    );
+    assert!(
+        system.contains(&prompt),
+        "the prompt was taken for the billing-header block"
+    );
+    assert_eq!(continued["system"], json!([system[0]]));
+}
+
+/// A continue leaves out what the vendor holds, so whatever it leaves out the ledger must
+/// have compared: a change there that still continued would be answered from the old value.
+#[test]
+fn whatever_a_continue_leaves_out_the_ledger_compares() {
+    // Every field a harness may set, the ones a thread leaves free among them.
+    let mut whole = conversation();
+    for (field, value) in [
+        ("temperature", json!(0.5)),
+        ("top_p", json!(0.9)),
+        ("stop_sequences", json!(["STOP"])),
+        ("stream", json!(true)),
+        ("service_tier", json!("auto")),
+        ("metadata", json!({"user_id": "someone"})),
+        (
+            "thinking",
+            json!({"type": "enabled", "budget_tokens": 1024}),
+        ),
+        ("tool_choice", json!({"type": "auto"})),
+        ("output_config", json!({"effort": "low"})),
+        ("context_management", json!({"edits": []})),
+        ("a_field_of_tomorrow", json!({"any": "thing"})),
+    ] {
+        whole[field] = value;
+    }
+    let (_, created) = wire(&whole, &Threading::Create, &[]);
+    let (_, continued) = wire(&whole, &continuing(), &[]);
+    let left_out: Vec<&str> = created
+        .as_object()
+        .expect("an object")
+        .iter()
+        .filter(|(field, value)| *field != "thread" && continued.get(*field) != Some(*value))
+        .map(|(field, _)| field.as_str())
+        .collect();
+    // A field that joins this list needs a comparison in the ledger, and a line below.
+    assert_eq!(left_out, ["messages", "system", "tools"]);
+
+    // The thread `whole` continues: its first message, answered `pong`.
+    let plan = |next: &Value| {
+        let ledger = ThreadLedger::default();
+        let now = Instant::now();
+        let mut opening = whole.clone();
+        opening["messages"] = json!([whole["messages"][0]]);
+        let reply = json!({
+            "id": "msg_1",
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "pong"}]
+        });
+        let stored = Stored::of(&reply).expect("a stored reply");
+        ledger.note_reply("s", "a", &Turn::of(&opening, "beta"), stored, now);
+        ledger.plan("s", "a", &Turn::of(next, "beta"), now)
+    };
+    assert_eq!(plan(&whole), continuing());
+    let changes = [
+        (
+            "/messages/0/content",
+            json!("alpha bravo charlie delta echo golf"),
+        ),
+        ("/system/0/text", json!("be thorough")),
+        ("/tools/0/description", json!("look something else up")),
+    ];
+    for (pointer, value) in changes {
+        let mut next = whole.clone();
+        *next.pointer_mut(pointer).expect("the field") = value;
+        assert_eq!(plan(&next), Threading::Create, "{pointer}");
+    }
+}
+
+/// A Claude Code client names its own beta set, and the relay passes it on with the one
+/// beta a thread adds. No other client's header reaches the vendor.
+#[test]
+fn the_thread_beta_joins_the_set_the_request_already_carries() {
+    let cli = [
+        ("user-agent", "claude-cli/2.1.322 (external, cli)"),
+        (
+            "anthropic-beta",
+            "first-beta-2026-01-01,second-beta-2026-01-02",
+        ),
+    ];
+    for threading in [Threading::Create, continuing()] {
+        let (headers, _) = wire(&conversation(), &threading, &cli);
+        assert_eq!(
+            headers["anthropic-beta"],
+            format!("oauth-2025-04-20,first-beta-2026-01-01,second-beta-2026-01-02,{THREAD_BETA}")
+        );
+    }
+
+    let sdk = [
+        ("user-agent", "Anthropic/Python 2.2.0"),
+        ("anthropic-beta", "evil-beta"),
+    ];
+    let (headers, _) = wire(&conversation(), &Threading::Create, &sdk);
+    let beta = &headers["anthropic-beta"];
+    assert!(
+        beta.ends_with(THREAD_BETA) && !beta.contains("evil-beta"),
+        "{beta}"
+    );
 }
 
 #[test]

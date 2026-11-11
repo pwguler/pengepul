@@ -21,6 +21,9 @@ in files.
   whole-request one for a reply read whole and only the **Silence limit**
   (`stream-messages-ms`) for a stream, and reads each response's **Retry hint**
   off its headers (`retry-after-ms`, or `retry-after` as seconds or an HTTP date).
+  For an anthropic Messages request the request path also asks the Thread ledger
+  how the turn goes out, and sends a **Declined thread** again without that Thread
+  before anything is recorded.
 - **Account** (`accounts.rs`) — `AccountManager`: holds every Account of one
   Provider and picks who serves next; **Rotation**, **Priority**, **Cooldown**
   and due **Refresh** live here, and every request outcome updates the Account's
@@ -48,6 +51,12 @@ in files.
   reached, pasted as the code or the whole callback URL. A pasted code's state is
   not checked; the PKCE verifier, which only this process holds, binds it to this
   login.
+- **Thread ledger** (`threads.rs`) — decides whether a turn of an anthropic
+  conversation can leave as the continuation of a **Thread**, and holds the little the
+  next turn is checked against: the Account, the last stored reply, and what the
+  conversation said up to it. In memory only, taken on use and dropped on the first
+  doubt. It knows nothing of HTTP or of an Account's health, and it writes no request:
+  what a threaded turn sends is the Upstream client's.
 - **Cloaking sanitizer** (`masquerade.rs`) — strips a harness's bot-identity
   system sections, `PascalCase`s its tool names, and rewrites the literal phrases
   that trip the Classifier (openclaw sections and tool names; pi and opencode
@@ -55,8 +64,11 @@ in files.
 - **Upstream + vendor identity** (`upstream.rs`) — owns every outbound vendor
   call behind one trait, and `apply_cloaking` injects the billing-header block,
   the "You are Claude Code" prefix, the account metadata and the identifying
-  headers. `cloaking_versions.rs` supplies the vendor CLI versions it learns at
-  runtime. A grok call carries the bearer and the two headers the grok Upstream
+  headers. It also writes what a threaded turn sends: given the conversation whole
+  and how much of it the vendor holds, the beta set, the billing-header block and
+  the shape of a continue are its to decide. `cloaking_versions.rs` supplies the
+  vendor CLI versions it learns at runtime. A grok call carries the bearer and the
+  two headers the grok Upstream
   (grok build's chat proxy) requires (`grok_chat_headers`), and no Cloaking; a
   426 naming a newer client version is retried once with it, and that version is
   kept for the process lifetime (`learn_grok_client_version`). A chat call to a
@@ -129,7 +141,10 @@ in files.
 
 - **`UpstreamClient`** — the test seam: which vendor wire is spoken and whether
   any HTTP happens at all. `apply_cloaking` runs *below* it inside the HTTP
-  client, so a test double sees the pre-cloak body and headers. Model metadata
+  client, so a test double sees the pre-cloak body and headers. How a turn is
+  threaded crosses it as a fact beside the whole conversation, never as a shorter
+  body: a double sees every turn whole, and what a continue looks like on the wire
+  is tested where it is written. Model metadata
   ranking runs below it too, operator tier included, so a test double's models
   are advertised as it returns them (ADR-0029). So do a stream's Silence limit
   and the Retry hint's parse: a test double hands back a parsed hint, and only a
@@ -323,6 +338,24 @@ in files.
   display) and `web-fetch` stays for the native tool swap — ADR-0014.
 - **A (Inbound dialect, Provider) pair the relay cannot serve is refused 501 at
   routing**, never sent upstream and never retried.
+- **A Thread never changes what the relay hands a client.** A Harness sends the whole
+  conversation on every turn and the relay decides how much of it the vendor already
+  holds; the reply is the vendor's, passed on as a Plain request's is. A turn
+  continues only when the relay can show the vendor holds what came before: the same
+  Account, a stored reply under 270 seconds old that the client repeats, the same
+  earlier messages, and nothing changed that the vendor holds fixed. Anything else is
+  sent whole (ADR-0032).
+- **A Declined thread is decided by status, never by words.** Any 4xx to a threaded
+  turn but 401 and 429 may be the Thread's doing. The turn is sent again without
+  that Thread, as a new one when the old is gone or busy and Plain otherwise, and the
+  answer to the last attempt is the one that is recorded and returned. A conversation
+  the vendor took Plain after declining stays Plain on that Account, and three in a
+  row rest the Account for an hour. A vendor fault on a continue, other than a 529,
+  is sent again Plain too and is held against nothing. A 401, a 429, a 529 and a
+  fault on a create are the Account's, as for any request (ADR-0032).
+- **A Thread lives and dies with the process.** Nothing about one is written to
+  disk: the vendor drops a Thread five minutes after its last request, so a restart
+  costs one create per conversation.
 - **`launch` leaves nothing behind.** A harness is pointed at the relay by the
   environment and the arguments of one process, never by a file: the same
   binary started any other way still resolves its own accounts and its own

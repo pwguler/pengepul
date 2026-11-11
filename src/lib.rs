@@ -13,6 +13,7 @@ pub mod render;
 pub mod runtime;
 pub mod service;
 pub mod streaming;
+pub mod threads;
 pub mod tokens;
 pub mod translate;
 pub mod types;
