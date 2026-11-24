@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -86,7 +86,16 @@ pub struct Config {
     /// Each Account's Priority, keyed by Provider id and then Account key. Smaller is
     /// preferred; an Account left out takes [`DEFAULT_PRIORITY`].
     pub priority: BTreeMap<String, BTreeMap<String, i64>>,
+    pub allow: AllowLists,
+    /// The file this config was loaded from, which `/admin/reload` reads `allow:` from
+    /// again. `None` for a config built in code.
+    pub path: Option<PathBuf>,
 }
+
+/// The models each Provider may advertise and serve, keyed by Provider id and matched exactly
+/// against a model id without its `<provider>/` prefix. A Provider left out serves every model
+/// its Upstream lists.
+pub type AllowLists = BTreeMap<String, BTreeSet<String>>;
 
 /// The Priority of an Account the config does not list. Every such Account shares it, so a
 /// positive number demotes an Account below them and a negative one promotes it.
@@ -183,10 +192,28 @@ struct RawConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct RawConfiguredProvider {
-    #[serde(rename = "base-url")]
+    // Empty only on a built-in's allow-only entry, which must be written back without one.
+    #[serde(rename = "base-url", skip_serializing_if = "String::is_empty")]
     base_url: String,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     models: BTreeMap<String, ConfiguredModel>,
+    // `deserialize_with` runs only for a key that is present, so an `allow:` whose entries are
+    // all commented out (a YAML null) is the empty list `validate_providers` refuses, never
+    // the absent key that serves every model.
+    #[serde(
+        default,
+        deserialize_with = "present_list",
+        skip_serializing_if = "Option::is_none"
+    )]
+    allow: Option<Vec<String>>,
+}
+
+fn present_list<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error> {
+    Ok(Some(
+        Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default(),
+    ))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -336,6 +363,9 @@ pub fn register_provider(path: &Path, id: &str, base_url: &str) -> Result<String
         "{}.lock",
         path.file_name().unwrap_or_default().to_string_lossy()
     ));
+    // Before anything else: an allow-only entry under a built-in name would otherwise pass
+    // for a registration with an empty URL.
+    validate_provider_id(id)?;
     let _lock = FileLock::acquire(&lock_path)?;
     // A trailing slash would make `{base_url}/chat/completions` a double
     // slash, which some hosts answer with a 404 that names nothing
@@ -391,14 +421,7 @@ pub fn load_config(
         .context("HOME is not set")?;
     let (read_path, write_path) = config_paths(config_path, Some(&home), cwd);
     let mut raw = if read_path.exists() {
-        let text = fs::read_to_string(&read_path)
-            .with_context(|| format!("failed to read {}", read_path.display()))?;
-        if text.trim().is_empty() {
-            RawConfig::default()
-        } else {
-            serde_yaml::from_str::<RawConfig>(&text)
-                .with_context(|| format!("invalid config {}", read_path.display()))?
-        }
+        read_raw(&read_path)?
     } else {
         RawConfig::default()
     };
@@ -415,12 +438,29 @@ pub fn load_config(
         write_config(&write_path, &raw, true)?;
     }
 
-    let providers = validate_providers(&raw.providers)?;
+    config_from_raw(raw, &home, write_path)
+}
 
+/// Read the config file the relay loaded again, for `/admin/reload`: every check `load_config`
+/// applies, and nothing written. A `~` in `auth-dir` expands against `HOME` as it is now.
+///
+/// # Errors
+///
+/// Returns an error when `HOME` is not set, or when the file cannot be read or would be
+/// refused at load.
+pub fn reread_config(path: &Path) -> Result<Config> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is not set")?;
+    config_from_raw(read_raw(path)?, &home, path.to_path_buf())
+}
+
+fn config_from_raw(raw: RawConfig, home: &Path, path: PathBuf) -> Result<Config> {
+    let (providers, allow) = validate_providers(&raw.providers)?;
     Ok(Config {
         host: raw.host,
         port: raw.port,
-        auth_dir: resolve_auth_dir(&raw.auth_dir, &home),
+        auth_dir: resolve_auth_dir(&raw.auth_dir, home),
         api_keys: raw.api_keys.into_iter().collect(),
         body_limit: parse_body_limit(&raw.body_limit)
             .with_context(|| format!("body-limit: {:?}", raw.body_limit))?,
@@ -445,7 +485,18 @@ pub fn load_config(
             poll_minutes: raw.quota.poll_minutes.max(1),
         },
         priority: raw.priority,
+        allow,
+        path: Some(path),
     })
+}
+
+fn read_raw(path: &Path) -> Result<RawConfig> {
+    let text =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if text.trim().is_empty() {
+        return Ok(RawConfig::default());
+    }
+    serde_yaml::from_str(&text).with_context(|| format!("invalid config {}", path.display()))
 }
 
 /// Exclusive ownership of a config file for the length of a
@@ -589,39 +640,63 @@ pub fn validate_provider_id(id: &str) -> Result<()> {
 }
 
 /// Turn the raw `providers:` section into validated configured
-/// providers.
+/// providers and the allow lists of every Provider.
 ///
-/// Each id passes `validate_provider_id`, `base-url` is required, and a stated
-/// model limit must be above 0; the upstream's keys live in the auth-dir,
-/// not here.
+/// A built-in's canonical name may only carry `allow:`, since its endpoint is
+/// fixed. Every other id passes `validate_provider_id`, `base-url` is
+/// required, and a stated model limit must be above 0; the upstream's keys
+/// live in the auth-dir, not here. An `allow:` must name at least one model.
 fn validate_providers(
     raw: &BTreeMap<String, RawConfiguredProvider>,
-) -> Result<BTreeMap<String, ConfiguredProvider>> {
+) -> Result<(BTreeMap<String, ConfiguredProvider>, AllowLists)> {
     let mut providers = BTreeMap::new();
+    let mut allow = BTreeMap::new();
     for (id, entry) in raw {
-        validate_provider_id(id)?;
-        if entry.base_url.trim().is_empty() {
-            bail!("providers: {id} is missing base-url");
-        }
-        for (model, stated) in &entry.models {
-            for (field, value) in [
-                ("context-window", stated.context_window),
-                ("max-output-tokens", stated.max_output_tokens),
-            ] {
-                if value == Some(0) {
-                    bail!("providers: {id}.models.{model}.{field} must be above 0");
+        let built_in = id
+            .parse::<ProviderKind>()
+            .is_ok_and(|kind| kind.canonical_id() == id);
+        if built_in {
+            if !entry.base_url.trim().is_empty()
+                || !entry.models.is_empty()
+                || entry.allow.is_none()
+            {
+                bail!(
+                    "providers: {id} is a built-in provider name; its entry may carry only allow:"
+                );
+            }
+        } else {
+            validate_provider_id(id)?;
+            if entry.base_url.trim().is_empty() {
+                bail!("providers: {id} is missing base-url");
+            }
+            for (model, stated) in &entry.models {
+                for (field, value) in [
+                    ("context-window", stated.context_window),
+                    ("max-output-tokens", stated.max_output_tokens),
+                ] {
+                    if value == Some(0) {
+                        bail!("providers: {id}.models.{model}.{field} must be above 0");
+                    }
                 }
             }
+            providers.insert(
+                id.clone(),
+                ConfiguredProvider {
+                    base_url: entry.base_url.trim().to_string(),
+                    models: entry.models.clone(),
+                },
+            );
         }
-        providers.insert(
-            id.clone(),
-            ConfiguredProvider {
-                base_url: entry.base_url.trim().to_string(),
-                models: entry.models.clone(),
-            },
-        );
+        if let Some(list) = &entry.allow {
+            if list.is_empty() {
+                bail!(
+                    "providers: {id}.allow is empty, so {id} would serve none of its models; list at least one or remove allow:"
+                );
+            }
+            allow.insert(id.clone(), list.iter().cloned().collect());
+        }
     }
-    Ok(providers)
+    Ok((providers, allow))
 }
 
 fn config_paths(
@@ -982,12 +1057,17 @@ mod register_tests {
         let path = dir.path().join("config.yaml");
         fs::write(
             &path,
-            "host: \"127.0.0.1\"\nport: 8317\napi-keys:\n  - sk-test\nproviders:\n  omlx:\n    base-url: http://10.10.1.25:8000/v1\n    models:\n      Qwen3.8-27B-Uncensored-MLX:\n        reasoning: true\n        context-window: 262144\n",
+            "host: \"127.0.0.1\"\nport: 8317\napi-keys:\n  - sk-test\nproviders:\n  anthropic:\n    allow: [claude-opus-5-5]\n  omlx:\n    base-url: http://10.10.1.25:8000/v1\n    allow: [Qwen3.8-27B-Uncensored-MLX]\n    models:\n      Qwen3.8-27B-Uncensored-MLX:\n        reasoning: true\n        context-window: 262144\n",
         )
         .expect("write config");
 
         register_provider(&path, "omlx", "http://10.10.1.25:8000/v1").expect("same URL");
 
+        let written = fs::read_to_string(&path).expect("read config");
+        assert!(
+            !written.contains("base-url: ''"),
+            "an allow-only entry gained an empty base-url: {written}"
+        );
         let config = crate::config::load_config(Some(&path), Some(dir.path()), dir.path())
             .expect("load config");
         assert_eq!(
@@ -998,6 +1078,34 @@ mod register_tests {
                 max_output_tokens: None,
             }
         );
+        assert_eq!(
+            config.allow["omlx"],
+            ["Qwen3.8-27B-Uncensored-MLX".to_string()].into()
+        );
+        assert_eq!(
+            config.allow["anthropic"],
+            ["claude-opus-5-5".to_string()].into()
+        );
+    }
+
+    /// An allow-only entry under a built-in name is not a registration that `login` can extend:
+    /// a built-in's endpoint is fixed, so the name is refused as it always was.
+    #[test]
+    fn a_built_in_name_is_refused_even_beside_its_allow_only_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yaml");
+        let before =
+            "api-keys:\n  - sk-test\nproviders:\n  anthropic:\n    allow: [claude-opus-5-5]\n";
+        fs::write(&path, before).expect("write config");
+
+        let error = register_provider(&path, "anthropic", "https://example.com/v1")
+            .expect_err("a built-in name was registered");
+
+        assert_eq!(
+            error.to_string(),
+            "providers: anthropic is a built-in provider name"
+        );
+        assert_eq!(fs::read_to_string(&path).expect("read config"), before);
     }
 }
 

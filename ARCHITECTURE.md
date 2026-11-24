@@ -85,7 +85,10 @@ in files.
   under the upstream's `/models` body, under what the operator states in a
   configured provider's `models:` in `config.yaml` (ADR-0029). grok publishes no
   list to fetch: its two models, `grok-4.6` and `grok-4.5`, are a static one
-  (`grok_static_models`).
+  (`grok_static_models`). It also holds the operator's `allow:` lists: a Provider
+  with one advertises only the listed ids its Upstream lists, matched exactly on the
+  id `upstream_model` produces, while its fetched list stays whole so a bare id still
+  resolves to it and is refused by name.
 - **Translation** (`translate.rs`, `streaming.rs`) — rewrites a body between
   Inbound and upstream **Dialect**, whole-document and one SSE event at a time;
   pure JSON, no I/O. Every pair the route table can produce has a translation,
@@ -99,7 +102,11 @@ in files.
 - **Config** (`config.rs`) — parses `config.yaml`, including the `providers:`
   section, which is the only Provider registry: there is no database table.
   An entry named for a built-in (`anthropic`, `claude`, `codex`, `grok`)
-  stops the relay at load, since the built-in Pool's prefix would shadow it.
+  stops the relay at load, since the built-in Pool's prefix would shadow it,
+  unless it names a built-in canonically and carries only `allow:`, which
+  narrows that built-in's models and registers nothing. `/admin/reload` reads
+  the file again under the same checks (`reread_config`) and applies only its
+  `allow:` lists; every other key needs a restart.
   It also writes it: `register_provider` adds one entry for `login
   --base-url`, and refuses an id already present with a different URL
   rather than overwriting it. The write is a read-modify-write on one
@@ -151,7 +158,7 @@ in files.
   test that streams from a real HTTP server can show where a stream is cut.
 - **`ProviderKind`** — a closed enum (Anthropic, Codex, Grok, Generic) that
   switches the credential lifecycle, the OAuth flow, and whether Cloaking runs,
-  and names the ids a `providers:` entry may not take; the compiler is the
+  and names the ids a configured Provider may not take; the compiler is the
   checklist when a fifth kind arrives.
 - **`CliRuntime`** — every side effect a CLI verb performs, so `cli.rs` stays
   pure argument handling.
@@ -189,8 +196,9 @@ in files.
   against live traffic; an under-strip surfaces only as an upstream 400 with no
   log line, so the rules bias toward failing loud over deleting operator content.
 - **One model id resolves to exactly one Provider**, and an id nobody claims is
-  refused 400 before any Account is touched. A bare id never routes to a
-  configured endpoint — only an explicit `<provider>/` prefix does.
+  refused 400 before any Account is touched, as is an id outside its Provider's
+  `allow:` list (`resolve_model`, the one resolution every route calls). A bare id
+  never routes to a configured endpoint — only an explicit `<provider>/` prefix does.
 - **The `<provider>/` prefix is the only rewrite of a model id.** `upstream_model` removes
   it so the request asks the vendor for a model by the name the client gave after the prefix,
   and Usage counters key on that same name. Nothing else in the id is rewritten — not a
