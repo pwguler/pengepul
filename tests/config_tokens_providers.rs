@@ -385,6 +385,80 @@ priority:
     );
 }
 
+/// round-robin-rotation AC-1: one setting per Provider id, and a Provider the map leaves out
+/// rotates by Priority, as every Pool did before the key existed.
+#[test]
+fn rotation_loads_per_provider_and_a_provider_left_out_rotates_by_priority() {
+    use pengepul::config::RotationMode;
+
+    let (_tmp, home, config_path) = write_config_with(
+        r"api-keys:
+  - sk-local
+rotation:
+  anthropic: round-robin
+  codex: priority
+",
+    );
+
+    let config = load_config(Some(&config_path), Some(&home), &home).expect("load config");
+
+    assert_eq!(config.rotation_for("anthropic"), RotationMode::RoundRobin);
+    assert_eq!(config.rotation_for("codex"), RotationMode::Priority);
+    assert_eq!(config.rotation_for("grok"), RotationMode::Priority);
+
+    let (_tmp, home, config_path) = write_config_with("api-keys:\n  - sk-local\n");
+    let config = load_config(Some(&config_path), Some(&home), &home).expect("load config");
+    assert_eq!(config.rotation_for("anthropic"), RotationMode::Priority);
+}
+
+/// round-robin-rotation AC-1: a mode the relay does not know stops it at load rather than
+/// falling back to Priority, which would hide the operator's typo behind the old behaviour.
+#[test]
+fn a_rotation_mode_the_relay_does_not_know_is_refused_at_load() {
+    for mode in ["random", "round_robin", "Round-Robin", "roundrobin", "1"] {
+        let (_tmp, home, config_path) = write_config_with(&format!(
+            "api-keys:\n  - sk-local\nrotation:\n  anthropic: {mode}\n"
+        ));
+
+        let error = load_config(Some(&config_path), Some(&home), &home)
+            .expect_err(&format!("rotation mode {mode:?} was accepted"));
+        assert!(
+            format!("{error:#}").contains("rotation"),
+            "error names the section: {error:#}"
+        );
+    }
+}
+
+/// round-robin-rotation AC-1: a build without the key refuses a config that carries it, so a
+/// config the relay generates or rewrites gains no `rotation:`, and an operator's is kept.
+#[test]
+fn the_relay_writes_rotation_only_when_the_operator_set_it() {
+    use pengepul::config::RotationMode;
+
+    let tmp = tempdir().expect("tempdir");
+    let home = tmp.path().join("home");
+    let generated = tmp.path().join("generated.yaml");
+    load_config(Some(&generated), Some(&home), tmp.path()).expect("load config");
+    let written = fs::read_to_string(&generated).expect("generated config");
+    assert!(!written.contains("rotation"), "{written}");
+
+    for (stated, kept) in [("", false), ("rotation:\n  anthropic: round-robin\n", true)] {
+        let (_tmp, home, config_path) =
+            write_config_with(&format!("api-keys:\n  - sk-local\n{stated}"));
+        pengepul::config::register_provider(&config_path, "groq", "https://api.groq.com/openai/v1")
+            .expect("register");
+        let rewritten = fs::read_to_string(&config_path).expect("rewritten config");
+        assert_eq!(rewritten.contains("rotation"), kept, "{rewritten}");
+        let config = load_config(Some(&config_path), Some(&home), &home).expect("reload");
+        let expected = if kept {
+            RotationMode::RoundRobin
+        } else {
+            RotationMode::Priority
+        };
+        assert_eq!(config.rotation_for("anthropic"), expected, "{rewritten}");
+    }
+}
+
 #[test]
 fn provider_entry_with_unknown_field_is_rejected() {
     let (_tmp, home, config_path) = write_config_with(
