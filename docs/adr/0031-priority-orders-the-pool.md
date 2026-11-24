@@ -114,3 +114,9 @@ tier-1 accounts are cooling is the Priority-2 account served.
 
 `cargo test`, `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` pass. The
 glossary, the README and the code agree on **Priority** (AC-8).
+
+## Amendment: a Pool can opt out of the order
+
+ADR-0033 lets `rotation:` set a Pool to round-robin, which hands new conversations out in turn
+and reads no Priority. Everything above still holds for every Pool left at `priority`, the
+default, including the rejection of round-robin among equals: the two never mix inside one Pool.

@@ -25,9 +25,10 @@ in files.
   how the turn goes out, and sends a **Declined thread** again without that Thread
   before anything is recorded.
 - **Account** (`accounts.rs`) — `AccountManager`: holds every Account of one
-  Provider and picks who serves next; **Rotation**, **Priority**, **Cooldown**
-  and due **Refresh** live here, and every request outcome updates the Account's
-  Usage counters, which it hands to the Credential store to persist. A
+  Provider and picks who serves next; **Rotation**, **Priority**, **Round-robin**'s
+  turn, **Cooldown** and due **Refresh** live here, and every request outcome
+  updates the Account's Usage counters, which it hands to the Credential store to
+  persist. A
   Cooldown's length is what its failure's policy sets, or the Retry hint a 429
   or 503 carried when that is longer, capped at a day. Every
   outcome passes through one private seam (`AccountState::settle`), so the
@@ -200,17 +201,28 @@ in files.
   resolved once before the attempt loop.
 - **Priority orders new conversations inside one Pool, and decides nothing else.** Each
   Account carries an integer (`priority:` in the config, keyed by Provider and Account key,
-  default `0`); a new conversation takes the serving Account of smallest one, then the soonest
-  weekly quota reset, then the Account key. The `accounts` views list each Pool in that same
-  order, so the page reads as the policy it shows. It never compares across Pools, never reads
+  default `0`); in a Pool that rotates by Priority, the default, a new conversation takes the
+  serving Account of smallest one, then the soonest weekly quota reset, then the Account key.
+  The `accounts` views list each Pool in the order its rotation hands out new conversations, so
+  the page reads as the policy it shows. It never compares across Pools, never reads
   quota utilization, and never overrides cache affinity or availability: an Account leaves the
   serving set only on Cooldown, Disabled or a missing credential, and a conversation with
   affinity keeps its Account while that Account can serve (ADR-0031).
+- **A Round-robin Pool hands new conversations out in turn, and reads no Priority.**
+  `rotation:` in the config sets it per Provider. Each new conversation takes the first serving
+  Account after the one the Pool placed last, in Account-key order, wrapping after the last key;
+  a conversation whose Account cannot serve, or that Failover leaves, is placed the same way and
+  its affinity moves with it, while one with affinity takes no turn. The turn is the key of the
+  last placement, held in the Pool's `AccountManager` behind its lock, so concurrent placements
+  take distinct turns; it is not persisted, and a restart starts at the first key. It is the one
+  key `/admin/reload` applies, from the file the relay loaded, and a file that would be refused
+  at load refuses the reload. The payload names each Pool's rotation, and the views print a
+  Round-robin Pool's Accounts in turn order with no Priority beside them (ADR-0033).
 - **Rotation prefers the Account holding the cache, and never waits for it.**
   Each upstream keeps its own prompt cache, so a conversation stays on the
   Account that served it last while that Account is off Cooldown, and takes the
-  best serving Account by the Priority order the moment it is not (ADR-0017,
-  ADR-0031). The preference is keyed by
+  next serving Account by the Pool's rotation, the Priority order or the next
+  turn, the moment it is not (ADR-0017, ADR-0031, ADR-0033). The preference is keyed by
   the session a harness names — a session header, or the `prompt_cache_key`
   its body carries — or, when it names none, by a hash of the cacheable
   prefix: the system blocks, `tools` and `model`, plus a fixed window over the
