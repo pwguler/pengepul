@@ -816,13 +816,13 @@ async fn admin_reload_rereads_the_allow_lists() {
     for (rest, reason) in [
         (
             format!("providers:\n  anthropic:\n    allow: []\n{groq}"),
-            "anthropic.allow is empty",
+            "the config file does not load",
         ),
         (
             format!(
                 "body-limit: lots\nproviders:\n  anthropic:\n    allow: [claude-opus-5-5]\n{groq}"
             ),
-            "body-limit",
+            "the config file does not load",
         ),
         (
             "providers:\n  anthropic:\n    allow: [claude-opus-5-5]\n".to_string(),
@@ -3158,10 +3158,8 @@ async fn admin_reload_applies_the_rotation_the_config_file_holds_now() {
     let (status, body) = reload().await;
     assert_eq!(status, 500, "{body}");
     assert!(
-        body["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("rotation")),
-        "the refusal does not name the key: {body}"
+        !body.to_string().contains("sideways"),
+        "the refusal quotes the file: {body}"
     );
     converse(&["r-5"]).await;
 

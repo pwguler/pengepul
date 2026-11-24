@@ -1553,7 +1553,15 @@ async fn admin_reload(State(state): State<AppState>, headers: HeaderMap) -> Resp
     if let Some(path) = &state.config.path {
         let reread = match crate::config::reread_config(path) {
             Ok(reread) => reread,
-            Err(error) => return config_reload_refused(&format!("{error:#}")),
+            Err(error) => {
+                // The chain can quote a value from the file, a key or a token among them, so it
+                // goes to the log the operator reads and never to the client.
+                tracing::warn!(
+                    error = %format_args!("{error:#}"),
+                    "reload refused: the config file does not load, and the config in force stays"
+                );
+                return config_reload_refused("the config file does not load; see the relay log");
+            }
         };
         // A configured Provider serves until a restart, so its allow list cannot leave with
         // its entry.
@@ -1563,6 +1571,10 @@ async fn admin_reload(State(state): State<AppState>, headers: HeaderMap) -> Resp
             .keys()
             .find(|id| !reread.providers.contains_key(*id))
         {
+            tracing::warn!(
+                provider = %gone,
+                "reload refused: the config drops a provider that serves until a restart"
+            );
             return config_reload_refused(&format!(
                 "providers: {gone} serves until a restart and is gone from the config; restart to remove it"
             ));
@@ -1600,13 +1612,7 @@ async fn admin_reload(State(state): State<AppState>, headers: HeaderMap) -> Resp
             Ok(value) => {
                 reloaded.insert(provider.to_string(), value);
             }
-            Err(error) => {
-                return AppError::simple(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to reload accounts: {error}"),
-                )
-                .into_response();
-            }
+            Err(error) => return accounts_reload_failed(&provider, &error),
         }
     }
     for (id, manager) in &state.account_managers.generic {
@@ -1614,13 +1620,7 @@ async fn admin_reload(State(state): State<AppState>, headers: HeaderMap) -> Resp
             Ok(result) => {
                 reloaded.insert(id.clone(), result);
             }
-            Err(error) => {
-                return AppError::simple(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to reload accounts: {error}"),
-                )
-                .into_response();
-            }
+            Err(error) => return accounts_reload_failed(id, &error),
         }
     }
 
@@ -1635,6 +1635,23 @@ fn config_reload_refused(reason: &str) -> Response {
     AppError::simple(
         StatusCode::INTERNAL_SERVER_ERROR,
         format!("failed to reload config: {reason}"),
+    )
+    .into_response()
+}
+
+/// The client is told which Pool failed and the log why: the cause names paths under the auth
+/// directory, which the config sets.
+fn accounts_reload_failed(provider: &impl std::fmt::Display, error: &anyhow::Error) -> Response {
+    tracing::warn!(
+        %provider,
+        error = %format_args!("{error:#}"),
+        "account reload failed: the pool's credentials could not be read"
+    );
+    AppError::simple(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!(
+            "failed to reload accounts: {provider}'s credentials could not be read; see the relay log"
+        ),
     )
     .into_response()
 }
@@ -5498,6 +5515,168 @@ mod tests {
             managers.anthropic.try_lock().expect("unshared").rotation(),
             crate::config::RotationMode::Priority
         );
+    }
+
+    /// A relay running `config` behind the key [`reload`] presents. `/admin/reload` reads
+    /// `config.path` again when it has one.
+    fn admin_state(tmp: &std::path::Path, mut config: Config) -> AppState {
+        config.api_keys.insert("sk-test".to_string());
+        AppState {
+            config: Arc::new(config),
+            ..test_state(tmp, Arc::new(CapturingUpstream::default()))
+        }
+    }
+
+    /// `POST /admin/reload` as the client receives it: the status, and the body as raw text, so
+    /// an assertion about what the body quotes reads every byte of it.
+    async fn reload(state: AppState) -> (StatusCode, String) {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer sk-test".parse().expect("header"));
+        let response = super::admin_reload(axum::extract::State(state), headers).await;
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// Whether any captured line carries `needle` in any field.
+    fn logged(captured: &Arc<std::sync::Mutex<CapturedFields>>, needle: &str) -> bool {
+        captured
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .flatten()
+            .any(|(_, value)| value.contains(needle))
+    }
+
+    /// A config that does not load refuses the reload without quoting it: a load error quotes
+    /// the value it could not read, and in `config.yaml` that value can be a Local API key or an
+    /// upstream token. The relay log, which the operator reads, keeps the whole error.
+    #[tokio::test]
+    async fn a_config_that_does_not_load_refuses_the_reload_without_quoting_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("config.yaml");
+        let captured = capture();
+        // Three ways a value reaches the error: serde quotes a value of the wrong type and an
+        // unknown variant, and the `body-limit` check quotes what it could not parse.
+        for (secret, text) in [
+            ("sk-LEAKCHECK123-list", "api-keys: sk-LEAKCHECK123-list\n"),
+            (
+                "sk-LEAKCHECK123-limit",
+                "api-keys: [sk-test]\nbody-limit: sk-LEAKCHECK123-limit\n",
+            ),
+            (
+                "sk-LEAKCHECK123-mode",
+                "api-keys: [sk-test]\nrotation:\n  anthropic: sk-LEAKCHECK123-mode\n",
+            ),
+        ] {
+            std::fs::write(&path, text).expect("write config");
+            let mut config = test_config(tmp.path().to_path_buf());
+            config.path = Some(path.clone());
+
+            let (status, body) = reload(admin_state(tmp.path(), config)).await;
+
+            assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{secret}: {body}"
+            );
+            assert!(
+                !body.contains(secret),
+                "the refusal quotes the file: {body}"
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(&body).expect("json body")["error"]["message"],
+                "failed to reload config: the config file does not load; see the relay log"
+            );
+            assert!(
+                logged(&captured, secret),
+                "the log does not carry the load error for {secret}"
+            );
+        }
+    }
+
+    /// A file that loads but drops a configured Provider still serving is refused by naming the
+    /// Provider, which is no secret, and nothing the file holds; the log names the Provider too.
+    #[tokio::test]
+    async fn a_reload_that_drops_a_serving_provider_names_only_the_provider() {
+        const GONE: &str = "leakcheck-gone";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("config.yaml");
+        // It loads, and drops GONE. The key it adds is what a refusal quoting the file would show.
+        std::fs::write(&path, "api-keys: [sk-test, sk-LEAKCHECK123-gone]\n").expect("write config");
+        let captured = capture();
+        let mut config = test_config(tmp.path().to_path_buf());
+        config.path = Some(path);
+        config.providers.insert(
+            GONE.to_string(),
+            crate::config::ConfiguredProvider {
+                base_url: "https://leakcheck.example/v1".to_string(),
+                models: BTreeMap::new(),
+            },
+        );
+
+        let (status, body) = reload(admin_state(tmp.path(), config)).await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(!body.contains("sk-LEAKCHECK123-gone"), "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("json body")["error"]["message"],
+            format!(
+                "failed to reload config: providers: {GONE} serves until a restart and is gone \
+                 from the config; restart to remove it"
+            )
+        );
+        assert!(logged(&captured, GONE), "the log does not name {GONE}");
+    }
+
+    /// An account reload that fails names the Pool and not the cause, which is a path under the
+    /// auth directory the config sets; the relay log keeps the cause. Both kinds of Pool: the
+    /// built-ins and the configured ones are reloaded in separate loops.
+    #[tokio::test]
+    async fn a_failed_account_reload_names_the_pool_and_logs_the_cause() {
+        const CONFIGURED: &str = "leakcheck-pool";
+        let captured = capture();
+        for broken in [ProviderId::anthropic(), ProviderId::generic(CONFIGURED)] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            // The directory's name stands in for whatever the configured auth-dir path holds.
+            let auth = tmp.path().join("sk-LEAKCHECK123-auth");
+            std::fs::create_dir_all(&auth).expect("auth dir");
+            let mut state = admin_state(&auth, test_config(auth.clone()));
+            Arc::get_mut(&mut state.account_managers)
+                .expect("unshared")
+                .generic
+                .insert(
+                    CONFIGURED.to_string(),
+                    tokio::sync::Mutex::new(manager(&auth, ProviderId::generic(CONFIGURED))),
+                );
+            // A file where the Pool's directory belongs cannot be listed.
+            std::fs::write(auth.join(broken.storage_dir()), "").expect("block the pool");
+
+            let (status, body) = reload(state).await;
+
+            assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{broken}: {body}"
+            );
+            assert!(!body.contains("sk-LEAKCHECK123-auth"), "{body}");
+            assert_eq!(
+                serde_json::from_str::<Value>(&body).expect("json body")["error"]["message"],
+                format!(
+                    "failed to reload accounts: {broken}'s credentials could not be read; see the \
+                     relay log"
+                )
+            );
+            assert!(
+                logged(&captured, &auth.display().to_string()),
+                "the log does not carry the cause for {broken}"
+            );
+        }
     }
 
     /// The `"cacheable prefix"` line says what this request's opening hashed to; the
