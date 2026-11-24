@@ -134,7 +134,7 @@ _Avoid_: billing classifier, detector, filter
 
 ## Relationships
 
-- pengepul has three built-in **Providers** — anthropic, codex, grok — plus one configured **Provider** per `providers:` config entry, which may not take a built-in's name.
+- pengepul has three built-in **Providers** — anthropic, codex, grok — plus one configured **Provider** per `providers:` config entry with a `base-url`, which may not take a built-in's name. An entry under a built-in's name carries only `allow:`: it narrows the models that built-in serves and is not a **Provider** of its own.
 - One **Provider** has zero or more **Accounts**; one **Account** belongs to exactly one **Provider**.
 - Within one **Provider** an **Account** is keyed by exactly one email (anthropic, codex, grok) or by a label derived from the key (static-key providers), and keys are unique.
 - One **Account** holds exactly one credential: an access-token/refresh-token pair for anthropic, codex and grok, or one static API key for a configured OpenAI-compatible **Provider**.
@@ -171,7 +171,7 @@ _Avoid_: billing classifier, detector, filter
 
 ## Flagged ambiguities
 
-- "provider" names both the vendor and a configured entry for that vendor. Resolved: **Provider** means the vendor. For a configured OpenAI-compatible endpoint, the config entry is the Provider; for anthropic, codex and grok there is no config entry because they are built in.
+- "provider" names both the vendor and a configured entry for that vendor. Resolved: **Provider** means the vendor. For a configured OpenAI-compatible endpoint, the config entry is the Provider; for anthropic, codex and grok no config entry registers them because they are built in, and an entry under their name carries only `allow:`.
 - "claude" appears as an alias for anthropic in stored credentials. Resolved: **anthropic** is the only spelling an operator uses or types.
 - "account", "credential" and "token" all name the same file under the auth directory across the README, the CLI and the source. Resolved: **Account** is the domain noun — the identity, its credential, and its record. Credential is the secret inside an account. Token is a wire artifact and never means the account.
 - Accounts are keyed by email. Resolved: read the field as the account key, not as an address.
