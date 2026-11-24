@@ -1526,11 +1526,21 @@ async fn admin_toggle(
             ),
         )
         .into_response(),
-        Err(ToggleError::Io(error)) => AppError::simple(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to rename {account}'s credential: {error:#}"),
-        )
-        .into_response(),
+        Err(ToggleError::Io(error)) => {
+            // The client learns which credential failed and the log learns why, as a refused
+            // reload does.
+            tracing::warn!(
+                %provider,
+                %account,
+                error = %format_args!("{error:#}"),
+                "account disable or enable failed: the credential could not be renamed"
+            );
+            AppError::simple(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to rename {account}'s credential; see the relay log"),
+            )
+            .into_response()
+        }
     }
 }
 
@@ -5520,8 +5530,8 @@ mod tests {
         );
     }
 
-    /// A relay running `config` behind the Local API key [`reload`] presents. `/admin/reload`
-    /// reads `config.path` again when it has one.
+    /// A relay running `config` behind the Local API key [`admin_headers`] presents.
+    /// `/admin/reload` reads `config.path` again when it has one.
     fn admin_state(tmp: &std::path::Path, mut config: Config) -> AppState {
         config.api_keys.insert("sk-test".to_string());
         AppState {
@@ -5530,12 +5540,16 @@ mod tests {
         }
     }
 
-    /// `POST /admin/reload` as the client receives it: the status, and the body as raw text, so
-    /// an assertion about what the body quotes reads every byte of it.
-    async fn reload(state: AppState) -> (StatusCode, String) {
+    /// The headers of an admin request to a relay [`admin_state`] built.
+    fn admin_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer sk-test".parse().expect("header"));
-        let response = super::admin_reload(axum::extract::State(state), headers).await;
+        headers
+    }
+
+    /// A response as the client receives it: the status, and the body as raw text, so an
+    /// assertion about what the body quotes reads every byte of it.
+    async fn received(response: axum::response::Response) -> (StatusCode, String) {
         let status = response.status();
         let body = response
             .into_body()
@@ -5544,6 +5558,11 @@ mod tests {
             .expect("body")
             .to_bytes();
         (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// `POST /admin/reload` as the client receives it.
+    async fn reload(state: AppState) -> (StatusCode, String) {
+        received(super::admin_reload(axum::extract::State(state), admin_headers()).await).await
     }
 
     /// Whether a warn line carries `needle`. Warn, because the relay's default filter keeps it;
@@ -5683,6 +5702,47 @@ mod tests {
                 "the log does not carry the cause for {broken}"
             );
         }
+    }
+
+    /// A disable that fails on disk names the account and not the cause, which names paths under
+    /// the auth directory the config sets; the relay log keeps the cause.
+    #[tokio::test]
+    async fn a_failed_toggle_names_the_account_and_logs_the_cause() {
+        const ACCOUNT: &str = "toggle-leak@example.com";
+        let captured = capture();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // The directory's name stands in for whatever the configured auth-dir path holds.
+        let auth = tmp.path().join("sk-LEAKCHECK123-toggle");
+        save_token(
+            &auth,
+            &token(ACCOUNT, "anthropic-access-toggle", "2030-01-01T00:00:00Z"),
+        )
+        .expect("save the account");
+        let state = admin_state(&auth, test_config(auth.clone()));
+        // The Pool has loaded the account. A file where its directory was fails the disable, for
+        // root too, which a read-only directory would not.
+        let pool_dir = auth.join(ProviderId::anthropic().storage_dir());
+        std::fs::remove_dir_all(&pool_dir).expect("remove the pool's directory");
+        std::fs::write(&pool_dir, "").expect("block the pool");
+        let request = axum::body::Bytes::from(
+            json!({"account": ACCOUNT, "provider": "anthropic"}).to_string(),
+        );
+
+        let (status, body) = received(
+            super::admin_disable(axum::extract::State(state), admin_headers(), request).await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(!body.contains("sk-LEAKCHECK123-toggle"), "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("json body")["error"]["message"],
+            format!("failed to rename {ACCOUNT}'s credential; see the relay log")
+        );
+        assert!(
+            logged(&captured, &auth.display().to_string()),
+            "the log does not carry the cause"
+        );
     }
 
     /// The `"cacheable prefix"` line says what this request's opening hashed to; the
