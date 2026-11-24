@@ -115,6 +115,34 @@ left out keeps what pengepul would advertise without it. A model the endpoint do
 list is not advertised, and an unknown field or a zero limit stops the relay at load.
 `models:` is read at startup, so an edit needs a restart.
 
+### Allow lists
+
+A provider's `allow:` narrows it to the models it names. `/v1/models` advertises only the
+named models its upstream lists, and a request for any other model of that provider,
+prefixed or bare, answers 400 `model_not_allowed` before any account is used. So does a
+Chat request whose `models` fallback list (OpenRouter's) names one. A provider without
+`allow:` serves every model its upstream lists. An entry is a model id exactly as
+the provider lists it, without the `<provider>/` prefix; there are no wildcards. A built-in
+takes an entry of its own that carries only `allow:`:
+
+```yaml
+# ~/.pengepul/config.yaml
+providers:
+  anthropic:
+    allow: [claude-opus-5-5, claude-sonnet-5-5]
+  commandcode:
+    base-url: https://api.commandcode.ai/provider/v1
+    allow:
+      - deepseek/deepseek-v4.1-flash # served as commandcode/deepseek/deepseek-v4.1-flash
+```
+
+An entry the upstream does not list is not advertised, and every model-list refresh logs it
+as a warning, so a typo shows. An empty `allow:`, including one whose entries are all
+commented out, stops the relay at load, since it would serve none of the provider's models.
+`pengepul accounts --reload` reads the lists again without a restart. A config that would not
+load is refused there and the lists in force stay, as is one that drops a running provider's
+entry: removing a provider still takes a restart.
+
 Login opens a browser and finishes on a localhost callback. On a remote host, forward the
 port first:
 
@@ -266,6 +294,11 @@ providers:
         reasoning: false
         context-window: 131072
         max-output-tokens: 32768
+    allow: [llama-3.3-70b-versatile] # optional; serve only these models
+  # optional; a built-in's entry carries only allow:. A build older than the one that added
+  # allow: refuses a config that carries it.
+  anthropic:
+    allow: [claude-opus-5-5]
 body-limit: 200mb # largest request body the relay will read; empty means unlimited
 timeouts:
   messages-ms: 120000 # deadline for a whole reply the client did not stream

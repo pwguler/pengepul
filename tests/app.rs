@@ -14,7 +14,7 @@ use pengepul::app::{
 use pengepul::cloaking_versions::CliVersions;
 use pengepul::config::{
     BodyLimit, CloakingConfig, Config, DEFAULT_BODY_LIMIT_BYTES, DebugMode, QuotaConfig,
-    TimeoutConfig,
+    TimeoutConfig, load_config,
 };
 use pengepul::models::{FetchedModels, ModelMetadata, ModelPricing};
 use pengepul::quota::{QuotaSnapshot, QuotaWindow};
@@ -27,6 +27,8 @@ use tower::ServiceExt;
 #[derive(Default)]
 struct FakeUpstream {
     calls: Mutex<Vec<UpstreamRequest>>,
+    /// What each Provider's model fetch returns; a Provider left out lists nothing.
+    listed: Vec<(ProviderKind, Vec<&'static str>)>,
 }
 
 impl FakeUpstream {
@@ -263,11 +265,17 @@ impl UpstreamClient for FakeUpstream {
 
     fn fetch_models(
         &self,
-        _kind: ProviderKind,
+        kind: ProviderKind,
         _account: AvailableAccount,
         _config: Arc<Config>,
     ) -> ModelsFuture {
-        Box::pin(async move { Ok(FetchedModels::new(Vec::new())) })
+        let ids = self
+            .listed
+            .iter()
+            .filter(|(listed, _)| *listed == kind)
+            .flat_map(|(_, ids)| ids.iter().map(|id| (*id).to_string()))
+            .collect();
+        Box::pin(async move { Ok(FetchedModels::new(ids)) })
     }
 }
 
@@ -298,6 +306,7 @@ fn config(auth_dir: PathBuf) -> Config {
         },
         rotation: BTreeMap::default(),
         priority: BTreeMap::default(),
+        allow: BTreeMap::default(),
         path: None,
     }
 }
@@ -543,6 +552,398 @@ async fn app_rejects_an_unknown_model() {
 
     assert_eq!(status, 400);
     assert_eq!(body["error"]["message"], "unknown model: gemini-3");
+}
+
+/// A client request for `model` on `uri`, carrying what every model route requires.
+async fn post_model(app: &axum::Router, uri: &str, model: &str) -> (u16, Value) {
+    json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "256")
+            .body(Body::from(
+                json!({"model": model, "messages": [{"role": "user", "content": "hi"}]})
+                    .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await
+}
+
+/// `/v1/models` once the catalog refresh, which runs on a spawned task after app creation,
+/// advertises `expected`; bounded, then whatever it advertises.
+async fn advertised_once(app: &axum::Router, expected: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    for _ in 0..100 {
+        let (status, body) = json_response(
+            app.clone(),
+            axum::http::Request::builder()
+                .uri("/v1/models")
+                .header("authorization", "Bearer sk-test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, 200);
+        ids = body["data"]
+            .as_array()
+            .expect("data")
+            .iter()
+            .filter_map(|item| item["id"].as_str().map(ToOwned::to_owned))
+            .collect();
+        if ids.iter().any(|id| id == expected) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    ids.sort();
+    ids
+}
+
+fn allowing(mut config: Config, provider: &str, models: &[&str]) -> Config {
+    config.allow.insert(
+        provider.to_string(),
+        models.iter().map(|id| (*id).to_string()).collect(),
+    );
+    config
+}
+
+fn listing_anthropic_and_codex() -> Arc<FakeUpstream> {
+    Arc::new(FakeUpstream {
+        listed: vec![
+            (
+                ProviderKind::Anthropic,
+                vec!["claude-opus-5-5", "claude-sonnet-5-5", "mythos-preview"],
+            ),
+            (ProviderKind::Codex, vec!["gpt-5.5", "gpt-5.4"]),
+        ],
+        ..FakeUpstream::default()
+    })
+}
+
+#[tokio::test]
+async fn an_allow_list_narrows_v1_models_for_its_provider_only() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_provider_token(tmp.path(), ProviderId::anthropic(), "alice@example.com");
+    save_provider_token(tmp.path(), ProviderId::codex(), "carol@example.com");
+    let config = allowing(
+        config(tmp.path().to_path_buf()),
+        "anthropic",
+        &["claude-opus-5-5", "claude-opus-9"],
+    );
+    let app = create_app_with_upstream(config, listing_anthropic_and_codex());
+
+    let ids = advertised_once(&app, "codex/gpt-5.5").await;
+
+    // claude-opus-9 is allowed but not listed, so it is not advertised; codex has no allow
+    // list and advertises everything it lists.
+    assert_eq!(
+        ids,
+        [
+            "anthropic/claude-opus-5-5",
+            "codex/gpt-5.4",
+            "codex/gpt-5.5"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_model_outside_its_providers_allow_list_is_refused_on_every_route() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_provider_token(tmp.path(), ProviderId::anthropic(), "alice@example.com");
+    save_token(tmp.path(), &groq_key_token()).expect("save groq key");
+    let config = allowing(
+        allowing(
+            config_with_groq(tmp.path().to_path_buf()),
+            "anthropic",
+            &["claude-opus-5-5"],
+        ),
+        "groq",
+        &["llama-3.3-70b"],
+    );
+    let upstream = listing_anthropic_and_codex();
+    let app = create_app_with_upstream(config, upstream.clone());
+    // Once the list is in, `mythos-preview` resolves to anthropic by that list alone.
+    advertised_once(&app, "anthropic/claude-opus-5-5").await;
+
+    for (model, native, provider) in [
+        (
+            "anthropic/claude-sonnet-5-5",
+            "claude-sonnet-5-5",
+            "anthropic",
+        ),
+        // bare, listed nowhere, resolved by the prefix heuristic
+        ("claude-haiku-9", "claude-haiku-9", "anthropic"),
+        // bare, resolved by the fetched list
+        ("mythos-preview", "mythos-preview", "anthropic"),
+        ("groq/llama-3.1-8b", "llama-3.1-8b", "groq"),
+    ] {
+        for uri in [
+            "/v1/chat/completions",
+            "/v1/responses",
+            "/v1/messages",
+            "/v1/messages/count_tokens",
+        ] {
+            let (status, body) = post_model(&app, uri, model).await;
+
+            assert_eq!(status, 400, "{uri} {model}: {body}");
+            assert_eq!(
+                body["error"]["message"],
+                format!(
+                    "model not allowed: {model} ({native} is not in the {provider} allow list)"
+                ),
+                "{uri} {model}"
+            );
+            assert_eq!(body["error"]["type"], "model_not_allowed", "{uri} {model}");
+            assert_eq!(body["error"]["provider"], provider, "{uri} {model}");
+        }
+    }
+    assert!(
+        upstream.calls().is_empty(),
+        "a refused model reached the upstream"
+    );
+    // Refused before an Account was chosen: nothing is booked against one.
+    let (_, accounts) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .uri("/admin/accounts")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    for pool in ["anthropic", "groq"] {
+        let account = &accounts["providers"][pool]["accounts"][0];
+        assert_eq!(account["totalRequests"], 0, "{pool}: {account}");
+    }
+}
+
+#[tokio::test]
+async fn an_allowed_model_and_a_provider_without_an_allow_list_are_served_as_before() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_provider_token(tmp.path(), ProviderId::anthropic(), "alice@example.com");
+    save_provider_token(tmp.path(), ProviderId::codex(), "carol@example.com");
+    let config = allowing(
+        config(tmp.path().to_path_buf()),
+        "anthropic",
+        &["claude-opus-5-5"],
+    );
+    let upstream = listing_anthropic_and_codex();
+    let app = create_app_with_upstream(config, upstream.clone());
+
+    for (uri, model) in [
+        ("/v1/messages", "anthropic/claude-opus-5-5"),
+        ("/v1/messages", "claude-opus-5-5"),
+        ("/v1/messages/count_tokens", "anthropic/claude-opus-5-5"),
+        ("/v1/chat/completions", "claude-opus-5-5"),
+        ("/v1/responses", "codex/gpt-5.4"),
+        // no allow list: an id codex does not list still routes by shape, as before
+        ("/v1/responses", "gpt-7"),
+    ] {
+        let (status, body) = post_model(&app, uri, model).await;
+        assert_eq!(status, 200, "{uri} {model}: {body}");
+    }
+    let asked = upstream
+        .calls()
+        .iter()
+        .map(|call| call.body["model"].as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        asked,
+        [
+            "claude-opus-5-5",
+            "claude-opus-5-5",
+            "claude-opus-5-5",
+            "claude-opus-5-5",
+            "gpt-5.4",
+            "gpt-7"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn admin_reload_rereads_the_allow_lists() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_provider_token(tmp.path(), ProviderId::anthropic(), "alice@example.com");
+    let config_path = tmp.path().join("config.yaml");
+    let write = |rest: &str| {
+        std::fs::write(
+            &config_path,
+            format!(
+                "auth-dir: {}\napi-keys: [sk-test]\nquota:\n  poll: false\n{rest}",
+                tmp.path().display()
+            ),
+        )
+        .expect("write config");
+    };
+    let groq = "  groq:\n    base-url: https://api.groq.com/openai/v1\n";
+    write(&format!(
+        "providers:\n  anthropic:\n    allow: [claude-opus-5-5]\n{groq}"
+    ));
+    let config = load_config(Some(&config_path), Some(tmp.path()), tmp.path()).expect("load");
+    let app = create_app_with_upstream(config, listing_anthropic_and_codex());
+    let reload = || async {
+        json_response(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/admin/reload")
+                .header("authorization", "Bearer sk-test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+    };
+    let sonnet = "anthropic/claude-sonnet-5-5";
+    let opus = "anthropic/claude-opus-5-5";
+    assert_eq!(post_model(&app, "/v1/messages", sonnet).await.0, 400);
+
+    write(&format!(
+        "providers:\n  anthropic:\n    allow: [claude-sonnet-5-5]\n{groq}"
+    ));
+    assert_eq!(reload().await.0, 200);
+
+    assert_eq!(post_model(&app, "/v1/messages", sonnet).await.0, 200);
+    assert_eq!(post_model(&app, "/v1/messages", opus).await.0, 400);
+    assert_eq!(advertised_once(&app, sonnet).await, [sonnet]);
+
+    // A config that would not load is refused whole, and the lists in force stay: an empty
+    // list, a setting outside `providers:`, and a running Provider whose entry is gone, which
+    // would otherwise lose its list while it still serves.
+    for (rest, reason) in [
+        (
+            format!("providers:\n  anthropic:\n    allow: []\n{groq}"),
+            "anthropic.allow is empty",
+        ),
+        (
+            format!(
+                "body-limit: lots\nproviders:\n  anthropic:\n    allow: [claude-opus-5-5]\n{groq}"
+            ),
+            "body-limit",
+        ),
+        (
+            "providers:\n  anthropic:\n    allow: [claude-opus-5-5]\n".to_string(),
+            "groq serves until a restart",
+        ),
+    ] {
+        write(&rest);
+        let (status, body) = reload().await;
+        assert_eq!(status, 500, "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(reason)),
+            "{reason}: {body}"
+        );
+        assert_eq!(
+            post_model(&app, "/v1/messages", sonnet).await.0,
+            200,
+            "{reason}"
+        );
+        assert_eq!(
+            post_model(&app, "/v1/messages", opus).await.0,
+            400,
+            "{reason}"
+        );
+    }
+}
+
+/// A gateway can serve a Chat body's `models` as fallbacks when `model` fails (openrouter
+/// does), and a configured Provider's body travels as the client wrote it: a fallback is a
+/// model the request names.
+#[tokio::test]
+async fn a_fallback_list_must_name_allowed_models_only() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &groq_key_token()).expect("save groq key");
+    let upstream = Arc::new(GenericUpstream::default());
+    let app = create_app_with_upstream(
+        allowing(
+            config_with_groq(tmp.path().to_path_buf()),
+            "groq",
+            &["llama-3.3-70b"],
+        ),
+        upstream.clone(),
+    );
+    let chat = |models: Value| {
+        let app = app.clone();
+        async move {
+            json_response(
+                app,
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer sk-test")
+                    .header("content-type", "application/json")
+                    .header("content-length", "256")
+                    .body(Body::from(
+                        json!({
+                            "model": "groq/llama-3.3-70b",
+                            "models": models,
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+        }
+    };
+
+    for models in [
+        json!(["llama-3.1-8b"]),
+        json!(["llama-3.3-70b", 7]),
+        json!("llama-3.1-8b"),
+    ] {
+        let (status, body) = chat(models.clone()).await;
+        assert_eq!(status, 400, "{models}: {body}");
+        assert_eq!(body["error"]["type"], "model_not_allowed", "{models}");
+    }
+    assert!(
+        upstream.calls().is_empty(),
+        "a refused fallback reached the upstream"
+    );
+
+    let (status, body) = chat(json!(["llama-3.3-70b"])).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(upstream.calls()[0].body["models"], json!(["llama-3.3-70b"]));
+}
+
+#[tokio::test]
+async fn a_fallback_list_on_a_provider_without_an_allow_list_travels_as_before() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &groq_key_token()).expect("save groq key");
+    let upstream = Arc::new(GenericUpstream::default());
+    let app =
+        create_app_with_upstream(config_with_groq(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, body) = json_response(
+        app,
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "256")
+            .body(Body::from(
+                json!({
+                    "model": "groq/llama-3.3-70b",
+                    "models": ["anything-at-all", 7],
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        upstream.calls()[0].body["models"],
+        json!(["anything-at-all", 7])
+    );
 }
 
 #[tokio::test]
@@ -2784,6 +3185,66 @@ async fn admin_reload_applies_the_rotation_the_config_file_holds_now() {
             "alice@example.com",
             "alice@example.com",
         ]
+    );
+}
+
+#[tokio::test]
+async fn a_reload_refused_after_its_file_loads_applies_no_rotation_either() {
+    // A file can load and still refuse the reload: here it drops a configured Provider that
+    // serves until a restart. The rotation in that same file must not apply, so the turn goes
+    // on to erin; had the reload switched anthropic to priority, r-3 would land on alice.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for email in ["alice@example.com", "bob@example.com", "erin@example.com"] {
+        save_provider_token(tmp.path(), ProviderId::anthropic(), email);
+    }
+    let config_path = tmp.path().join("config.yaml");
+    let write = |rest: &str| {
+        std::fs::write(
+            &config_path,
+            format!(
+                "auth-dir: {}\napi-keys: [sk-test]\nquota:\n  poll: false\n{rest}",
+                tmp.path().display()
+            ),
+        )
+        .expect("write config");
+    };
+    write(
+        "providers:\n  groq:\n    base-url: https://api.groq.com/openai/v1\nrotation:\n  anthropic: round-robin\n",
+    );
+    let config = pengepul::config::load_config(Some(&config_path), Some(tmp.path()), tmp.path())
+        .expect("load config");
+    let upstream = Arc::new(FakeUpstream::default());
+    let app = create_app_with_upstream(config, upstream.clone());
+    for session in ["r-1", "r-2"] {
+        let (status, body) =
+            json_response(app.clone(), session_request("claude-sonnet-4-6", session)).await;
+        assert_eq!(status, 200, "{session}: {body}");
+    }
+
+    write("rotation:\n  anthropic: priority\n");
+    let (status, body) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/admin/reload")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 500, "{body}");
+    let (status, body) =
+        json_response(app.clone(), session_request("claude-sonnet-4-6", "r-3")).await;
+    assert_eq!(status, 200, "r-3: {body}");
+
+    let served: Vec<String> = upstream
+        .calls()
+        .iter()
+        .map(|call| call.account.token.email.clone())
+        .collect();
+    assert_eq!(
+        served,
+        ["alice@example.com", "bob@example.com", "erin@example.com"]
     );
 }
 

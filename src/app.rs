@@ -602,6 +602,8 @@ pub fn create_app_with_upstream(config: Config, upstream: Arc<dyn UpstreamClient
         .flatten()
         .collect();
     record_peak(&config.auth_dir, &snapshots);
+    let mut catalog = ModelCatalog::default();
+    catalog.set_allow(config.allow.clone());
     let config = Arc::new(config);
     let cloaking = Arc::new(StdRwLock::new(Cloaking::new(
         &config,
@@ -614,7 +616,7 @@ pub fn create_app_with_upstream(config: Config, upstream: Arc<dyn UpstreamClient
         upstream,
         account_managers: Arc::new(account_managers),
         rate_limit_buckets: Arc::new(StdMutex::new(BTreeMap::new())),
-        catalog: Arc::new(StdRwLock::new(ModelCatalog::default())),
+        catalog: Arc::new(StdRwLock::new(catalog)),
         threads: Arc::new(crate::threads::ThreadLedger::default()),
         started_at: Instant::now(),
     };
@@ -1106,11 +1108,9 @@ async fn refresh_model_catalog(state: &AppState) {
             .await
         {
             Ok(FetchedModels { ids, metadata }) => {
-                state
-                    .catalog
-                    .write()
-                    .expect("catalog lock poisoned")
-                    .set_direct(kind, FetchedModels::with_metadata(ids, metadata));
+                let mut catalog = state.catalog.write().expect("catalog lock poisoned");
+                catalog.set_direct(kind, FetchedModels::with_metadata(ids, metadata));
+                warn_unmatched_allow(&catalog, &ProviderId::for_kind(kind));
             }
             Err(error) => {
                 tracing::warn!(
@@ -1133,16 +1133,27 @@ async fn refresh_model_catalog(state: &AppState) {
             .await
         {
             Ok(FetchedModels { ids, metadata }) => {
-                state
-                    .catalog
-                    .write()
-                    .expect("catalog lock poisoned")
-                    .set_generic(provider_id, FetchedModels::with_metadata(ids, metadata));
+                let mut catalog = state.catalog.write().expect("catalog lock poisoned");
+                catalog.set_generic(provider_id, FetchedModels::with_metadata(ids, metadata));
+                warn_unmatched_allow(&catalog, &provider);
             }
             Err(error) => {
                 tracing::warn!(provider = provider_id, ?error, "model list fetch failed");
             }
         }
+    }
+}
+
+/// An allow-list entry the Upstream does not list is never advertised, so a typo would
+/// otherwise show only as a model that is missing.
+fn warn_unmatched_allow(catalog: &ModelCatalog, provider: &ProviderId) {
+    let unmatched = catalog.unmatched_allow(provider);
+    if !unmatched.is_empty() {
+        tracing::warn!(
+            provider = %provider,
+            ?unmatched,
+            "allow entries name no model the upstream lists"
+        );
     }
 }
 
@@ -1542,14 +1553,21 @@ async fn admin_reload(State(state): State<AppState>, headers: HeaderMap) -> Resp
     if let Some(path) = &state.config.path {
         let reread = match crate::config::reread_config(path) {
             Ok(reread) => reread,
-            Err(error) => {
-                return AppError::simple(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to reload config: {error:#}"),
-                )
-                .into_response();
-            }
+            Err(error) => return config_reload_refused(&format!("{error:#}")),
         };
+        // A configured Provider serves until a restart, so its allow list cannot leave with
+        // its entry.
+        if let Some(gone) = state
+            .config
+            .providers
+            .keys()
+            .find(|id| !reread.providers.contains_key(*id))
+        {
+            return config_reload_refused(&format!(
+                "providers: {gone} serves until a restart and is gone from the config; restart to remove it"
+            ));
+        }
+        // Nothing is refused past this point, so the two keys apply together or not at all.
         // Each Pool takes the rotation the file holds now (round-robin-rotation AC-8).
         warn_unknown_rotation_providers(&state.config, &reread.rotation);
         for (provider, manager) in state.account_managers.pools() {
@@ -1558,6 +1576,11 @@ async fn admin_reload(State(state): State<AppState>, headers: HeaderMap) -> Resp
                 .await
                 .set_rotation(reread.rotation_for(&provider.id));
         }
+        state
+            .catalog
+            .write()
+            .expect("catalog lock poisoned")
+            .set_allow(reread.allow);
     }
 
     // Every pool is reloaded here, built-ins included. A hand-written list of
@@ -1606,6 +1629,14 @@ async fn admin_reload(State(state): State<AppState>, headers: HeaderMap) -> Resp
     tokio::spawn(async move { refresh_model_catalog(&refresh_state).await });
 
     Json(json!({"reloaded": reloaded, "generated_at": now_iso()})).into_response()
+}
+
+fn config_reload_refused(reason: &str) -> Response {
+    AppError::simple(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("failed to reload config: {reason}"),
+    )
+    .into_response()
 }
 
 async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1694,19 +1725,10 @@ async fn count_tokens(State(state): State<AppState>, headers: HeaderMap, body: B
     let Some(model_id) = required_model(&body) else {
         return AppError::simple(StatusCode::BAD_REQUEST, "model is required").into_response();
     };
-    let Some(provider) = state
-        .catalog
-        .read()
-        .expect("catalog lock poisoned")
-        .resolve_id(model_id, &state.config.providers)
-    else {
-        return AppError::simple(
-            StatusCode::BAD_REQUEST,
-            format!("unknown model: {model_id}"),
-        )
-        .into_response();
+    let (provider, model) = match resolve_model(&state, model_id) {
+        Ok(resolved) => resolved,
+        Err(error) => return error.into_response(),
     };
-    let model = upstream_model(model_id, &provider).to_string();
     if provider.kind != ProviderKind::Anthropic {
         return AppError::provider(
             StatusCode::NOT_IMPLEMENTED,
@@ -1775,6 +1797,60 @@ fn parse_request(state: &AppState, headers: &HeaderMap, body: &[u8]) -> Result<V
         .map_err(|_| AppError::simple(StatusCode::BAD_REQUEST, "invalid JSON body"))
 }
 
+/// The Provider a client's model id resolves to and the id that Provider is asked for, or the
+/// 400 that refuses it: an id nobody claims, or one outside its Provider's allow list.
+fn resolve_model(state: &AppState, model_id: &str) -> Result<(ProviderId, String), AppError> {
+    let catalog = state.catalog.read().expect("catalog lock poisoned");
+    let provider = catalog
+        .resolve_id(model_id, &state.config.providers)
+        .ok_or_else(|| {
+            AppError::simple(
+                StatusCode::BAD_REQUEST,
+                format!("unknown model: {model_id}"),
+            )
+        })?;
+    let model = upstream_model(model_id, &provider);
+    if !catalog.allows(&provider, model) {
+        return Err(model_not_allowed(model_id, model, provider));
+    }
+    Ok((provider, model.to_string()))
+}
+
+/// A gateway can serve a body's `models` as fallbacks when `model` fails (openrouter does), and
+/// a configured Provider's Chat body travels as the client wrote it, so each entry must be
+/// allowed too.
+fn check_fallback_models(
+    state: &AppState,
+    provider: &ProviderId,
+    body: &Value,
+) -> Result<(), AppError> {
+    let Some(models) = body.get("models").filter(|models| !models.is_null()) else {
+        return Ok(());
+    };
+    let catalog = state.catalog.read().expect("catalog lock poisoned");
+    let entries = models
+        .as_array()
+        .map_or_else(|| vec![models], |entries| entries.iter().collect());
+    for entry in entries {
+        let name = entry
+            .as_str()
+            .map_or_else(|| entry.to_string(), str::to_string);
+        if !catalog.allows(provider, &name) {
+            return Err(model_not_allowed(&name, &name, provider.clone()));
+        }
+    }
+    Ok(())
+}
+
+fn model_not_allowed(model_id: &str, model: &str, provider: ProviderId) -> AppError {
+    AppError::provider(
+        StatusCode::BAD_REQUEST,
+        format!("model not allowed: {model_id} ({model} is not in the {provider} allow list)"),
+        "model_not_allowed",
+        provider,
+    )
+}
+
 /// The parts of a client request routing needs: the provider its model
 /// resolves to, the id the upstream is asked for, whether the client wants a
 /// stream, and the conversation it belongs to.
@@ -1800,19 +1876,10 @@ fn resolve_route_request(
             "model is required",
         ));
     };
-    let provider = state
-        .catalog
-        .read()
-        .expect("catalog lock poisoned")
-        .resolve_id(model_id, &state.config.providers)
-        .ok_or_else(|| {
-            AppError::simple(
-                StatusCode::BAD_REQUEST,
-                format!("unknown model: {model_id}"),
-            )
-        })?;
+    let (provider, model) = resolve_model(state, model_id)?;
+    check_fallback_models(state, &provider, body)?;
     Ok(ResolvedRequest {
-        model: upstream_model(model_id, &provider).to_string(),
+        model,
         client_wants_stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
         conversation: conversation_key(headers, body, route),
         provider,
@@ -5251,20 +5318,10 @@ mod tests {
         drop(managers);
 
         let events = captured.lock().expect("capture lock");
-        // The capture is the process's, and other tests log the same addresses ("account
-        // selected"), so only the warning this test is about counts.
-        let account_warning = |fields: &[(String, String)], email: &str| {
-            field_is(fields, "account", email)
-                && fields.iter().any(|(key, value)| {
-                    key == "message" && value.contains("priority names an account")
-                })
-        };
-        let ghost = events
-            .iter()
-            .filter(|fields| account_warning(fields, "ghost@example.com"))
-            .count();
+        let unknown_account = "priority names an account this pool does not hold; a reload or restart that adds it applies it";
         assert_eq!(
-            ghost, 1,
+            lines_named(&events, unknown_account, "account", "ghost@example.com").len(),
+            1,
             "the unknown account key was not warned about once"
         );
         assert!(
@@ -5275,11 +5332,10 @@ mod tests {
             "the unknown provider was not warned about: {events:?}"
         );
         // The key that names a real Account stays quiet, so the warning is not noise on
-        // every start.
+        // every start. Only the warning counts: tests running beside this one log their own
+        // lines for alice into the same capture.
         assert!(
-            !events
-                .iter()
-                .any(|fields| account_warning(fields, "alice@example.com")),
+            lines_named(&events, unknown_account, "account", "alice@example.com").is_empty(),
             "a configured Account was warned about"
         );
     }
@@ -5884,6 +5940,7 @@ mod tests {
             },
             rotation: BTreeMap::default(),
             priority: BTreeMap::default(),
+            allow: BTreeMap::default(),
             path: None,
         }
     }
