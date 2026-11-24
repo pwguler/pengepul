@@ -141,8 +141,9 @@ as a warning, so a typo shows. An empty `allow:`, including one whose entries ar
 commented out, stops the relay at load, since it would serve none of the provider's models.
 `pengepul accounts --reload` reads the lists again without a restart. A config that would not
 load is refused there and the lists in force stay, as is one that drops a running provider's
-entry: removing a provider still takes a restart. The refusal quotes nothing from the file,
-which holds keys; the relay's log (`pengepul service logs`) says what did not load.
+entry: removing a provider still takes a restart. A refused reload quotes nothing from the
+file, which can hold local API keys; the relay's log (`pengepul service logs`) says what did
+not load.
 
 Login opens a browser and finishes on a localhost callback. On a remote host, forward the
 port first:

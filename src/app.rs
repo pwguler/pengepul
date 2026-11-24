@@ -1554,8 +1554,8 @@ async fn admin_reload(State(state): State<AppState>, headers: HeaderMap) -> Resp
         let reread = match crate::config::reread_config(path) {
             Ok(reread) => reread,
             Err(error) => {
-                // The chain can quote a value from the file, a key or a token among them, so it
-                // goes to the log the operator reads and never to the client.
+                // The chain can quote values from the file, a Local API key or an upstream token
+                // among them, so it goes to the log the operator reads and never to the client.
                 tracing::warn!(
                     error = %format_args!("{error:#}"),
                     "reload refused: the config file does not load, and the config in force stays"
@@ -1639,8 +1639,8 @@ fn config_reload_refused(reason: &str) -> Response {
     .into_response()
 }
 
-/// The client is told which Pool failed and the log why: the cause names paths under the auth
-/// directory, which the config sets.
+/// The client learns which Pool failed and the log learns why, the same split a refused config
+/// reload makes.
 fn accounts_reload_failed(provider: &impl std::fmt::Display, error: &anyhow::Error) -> Response {
     tracing::warn!(
         %provider,
@@ -5190,7 +5190,10 @@ mod tests {
         fn event(&self, event: &tracing::Event<'_>) {
             let mut capture = FieldCapture::default();
             event.record(&mut capture);
-            let mut fields = vec![("target".to_string(), event.metadata().target().to_string())];
+            let mut fields = vec![
+                ("target".to_string(), event.metadata().target().to_string()),
+                ("level".to_string(), event.metadata().level().to_string()),
+            ];
             fields.extend(capture.0);
             self.0.lock().expect("capture lock").push(fields);
         }
@@ -5517,8 +5520,8 @@ mod tests {
         );
     }
 
-    /// A relay running `config` behind the key [`reload`] presents. `/admin/reload` reads
-    /// `config.path` again when it has one.
+    /// A relay running `config` behind the Local API key [`reload`] presents. `/admin/reload`
+    /// reads `config.path` again when it has one.
     fn admin_state(tmp: &std::path::Path, mut config: Config) -> AppState {
         config.api_keys.insert("sk-test".to_string());
         AppState {
@@ -5543,12 +5546,14 @@ mod tests {
         (status, String::from_utf8_lossy(&body).into_owned())
     }
 
-    /// Whether any captured line carries `needle` in any field.
+    /// Whether a warn line carries `needle`. Warn, because the relay's default filter keeps it;
+    /// any field, so the check holds when the line's wording or field names change.
     fn logged(captured: &Arc<std::sync::Mutex<CapturedFields>>, needle: &str) -> bool {
         captured
             .lock()
             .expect("capture lock")
             .iter()
+            .filter(|fields| field_is(fields, "level", "WARN"))
             .flatten()
             .any(|(_, value)| value.contains(needle))
     }
@@ -5587,7 +5592,7 @@ mod tests {
             );
             assert!(
                 !body.contains(secret),
-                "the refusal quotes the file: {body}"
+                "the response quotes the file: {body}"
             );
             assert_eq!(
                 serde_json::from_str::<Value>(&body).expect("json body")["error"]["message"],
@@ -5607,7 +5612,8 @@ mod tests {
         const GONE: &str = "leakcheck-gone";
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("config.yaml");
-        // It loads, and drops GONE. The key it adds is what a refusal quoting the file would show.
+        // It loads, and drops GONE. The Local API key it adds is what a response quoting the
+        // file would show.
         std::fs::write(&path, "api-keys: [sk-test, sk-LEAKCHECK123-gone]\n").expect("write config");
         let captured = capture();
         let mut config = test_config(tmp.path().to_path_buf());
