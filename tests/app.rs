@@ -2624,6 +2624,46 @@ async fn a_round_robin_pool_hands_out_new_conversations_in_turn_beside_a_priorit
 }
 
 #[tokio::test]
+async fn a_failover_in_a_round_robin_pool_takes_the_next_turn_and_keeps_it() {
+    // round-robin-rotation AC-5 through the attempt loop: `s-1` draws alice, who answers
+    // 429, and the retry is placed by the cursor on bob, where the conversation then stays.
+    // The retry was a turn, so the next new conversation goes to erin; by Priority it would
+    // have gone to bob as well.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for email in ["alice@example.com", "bob@example.com", "erin@example.com"] {
+        save_provider_token(tmp.path(), ProviderId::anthropic(), email);
+    }
+    let upstream = Arc::new(RetryUpstream::default());
+    let mut cfg = config(tmp.path().to_path_buf());
+    cfg.rotation.insert(
+        "anthropic".to_string(),
+        pengepul::config::RotationMode::RoundRobin,
+    );
+    let app = create_app_with_upstream(cfg, upstream.clone());
+
+    for session in ["s-1", "s-2", "s-1"] {
+        let (status, body) =
+            json_response(app.clone(), session_request("claude-sonnet-4-6", session)).await;
+        assert_eq!(status, 200, "{session}: {body}");
+    }
+
+    let served: Vec<String> = upstream
+        .calls()
+        .iter()
+        .map(|call| call.account.token.email.clone())
+        .collect();
+    assert_eq!(
+        served,
+        [
+            "alice@example.com",
+            "bob@example.com",
+            "erin@example.com",
+            "bob@example.com",
+        ]
+    );
+}
+
+#[tokio::test]
 async fn messages_route_retries_next_account_after_retryable_upstream_failure() {
     let tmp = tempfile::tempdir().expect("tempdir");
     for (email, access_token) in [
