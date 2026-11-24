@@ -48,12 +48,13 @@ only, so a restart starts at the first key. `/admin/reload` re-reads `rotation:`
 - `/admin/reload` re-reads `rotation:` from the file the relay loaded. A file that is gone, or
   that would be refused at load, refuses the reload and changes nothing. `priority:` still needs
   a restart (ADR-0031).
-- **A restart, or the affinity map's wholesale flush at 1024 conversations (ADR-0017), re-deals
-  a round-robin Pool's running conversations.** The relay forgets which Account each one used,
-  so its next turn is placed like a new conversation's: with k serving Accounts, about (k-1)/k
-  of them land on another Account and pay one cold read. By Priority the same miss falls on the
-  preferred Account, where most of them already were, so ADR-0017's price of one cold read per
-  conversation is paid in full only by an opted-in Pool. The bound and its flush are unchanged.
+- **A restart, or the wholesale flush of a Pool's affinity map at 1024 conversations
+  (ADR-0017), re-deals a round-robin Pool's running conversations.** The relay forgets which
+  Account each one used, so its next turn is placed like a new conversation's: with k serving
+  Accounts, about (k-1)/k of them land on another Account and pay one cold read. By Priority the
+  same miss falls on the preferred Account, where most of them already were, so ADR-0017's price
+  of one cold read per conversation falls mostly on an opted-in Pool. The bound and its flush
+  are unchanged.
 - `priority:` stays valid for a round-robin Pool and is not read. The admin payload names each
   Pool's rotation, and `pengepul accounts` lists a round-robin Pool's Accounts in Account-key
   order with no Priority beside them, so no number that decides nothing is printed.

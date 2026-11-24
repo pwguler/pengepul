@@ -208,19 +208,19 @@ in files.
   quota utilization, and never overrides cache affinity or availability: an Account leaves the
   serving set only on Cooldown, Disabled or a missing credential, and a conversation with
   affinity keeps its Account while that Account can serve (ADR-0031).
-- **A Round-robin Pool hands new conversations out in turn, and reads no Priority.**
-  `rotation:` in the config sets it per Provider. Each new conversation takes the first serving
-  Account after the one the Pool placed last, in Account-key order, wrapping after the last key;
-  a conversation whose Account cannot serve, or that Failover leaves, is placed the same way and
+- **A Round-robin Pool hands new conversations out in turn, and reads no Priority.** `rotation:`
+  in the config sets it per Provider. Each new conversation takes the first serving Account
+  after the one the Pool placed last, in Account-key order, wrapping after the last key; a
+  conversation whose Account cannot serve, or that Failover leaves, is placed the same way and
   its affinity moves with it, while one with affinity takes no turn. The turn is the key of the
   last placement, held in the Pool's `AccountManager` behind its lock, so concurrent placements
   take distinct turns; it is not persisted, and a restart starts at the first key. A restart, or
-  the affinity map's flush at 1024 conversations, also forgets which Account each running
-  conversation used, so its next turn is placed like a new one's (ADR-0017). `/admin/reload`
-  applies `rotation:`, read again from the file the relay loaded, while `priority:` still needs a
-  restart; a file that is gone, or that would be refused at load, refuses the whole reload. The
-  payload names each Pool's rotation, and the views print a Round-robin Pool's Accounts in
-  Account-key order with no Priority beside them (ADR-0033).
+  the flush of the Pool's affinity map at 1024 conversations, also forgets which Account each
+  running conversation used, so its next turn is placed like a new one's (ADR-0017).
+  `/admin/reload` applies `rotation:`, read again from the file the relay loaded, while
+  `priority:` still needs a restart; a file that is gone, or that would be refused at load,
+  refuses the whole reload. The payload names each Pool's rotation, and the views print a
+  Round-robin Pool's Accounts in Account-key order with no Priority beside them (ADR-0033).
 - **Rotation prefers the Account holding the cache, and never waits for it.**
   Each upstream keeps its own prompt cache, so a conversation stays on the
   Account that served it last while that Account is off Cooldown, and takes the

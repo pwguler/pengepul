@@ -75,7 +75,7 @@ Re-serving one client request on a different account of the same provider after 
 _Avoid_: retry, fallback, attempt budget
 
 **Pool**:
-The set of Accounts of one Provider behind the relay, handed each new conversation by **Rotation**: by **Priority**, or in turn, reading no Priority, when set to **Round-robin**.
+The set of Accounts of one Provider behind the relay, handed each new conversation by **Rotation**: by **Priority**, or in turn, keeping every Priority and reading none, when set to **Round-robin**.
 _Avoid_: account list, fleet, grouping
 
 **Panel**:

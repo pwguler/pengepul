@@ -287,14 +287,14 @@ account on cooldown, disabled or without a credential; a provider left out of `r
 rotates by priority. A conversation already running keeps its account and takes no turn while
 that account can serve; when it cannot, or a failover moves it, the conversation takes the next
 turn and stays where it lands. The relay keeps which account a conversation used in memory and
-forgets it on a restart, or when that memory fills at 1024 conversations: a running
-conversation's next turn is then placed like a new one's, and pays one cold read of its cached
-prompt. The turn itself starts at the first account key when the relay starts. `priority:`
-stays valid for such a pool and is not read, so `pengepul accounts` names the pool
-`round-robin`, lists its accounts in account-key order, and prints no priority for them.
-`pengepul accounts --reload` applies a changed `rotation:` without a restart; when the config
-file is gone or no longer loads, it refuses the whole reload, accounts included. `priority:` is
-read at startup.
+forgets it on a restart, or when a pool's memory fills at 1024 conversations: a running
+conversation's next turn is then placed like a new one's, so most such conversations land on
+another account and pay one cold read of their cached prompt. The turn itself starts at the
+first account key when the relay starts. `priority:` stays valid for such a pool and is not
+read, so `pengepul accounts` names the pool `round-robin`, lists its accounts in account-key
+order, and prints no priority for them. `pengepul accounts --reload` applies a changed
+`rotation:` without a restart; when the config file is gone or no longer loads, it refuses the
+whole reload, accounts included. `priority:` is read at startup.
 
 `stream-messages-ms` is a silence limit, not a deadline: a streamed reply runs as long as it
 keeps sending, and fails once it sends nothing for that long, before it starts or between
