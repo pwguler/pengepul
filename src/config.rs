@@ -89,7 +89,8 @@ pub struct Config {
     /// Each Account's Priority, keyed by Provider id and then Account key. Smaller is
     /// preferred; an Account left out takes [`DEFAULT_PRIORITY`].
     pub priority: BTreeMap<String, BTreeMap<String, i64>>,
-    /// The file this config was loaded from, which `/admin/reload` reads `rotation:` from
+    /// The file this config lives in once loaded: the one it was read from, or the one
+    /// `load_config` migrated a legacy config to. `/admin/reload` reads `rotation:` from it
     /// again. `None` for a config built in code.
     pub path: Option<PathBuf>,
 }
@@ -435,7 +436,9 @@ pub fn load_config(
 }
 
 /// Read the config file the relay loaded again, for `/admin/reload`: every check `load_config`
-/// applies, and nothing written. A `~` in `auth-dir` expands against `HOME` as it is now.
+/// applies, and nothing written. A `~` in `auth-dir` expands against `HOME` as it is now. A file
+/// that is gone is refused, where `load_config` reads one as the defaults: a reload must not
+/// reset what the operator set.
 ///
 /// # Errors
 ///
@@ -555,8 +558,8 @@ impl Config {
         self.rotation.get(provider_id).copied().unwrap_or_default()
     }
 
-    /// The Provider ids a `priority:` entry can name: the built-in Pools plus every
-    /// configured one. The built-ins come from [`ProviderKind`], so a fourth kind cannot be
+    /// The Provider ids a `priority:` or `rotation:` entry can name: the built-in Pools plus
+    /// every configured one. The built-ins come from [`ProviderKind`], so a fourth kind cannot be
     /// forgotten here while it serves.
     #[must_use]
     pub fn known_providers(&self) -> HashSet<&str> {

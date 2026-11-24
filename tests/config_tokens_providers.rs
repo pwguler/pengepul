@@ -412,10 +412,18 @@ rotation:
 }
 
 /// round-robin-rotation AC-1: a mode the relay does not know stops it at load rather than
-/// falling back to Priority, which would hide the operator's typo behind the old behaviour.
+/// falling back to Priority, which would hide the operator's typo behind the old behaviour. The
+/// error names the entry, not only the key: a build without `rotation:` refuses the key itself.
 #[test]
 fn a_rotation_mode_the_relay_does_not_know_is_refused_at_load() {
-    for mode in ["random", "round_robin", "Round-Robin", "roundrobin", "1"] {
+    for mode in [
+        "random",
+        "round_robin",
+        "Round-Robin",
+        "roundrobin",
+        "1",
+        "",
+    ] {
         let (_tmp, home, config_path) = write_config_with(&format!(
             "api-keys:\n  - sk-local\nrotation:\n  anthropic: {mode}\n"
         ));
@@ -423,8 +431,8 @@ fn a_rotation_mode_the_relay_does_not_know_is_refused_at_load() {
         let error = load_config(Some(&config_path), Some(&home), &home)
             .expect_err(&format!("rotation mode {mode:?} was accepted"));
         assert!(
-            format!("{error:#}").contains("rotation"),
-            "error names the section: {error:#}"
+            format!("{error:#}").contains("rotation.anthropic"),
+            "error names the entry: {error:#}"
         );
     }
 }

@@ -1240,32 +1240,33 @@ impl AccountManager {
     /// Accounts are all cooling cannot shadow the next one: the best of what is left wins,
     /// which is what makes Priority an order over the serving set rather than a pin (AC-3).
     fn best_serving(&self, now: f64) -> Option<&AccountState> {
-        self.order
-            .iter()
-            .filter_map(|email| self.accounts.get(email))
-            .filter(|state| can_serve(state, now))
+        self.serving(now)
+            .map(|(_, state)| state)
             .min_by(|left, right| self.prefer(&left.token.email, &right.token.email, now))
     }
 
     /// The Account a new conversation is handed in a round-robin Pool: the first serving
     /// Account after the one placed last, in Account-key order, wrapping to the first. Priority
-    /// and the weekly reset are not read, and an Account that cannot serve is passed over
-    /// exactly as [`Self::best_serving`] passes it over (AC-2, AC-4).
+    /// and the weekly reset are not read (round-robin-rotation AC-2, AC-4).
     fn next_in_turn(&self, now: f64) -> Option<&AccountState> {
-        let serving = || {
-            self.order.iter().filter(|email| {
-                self.accounts
-                    .get(*email)
-                    .is_some_and(|state| can_serve(state, now))
-            })
-        };
-        let after_last = self
-            .last_placed
-            .as_ref()
-            .and_then(|last| serving().filter(|email| *email > last).min());
+        let after_last = self.last_placed.as_ref().and_then(|last| {
+            self.serving(now)
+                .filter(|(email, _)| *email > last)
+                .min_by_key(|(email, _)| *email)
+        });
         after_last
-            .or_else(|| serving().min())
-            .and_then(|email| self.accounts.get(email))
+            .or_else(|| self.serving(now).min_by_key(|(email, _)| *email))
+            .map(|(_, state)| state)
+    }
+
+    /// The Accounts that can serve now, with their keys: in the rotation order (a credential,
+    /// not Disabled) and off Cooldown. Both rotations choose among exactly these, so neither
+    /// can hand out an Account the other passes over.
+    fn serving(&self, now: f64) -> impl Iterator<Item = (&String, &AccountState)> {
+        self.order
+            .iter()
+            .filter_map(|email| Some((email, self.accounts.get(email)?)))
+            .filter(move |(_, state)| can_serve(state, now))
     }
 
     #[must_use]

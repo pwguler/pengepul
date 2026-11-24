@@ -5251,9 +5251,17 @@ mod tests {
         drop(managers);
 
         let events = captured.lock().expect("capture lock");
+        // The capture is the process's, and other tests log the same addresses ("account
+        // selected"), so only the warning this test is about counts.
+        let account_warning = |fields: &[(String, String)], email: &str| {
+            field_is(fields, "account", email)
+                && fields.iter().any(|(key, value)| {
+                    key == "message" && value.contains("priority names an account")
+                })
+        };
         let ghost = events
             .iter()
-            .filter(|fields| field_is(fields, "account", "ghost@example.com"))
+            .filter(|fields| account_warning(fields, "ghost@example.com"))
             .count();
         assert_eq!(
             ghost, 1,
@@ -5271,7 +5279,7 @@ mod tests {
         assert!(
             !events
                 .iter()
-                .any(|fields| field_is(fields, "account", "alice@example.com")),
+                .any(|fields| account_warning(fields, "alice@example.com")),
             "a configured Account was warned about"
         );
     }
@@ -5418,9 +5426,9 @@ mod tests {
                 .iter()
                 .filter(|fields| {
                     field_is(fields, "provider", provider)
-                        && fields
-                            .iter()
-                            .any(|(key, value)| key == "message" && value.contains("rotation"))
+                        && fields.iter().any(|(key, value)| {
+                            key == "message" && value.contains("rotation names a provider")
+                        })
                 })
                 .count()
         };
