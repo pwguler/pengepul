@@ -5281,12 +5281,10 @@ mod tests {
         drop(managers);
 
         let events = captured.lock().expect("capture lock");
-        let ghost = events
-            .iter()
-            .filter(|fields| field_is(fields, "account", "ghost@example.com"))
-            .count();
+        let unknown_account = "priority names an account this pool does not hold; a reload or restart that adds it applies it";
         assert_eq!(
-            ghost, 1,
+            lines_named(&events, unknown_account, "account", "ghost@example.com").len(),
+            1,
             "the unknown account key was not warned about once"
         );
         assert!(
@@ -5297,11 +5295,10 @@ mod tests {
             "the unknown provider was not warned about: {events:?}"
         );
         // The key that names a real Account stays quiet, so the warning is not noise on
-        // every start.
+        // every start. Only the warning counts: tests running beside this one log their own
+        // lines for alice into the same capture.
         assert!(
-            !events
-                .iter()
-                .any(|fields| field_is(fields, "account", "alice@example.com")),
+            lines_named(&events, unknown_account, "account", "alice@example.com").is_empty(),
             "a configured Account was warned about"
         );
     }
