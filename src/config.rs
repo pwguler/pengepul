@@ -89,6 +89,9 @@ pub struct Config {
     /// Each Account's Priority, keyed by Provider id and then Account key. Smaller is
     /// preferred; an Account left out takes [`DEFAULT_PRIORITY`].
     pub priority: BTreeMap<String, BTreeMap<String, i64>>,
+    /// The file this config was loaded from, which `/admin/reload` reads `rotation:` from
+    /// again. `None` for a config built in code.
+    pub path: Option<PathBuf>,
 }
 
 /// The Priority of an Account the config does not list. Every such Account shares it, so a
@@ -411,14 +414,7 @@ pub fn load_config(
         .context("HOME is not set")?;
     let (read_path, write_path) = config_paths(config_path, Some(&home), cwd);
     let mut raw = if read_path.exists() {
-        let text = fs::read_to_string(&read_path)
-            .with_context(|| format!("failed to read {}", read_path.display()))?;
-        if text.trim().is_empty() {
-            RawConfig::default()
-        } else {
-            serde_yaml::from_str::<RawConfig>(&text)
-                .with_context(|| format!("invalid config {}", read_path.display()))?
-        }
+        read_raw(&read_path)?
     } else {
         RawConfig::default()
     };
@@ -435,12 +431,29 @@ pub fn load_config(
         write_config(&write_path, &raw, true)?;
     }
 
-    let providers = validate_providers(&raw.providers)?;
+    config_from_raw(raw, &home, write_path)
+}
 
+/// Read the config file the relay loaded again, for `/admin/reload`: every check `load_config`
+/// applies, and nothing written. A `~` in `auth-dir` expands against `HOME` as it is now.
+///
+/// # Errors
+///
+/// Returns an error when `HOME` is not set, or when the file cannot be read or would be
+/// refused at load.
+pub fn reread_config(path: &Path) -> Result<Config> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is not set")?;
+    config_from_raw(read_raw(path)?, &home, path.to_path_buf())
+}
+
+fn config_from_raw(raw: RawConfig, home: &Path, path: PathBuf) -> Result<Config> {
+    let providers = validate_providers(&raw.providers)?;
     Ok(Config {
         host: raw.host,
         port: raw.port,
-        auth_dir: resolve_auth_dir(&raw.auth_dir, &home),
+        auth_dir: resolve_auth_dir(&raw.auth_dir, home),
         api_keys: raw.api_keys.into_iter().collect(),
         body_limit: parse_body_limit(&raw.body_limit)
             .with_context(|| format!("body-limit: {:?}", raw.body_limit))?,
@@ -466,7 +479,17 @@ pub fn load_config(
         },
         rotation: raw.rotation,
         priority: raw.priority,
+        path: Some(path),
     })
+}
+
+fn read_raw(path: &Path) -> Result<RawConfig> {
+    let text =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if text.trim().is_empty() {
+        return Ok(RawConfig::default());
+    }
+    serde_yaml::from_str(&text).with_context(|| format!("invalid config {}", path.display()))
 }
 
 /// Exclusive ownership of a config file for the length of a

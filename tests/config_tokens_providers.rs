@@ -459,6 +459,35 @@ fn the_relay_writes_rotation_only_when_the_operator_set_it() {
     }
 }
 
+/// round-robin-rotation AC-8: what `/admin/reload` reads. It refuses what a load refuses, and
+/// it writes nothing, not even the API key a load would generate for a file that has none.
+#[test]
+fn rereading_the_config_refuses_what_a_load_refuses_and_writes_nothing() {
+    use pengepul::config::{RotationMode, reread_config};
+
+    let (_tmp, _home, config_path) = write_config_with("rotation:\n  anthropic: round-robin\n");
+    let config = reread_config(&config_path).expect("reread");
+    assert_eq!(config.rotation_for("anthropic"), RotationMode::RoundRobin);
+    assert_eq!(config.path.as_deref(), Some(config_path.as_path()));
+    assert_eq!(
+        fs::read_to_string(&config_path).expect("read config"),
+        "rotation:\n  anthropic: round-robin\n",
+        "a reread wrote the file"
+    );
+
+    for refused in [
+        "rotation:\n  anthropic: sideways\n",
+        "body-limit: lots\n",
+        "providers:\n  groq: {}\n",
+    ] {
+        let (_tmp, _home, config_path) = write_config_with(refused);
+        assert!(
+            reread_config(&config_path).is_err(),
+            "a reread accepted {refused:?}"
+        );
+    }
+}
+
 #[test]
 fn provider_entry_with_unknown_field_is_rejected() {
     let (_tmp, home, config_path) = write_config_with(

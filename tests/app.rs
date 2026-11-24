@@ -298,6 +298,7 @@ fn config(auth_dir: PathBuf) -> Config {
         },
         rotation: BTreeMap::default(),
         priority: BTreeMap::default(),
+        path: None,
     }
 }
 
@@ -2659,6 +2660,94 @@ async fn a_failover_in_a_round_robin_pool_takes_the_next_turn_and_keeps_it() {
             "bob@example.com",
             "erin@example.com",
             "bob@example.com",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn admin_reload_applies_the_rotation_the_config_file_holds_now() {
+    // round-robin-rotation AC-8. The relay re-reads the file it loaded: by Priority both new
+    // conversations share alice; switched to round-robin, the turn starts after alice, the
+    // Account Priority placed last; a mode the relay does not know refuses the reload and the
+    // turn goes on; switched back, Priority decides again.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for email in ["alice@example.com", "bob@example.com"] {
+        save_provider_token(tmp.path(), ProviderId::anthropic(), email);
+    }
+    let config_path = tmp.path().join("config.yaml");
+    let write = |rotation: &str| {
+        std::fs::write(
+            &config_path,
+            format!(
+                "auth-dir: {}\napi-keys: [sk-test]\nquota:\n  poll: false\n{rotation}",
+                tmp.path().display()
+            ),
+        )
+        .expect("write config");
+    };
+    write("");
+    let config = pengepul::config::load_config(Some(&config_path), Some(tmp.path()), tmp.path())
+        .expect("load config");
+    let upstream = Arc::new(FakeUpstream::default());
+    let app = create_app_with_upstream(config, upstream.clone());
+    let reload = || async {
+        json_response(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/admin/reload")
+                .header("authorization", "Bearer sk-test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+    };
+    let converse = |sessions: &'static [&'static str]| {
+        let app = app.clone();
+        async move {
+            for session in sessions {
+                let (status, body) =
+                    json_response(app.clone(), session_request("claude-sonnet-4-6", session)).await;
+                assert_eq!(status, 200, "{session}: {body}");
+            }
+        }
+    };
+
+    converse(&["r-1", "r-2"]).await;
+    write("rotation:\n  anthropic: round-robin\n");
+    assert_eq!(reload().await.0, 200);
+    converse(&["r-3", "r-4"]).await;
+
+    write("rotation:\n  anthropic: sideways\n");
+    let (status, body) = reload().await;
+    assert_eq!(status, 500, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("rotation")),
+        "the refusal does not name the key: {body}"
+    );
+    converse(&["r-5"]).await;
+
+    write("");
+    assert_eq!(reload().await.0, 200);
+    converse(&["r-6", "r-7"]).await;
+
+    let served: Vec<String> = upstream
+        .calls()
+        .iter()
+        .map(|call| call.account.token.email.clone())
+        .collect();
+    assert_eq!(
+        served,
+        [
+            "alice@example.com",
+            "alice@example.com",
+            "bob@example.com",
+            "alice@example.com",
+            "bob@example.com",
+            "alice@example.com",
+            "alice@example.com",
         ]
     );
 }

@@ -1528,6 +1528,28 @@ async fn admin_reload(State(state): State<AppState>, headers: HeaderMap) -> Resp
         return error.into_response();
     }
 
+    // First, so a config that no longer loads refuses the reload before anything changes.
+    if let Some(path) = &state.config.path {
+        let reread = match crate::config::reread_config(path) {
+            Ok(reread) => reread,
+            Err(error) => {
+                return AppError::simple(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to reload config: {error:#}"),
+                )
+                .into_response();
+            }
+        };
+        // `rotation:` is the one key a reload applies (round-robin-rotation AC-8).
+        warn_unknown_rotation_providers(&state.config, &reread.rotation);
+        for (provider, manager) in state.account_managers.pools() {
+            manager
+                .lock()
+                .await
+                .set_rotation(reread.rotation_for(&provider.id));
+        }
+    }
+
     // Every pool is reloaded here, built-ins included. A hand-written list of
     // providers is what let grok's fresh login be silently ignored: the token
     // file was replaced, reload reported nothing, and the relay kept serving
@@ -5844,6 +5866,7 @@ mod tests {
             },
             rotation: BTreeMap::default(),
             priority: BTreeMap::default(),
+            path: None,
         }
     }
 
