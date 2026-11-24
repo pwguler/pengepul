@@ -2550,6 +2550,79 @@ async fn without_a_configured_priority_new_conversations_do_not_alternate() {
     );
 }
 
+/// A Messages request for `model` in the conversation the harness names `session`.
+fn session_request(model: &str, session: &str) -> axum::http::Request<Body> {
+    let body = json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "reply exactly: pong"}]
+    })
+    .to_string();
+    axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("authorization", "Bearer sk-test")
+        .header("content-type", "application/json")
+        .header("content-length", body.len())
+        .header("x-claude-code-session-id", session)
+        .body(Body::from(body))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_round_robin_pool_hands_out_new_conversations_in_turn_beside_a_priority_pool() {
+    // round-robin-rotation AC-2, AC-3 and AC-7 through the routes: `rotation:` reaches the
+    // Pool it names and no other. anthropic takes a turn per new conversation, and `a-1`'s
+    // second turn stays on alice without taking one, so `a-3` lands on erin; codex keeps
+    // its Priority order, where the Account key breaks the tie for every new conversation.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for email in ["alice@example.com", "bob@example.com", "erin@example.com"] {
+        save_provider_token(tmp.path(), ProviderId::anthropic(), email);
+    }
+    for email in ["carol@example.com", "dave@example.com"] {
+        save_provider_token(tmp.path(), ProviderId::codex(), email);
+    }
+    let upstream = Arc::new(FakeUpstream::default());
+    let mut cfg = config(tmp.path().to_path_buf());
+    cfg.rotation.insert(
+        "anthropic".to_string(),
+        pengepul::config::RotationMode::RoundRobin,
+    );
+    let app = create_app_with_upstream(cfg, upstream.clone());
+
+    for (model, session) in [
+        ("claude-sonnet-4-6", "a-1"),
+        ("claude-sonnet-4-6", "a-2"),
+        ("claude-sonnet-4-6", "a-1"),
+        ("claude-sonnet-4-6", "a-3"),
+        ("claude-sonnet-4-6", "a-4"),
+        ("gpt-5.4", "c-1"),
+        ("gpt-5.4", "c-2"),
+        ("gpt-5.4", "c-3"),
+    ] {
+        let (status, body) = json_response(app.clone(), session_request(model, session)).await;
+        assert_eq!(status, 200, "{session}: {body}");
+    }
+
+    let served: Vec<String> = upstream
+        .calls()
+        .iter()
+        .map(|call| call.account.token.email.clone())
+        .collect();
+    assert_eq!(
+        served,
+        [
+            "alice@example.com",
+            "bob@example.com",
+            "alice@example.com",
+            "erin@example.com",
+            "alice@example.com",
+            "carol@example.com",
+            "carol@example.com",
+            "carol@example.com",
+        ]
+    );
+}
+
 #[tokio::test]
 async fn messages_route_retries_next_account_after_retryable_upstream_failure() {
     let tmp = tempfile::tempdir().expect("tempdir");
