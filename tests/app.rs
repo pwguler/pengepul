@@ -304,6 +304,7 @@ fn config(auth_dir: PathBuf) -> Config {
             poll: false,
             poll_minutes: 15,
         },
+        rotation: BTreeMap::default(),
         priority: BTreeMap::default(),
         allow: BTreeMap::default(),
         path: None,
@@ -2948,6 +2949,302 @@ async fn without_a_configured_priority_new_conversations_do_not_alternate() {
     assert_eq!(
         calls[0].account.token.access_token,
         "anthropic-access-alice"
+    );
+}
+
+/// A Messages request for `model` in the conversation the harness names `session`.
+fn session_request(model: &str, session: &str) -> axum::http::Request<Body> {
+    let body = json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "reply exactly: pong"}]
+    })
+    .to_string();
+    axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("authorization", "Bearer sk-test")
+        .header("content-type", "application/json")
+        .header("content-length", body.len())
+        .header("x-claude-code-session-id", session)
+        .body(Body::from(body))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_round_robin_pool_hands_out_new_conversations_in_turn_beside_a_priority_pool() {
+    // round-robin-rotation AC-2, AC-3 and AC-7 through the routes: `rotation:` reaches the
+    // Pool it names and no other. anthropic takes a turn per new conversation, and `a-1`'s
+    // second turn stays on alice without taking one, so `a-3` lands on erin; codex keeps
+    // its Priority order, where the Account key breaks the tie for every new conversation.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for email in ["alice@example.com", "bob@example.com", "erin@example.com"] {
+        save_provider_token(tmp.path(), ProviderId::anthropic(), email);
+    }
+    for email in ["carol@example.com", "dave@example.com"] {
+        save_provider_token(tmp.path(), ProviderId::codex(), email);
+    }
+    let upstream = Arc::new(FakeUpstream::default());
+    let mut cfg = config(tmp.path().to_path_buf());
+    cfg.rotation.insert(
+        "anthropic".to_string(),
+        pengepul::config::RotationMode::RoundRobin,
+    );
+    let app = create_app_with_upstream(cfg, upstream.clone());
+
+    for (model, session) in [
+        ("claude-sonnet-4-6", "a-1"),
+        ("claude-sonnet-4-6", "a-2"),
+        ("claude-sonnet-4-6", "a-1"),
+        ("claude-sonnet-4-6", "a-3"),
+        ("claude-sonnet-4-6", "a-4"),
+        ("gpt-5.4", "c-1"),
+        ("gpt-5.4", "c-2"),
+        ("gpt-5.4", "c-3"),
+    ] {
+        let (status, body) = json_response(app.clone(), session_request(model, session)).await;
+        assert_eq!(status, 200, "{session}: {body}");
+    }
+
+    let served: Vec<String> = upstream
+        .calls()
+        .iter()
+        .map(|call| call.account.token.email.clone())
+        .collect();
+    assert_eq!(
+        served,
+        [
+            "alice@example.com",
+            "bob@example.com",
+            "alice@example.com",
+            "erin@example.com",
+            "alice@example.com",
+            "carol@example.com",
+            "carol@example.com",
+            "carol@example.com",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn admin_accounts_names_each_pools_rotation() {
+    // round-robin-rotation AC-9: the payload says which Pools ignore the Priority their
+    // records still carry, so no reader has to guess from the config.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_provider_token(tmp.path(), ProviderId::anthropic(), "alice@example.com");
+    save_provider_token(tmp.path(), ProviderId::codex(), "carol@example.com");
+    let mut cfg = config(tmp.path().to_path_buf());
+    cfg.rotation.insert(
+        "anthropic".to_string(),
+        pengepul::config::RotationMode::RoundRobin,
+    );
+    let app = create_app_with_upstream(cfg, Arc::new(FakeUpstream::default()));
+
+    let (status, body) = json_response(
+        app,
+        axum::http::Request::builder()
+            .uri("/admin/accounts")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert_eq!(body["providers"]["anthropic"]["rotation"], "round-robin");
+    assert_eq!(body["providers"]["codex"]["rotation"], "priority");
+    assert_eq!(body["providers"]["grok"]["rotation"], "priority");
+    // The records keep their Priority pair: the Pool's rotation is what says it is unread.
+    assert_eq!(
+        body["providers"]["anthropic"]["accounts"][0]["prioritySource"],
+        "default"
+    );
+}
+
+#[tokio::test]
+async fn a_failover_in_a_round_robin_pool_takes_the_next_turn_and_keeps_it() {
+    // round-robin-rotation AC-5 through the attempt loop: `s-1` draws alice, who answers
+    // 429, and the retry is placed by the cursor on bob, where the conversation then stays.
+    // The retry was a turn, so the next new conversation goes to erin; by Priority it would
+    // have gone to bob as well.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for email in ["alice@example.com", "bob@example.com", "erin@example.com"] {
+        save_provider_token(tmp.path(), ProviderId::anthropic(), email);
+    }
+    let upstream = Arc::new(RetryUpstream::default());
+    let mut cfg = config(tmp.path().to_path_buf());
+    cfg.rotation.insert(
+        "anthropic".to_string(),
+        pengepul::config::RotationMode::RoundRobin,
+    );
+    let app = create_app_with_upstream(cfg, upstream.clone());
+
+    for session in ["s-1", "s-2", "s-1"] {
+        let (status, body) =
+            json_response(app.clone(), session_request("claude-sonnet-4-6", session)).await;
+        assert_eq!(status, 200, "{session}: {body}");
+    }
+
+    let served: Vec<String> = upstream
+        .calls()
+        .iter()
+        .map(|call| call.account.token.email.clone())
+        .collect();
+    assert_eq!(
+        served,
+        [
+            "alice@example.com",
+            "bob@example.com",
+            "erin@example.com",
+            "bob@example.com",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn admin_reload_applies_the_rotation_the_config_file_holds_now() {
+    // round-robin-rotation AC-8. The relay re-reads the file it loaded: by Priority both new
+    // conversations share alice; switched to round-robin, the turn starts after alice, the
+    // Account Priority placed last; a mode the relay does not know refuses the reload and the
+    // turn goes on; switched back, Priority decides again.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for email in ["alice@example.com", "bob@example.com"] {
+        save_provider_token(tmp.path(), ProviderId::anthropic(), email);
+    }
+    let config_path = tmp.path().join("config.yaml");
+    let write = |rotation: &str| {
+        std::fs::write(
+            &config_path,
+            format!(
+                "auth-dir: {}\napi-keys: [sk-test]\nquota:\n  poll: false\n{rotation}",
+                tmp.path().display()
+            ),
+        )
+        .expect("write config");
+    };
+    write("");
+    let config = pengepul::config::load_config(Some(&config_path), Some(tmp.path()), tmp.path())
+        .expect("load config");
+    let upstream = Arc::new(FakeUpstream::default());
+    let app = create_app_with_upstream(config, upstream.clone());
+    let reload = || async {
+        json_response(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/admin/reload")
+                .header("authorization", "Bearer sk-test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+    };
+    let converse = |sessions: &'static [&'static str]| {
+        let app = app.clone();
+        async move {
+            for session in sessions {
+                let (status, body) =
+                    json_response(app.clone(), session_request("claude-sonnet-4-6", session)).await;
+                assert_eq!(status, 200, "{session}: {body}");
+            }
+        }
+    };
+
+    converse(&["r-1", "r-2"]).await;
+    write("rotation:\n  anthropic: round-robin\n");
+    assert_eq!(reload().await.0, 200);
+    converse(&["r-3", "r-4"]).await;
+
+    write("rotation:\n  anthropic: sideways\n");
+    let (status, body) = reload().await;
+    assert_eq!(status, 500, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("rotation")),
+        "the refusal does not name the key: {body}"
+    );
+    converse(&["r-5"]).await;
+
+    write("");
+    assert_eq!(reload().await.0, 200);
+    converse(&["r-6", "r-7"]).await;
+
+    let served: Vec<String> = upstream
+        .calls()
+        .iter()
+        .map(|call| call.account.token.email.clone())
+        .collect();
+    assert_eq!(
+        served,
+        [
+            "alice@example.com",
+            "alice@example.com",
+            "bob@example.com",
+            "alice@example.com",
+            "bob@example.com",
+            "alice@example.com",
+            "alice@example.com",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_reload_refused_after_its_file_loads_applies_no_rotation_either() {
+    // A file can load and still refuse the reload: here it drops a configured Provider that
+    // serves until a restart. The rotation in that same file must not apply, so the turn goes
+    // on to erin; had the reload switched anthropic to priority, r-3 would land on alice.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for email in ["alice@example.com", "bob@example.com", "erin@example.com"] {
+        save_provider_token(tmp.path(), ProviderId::anthropic(), email);
+    }
+    let config_path = tmp.path().join("config.yaml");
+    let write = |rest: &str| {
+        std::fs::write(
+            &config_path,
+            format!(
+                "auth-dir: {}\napi-keys: [sk-test]\nquota:\n  poll: false\n{rest}",
+                tmp.path().display()
+            ),
+        )
+        .expect("write config");
+    };
+    write(
+        "providers:\n  groq:\n    base-url: https://api.groq.com/openai/v1\nrotation:\n  anthropic: round-robin\n",
+    );
+    let config = pengepul::config::load_config(Some(&config_path), Some(tmp.path()), tmp.path())
+        .expect("load config");
+    let upstream = Arc::new(FakeUpstream::default());
+    let app = create_app_with_upstream(config, upstream.clone());
+    for session in ["r-1", "r-2"] {
+        let (status, body) =
+            json_response(app.clone(), session_request("claude-sonnet-4-6", session)).await;
+        assert_eq!(status, 200, "{session}: {body}");
+    }
+
+    write("rotation:\n  anthropic: priority\n");
+    let (status, body) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/admin/reload")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 500, "{body}");
+    let (status, body) =
+        json_response(app.clone(), session_request("claude-sonnet-4-6", "r-3")).await;
+    assert_eq!(status, 200, "r-3: {body}");
+
+    let served: Vec<String> = upstream
+        .calls()
+        .iter()
+        .map(|call| call.account.token.email.clone())
+        .collect();
+    assert_eq!(
+        served,
+        ["alice@example.com", "bob@example.com", "erin@example.com"]
     );
 }
 

@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 
 use serde_json::Value;
 
-use crate::config::DEFAULT_PRIORITY;
+use crate::config::{DEFAULT_PRIORITY, RotationMode};
 use crate::quota::{self, QuotaWindow};
 use crate::render::{
     AMBER, ActionGlyph, BOLD, DIM, Fact, GREEN, INNER_WIDTH, Output, RED, fact_panel, fact_row,
@@ -135,11 +135,16 @@ pub(crate) fn print_accounts(payload: &Value, output: &mut Output, now: f64, ver
             .and_then(Value::as_i64)
             .unwrap_or(0);
         let suffix = if count == 1 { "account" } else { "accounts" };
-        output.line(&format!("{provider_id}: {count} {suffix}"));
+        let rotation = rotation_of(provider);
+        let mut header = format!("{provider_id}: {count} {suffix}");
+        if rotation == RotationMode::RoundRobin {
+            header.push_str(" rotation=round-robin");
+        }
+        output.line(&header);
         let Some(records) = provider.get("accounts").and_then(Value::as_array) else {
             continue;
         };
-        for account in accounts_in_priority_order(records, now) {
+        for account in accounts_in_rotation_order(records, rotation, now) {
             let failures = account
                 .get("failureCount")
                 .and_then(Value::as_i64)
@@ -173,7 +178,7 @@ pub(crate) fn print_accounts(payload: &Value, output: &mut Output, now: f64, ver
             }
             let last_ok = last_ok_age(account, now).unwrap_or_else(|| "never".to_string());
             write!(line, " last_ok={last_ok}").expect("write to String cannot fail");
-            if let Some((priority, source)) = priority_pair(account) {
+            if let Some((priority, source)) = priority_pair(account, rotation) {
                 write!(line, " priority={priority} source={source}")
                     .expect("write to String cannot fail");
             }
@@ -233,27 +238,43 @@ fn weekly_reset(account: &Value, now: f64) -> Option<i64> {
     (!quota::rolled_at(Some(resets_at), quota::epoch_seconds(now))).then_some(resets_at)
 }
 
-/// The Accounts of one Pool in the order Rotation hands out new conversations, which is the
-/// order the operator reads them in: smallest **Priority**, then the soonest weekly reset the
-/// vendor named (an Account without a current one last), then the Account key (AC-2). The
-/// relay lists records in Account-key order, so a view that prints a Priority has to reorder
-/// them; otherwise the page ranks the Accounts against the policy it is showing.
-pub(crate) fn accounts_in_priority_order(accounts: &[Value], now: f64) -> Vec<&Value> {
+/// The Accounts of one Pool in the order its Rotation hands out new conversations, which is the
+/// order the operator reads them in. By **Priority**: smallest Priority, then the soonest weekly
+/// reset the vendor named (an Account without a current one last), then the Account key (AC-2).
+/// **Round-robin**: the Account key, the order the turn walks (round-robin-rotation AC-9).
+/// Otherwise the page ranks the Accounts against the policy it is showing.
+pub(crate) fn accounts_in_rotation_order(
+    accounts: &[Value],
+    rotation: RotationMode,
+    now: f64,
+) -> Vec<&Value> {
     let mut ordered: Vec<&Value> = accounts.iter().collect();
-    ordered.sort_by(|left, right| {
-        priority_of(left)
-            .cmp(&priority_of(right))
-            .then_with(
-                || match (weekly_reset(left, now), weekly_reset(right, now)) {
-                    (Some(left), Some(right)) => left.cmp(&right),
-                    (Some(_), None) => Ordering::Less,
-                    (None, Some(_)) => Ordering::Greater,
-                    (None, None) => Ordering::Equal,
-                },
-            )
-            .then_with(|| email(left).cmp(email(right)))
-    });
+    match rotation {
+        RotationMode::Priority => ordered.sort_by(|left, right| {
+            priority_of(left)
+                .cmp(&priority_of(right))
+                .then_with(
+                    || match (weekly_reset(left, now), weekly_reset(right, now)) {
+                        (Some(left), Some(right)) => left.cmp(&right),
+                        (Some(_), None) => Ordering::Less,
+                        (None, Some(_)) => Ordering::Greater,
+                        (None, None) => Ordering::Equal,
+                    },
+                )
+                .then_with(|| email(left).cmp(email(right)))
+        }),
+        RotationMode::RoundRobin => ordered.sort_by(|left, right| email(left).cmp(email(right))),
+    }
     ordered
+}
+
+/// How a Pool hands out new conversations, as the payload names it. A relay that predates the
+/// field rotates every Pool by Priority, and so does a name this build does not know.
+fn rotation_of(provider: &Value) -> RotationMode {
+    provider
+        .get("rotation")
+        .and_then(|rotation| serde::Deserialize::deserialize(rotation).ok())
+        .unwrap_or_default()
 }
 
 pub(crate) fn providers(payload: &Value) -> Vec<(&str, &Value)> {
@@ -458,10 +479,13 @@ pub(crate) fn model_rows(account: &Value) -> Vec<ModelRow> {
 /// (accounts-verbose); without it the view stops at the account scope.
 pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64, verbose: bool) {
     for (provider_id, provider) in providers(payload) {
+        let rotation = rotation_of(provider);
         let accounts = provider
             .get("accounts")
             .and_then(Value::as_array)
-            .map_or_else(Vec::new, |records| accounts_in_priority_order(records, now));
+            .map_or_else(Vec::new, |records| {
+                accounts_in_rotation_order(records, rotation, now)
+            });
         let count = provider
             .get("account_count")
             .and_then(Value::as_i64)
@@ -481,8 +505,15 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64, ve
             })
             .count();
 
+        // A round-robin Pool's header says so: its Accounts read no Priority, and the rows print
+        // none (round-robin-rotation AC-9).
+        let turn = if rotation == RotationMode::RoundRobin {
+            "round-robin, "
+        } else {
+            ""
+        };
         output.line(&top_rule(&format!(
-            "pool {provider_id} ─ {count} {suffix}, {available} available"
+            "pool {provider_id} ─ {turn}{count} {suffix}, {available} available"
         )));
 
         let pool_total: i64 = accounts.iter().map(|account| account_tokens(account)).sum();
@@ -502,7 +533,7 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64, ve
         // token rows and the footer rollup align down the whole box.
         let mut panel_facts: Vec<Fact> = accounts
             .iter()
-            .flat_map(|account| account_detail_facts(account, now))
+            .flat_map(|account| account_detail_facts(account, now, rotation))
             .collect();
         panel_facts.extend(
             accounts
@@ -514,7 +545,7 @@ pub(crate) fn print_pool_rich(payload: &Value, output: &mut Output, now: f64, ve
         let column = label_column(&panel_facts);
         for account in &accounts {
             output.line(&panel_row(&account_row(account, pool_total, now)));
-            for fact in account_detail_facts(account, now) {
+            for fact in account_detail_facts(account, now, rotation) {
                 output.line(&panel_row(&format!("  {}", fact_row(&fact, column))));
             }
             for line in quota_lines(provider_id, account, now, true, RICH_BAR_WIDTH) {
@@ -976,16 +1007,20 @@ pub(crate) fn account_row(account: &Value, pool_total: i64, now: f64) -> String 
 /// every fact on that line stays a labelled one and no script has to parse a value for its
 /// source. `None` unless the payload carries both fields: a relay that predates them holds
 /// every Account at the same Priority, and a source guessed here would be the CLI's, not the
-/// relay's (ADR-0024).
-pub(crate) fn priority_pair(account: &Value) -> Option<(i64, &str)> {
+/// relay's (ADR-0024). `None` in a round-robin Pool too, which keeps the pair and reads none of
+/// it: a number printed there would claim to decide something (round-robin-rotation AC-9).
+pub(crate) fn priority_pair(account: &Value, rotation: RotationMode) -> Option<(i64, &str)> {
+    if rotation == RotationMode::RoundRobin {
+        return None;
+    }
     let priority = account.get("priority").and_then(Value::as_i64)?;
     let source = account.get("prioritySource").and_then(Value::as_str)?;
     Some((priority, source))
 }
 
 /// The pair as the rich account block prints it: `1 (config)`.
-pub(crate) fn priority_text(account: &Value) -> Option<String> {
-    priority_pair(account).map(|(priority, source)| format!("{priority} ({source})"))
+pub(crate) fn priority_text(account: &Value, rotation: RotationMode) -> Option<String> {
+    priority_pair(account, rotation).map(|(priority, source)| format!("{priority} ({source})"))
 }
 
 /// `part` as a rounded percentage of `whole`, or `None` when there is no whole to divide by.
@@ -1107,13 +1142,13 @@ fn reasoning_fact(reasoning: i64, output: i64, colour: &str) -> Fact {
 
 /// An account's block: when it last served (last-ok), then its token block on
 /// the same rows as every other scope (ADR-0024).
-pub(crate) fn account_detail_facts(account: &Value, now: f64) -> Vec<Fact> {
+pub(crate) fn account_detail_facts(account: &Value, now: f64, rotation: RotationMode) -> Vec<Fact> {
     let last_ok =
         last_ok_age(account, now).map_or_else(|| "never".to_string(), |age| format!("{age} ago"));
     let mut facts = vec![Fact::new("last ok", &paint(DIM, &last_ok))];
     // A Priority is the fact that picks this account for new work, so it follows the one
     // usage fact and opens the token block (AC-7).
-    if let Some(priority) = priority_text(account) {
+    if let Some(priority) = priority_text(account, rotation) {
         facts.push(Fact::new("priority", &paint(DIM, &priority)));
     }
     facts.extend(token_block_facts(

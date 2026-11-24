@@ -5840,6 +5840,135 @@ fn accounts_panel_names_each_accounts_priority() {
     assert_eq!(fact("default@x.com"), "priority 0 (default)", "{rich}");
 }
 
+/// round-robin-rotation AC-9: a `priority` Pool beside a round-robin one. The round-robin
+/// records arrive out of key order and carry Priorities that would reverse it, so a view that
+/// ranked them, or kept the payload's order, prints them out of turn.
+fn rotation_pools() -> Value {
+    json!({
+        "providers": {
+            "anthropic": {
+                "account_count": 2,
+                "rotation": "priority",
+                "accounts": [
+                    {"email": "a@x.com", "available": true, "priority": 1,
+                     "prioritySource": "config"},
+                    {"email": "b@x.com", "available": true, "priority": 0,
+                     "prioritySource": "default"}
+                ]
+            },
+            "commandcode": {
+                "account_count": 3,
+                "rotation": "round-robin",
+                "accounts": [
+                    {"email": "key-b", "available": true, "priority": 0,
+                     "prioritySource": "default"},
+                    {"email": "key-c", "available": true, "priority": -5,
+                     "prioritySource": "config"},
+                    {"email": "key-a", "available": true, "priority": 5,
+                     "prioritySource": "config"}
+                ]
+            }
+        }
+    })
+}
+
+/// round-robin-rotation AC-9, plain: the Pool's line names its rotation, its Accounts follow in
+/// the order the turn walks them, and none of them prints a Priority that decides nothing.
+#[test]
+fn plain_accounts_name_a_round_robin_pool_and_print_no_priority_for_it() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        accounts_payload: Some(rotation_pools()),
+        ..FakeRuntime::default()
+    };
+
+    let plain = run(&["accounts"], tmp.path(), &mut runtime).stdout;
+    let lines: Vec<&str> = plain.lines().collect();
+
+    assert!(
+        lines.contains(&"commandcode: 3 accounts rotation=round-robin"),
+        "{plain}"
+    );
+    assert!(lines.contains(&"anthropic: 2 accounts"), "{plain}");
+    let accounts = |prefix: &str| -> Vec<&str> {
+        lines
+            .iter()
+            .copied()
+            .filter(|line| line.starts_with(&format!("  {prefix}")))
+            .collect()
+    };
+    let round_robin = accounts("key-");
+    assert_eq!(
+        round_robin
+            .iter()
+            .map(|line| line.split_whitespace().next().expect("an account key"))
+            .collect::<Vec<_>>(),
+        ["key-a", "key-b", "key-c"],
+        "{plain}"
+    );
+    assert!(
+        round_robin
+            .iter()
+            .all(|line| line.ends_with(" last_ok=never")),
+        "{plain}"
+    );
+    // The `priority` Pool beside it prints as it always has.
+    assert_eq!(
+        accounts("")
+            .iter()
+            .filter(|line| line.contains("@x.com"))
+            .copied()
+            .collect::<Vec<_>>(),
+        [
+            "  b@x.com available failures=0 last_ok=never priority=0 source=default",
+            "  a@x.com available failures=0 last_ok=never priority=1 source=config",
+        ],
+        "{plain}"
+    );
+}
+
+/// round-robin-rotation AC-9, rich: the panel header carries the rotation as a qualifier, the
+/// Accounts follow in turn order, and no Priority row is printed for them.
+#[test]
+fn the_accounts_panel_names_a_round_robin_pool_and_prints_no_priority_for_it() {
+    let tmp = tempdir().expect("tempdir");
+    write_config(tmp.path(), "127.0.0.1", 8317);
+    let mut runtime = FakeRuntime {
+        rich: true,
+        accounts_payload: Some(rotation_pools()),
+        ..FakeRuntime::default()
+    };
+
+    let rich = strip_ansi(&run_style(&["accounts"], tmp.path(), &mut runtime, Style::Rich).stdout);
+    let (priority_panel, round_robin_panel) = rich
+        .split_once("┌─ pool commandcode")
+        .unwrap_or_else(|| panic!("no commandcode panel: {rich}"));
+
+    assert!(
+        priority_panel.starts_with("┌─ pool anthropic ─ 2 accounts, 2 available ─"),
+        "{rich}"
+    );
+    assert!(
+        round_robin_panel.starts_with(" ─ round-robin, 3 accounts, 3 available ─"),
+        "{rich}"
+    );
+    let positions: Vec<usize> = ["key-a", "key-b", "key-c"]
+        .iter()
+        .map(|key| {
+            round_robin_panel
+                .find(key)
+                .unwrap_or_else(|| panic!("{key} missing from the panel: {rich}"))
+        })
+        .collect();
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "the panel is out of turn order: {rich}"
+    );
+    assert!(!round_robin_panel.contains("priority"), "{rich}");
+    assert!(priority_panel.contains("priority"), "{rich}");
+}
+
 // ---------------------------------------------------------------------------
 // disable-an-account: the verbs
 // ---------------------------------------------------------------------------

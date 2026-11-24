@@ -83,12 +83,16 @@ pub struct Config {
     pub debug: DebugMode,
     pub providers: BTreeMap<String, ConfiguredProvider>,
     pub quota: QuotaConfig,
+    /// How each Pool hands out new conversations, keyed by Provider id. A Provider left out
+    /// rotates by [`RotationMode::Priority`].
+    pub rotation: BTreeMap<String, RotationMode>,
     /// Each Account's Priority, keyed by Provider id and then Account key. Smaller is
     /// preferred; an Account left out takes [`DEFAULT_PRIORITY`].
     pub priority: BTreeMap<String, BTreeMap<String, i64>>,
     pub allow: AllowLists,
-    /// The file this config was loaded from, which `/admin/reload` reads `allow:` from
-    /// again. `None` for a config built in code.
+    /// The file this config lives in once loaded: the one it was read from, or the one
+    /// `load_config` migrated a legacy config to. `/admin/reload` reads `allow:` and `rotation:`
+    /// from it again. `None` for a config built in code.
     pub path: Option<PathBuf>,
 }
 
@@ -100,6 +104,20 @@ pub type AllowLists = BTreeMap<String, BTreeSet<String>>;
 /// The Priority of an Account the config does not list. Every such Account shares it, so a
 /// positive number demotes an Account below them and a negative one promotes it.
 pub const DEFAULT_PRIORITY: i64 = 0;
+
+/// How a Pool hands out new conversations, set per Provider id under `rotation:`. A Provider the
+/// map leaves out rotates by Priority, as every Pool did before the key existed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RotationMode {
+    /// The serving Account of smallest Priority, then the soonest weekly reset, then the
+    /// Account key (ADR-0031).
+    #[default]
+    Priority,
+    /// The next serving Account after the one the Pool placed last, in Account-key order,
+    /// reading no Priority (ADR-0033).
+    RoundRobin,
+}
 
 /// The largest request body the relay will read, resolved once at config load.
 ///
@@ -187,6 +205,8 @@ struct RawConfig {
     quota: RawQuota,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     priority: BTreeMap<String, BTreeMap<String, i64>>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    rotation: BTreeMap<String, RotationMode>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -284,6 +304,7 @@ impl Default for RawConfig {
             providers: BTreeMap::new(),
             quota: RawQuota::default(),
             priority: BTreeMap::new(),
+            rotation: BTreeMap::new(),
         }
     }
 }
@@ -442,7 +463,9 @@ pub fn load_config(
 }
 
 /// Read the config file the relay loaded again, for `/admin/reload`: every check `load_config`
-/// applies, and nothing written. A `~` in `auth-dir` expands against `HOME` as it is now.
+/// applies, and nothing written. A `~` in `auth-dir` expands against `HOME` as it is now. A file
+/// that is gone is refused, where `load_config` reads one as the defaults: a reload must not
+/// reset what the operator set.
 ///
 /// # Errors
 ///
@@ -484,6 +507,7 @@ fn config_from_raw(raw: RawConfig, home: &Path, path: PathBuf) -> Result<Config>
             // vendors' endpoints. One minute is the floor an operator gets.
             poll_minutes: raw.quota.poll_minutes.max(1),
         },
+        rotation: raw.rotation,
         priority: raw.priority,
         allow,
         path: Some(path),
@@ -555,8 +579,15 @@ impl Config {
         self.priority.get(provider_id).cloned().unwrap_or_default()
     }
 
-    /// The Provider ids a `priority:` entry can name: the built-in Pools plus every
-    /// configured one. The built-ins come from [`ProviderKind`], so a fourth kind cannot be
+    /// How one Provider's Pool hands out new conversations: what `rotation:` sets for it, or
+    /// [`RotationMode::Priority`] for a Provider it leaves out.
+    #[must_use]
+    pub fn rotation_for(&self, provider_id: &str) -> RotationMode {
+        self.rotation.get(provider_id).copied().unwrap_or_default()
+    }
+
+    /// The Provider ids a `priority:` or `rotation:` entry can name: the built-in Pools plus
+    /// every configured one. The built-ins come from [`ProviderKind`], so a fourth kind cannot be
     /// forgotten here while it serves.
     #[must_use]
     pub fn known_providers(&self) -> HashSet<&str> {

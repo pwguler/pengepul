@@ -4,9 +4,9 @@ Run your own API relay for your AI subscriptions. Log in your Claude, ChatGPT/Co
 accounts once and every request is served from the pool, so your harness runs on your
 subscription instead of a per-token key.
 
-- Pools several subscription accounts per provider and orders them by a `priority:` of your
-  choosing, so the preferred account takes the new conversations while a running one keeps the
-  account holding its cache.
+- Pools several subscription accounts per provider and hands new conversations to the account
+  your `priority:` prefers, or to each account in turn with `rotation:`, while a running
+  conversation keeps the account holding its cache.
 - Serves your subscription inside openclaw and hermes, with no API key.
 - Relays any OpenAI-compatible API (groq, openrouter, deepseek, ...) through the pool.
 - Exposes the pool as a REST API, local or networked, for your own tools.
@@ -35,7 +35,9 @@ Log in more than once per provider to pool accounts; each new conversation goes 
 account of smallest `priority:` (default `0`, smaller is preferred), then to the one whose
 weekly quota resets soonest — an account with no reading sorts last, and the account key breaks
 the final tie — and a conversation already running stays on the account that holds its cache
-while that account can serve. A grok
+while that account can serve. A pool set to round-robin (`rotation: { anthropic: round-robin }`
+in `config.yaml`) reads no `priority:` and hands each new conversation to the next account in
+turn instead. A grok
 account serves `grok-4.6` and `grok-4.5`, each with a 500k context window, named bare or
 as `grok/grok-4.6`. Credentials live in `~/.pengepul` (`0600`); a running relay picks up a
 fresh login on restart or `pengepul accounts --reload`. Read the key clients use with
@@ -85,7 +87,8 @@ curl -sS http://127.0.0.1:8317/v1/chat/completions \
 ```
 
 Configured endpoints speak Chat Completions and hand each new conversation to the key of
-smallest `priority:` with the same failure handling as subscription providers.
+smallest `priority:`, or in turn under `rotation:`, with the same failure handling as
+subscription providers.
 
 `/v1/models` advertises what each endpoint's own `/models` publishes under these fields:
 `context_window`, `context_length` or vLLM's `max_model_len`; `max_output_tokens`;
@@ -279,6 +282,10 @@ api-keys:
 priority:
   anthropic:
     you@example.com: 1 # below the accounts the config leaves at the default
+# optional; per provider, priority (the default) or round-robin. Like priority:, a build older
+# than the one that added this key refuses a config that carries it.
+rotation:
+  groq: round-robin # each new conversation takes the next key; priority: is not read
 providers:
   groq:
     base-url: https://api.groq.com/openai/v1
@@ -306,6 +313,21 @@ quota:
 cloaking:
   message-threads: true # continue an anthropic conversation on the vendor instead of resending it
 ```
+
+A `round-robin` pool hands each new conversation to the next account after the one it last
+placed a conversation on, in account-key order, wrapping after the last key and passing over an
+account on cooldown, disabled or without a credential; a provider left out of `rotation:`
+rotates by priority. A conversation already running keeps its account and takes no turn while
+that account can serve; when it cannot, or a failover moves it, the conversation takes the next
+turn and stays where it lands. The relay keeps which account a conversation used in memory and
+forgets it on a restart, or when a pool's memory fills at 1024 conversations: a running
+conversation's next turn is then placed like a new one's, so most such conversations land on
+another account and pay one cold read of their cached prompt. The turn itself starts at the
+first account key when the relay starts. `priority:` stays valid for such a pool and is not
+read, so `pengepul accounts` names the pool `round-robin`, lists its accounts in account-key
+order, and prints no priority for them. `pengepul accounts --reload` applies a changed
+`rotation:` without a restart; when the config file is gone or no longer loads, it refuses the
+whole reload, accounts included. `priority:` is read at startup.
 
 `stream-messages-ms` is a silence limit, not a deadline: a streamed reply runs as long as it
 keeps sending, and fails once it sends nothing for that long, before it starts or between

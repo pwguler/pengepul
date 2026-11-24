@@ -25,7 +25,7 @@ use crate::accounts::{
 };
 use crate::admin_report::{status_json, usage_json};
 use crate::cloaking_versions::{CliVersions, codex_release, effective, npm_latest};
-use crate::config::{BodyLimit, Config};
+use crate::config::{BodyLimit, Config, RotationMode};
 use crate::masquerade::{masquerade_request, restore_tool_use_names};
 use crate::models::{
     FetchedModels, ModelCatalog, grok_static_models, parse_anthropic, parse_codex, parse_openai,
@@ -675,6 +675,7 @@ pub fn create_app_with_upstream(config: Config, upstream: Arc<dyn UpstreamClient
 
 fn build_account_managers(config: &Config) -> AccountManagers {
     warn_unknown_priority_providers(config);
+    warn_unknown_rotation_providers(config, &config.rotation);
     let mut anthropic = AccountManager::new(
         config.auth_dir.clone(),
         ProviderId::anthropic(),
@@ -703,6 +704,9 @@ fn build_account_managers(config: &Config) -> AccountManagers {
             seconds: 60 * 60,
         },
     );
+    anthropic.set_rotation(config.rotation_for("anthropic"));
+    codex.set_rotation(config.rotation_for("codex"));
+    grok.set_rotation(config.rotation_for("grok"));
     let _ = anthropic.load();
     let _ = codex.load();
     let _ = grok.load();
@@ -723,6 +727,7 @@ fn build_account_managers(config: &Config) -> AccountManagers {
                 seconds: 0,
             },
         );
+        manager.set_rotation(config.rotation_for(id));
         let _ = manager.load();
         warn_unknown_priority_accounts(id, &manager);
         generic.insert(id.clone(), tokio::sync::Mutex::new(manager));
@@ -755,6 +760,19 @@ fn warn_unknown_priority_providers(config: &Config) {
         tracing::warn!(
             provider = %provider_id,
             "priority names a provider this relay does not serve; the entry decides nothing"
+        );
+    }
+}
+
+/// A `rotation:` entry naming a Provider this relay does not serve, warned in the words the
+/// `priority:` warning uses and never refused (round-robin-rotation AC-1). It takes the map
+/// rather than the config because a reload reads the map afresh and checks it here again.
+fn warn_unknown_rotation_providers(config: &Config, rotation: &BTreeMap<String, RotationMode>) {
+    let known = config.known_providers();
+    for provider_id in rotation.keys().filter(|id| !known.contains(id.as_str())) {
+        tracing::warn!(
+            provider = %provider_id,
+            "rotation names a provider this relay does not serve; the entry decides nothing"
         );
     }
 }
@@ -1208,18 +1226,25 @@ async fn admin_accounts(
     );
     let mut pools = Vec::new();
     for (provider, manager) in state.account_managers.pools() {
-        pools.push((provider, manager.lock().await.snapshots_since(&cutoff)));
+        let manager = manager.lock().await;
+        pools.push((
+            provider,
+            manager.snapshots_since(&cutoff),
+            manager.rotation(),
+        ));
     }
     let peak = record_peak(
         &state.config.auth_dir,
         &pools
             .iter()
-            .flat_map(|(_, snapshots)| snapshots.iter().cloned())
+            .flat_map(|(_, snapshots, _)| snapshots.iter().cloned())
             .collect::<Vec<_>>(),
     );
     let providers: serde_json::Map<String, Value> = pools
         .iter()
-        .map(|(provider, snapshots)| (provider.to_string(), provider_entry(snapshots)))
+        .map(|(provider, snapshots, rotation)| {
+            (provider.to_string(), provider_entry(snapshots, *rotation))
+        })
         .collect();
 
     Json(json!({
@@ -1347,14 +1372,17 @@ fn record_peak(auth_dir: &std::path::Path, snapshots: &[Value]) -> Option<Peak> 
 /// Serializes the peak's read-compare-write across concurrent payload builds.
 static PEAK_LOCK: StdMutex<()> = StdMutex::new(());
 
-/// One provider's entry in the payload: its accounts, and how many there are.
+/// One provider's entry in the payload: its accounts, how many there are, and how the Pool
+/// hands out new conversations.
 ///
 /// The count is the list's own length rather than a separate call, because the
 /// header and the per-pool lines read the count while the view prints the list:
 /// a count that disagreed with what is listed is the disagreement the header
-/// exists to prevent (usage-after-removal).
-fn provider_entry(accounts: &[Value]) -> Value {
-    json!({"account_count": accounts.len(), "accounts": accounts})
+/// exists to prevent (usage-after-removal). The rotation sits beside the records rather than
+/// in them: a round-robin Pool's records keep their Priority pair, and this field is what
+/// says nothing reads it (round-robin-rotation AC-9).
+fn provider_entry(accounts: &[Value], rotation: RotationMode) -> Value {
+    json!({"account_count": accounts.len(), "accounts": accounts, "rotation": rotation})
 }
 
 #[derive(Clone, Copy)]
@@ -1538,6 +1566,15 @@ async fn admin_reload(State(state): State<AppState>, headers: HeaderMap) -> Resp
             return config_reload_refused(&format!(
                 "providers: {gone} serves until a restart and is gone from the config; restart to remove it"
             ));
+        }
+        // Nothing is refused past this point, so the two keys apply together or not at all.
+        // Each Pool takes the rotation the file holds now (round-robin-rotation AC-8).
+        warn_unknown_rotation_providers(&state.config, &reread.rotation);
+        for (provider, manager) in state.account_managers.pools() {
+            manager
+                .lock()
+                .await
+                .set_rotation(reread.rotation_for(&provider.id));
         }
         state
             .catalog
@@ -5421,6 +5458,48 @@ mod tests {
         assert_eq!(field_of(selected[3], "affinity"), "rotation");
     }
 
+    /// round-robin-rotation AC-1: a `rotation:` entry for a Provider the relay does not serve
+    /// is a warning that names it, and the Pools it does serve still take their settings.
+    #[tokio::test]
+    async fn a_rotation_entry_for_a_provider_the_relay_does_not_serve_is_warned() {
+        const GHOST: &str = "no-such-pool-for-rotation";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let captured = capture();
+        let mut config = test_config(tmp.path().to_path_buf());
+        config
+            .rotation
+            .insert(GHOST.to_string(), crate::config::RotationMode::RoundRobin);
+        config
+            .rotation
+            .insert("codex".to_string(), crate::config::RotationMode::RoundRobin);
+
+        let managers = super::build_account_managers(&config);
+
+        let warned = |provider: &str| {
+            captured
+                .lock()
+                .expect("capture lock")
+                .iter()
+                .filter(|fields| {
+                    field_is(fields, "provider", provider)
+                        && fields.iter().any(|(key, value)| {
+                            key == "message" && value.contains("rotation names a provider")
+                        })
+                })
+                .count()
+        };
+        assert_eq!(warned(GHOST), 1, "the unknown provider was not named once");
+        assert_eq!(warned("codex"), 0, "a provider the relay serves was warned");
+        assert_eq!(
+            managers.codex.try_lock().expect("unshared").rotation(),
+            crate::config::RotationMode::RoundRobin
+        );
+        assert_eq!(
+            managers.anthropic.try_lock().expect("unshared").rotation(),
+            crate::config::RotationMode::Priority
+        );
+    }
+
     /// The `"cacheable prefix"` line says what this request's opening hashed to; the
     /// `"upstream usage"` line says what the upstream billed for it. Together they settle the
     /// one question a cache miss leaves open — did the request change, or did the upstream
@@ -5859,6 +5938,7 @@ mod tests {
                 poll: false,
                 poll_minutes: 15,
             },
+            rotation: BTreeMap::default(),
             priority: BTreeMap::default(),
             allow: BTreeMap::default(),
             path: None,

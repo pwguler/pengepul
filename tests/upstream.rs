@@ -45,6 +45,7 @@ fn config() -> Config {
             poll: false,
             poll_minutes: 15,
         },
+        rotation: BTreeMap::default(),
         priority: BTreeMap::default(),
         allow: BTreeMap::default(),
         path: None,

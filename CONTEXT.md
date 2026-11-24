@@ -59,19 +59,23 @@ An Account the operator has taken out of its Pool, held out of Rotation and Fail
 _Avoid_: dead, paused, parked, retired, off
 
 **Priority**:
-An integer an Account carries inside its **Pool**, deciding the order **Rotation** hands out new conversations: the smaller the number, the more preferred the Account. It is set per Provider and Account key under `priority:` in `config.yaml`; an Account the config leaves out holds the default `0`, the same as every other Account it leaves out, so a Pool with no `priority:` at all is ordered by the tie-breakers alone. It is an order, not a share: equal Priorities are not interleaved, and the soonest weekly quota reset breaks the tie. A name the Pool does not hold is a startup warning, never a refusal (ADR-0031).
+An integer an Account carries inside its **Pool**, deciding the order **Rotation** hands out new conversations unless the Pool is set to **Round-robin**: the smaller the number, the more preferred the Account. It is set per Provider and Account key under `priority:` in `config.yaml`; an Account the config leaves out holds the default `0`, the same as every other Account it leaves out, so a Pool that rotates by Priority with no `priority:` at all is ordered by the tie-breakers alone. It is an order, not a share: equal Priorities are not interleaved, and the soonest weekly quota reset breaks the tie. A name the Pool does not hold is a startup warning, never a refusal (ADR-0031). A **Round-robin** Pool keeps the numbers and reads none of them (ADR-0033).
 _Avoid_: weight, rank, share, quota, plan tier
 
 **Rotation**:
-The policy by which each new conversation is handed the serving Account of smallest **Priority**, and a conversation already holding a cached prefix stays on its Account. Within equal Priority it takes the Account whose weekly quota window (`7d`) resets soonest as the vendor reads it (ADR-0030), an Account with no known weekly reset last, and the Account key as the last tie, so the choice is deterministic. An Account can serve unless it is on **Cooldown**, **Disabled**, or has no credential; near-exhausted quota never passes one over, and only those states hand the request to the next Priority. It prefers the account that already holds a conversation's cached prefix, even one of lower Priority and even after a preferred Account recovers, and falls back at the next selection whenever that Account cannot serve — availability outranks cache locality, and cache locality outranks Priority (ADR-0017, ADR-0031). The preference is keyed by the session a harness names — a session header, or the `prompt_cache_key` its body carries — or by a hash of the request's cacheable prefix when it names none.
-_Avoid_: round-robin, load balancing, sticky windows, account selection
+The policy by which each new conversation is handed a serving Account of its **Pool**, and a conversation already holding a cached prefix stays on its Account. A Pool rotates by **Priority** unless `rotation:` sets it to **Round-robin**, which keeps every Priority and reads none: by Priority, a new conversation takes the serving Account of smallest Priority, then the one whose weekly quota window (`7d`) resets soonest as the vendor reads it (ADR-0030), an Account with no known weekly reset last, and the Account key as the last tie, so the choice is deterministic. An Account can serve unless it is on **Cooldown**, **Disabled**, or has no credential; near-exhausted quota never passes one over, and only those states hand the request to the next Account in the Pool's order. It prefers the account that already holds a conversation's cached prefix, even one of lower Priority or out of turn, and even after a preferred Account recovers, and falls back at the next selection whenever that Account cannot serve — availability outranks cache locality, and cache locality outranks the Pool's order (ADR-0017, ADR-0031, ADR-0033). The preference is keyed by the session a harness names — a session header, or the `prompt_cache_key` its body carries — or by a hash of the request's cacheable prefix when it names none.
+_Avoid_: load balancing, sticky windows, account selection
+
+**Round-robin**:
+The **Rotation** a Pool opts into with `rotation: { <provider>: round-robin }`, in which each new conversation goes to the next serving Account after the one the Pool placed a conversation on last, in Account-key order and wrapping after the last key, so new conversations, not requests, spread evenly over the Accounts that can serve; **Priority** and the weekly reset are not read. A conversation holding a cached prefix stays on its Account and takes no turn; one whose Account goes on **Cooldown** or is **Disabled**, or that **Failover** moves, takes the next turn and stays on the Account it lands on. The turn passes over an Account that cannot serve and starts at the first Account key when the relay starts (ADR-0033).
+_Avoid_: load balancing, cursor
 
 **Failover**:
 Re-serving one client request on a different account of the same provider after the upstream rejects it in a way another account could survive. Each attempt re-enters **Rotation** rather than reusing the account already held, so a failover also moves the conversation's affinity onto the account that served it (ADR-0017).
 _Avoid_: retry, fallback, attempt budget
 
 **Pool**:
-The set of Accounts of one Provider behind the relay, ordered by **Priority** and handed each new conversation by **Rotation**.
+The set of Accounts of one Provider behind the relay, handed each new conversation by **Rotation**: by **Priority**, or in turn, keeping every Priority and reading none, when set to **Round-robin**.
 _Avoid_: account list, fleet, grouping
 
 **Panel**:
@@ -138,7 +142,8 @@ _Avoid_: billing classifier, detector, filter
 - One **Provider** has zero or more **Accounts**; one **Account** belongs to exactly one **Provider**.
 - Within one **Provider** an **Account** is keyed by exactly one email (anthropic, codex, grok) or by a label derived from the key (static-key providers), and keys are unique.
 - One **Account** holds exactly one credential: an access-token/refresh-token pair for anthropic, codex and grok, or one static API key for a configured OpenAI-compatible **Provider**.
-- One **Account** holds at most one **Priority**, and a **Pool** orders its **Accounts** by it; **Priority** never compares across **Pools** or **Providers**.
+- One **Account** holds at most one **Priority**, and a **Pool** that rotates by **Priority** orders its **Accounts** by it; **Priority** never compares across **Pools** or **Providers**.
+- One **Pool** rotates one way at a time, set per **Provider** under `rotation:`: by **Priority**, the default, or **Round-robin**. A **Round-robin** **Pool** keeps one turn of its own and reads no **Priority**.
 - One **Account** has at most one **Cooldown** in effect, with three duration policies: an ordinary failure cooldown, a longer one for **Reauth**, and a separate ceiling of up to an hour for an account that has never once succeeded — shorter than Reauth's, because it bounds how often a dead key is probed while a Reauth waits for a human (ADR-0020). A **Retry hint** stretches whichever applies to the wait the vendor named, up to a day, and never shortens it. A **Pool** of one account has none of the three: the account keeps serving its failures, and the client sees the vendor's own error (ADR-0027).
 - One model id resolves to exactly one **Provider**.
 - One client request is served by one **Account** at a time, and **Failover** only moves it between **Accounts** of the same **Provider**.
@@ -168,6 +173,14 @@ _Avoid_: billing classifier, detector, filter
 > **Dev:** "And the request that got the 503 — did it try the other two first?"
 >
 > **Operator:** "**Failover** tried, yes. It re-serves on a different **account** of the same **provider**, but only for statuses another **account** could plausibly survive. Every **account** was on **cooldown**, so it ran out of candidates and returned what it had."
+>
+> **Dev:** "Another pool is set to **round-robin**, but one long conversation keeps landing on the same **account**."
+>
+> **Operator:** "That's its cached prefix. **Round-robin** decides where a *new* conversation goes: the next **account** after the one the pool placed last. A conversation already running stays on the **account** holding its cache and takes no turn, until that **account** goes on **cooldown** or a **failover** moves it; then it takes the next turn like a new one."
+>
+> **Dev:** "And the **priority** numbers I set for that pool?"
+>
+> **Operator:** "Still valid, and unread while the **pool** is round-robin. Set it back to `priority` and reload, and they decide again."
 
 ## Flagged ambiguities
 
@@ -183,7 +196,8 @@ _Avoid_: billing classifier, detector, filter
 - "declined" suggests itself for every threaded turn the relay sends again. Resolved: only a **Thread** the vendor said no to is a **Declined thread**. A vendor fault on a continue is sent again **Plain** as well, and nothing is held against the conversation or the **Account** for it.
 - "session" names what a **Harness** calls its conversation and suggests itself for what the vendor holds. Resolved: a session is the key a **Harness** names for **Rotation**; the vendor holds a **Thread**, and one session may hold several conversations, each with its own.
 - "refresh" names both the secret an account holds and the act of replacing its expiring access token. Resolved: **Refresh** is the act. The secret is the refresh token.
-- "round-robin with sticky windows" survives in `docs/`, contradicting the README. Resolved: **Rotation** is not round-robin and has no stickiness in the sense of a fixed window or a client-level pin. A new conversation goes to the serving Account of smallest **Priority** by the tie-breakers above, not to the account after the one used last; the one thing **Rotation** does remember is which account last served a conversation's cacheable prefix, as a preference that a Cooldown overrides and that **Priority** does not (ADR-0017, ADR-0031). Nothing is keyed on a client or a credential.
+- "round-robin with sticky windows" survived in `docs/`, contradicting the README. Resolved: **Rotation** has no stickiness in the sense of a fixed window or a client-level pin, and it is round-robin only in a Pool set to **Round-robin**. By default a new conversation goes to the serving Account of smallest **Priority** by the tie-breakers above, not to the account after the one used last; a **Round-robin** Pool hands it to the account after the one it placed last, per conversation and never per request. Either way, the one thing **Rotation** remembers about a conversation is which account last served its cacheable prefix, as a preference that a Cooldown overrides and that neither **Priority** nor the turn does (ADR-0017, ADR-0031, ADR-0033). Nothing is keyed on a client or a credential.
+- "priority" names both the number an Account carries and the default `rotation:` setting. Resolved: **Priority** is the number; the setting `priority` means the Pool rotates by **Priority**, and the other setting is **Round-robin**, which keeps the Pool's Priorities and reads none of them.
 - "pool" and "pooling" name both the whole relay and one provider's accounts. Resolved: **Pool** is one Provider's set of Accounts; the process serving every pool is the relay.
 - The uncached counter is printed as `in` and read as the input, while the payload calls the same field `input`. Resolved: **Input** is the printed row for the whole prompt; the recorded counter keeps the field name `input` (`totalInputTokens` on the wire) and holds only the token no cache read or wrote, so it is narrower than the printed **Uncached** by the cache write. Both words are needed, and neither is renamed on the wire (ADR-0024).
 - The CLI printed cooldown accounts as "unavailable". Resolved: operator-facing output says "on cooldown" with the remaining time, and "unavailable" never names a **Cooldown**. It names the other state instead, one word in both styles: an account that cannot serve and has no cooldown to wait out — a record whose credential file the auth directory no longer holds. `accounts` prints it as `unavailable` plain and `● unavailable` rich, which is also the word the payload's `available: false` field uses. An earlier cut split the two styles, `unresponsive` in rich, on the argument that plain's bytes were frozen; those bytes are the plain branch's, so matching rich to plain cost nothing.

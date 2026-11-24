@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use crate::config::DEFAULT_PRIORITY;
+use crate::config::{DEFAULT_PRIORITY, RotationMode};
 use crate::quota::{QuotaSnapshot, WINDOW_WEEK, epoch_seconds, load_quota, rolled, save_quota};
 use crate::tokens::{
     DayUsage, ModelUsage, PersistedUsage, RETENTION_DAYS, load_all_tokens, load_disabled_tokens,
@@ -442,6 +442,13 @@ pub struct AccountManager {
     /// hold is kept and reported at startup rather than dropped: the operator's typo is
     /// still there when a later login or restart brings the Account it meant (AC-1).
     priorities: BTreeMap<String, i64>,
+    /// How this Pool hands out new conversations: by Priority, or in turn (ADR-0033).
+    rotation: RotationMode,
+    /// The Account the Pool's last placement went to, recorded under either rotation, so a
+    /// Pool switched to round-robin takes its turn from there. Round-robin's cursor: a key
+    /// rather than an index, so an Account joining or leaving the order cannot shift it, and
+    /// never persisted, so a restart starts the turn at the first Account key.
+    last_placed: Option<String>,
     /// Usage counters read from disk at `load()` and merged into fresh
     /// account states. Never updated afterwards: writes rebuild the accounts that
     /// loaded from memory and carry the rest of the file through unchanged
@@ -473,10 +480,22 @@ impl AccountManager {
             accounts: BTreeMap::new(),
             order: Vec::new(),
             priorities,
+            rotation: RotationMode::default(),
+            last_placed: None,
             persisted_usage: BTreeMap::new(),
             affinity: BTreeMap::new(),
             quota: BTreeMap::new(),
         }
+    }
+
+    /// Set how this Pool hands out new conversations, at startup and on every reload.
+    pub fn set_rotation(&mut self, rotation: RotationMode) {
+        self.rotation = rotation;
+    }
+
+    #[must_use]
+    pub fn rotation(&self) -> RotationMode {
+        self.rotation
     }
 
     #[must_use]
@@ -1221,11 +1240,33 @@ impl AccountManager {
     /// Accounts are all cooling cannot shadow the next one: the best of what is left wins,
     /// which is what makes Priority an order over the serving set rather than a pin (AC-3).
     fn best_serving(&self, now: f64) -> Option<&AccountState> {
+        self.serving(now)
+            .map(|(_, state)| state)
+            .min_by(|left, right| self.prefer(&left.token.email, &right.token.email, now))
+    }
+
+    /// The Account a new conversation is handed in a round-robin Pool: the first serving
+    /// Account after the one placed last, in Account-key order, wrapping to the first. Priority
+    /// and the weekly reset are not read (round-robin-rotation AC-2, AC-4).
+    fn next_in_turn(&self, now: f64) -> Option<&AccountState> {
+        let after_last = self.last_placed.as_ref().and_then(|last| {
+            self.serving(now)
+                .filter(|(email, _)| *email > last)
+                .min_by_key(|(email, _)| *email)
+        });
+        after_last
+            .or_else(|| self.serving(now).min_by_key(|(email, _)| *email))
+            .map(|(_, state)| state)
+    }
+
+    /// The Accounts that can serve now, with their keys: in the rotation order (a credential,
+    /// not Disabled) and off Cooldown. Both rotations choose among exactly these, so neither
+    /// can hand out an Account the other passes over.
+    fn serving(&self, now: f64) -> impl Iterator<Item = (&String, &AccountState)> {
         self.order
             .iter()
-            .filter_map(|email| self.accounts.get(email))
-            .filter(|state| can_serve(state, now))
-            .min_by(|left, right| self.prefer(&left.token.email, &right.token.email, now))
+            .filter_map(|email| Some((email, self.accounts.get(email)?)))
+            .filter(move |(_, state)| can_serve(state, now))
     }
 
     #[must_use]
@@ -1264,6 +1305,9 @@ impl AccountManager {
             }
             self.affinity
                 .insert(affinity.to_string(), account.token.email.clone());
+            // Every placement is a turn: a new conversation, and one whose Account cannot
+            // serve or that Failover left. A conversation honoured above takes none (AC-3, AC-5).
+            self.last_placed = Some(account.token.email.clone());
         }
         result
     }
@@ -1279,7 +1323,11 @@ impl AccountManager {
             };
         }
         let now = unix_now();
-        if let Some(state) = self.best_serving(now) {
+        let next = match self.rotation {
+            RotationMode::Priority => self.best_serving(now),
+            RotationMode::RoundRobin => self.next_in_turn(now),
+        };
+        if let Some(state) = next {
             return AccountResult {
                 account: Some(self.available_account(state)),
                 failure_kind: None,

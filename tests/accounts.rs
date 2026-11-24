@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use pengepul::accounts::{
     AccountManager, RefreshPolicy, RefreshPolicyKind, ToggleError, ToggleOutcome,
 };
+use pengepul::config::RotationMode;
 use pengepul::quota::{QuotaSnapshot, QuotaWindow};
 use pengepul::tokens::save_token;
 use pengepul::types::{ProviderId, RefreshTokenExhaustedError, TokenData, UsageData};
@@ -3250,4 +3251,242 @@ async fn the_demo_pool_lands_on_the_soonest_reset_tier_then_holds_its_sticky_con
     manager.record_billing_cooldown("p@example.com", "insufficient credits");
     manager.record_billing_cooldown("q@example.com", "insufficient credits");
     assert_eq!(served(&mut manager, 2), ["r@example.com"; 2]);
+}
+
+// ---------------------------------------------------------------------------
+// Round-robin: new conversations in turn, reading no Priority (round-robin-rotation)
+// ---------------------------------------------------------------------------
+
+/// A loaded `commandcode` Pool holding `emails` and set to round-robin, with `priorities` that
+/// the Pool keeps and must not read.
+fn round_robin_pool(
+    auth_dir: &Path,
+    emails: &[&str],
+    priorities: &[(&str, i64)],
+) -> AccountManager {
+    let mut manager = priority_pool(auth_dir, emails, priorities);
+    manager.set_rotation(RotationMode::RoundRobin);
+    manager
+}
+
+/// The Accounts `count` new conversations land on, each under a key no conversation of the
+/// Pool used before.
+fn placed(manager: &mut AccountManager, prefix: &str, count: usize) -> Vec<String> {
+    (0..count)
+        .map(|turn| {
+            manager
+                .account_for(&format!("{prefix}-{turn}"))
+                .account
+                .expect("an account")
+                .token
+                .email
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn round_robin_hands_new_conversations_out_in_account_key_order_reading_no_priority() {
+    // AC-2. Every Priority input points elsewhere: `c` holds the smallest Priority and `b` the
+    // soonest weekly reset, so by Priority all six would go to `c`. And `a`, disabled and
+    // enabled again, rejoins the rotation order at its end: the turn follows the Account key,
+    // not the order Accounts joined in.
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = round_robin_pool(
+        tmp.path(),
+        &["a@example.com", "b@example.com", "c@example.com"],
+        &[("c@example.com", -5), ("b@example.com", 3)],
+    );
+    manager.disable("a@example.com").expect("disable");
+    manager.enable("a@example.com").expect("enable");
+    manager.record_quota("a@example.com", weekly("2026-10-28T09:00:00Z", in_days(6)));
+    manager.record_quota("b@example.com", weekly("2026-10-28T09:00:00Z", in_days(1)));
+
+    assert_eq!(manager.rotation(), RotationMode::RoundRobin);
+    assert_eq!(
+        placed(&mut manager, "new", 6),
+        [
+            "a@example.com",
+            "b@example.com",
+            "c@example.com",
+            "a@example.com",
+            "b@example.com",
+            "c@example.com"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_sticky_conversation_keeps_its_account_and_takes_no_turn() {
+    // AC-3. Turns of a conversation that holds its Account are not placements. `sticky` holds
+    // `a` and `other` took `b`, so the cursor stands on `b`; `sticky`'s next turns move
+    // nothing, and the next new conversations go to `c` and then `a`.
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = round_robin_pool(
+        tmp.path(),
+        &["a@example.com", "b@example.com", "c@example.com"],
+        &[],
+    );
+    let first = manager.account_for("sticky");
+    assert_eq!(
+        first.account.expect("an account").token.email,
+        "a@example.com"
+    );
+    let other = manager.account_for("other");
+    assert_eq!(
+        other.account.expect("an account").token.email,
+        "b@example.com"
+    );
+    for _ in 0..2 {
+        let again = manager.account_for("sticky");
+        assert_eq!(again.affinity.as_str(), "honored");
+        assert_eq!(
+            again.account.expect("an account").token.email,
+            "a@example.com"
+        );
+    }
+
+    assert_eq!(
+        placed(&mut manager, "fresh", 2),
+        ["c@example.com", "a@example.com"]
+    );
+}
+
+#[tokio::test]
+async fn the_turn_passes_over_accounts_that_cannot_serve() {
+    // AC-4. `b` is cooling, `c` is Disabled and `bb` is a record whose credential is gone
+    // (ADR-0026), so only `a` and `d` take turns, until `b` recovers and rejoins after `a`.
+    let tmp = tempdir().expect("tempdir");
+    let provider_dir = tmp.path().join("commandcode");
+    fs::create_dir_all(&provider_dir).expect("provider dir");
+    fs::write(
+        provider_dir.join("usage.json"),
+        json!({"bb@example.com": {"total_requests": 3, "total_successes": 3}}).to_string(),
+    )
+    .expect("write usage");
+    let mut manager = round_robin_pool(
+        tmp.path(),
+        &[
+            "a@example.com",
+            "b@example.com",
+            "c@example.com",
+            "d@example.com",
+        ],
+        &[],
+    );
+    manager.record_billing_cooldown("b@example.com", "insufficient credits");
+    manager.disable("c@example.com").expect("disable");
+
+    assert_eq!(
+        placed(&mut manager, "new", 4),
+        [
+            "a@example.com",
+            "d@example.com",
+            "a@example.com",
+            "d@example.com"
+        ]
+    );
+
+    manager.enable("b@example.com").expect("clear the cooldown");
+    assert_eq!(
+        placed(&mut manager, "after", 2),
+        ["a@example.com", "b@example.com"]
+    );
+}
+
+#[tokio::test]
+async fn failover_takes_the_next_turn_and_the_conversation_moves_with_it() {
+    // AC-5. `x` holds `a` and `y` holds `b`, so the cursor stands on `b`. When `a` fails,
+    // `x` is placed again by the cursor (on `c`, not on the Account after `a`), its affinity
+    // moves there, and the move is a turn: the next new conversation wraps to `a`.
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = round_robin_pool(
+        tmp.path(),
+        &["a@example.com", "b@example.com", "c@example.com"],
+        &[],
+    );
+    assert_eq!(
+        manager.account_for("x").account.expect("x").token.email,
+        "a@example.com"
+    );
+    assert_eq!(
+        manager.account_for("y").account.expect("y").token.email,
+        "b@example.com"
+    );
+
+    manager.record_failure("a@example.com", "upstream", Some("503"), None);
+    let moved = manager.account_for("x");
+    assert_eq!(moved.affinity.as_str(), "rotation");
+    assert_eq!(moved.account.expect("x again").token.email, "c@example.com");
+
+    // `a` recovers; `x` stays where Failover put it.
+    manager.record_success("a@example.com", None, "deepseek-v4.1-flash");
+    let sticky = manager.account_for("x");
+    assert_eq!(sticky.affinity.as_str(), "honored");
+    assert_eq!(
+        sticky.account.expect("x sticky").token.email,
+        "c@example.com"
+    );
+
+    assert_eq!(placed(&mut manager, "z", 1), ["a@example.com"]);
+}
+
+#[tokio::test]
+async fn a_rebuilt_pool_starts_its_turn_at_the_first_key() {
+    // AC-6. Nothing persists the cursor: a restart begins at the first Account key, wherever
+    // the last process left off.
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = round_robin_pool(
+        tmp.path(),
+        &["a@example.com", "b@example.com", "c@example.com"],
+        &[],
+    );
+    assert_eq!(
+        placed(&mut manager, "before", 2),
+        ["a@example.com", "b@example.com"]
+    );
+
+    let mut rebuilt = never_refresh_manager(tmp.path().to_path_buf());
+    rebuilt.set_rotation(RotationMode::RoundRobin);
+    rebuilt.load().expect("load");
+    assert_eq!(placed(&mut rebuilt, "after", 1), ["a@example.com"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_new_conversations_each_take_a_turn_of_their_own() {
+    // AC-6. Placements race through the Pool's lock the way requests do, and each one moves
+    // the cursor once: nine new conversations on three Accounts land three on each.
+    let tmp = tempdir().expect("tempdir");
+    let manager = Arc::new(tokio::sync::Mutex::new(round_robin_pool(
+        tmp.path(),
+        &["a@example.com", "b@example.com", "c@example.com"],
+        &[],
+    )));
+    let placements = (0..9).map(|turn| {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move {
+            manager
+                .lock()
+                .await
+                .account_for(&format!("concurrent-{turn}"))
+                .account
+                .expect("an account")
+                .token
+                .email
+        })
+    });
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for placement in placements.collect::<Vec<_>>() {
+        *counts
+            .entry(placement.await.expect("placement task"))
+            .or_default() += 1;
+    }
+
+    assert_eq!(
+        counts,
+        std::collections::BTreeMap::from([
+            ("a@example.com".to_string(), 3),
+            ("b@example.com".to_string(), 3),
+            ("c@example.com".to_string(), 3),
+        ])
+    );
 }
