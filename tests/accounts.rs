@@ -37,6 +37,7 @@ async fn since_last_refresh_refreshes_legacy_token_without_last_refresh() {
         tmp.path().to_path_buf(),
         "codex".parse().unwrap(),
         std::collections::BTreeMap::new(),
+        RotationMode::Priority,
         move |refresh_token| {
             let captured = Arc::clone(&captured);
             Box::pin(async move {
@@ -97,6 +98,7 @@ async fn exhausted_refresh_token_marks_account_for_reauth() {
         tmp.path().to_path_buf(),
         "codex".parse().unwrap(),
         std::collections::BTreeMap::new(),
+        RotationMode::Priority,
         |_refresh_token| {
             Box::pin(async move {
                 Err(RefreshTokenExhaustedError::new(
@@ -153,6 +155,7 @@ async fn failure_cooldown_doubles_from_one_second() {
         tmp.path().to_path_buf(),
         "codex".parse().unwrap(),
         std::collections::BTreeMap::new(),
+        RotationMode::Priority,
         |_refresh_token| Box::pin(async { anyhow::bail!("unused refresh") }),
         RefreshPolicy::default(),
     );
@@ -205,6 +208,7 @@ async fn a_credential_that_never_succeeded_is_parked_past_the_transient_error_ce
         tmp.path().to_path_buf(),
         "codex".parse().unwrap(),
         std::collections::BTreeMap::new(),
+        RotationMode::Priority,
         |_refresh_token| Box::pin(async { anyhow::bail!("unused refresh") }),
         RefreshPolicy::default(),
     );
@@ -597,6 +601,7 @@ fn never_refresh_manager(auth_dir: PathBuf) -> AccountManager {
         auth_dir,
         ProviderId::generic("commandcode"),
         std::collections::BTreeMap::new(),
+        RotationMode::Priority,
         |_refresh_token| {
             Box::pin(async { Err(anyhow::anyhow!("refresh must never run for static keys")) })
         },
@@ -675,6 +680,7 @@ async fn a_pool_of_one_never_earns_a_cooldown() {
         tmp.path().to_path_buf(),
         "codex".parse().unwrap(),
         std::collections::BTreeMap::new(),
+        RotationMode::Priority,
         |_refresh_token| Box::pin(async { anyhow::bail!("unused refresh") }),
         RefreshPolicy::default(),
     );
@@ -1799,6 +1805,7 @@ async fn a_pinned_account_on_cooldown_falls_through_to_rotation() {
         tmp.path().to_path_buf(),
         ProviderId::anthropic(),
         std::collections::BTreeMap::new(),
+        RotationMode::Priority,
         |_refresh_token| {
             Box::pin(
                 async move { Err(RefreshTokenExhaustedError::new("unused", None, None).into()) },
@@ -1866,6 +1873,7 @@ async fn a_conversation_that_failed_over_stays_on_the_account_that_rescued_it() 
         tmp.path().to_path_buf(),
         ProviderId::anthropic(),
         std::collections::BTreeMap::new(),
+        RotationMode::Priority,
         |_refresh_token| {
             Box::pin(
                 async move { Err(RefreshTokenExhaustedError::new("unused", None, None).into()) },
@@ -2246,6 +2254,7 @@ fn refreshing_codex_manager(auth_dir: &Path) -> AccountManager {
         auth_dir.to_path_buf(),
         "codex".parse().unwrap(),
         std::collections::BTreeMap::new(),
+        RotationMode::Priority,
         |_refresh_token| {
             Box::pin(async {
                 Ok(TokenData {
@@ -2868,9 +2877,20 @@ async fn a_retry_hint_that_outlasts_a_reauth_keeps_the_reauth_reason() {
 // Priority: the selection order inside one Pool (account-priority)
 // ---------------------------------------------------------------------------
 
-/// A loaded `commandcode` Pool holding `emails`, with `priorities` keyed by Account key.
-/// Every one of them is a static key, so no refresh callback ever runs.
+/// A loaded `commandcode` Pool holding `emails` and rotating by Priority, with `priorities`
+/// keyed by Account key.
 fn priority_pool(auth_dir: &Path, emails: &[&str], priorities: &[(&str, i64)]) -> AccountManager {
+    loaded_pool(auth_dir, emails, priorities, RotationMode::Priority)
+}
+
+/// A loaded `commandcode` Pool holding `emails`, built with `rotation` and with `priorities`
+/// keyed by Account key. Every one of them is a static key, so no refresh callback ever runs.
+fn loaded_pool(
+    auth_dir: &Path,
+    emails: &[&str],
+    priorities: &[(&str, i64)],
+    rotation: RotationMode,
+) -> AccountManager {
     for email in emails {
         save_token(auth_dir, &static_token(email)).expect("save token");
     }
@@ -2881,6 +2901,7 @@ fn priority_pool(auth_dir: &Path, emails: &[&str], priorities: &[(&str, i64)]) -
             .iter()
             .map(|(email, priority)| ((*email).to_string(), *priority))
             .collect(),
+        rotation,
         |_refresh_token| Box::pin(async { anyhow::bail!("static keys do not refresh") }),
         RefreshPolicy {
             kind: RefreshPolicyKind::Never,
@@ -3264,9 +3285,7 @@ fn round_robin_pool(
     emails: &[&str],
     priorities: &[(&str, i64)],
 ) -> AccountManager {
-    let mut manager = priority_pool(auth_dir, emails, priorities);
-    manager.set_rotation(RotationMode::RoundRobin);
-    manager
+    loaded_pool(auth_dir, emails, priorities, RotationMode::RoundRobin)
 }
 
 /// The Accounts `count` new conversations land on, each under a key no conversation of the
@@ -3445,9 +3464,11 @@ async fn a_rebuilt_pool_starts_its_turn_at_the_first_key() {
         ["a@example.com", "b@example.com"]
     );
 
-    let mut rebuilt = never_refresh_manager(tmp.path().to_path_buf());
-    rebuilt.set_rotation(RotationMode::RoundRobin);
-    rebuilt.load().expect("load");
+    let mut rebuilt = round_robin_pool(
+        tmp.path(),
+        &["a@example.com", "b@example.com", "c@example.com"],
+        &[],
+    );
     assert_eq!(placed(&mut rebuilt, "after", 1), ["a@example.com"]);
 }
 

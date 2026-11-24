@@ -680,6 +680,7 @@ fn build_account_managers(config: &Config) -> AccountManagers {
         config.auth_dir.clone(),
         ProviderId::anthropic(),
         config.priority_for("anthropic"),
+        config.rotation_for("anthropic"),
         |refresh_token| Box::pin(refresh_anthropic_tokens(refresh_token)),
         RefreshPolicy::default(),
     );
@@ -687,6 +688,7 @@ fn build_account_managers(config: &Config) -> AccountManagers {
         config.auth_dir.clone(),
         ProviderId::codex(),
         config.priority_for("codex"),
+        config.rotation_for("codex"),
         |refresh_token| Box::pin(refresh_codex_tokens(refresh_token)),
         RefreshPolicy {
             kind: RefreshPolicyKind::SinceLastRefresh,
@@ -698,15 +700,13 @@ fn build_account_managers(config: &Config) -> AccountManagers {
         config.auth_dir.clone(),
         ProviderId::grok(),
         config.priority_for("grok"),
+        config.rotation_for("grok"),
         |refresh_token| Box::pin(refresh_grok_tokens(refresh_token)),
         RefreshPolicy {
             kind: RefreshPolicyKind::ExpiresLead,
             seconds: 60 * 60,
         },
     );
-    anthropic.set_rotation(config.rotation_for("anthropic"));
-    codex.set_rotation(config.rotation_for("codex"));
-    grok.set_rotation(config.rotation_for("grok"));
     let _ = anthropic.load();
     let _ = codex.load();
     let _ = grok.load();
@@ -721,13 +721,13 @@ fn build_account_managers(config: &Config) -> AccountManagers {
             config.auth_dir.clone(),
             ProviderId::generic(id.clone()),
             config.priority_for(id),
+            config.rotation_for(id),
             |_refresh_token| Box::pin(async { anyhow::bail!("static keys do not refresh") }),
             RefreshPolicy {
                 kind: RefreshPolicyKind::Never,
                 seconds: 0,
             },
         );
-        manager.set_rotation(config.rotation_for(id));
         let _ = manager.load();
         warn_unknown_priority_accounts(id, &manager);
         generic.insert(id.clone(), tokio::sync::Mutex::new(manager));
@@ -5340,6 +5340,48 @@ mod tests {
         );
     }
 
+    /// Every Pool is built with the rotation `rotation:` sets for it, a configured Pool as well
+    /// as a built-in one, and a Pool the map leaves out rotates by Priority.
+    #[test]
+    fn each_pool_is_built_with_the_rotation_the_config_sets_for_it() {
+        use crate::config::RotationMode::{Priority, RoundRobin};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(tmp.path().to_path_buf());
+        for id in ["groq", "mistral"] {
+            config.providers.insert(
+                id.to_string(),
+                crate::config::ConfiguredProvider {
+                    base_url: format!("https://{id}.example/v1"),
+                    models: BTreeMap::new(),
+                },
+            );
+        }
+        for id in ["codex", "groq"] {
+            config.rotation.insert(id.to_string(), RoundRobin);
+        }
+
+        let managers = super::build_account_managers(&config);
+
+        let rotations: BTreeMap<String, crate::config::RotationMode> = managers
+            .pools()
+            .into_iter()
+            .map(|(provider, manager)| {
+                let rotation = manager.try_lock().expect("unshared").rotation();
+                (provider.to_string(), rotation)
+            })
+            .collect();
+        assert_eq!(
+            rotations,
+            BTreeMap::from([
+                ("anthropic".to_string(), Priority),
+                ("codex".to_string(), RoundRobin),
+                ("grok".to_string(), Priority),
+                ("groq".to_string(), RoundRobin),
+                ("mistral".to_string(), Priority),
+            ])
+        );
+    }
+
     /// The line Rotation logs is the only place that says which account a conversation
     /// landed on and why, and it had no test: a field could be renamed or dropped with
     /// nothing to notice, which is the same blindness `--version` had. The request path
@@ -5950,6 +5992,7 @@ mod tests {
             auth_dir.to_path_buf(),
             provider,
             std::collections::BTreeMap::new(),
+            crate::config::RotationMode::Priority,
             |_refresh_token| {
                 Box::pin(async {
                     bail!("unused refresh");
