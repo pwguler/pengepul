@@ -1550,7 +1550,7 @@ async fn admin_reload(State(state): State<AppState>, headers: HeaderMap) -> Resp
                 .into_response();
             }
         };
-        // `rotation:` is the one key a reload applies (round-robin-rotation AC-8).
+        // Each Pool takes the rotation the file holds now (round-robin-rotation AC-8).
         warn_unknown_rotation_providers(&state.config, &reread.rotation);
         for (provider, manager) in state.account_managers.pools() {
             manager
