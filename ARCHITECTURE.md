@@ -107,7 +107,10 @@ in files.
   unless it names a built-in canonically and carries only `allow:`, which
   narrows that built-in's models and registers nothing. `/admin/reload` reads
   the file again under the same checks (`reread_config`) and applies only its
-  `allow:` lists and `rotation:`; every other key needs a restart.
+  `allow:` lists and `rotation:`; every other key needs a restart. A refused
+  reload quotes nothing from the file to the client: a load error can quote
+  values from it, a **Local API key** among them, so the error goes to the
+  relay log.
   It also writes it: `register_provider` adds one entry for `login
   --base-url`, and refuses an id already present with a different URL
   rather than overwriting it. The write is a read-modify-write on one

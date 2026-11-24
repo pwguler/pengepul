@@ -43,9 +43,9 @@ as before: it advertises everything its Upstream lists (automatic-model-coverage
   `allow:` entries that list does not contain, so a typo is visible.
 - AC-7: `POST /admin/reload` re-reads `allow:` from the config file the relay loaded, and
   `/v1/models` and routing follow the new lists. A config that would not load refuses the
-  reload with the load error and leaves the lists in force unchanged, and so does a config
-  that drops the entry of a configured Provider still serving, whose list would otherwise go
-  with it.
+  reload and leaves the lists in force unchanged, and so does a config that drops the entry of
+  a configured Provider still serving, whose list would otherwise go with it. The response to
+  a refused reload quotes nothing from the file; the relay log carries the load error.
 - AC-8: `cargo fmt --check`, `cargo clippy --locked --all-targets --all-features -- -D
   warnings` and `cargo test --locked` pass. Tests cover AC-1 to AC-5 and AC-7, and a Provider
   without `allow:` advertising and serving as before, its `models` list included.

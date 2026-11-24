@@ -19,7 +19,7 @@ A Pool can opt into round-robin Rotation, which reads no Priority and hands each
 - AC-5: When the Account a conversation holds cannot serve, or Failover leaves it, the request goes to the next serving Account in turn, that placement takes a turn, and the conversation's affinity moves there.
 - AC-6: The turn is one per Pool and lives in memory: a rebuilt Pool starts again at the first key, and concurrent new conversations each take a turn of their own.
 - AC-7: A `priority` Pool beside a round-robin Pool hands out new conversations exactly as before.
-- AC-8: `POST /admin/reload` applies the `rotation:` that the config file the relay loaded holds now. A file that is gone, or that would be refused at load, refuses the reload with that error and changes nothing.
+- AC-8: `POST /admin/reload` applies the `rotation:` that the config file the relay loaded holds now. A file that is gone, or that would be refused at load, refuses the reload and changes nothing; the response quotes nothing from the file, and the relay log carries the error.
 - AC-9: `/admin/accounts` names each Pool's rotation. `pengepul accounts` names a round-robin Pool in its header, lists its Accounts in key order, and prints no Priority for them, in both styles; a `priority` Pool prints as before.
 - AC-10: `CONTEXT.md` defines **Round-robin**, and its Rotation, Priority and Pool entries agree with it; README documents `rotation:` with an example; rubric judges that the glossary, README and code agree.
 

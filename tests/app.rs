@@ -812,41 +812,39 @@ async fn admin_reload_rereads_the_allow_lists() {
 
     // A config that would not load is refused whole, and the lists in force stay: an empty
     // list, a setting outside `providers:`, and a running Provider whose entry is gone, which
-    // would otherwise lose its list while it still serves.
-    for (rest, reason) in [
+    // would otherwise lose its list while it still serves. The response quotes nothing from
+    // the file, so it is compared whole.
+    let unloadable = "failed to reload config: the config file does not load; see the relay log";
+    for (rest, message) in [
         (
             format!("providers:\n  anthropic:\n    allow: []\n{groq}"),
-            "anthropic.allow is empty",
+            unloadable,
         ),
         (
             format!(
                 "body-limit: lots\nproviders:\n  anthropic:\n    allow: [claude-opus-5-5]\n{groq}"
             ),
-            "body-limit",
+            unloadable,
         ),
         (
             "providers:\n  anthropic:\n    allow: [claude-opus-5-5]\n".to_string(),
-            "groq serves until a restart",
+            "failed to reload config: providers: groq serves until a restart and is gone from the \
+             config; restart to remove it",
         ),
     ] {
         write(&rest);
         let (status, body) = reload().await;
         assert_eq!(status, 500, "{body}");
-        assert!(
-            body["error"]["message"]
-                .as_str()
-                .is_some_and(|message| message.contains(reason)),
-            "{reason}: {body}"
-        );
+        assert_eq!(body["error"]["message"], message, "{rest}");
         assert_eq!(
             post_model(&app, "/v1/messages", sonnet).await.0,
             200,
-            "{reason}"
+            "{rest}"
         );
         assert_eq!(
             post_model(&app, "/v1/messages", opus).await.0,
             400,
-            "{reason}"
+            "{rest}"
         );
     }
 }
@@ -3158,10 +3156,8 @@ async fn admin_reload_applies_the_rotation_the_config_file_holds_now() {
     let (status, body) = reload().await;
     assert_eq!(status, 500, "{body}");
     assert!(
-        body["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("rotation")),
-        "the refusal does not name the key: {body}"
+        !body.to_string().contains("sideways"),
+        "the response quotes the file: {body}"
     );
     converse(&["r-5"]).await;
 
