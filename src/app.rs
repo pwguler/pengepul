@@ -1215,18 +1215,25 @@ async fn admin_accounts(
     );
     let mut pools = Vec::new();
     for (provider, manager) in state.account_managers.pools() {
-        pools.push((provider, manager.lock().await.snapshots_since(&cutoff)));
+        let manager = manager.lock().await;
+        pools.push((
+            provider,
+            manager.snapshots_since(&cutoff),
+            manager.rotation(),
+        ));
     }
     let peak = record_peak(
         &state.config.auth_dir,
         &pools
             .iter()
-            .flat_map(|(_, snapshots)| snapshots.iter().cloned())
+            .flat_map(|(_, snapshots, _)| snapshots.iter().cloned())
             .collect::<Vec<_>>(),
     );
     let providers: serde_json::Map<String, Value> = pools
         .iter()
-        .map(|(provider, snapshots)| (provider.to_string(), provider_entry(snapshots)))
+        .map(|(provider, snapshots, rotation)| {
+            (provider.to_string(), provider_entry(snapshots, *rotation))
+        })
         .collect();
 
     Json(json!({
@@ -1354,14 +1361,17 @@ fn record_peak(auth_dir: &std::path::Path, snapshots: &[Value]) -> Option<Peak> 
 /// Serializes the peak's read-compare-write across concurrent payload builds.
 static PEAK_LOCK: StdMutex<()> = StdMutex::new(());
 
-/// One provider's entry in the payload: its accounts, and how many there are.
+/// One provider's entry in the payload: its accounts, how many there are, and how the Pool
+/// hands out new conversations.
 ///
 /// The count is the list's own length rather than a separate call, because the
 /// header and the per-pool lines read the count while the view prints the list:
 /// a count that disagreed with what is listed is the disagreement the header
-/// exists to prevent (usage-after-removal).
-fn provider_entry(accounts: &[Value]) -> Value {
-    json!({"account_count": accounts.len(), "accounts": accounts})
+/// exists to prevent (usage-after-removal). The rotation sits beside the records rather than
+/// in them: a round-robin Pool's records keep their Priority pair, and this field is what
+/// says nothing reads it (round-robin-rotation AC-9).
+fn provider_entry(accounts: &[Value], rotation: RotationMode) -> Value {
+    json!({"account_count": accounts.len(), "accounts": accounts, "rotation": rotation})
 }
 
 #[derive(Clone, Copy)]

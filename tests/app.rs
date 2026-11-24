@@ -2625,6 +2625,41 @@ async fn a_round_robin_pool_hands_out_new_conversations_in_turn_beside_a_priorit
 }
 
 #[tokio::test]
+async fn admin_accounts_names_each_pools_rotation() {
+    // round-robin-rotation AC-9: the payload says which Pools ignore the Priority their
+    // records still carry, so no reader has to guess from the config.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_provider_token(tmp.path(), ProviderId::anthropic(), "alice@example.com");
+    save_provider_token(tmp.path(), ProviderId::codex(), "carol@example.com");
+    let mut cfg = config(tmp.path().to_path_buf());
+    cfg.rotation.insert(
+        "anthropic".to_string(),
+        pengepul::config::RotationMode::RoundRobin,
+    );
+    let app = create_app_with_upstream(cfg, Arc::new(FakeUpstream::default()));
+
+    let (status, body) = json_response(
+        app,
+        axum::http::Request::builder()
+            .uri("/admin/accounts")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert_eq!(body["providers"]["anthropic"]["rotation"], "round-robin");
+    assert_eq!(body["providers"]["codex"]["rotation"], "priority");
+    assert_eq!(body["providers"]["grok"]["rotation"], "priority");
+    // The records keep their Priority pair: the Pool's rotation is what says it is unread.
+    assert_eq!(
+        body["providers"]["anthropic"]["accounts"][0]["prioritySource"],
+        "default"
+    );
+}
+
+#[tokio::test]
 async fn a_failover_in_a_round_robin_pool_takes_the_next_turn_and_keeps_it() {
     // round-robin-rotation AC-5 through the attempt loop: `s-1` draws alice, who answers
     // 429, and the retry is placed by the cursor on bob, where the conversation then stays.
