@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::config::{ConfiguredModel, ConfiguredProvider};
+use crate::config::{AllowLists, ConfiguredModel, ConfiguredProvider};
 use crate::types::{ProviderId, ProviderKind};
 
 /// What a model costs, in USD per million tokens. Every field is optional: an upstream
@@ -586,6 +586,9 @@ pub struct ModelCatalog {
     /// configured provider id -> the model ids its `/v1/models` returned. Only
     /// advertised; bare ids never route to generic providers (prefix-only).
     generic: BTreeMap<String, Vec<GenericModel>>,
+    /// The operator's `allow:` lists. The lists above stay whole, so a bare id still resolves
+    /// to the Provider that lists it and is refused by name rather than as unknown.
+    allow: AllowLists,
 }
 
 impl ModelCatalog {
@@ -609,6 +612,43 @@ impl ModelCatalog {
             })
             .collect();
         self.generic.insert(provider_id.to_string(), entries);
+    }
+
+    /// Replace every Provider's allow list.
+    pub fn set_allow(&mut self, allow: AllowLists) {
+        self.allow = allow;
+    }
+
+    /// Whether `provider` may advertise and serve `model`, its id without the `<provider>/`
+    /// prefix. A Provider with no allow list may serve any model.
+    #[must_use]
+    pub fn allows(&self, provider: &ProviderId, model: &str) -> bool {
+        self.allow
+            .get(provider.id.as_ref())
+            .is_none_or(|allowed| allowed.contains(model))
+    }
+
+    /// The entries of `provider`'s allow list that its last fetched list does not contain.
+    #[must_use]
+    pub fn unmatched_allow(&self, provider: &ProviderId) -> Vec<&str> {
+        let Some(allowed) = self.allow.get(provider.id.as_ref()) else {
+            return Vec::new();
+        };
+        let listed = |model: &str| match provider.kind {
+            ProviderKind::Generic => self
+                .generic
+                .get(provider.id.as_ref())
+                .is_some_and(|models| models.iter().any(|listed| listed.id == model)),
+            kind => self
+                .direct
+                .get(model)
+                .is_some_and(|listed| listed.kind == kind),
+        };
+        allowed
+            .iter()
+            .map(String::as_str)
+            .filter(|model| !listed(model))
+            .collect()
     }
 
     /// Resolve a request's model id to the provider that should serve it, or `None` when no
@@ -661,6 +701,9 @@ impl ModelCatalog {
                 });
             }
         }
+        out.retain(|model| {
+            self.allows(&model.provider, upstream_model(&model.id, &model.provider))
+        });
         out
     }
 }
@@ -1448,6 +1491,106 @@ mod tests {
                 .iter()
                 .any(|m| m.id == "codex/gpt-5.5" && m.provider == ProviderId::codex())
         );
+    }
+
+    /// A catalog holding three Providers' fetched lists, with allow lists on two of them.
+    fn allowlisted_catalog() -> ModelCatalog {
+        let mut catalog = ModelCatalog::default();
+        catalog.set_direct(
+            ProviderKind::Anthropic,
+            FetchedModels::new(vec![
+                "claude-opus-5-5".into(),
+                "claude-sonnet-5-5".into(),
+                "claude-haiku-5".into(),
+            ]),
+        );
+        catalog.set_direct(
+            ProviderKind::Codex,
+            FetchedModels::new(vec!["gpt-5.5".into(), "gpt-5.4".into()]),
+        );
+        catalog.set_generic(
+            "commandcode",
+            FetchedModels::new(vec![
+                "deepseek/deepseek-v4.1-flash".into(),
+                "kimi-k3".into(),
+            ]),
+        );
+        catalog.set_allow(BTreeMap::from([
+            (
+                "anthropic".to_string(),
+                ["claude-opus-5-5", "claude-opus-9"]
+                    .map(String::from)
+                    .into(),
+            ),
+            (
+                "commandcode".to_string(),
+                ["deepseek/deepseek-v4.1-flash"].map(String::from).into(),
+            ),
+        ]));
+        catalog
+    }
+
+    #[test]
+    fn an_allow_list_narrows_what_its_provider_advertises_and_no_other() {
+        let mut ids = allowlisted_catalog()
+            .advertised()
+            .into_iter()
+            .map(|model| model.id)
+            .collect::<Vec<_>>();
+        ids.sort();
+
+        // claude-opus-9 is allowed but not listed upstream, so it is not advertised; codex has
+        // no allow list and advertises its whole list.
+        assert_eq!(
+            ids,
+            [
+                "anthropic/claude-opus-5-5",
+                "codex/gpt-5.4",
+                "codex/gpt-5.5",
+                "commandcode/deepseek/deepseek-v4.1-flash",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_allow_list_matches_the_native_id_exactly() {
+        let catalog = allowlisted_catalog();
+        let commandcode = ProviderId::generic("commandcode");
+
+        assert!(catalog.allows(&ProviderId::anthropic(), "claude-opus-5-5"));
+        assert!(catalog.allows(&commandcode, "deepseek/deepseek-v4.1-flash"));
+        for refused in [
+            "claude-sonnet-5-5",
+            "anthropic/claude-opus-5-5",
+            "Claude-Opus-5-5",
+            "claude-opus-5",
+            "claude-opus-5-5 ",
+        ] {
+            assert!(
+                !catalog.allows(&ProviderId::anthropic(), refused),
+                "{refused} was allowed"
+            );
+        }
+        assert!(!catalog.allows(&commandcode, "deepseek-v4.1-flash"));
+        // No allow list: anything the Provider is asked for, listed or not.
+        assert!(catalog.allows(&ProviderId::codex(), "gpt-5.5"));
+        assert!(catalog.allows(&ProviderId::codex(), "gpt-7"));
+    }
+
+    #[test]
+    fn unmatched_entries_are_the_allowed_ids_the_upstream_does_not_list() {
+        let catalog = allowlisted_catalog();
+
+        assert_eq!(
+            catalog.unmatched_allow(&ProviderId::anthropic()),
+            ["claude-opus-9"]
+        );
+        assert!(
+            catalog
+                .unmatched_allow(&ProviderId::generic("commandcode"))
+                .is_empty()
+        );
+        assert!(catalog.unmatched_allow(&ProviderId::codex()).is_empty());
     }
 
     #[test]
