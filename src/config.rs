@@ -87,6 +87,9 @@ pub struct Config {
     /// preferred; an Account left out takes [`DEFAULT_PRIORITY`].
     pub priority: BTreeMap<String, BTreeMap<String, i64>>,
     pub allow: AllowLists,
+    /// The file this config was loaded from, which `/admin/reload` reads `allow:` from
+    /// again. `None` for a config built in code.
+    pub path: Option<PathBuf>,
 }
 
 /// The models each Provider may advertise and serve, keyed by Provider id and matched exactly
@@ -403,14 +406,7 @@ pub fn load_config(
         .context("HOME is not set")?;
     let (read_path, write_path) = config_paths(config_path, Some(&home), cwd);
     let mut raw = if read_path.exists() {
-        let text = fs::read_to_string(&read_path)
-            .with_context(|| format!("failed to read {}", read_path.display()))?;
-        if text.trim().is_empty() {
-            RawConfig::default()
-        } else {
-            serde_yaml::from_str::<RawConfig>(&text)
-                .with_context(|| format!("invalid config {}", read_path.display()))?
-        }
+        read_raw(&read_path)?
     } else {
         RawConfig::default()
     };
@@ -458,7 +454,29 @@ pub fn load_config(
         },
         priority: raw.priority,
         allow,
+        path: Some(write_path),
     })
+}
+
+/// Read the `allow:` lists from the config file at `path` again, under every check
+/// `load_config` applies to the `providers:` section.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read or parsed, or when its `providers:` section
+/// would be refused at load.
+pub fn load_allow(path: &Path) -> Result<AllowLists> {
+    let (_, allow) = validate_providers(&read_raw(path)?.providers)?;
+    Ok(allow)
+}
+
+fn read_raw(path: &Path) -> Result<RawConfig> {
+    let text =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if text.trim().is_empty() {
+        return Ok(RawConfig::default());
+    }
+    serde_yaml::from_str(&text).with_context(|| format!("invalid config {}", path.display()))
 }
 
 /// Exclusive ownership of a config file for the length of a

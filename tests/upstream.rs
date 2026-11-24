@@ -47,6 +47,7 @@ fn config() -> Config {
         },
         priority: BTreeMap::default(),
         allow: BTreeMap::default(),
+        path: None,
     }
 }
 

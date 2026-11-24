@@ -602,6 +602,8 @@ pub fn create_app_with_upstream(config: Config, upstream: Arc<dyn UpstreamClient
         .flatten()
         .collect();
     record_peak(&config.auth_dir, &snapshots);
+    let mut catalog = ModelCatalog::default();
+    catalog.set_allow(config.allow.clone());
     let config = Arc::new(config);
     let cloaking = Arc::new(StdRwLock::new(Cloaking::new(
         &config,
@@ -614,7 +616,7 @@ pub fn create_app_with_upstream(config: Config, upstream: Arc<dyn UpstreamClient
         upstream,
         account_managers: Arc::new(account_managers),
         rate_limit_buckets: Arc::new(StdMutex::new(BTreeMap::new())),
-        catalog: Arc::new(StdRwLock::new(ModelCatalog::default())),
+        catalog: Arc::new(StdRwLock::new(catalog)),
         threads: Arc::new(crate::threads::ThreadLedger::default()),
         started_at: Instant::now(),
     };
@@ -1088,11 +1090,9 @@ async fn refresh_model_catalog(state: &AppState) {
             .await
         {
             Ok(FetchedModels { ids, metadata }) => {
-                state
-                    .catalog
-                    .write()
-                    .expect("catalog lock poisoned")
-                    .set_direct(kind, FetchedModels::with_metadata(ids, metadata));
+                let mut catalog = state.catalog.write().expect("catalog lock poisoned");
+                catalog.set_direct(kind, FetchedModels::with_metadata(ids, metadata));
+                warn_unmatched_allow(&catalog, &ProviderId::for_kind(kind));
             }
             Err(error) => {
                 tracing::warn!(
@@ -1115,16 +1115,27 @@ async fn refresh_model_catalog(state: &AppState) {
             .await
         {
             Ok(FetchedModels { ids, metadata }) => {
-                state
-                    .catalog
-                    .write()
-                    .expect("catalog lock poisoned")
-                    .set_generic(provider_id, FetchedModels::with_metadata(ids, metadata));
+                let mut catalog = state.catalog.write().expect("catalog lock poisoned");
+                catalog.set_generic(provider_id, FetchedModels::with_metadata(ids, metadata));
+                warn_unmatched_allow(&catalog, &provider);
             }
             Err(error) => {
                 tracing::warn!(provider = provider_id, ?error, "model list fetch failed");
             }
         }
+    }
+}
+
+/// An allow-list entry the Upstream does not list is never advertised, so a typo would
+/// otherwise show only as a model that is missing.
+fn warn_unmatched_allow(catalog: &ModelCatalog, provider: &ProviderId) {
+    let unmatched = catalog.unmatched_allow(provider);
+    if !unmatched.is_empty() {
+        tracing::warn!(
+            provider = %provider,
+            ?unmatched,
+            "allow entries name no model the upstream lists"
+        );
     }
 }
 
@@ -1510,6 +1521,24 @@ async fn admin_reload(State(state): State<AppState>, headers: HeaderMap) -> Resp
         return error.into_response();
     }
 
+    // First, so a config that no longer loads refuses the reload before anything changes.
+    if let Some(path) = &state.config.path {
+        match crate::config::load_allow(path) {
+            Ok(allow) => state
+                .catalog
+                .write()
+                .expect("catalog lock poisoned")
+                .set_allow(allow),
+            Err(error) => {
+                return AppError::simple(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to reload config: {error:#}"),
+                )
+                .into_response();
+            }
+        }
+    }
+
     // Every pool is reloaded here, built-ins included. A hand-written list of
     // providers is what let grok's fresh login be silently ignored: the token
     // file was replaced, reload reported nothing, and the relay kept serving
@@ -1644,19 +1673,10 @@ async fn count_tokens(State(state): State<AppState>, headers: HeaderMap, body: B
     let Some(model_id) = required_model(&body) else {
         return AppError::simple(StatusCode::BAD_REQUEST, "model is required").into_response();
     };
-    let Some(provider) = state
-        .catalog
-        .read()
-        .expect("catalog lock poisoned")
-        .resolve_id(model_id, &state.config.providers)
-    else {
-        return AppError::simple(
-            StatusCode::BAD_REQUEST,
-            format!("unknown model: {model_id}"),
-        )
-        .into_response();
+    let (provider, model) = match resolve_model(&state, model_id) {
+        Ok(resolved) => resolved,
+        Err(error) => return error.into_response(),
     };
-    let model = upstream_model(model_id, &provider).to_string();
     if provider.kind != ProviderKind::Anthropic {
         return AppError::provider(
             StatusCode::NOT_IMPLEMENTED,
@@ -1725,6 +1745,30 @@ fn parse_request(state: &AppState, headers: &HeaderMap, body: &[u8]) -> Result<V
         .map_err(|_| AppError::simple(StatusCode::BAD_REQUEST, "invalid JSON body"))
 }
 
+/// The Provider a client's model id resolves to and the id that Provider is asked for, or the
+/// 400 that refuses it: an id nobody claims, or one outside its Provider's allow list.
+fn resolve_model(state: &AppState, model_id: &str) -> Result<(ProviderId, String), AppError> {
+    let catalog = state.catalog.read().expect("catalog lock poisoned");
+    let provider = catalog
+        .resolve_id(model_id, &state.config.providers)
+        .ok_or_else(|| {
+            AppError::simple(
+                StatusCode::BAD_REQUEST,
+                format!("unknown model: {model_id}"),
+            )
+        })?;
+    let model = upstream_model(model_id, &provider);
+    if !catalog.allows(&provider, model) {
+        return Err(AppError::provider(
+            StatusCode::BAD_REQUEST,
+            format!("model not allowed: {model_id} ({model} is not in the {provider} allow list)"),
+            "model_not_allowed",
+            provider,
+        ));
+    }
+    Ok((provider, model.to_string()))
+}
+
 /// The parts of a client request routing needs: the provider its model
 /// resolves to, the id the upstream is asked for, whether the client wants a
 /// stream, and the conversation it belongs to.
@@ -1750,19 +1794,9 @@ fn resolve_route_request(
             "model is required",
         ));
     };
-    let provider = state
-        .catalog
-        .read()
-        .expect("catalog lock poisoned")
-        .resolve_id(model_id, &state.config.providers)
-        .ok_or_else(|| {
-            AppError::simple(
-                StatusCode::BAD_REQUEST,
-                format!("unknown model: {model_id}"),
-            )
-        })?;
+    let (provider, model) = resolve_model(state, model_id)?;
     Ok(ResolvedRequest {
-        model: upstream_model(model_id, &provider).to_string(),
+        model,
         client_wants_stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
         conversation: conversation_key(headers, body, route),
         provider,
@@ -5784,6 +5818,7 @@ mod tests {
             },
             priority: BTreeMap::default(),
             allow: BTreeMap::default(),
+            path: None,
         }
     }
 
