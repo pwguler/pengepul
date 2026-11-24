@@ -105,7 +105,8 @@ in files.
   stops the relay at load, since the built-in Pool's prefix would shadow it,
   unless it names a built-in canonically and carries only `allow:`, which
   narrows that built-in's models and registers nothing. `/admin/reload` reads
-  the `allow:` lists again (`load_allow`); every other key needs a restart.
+  the file again under the same checks (`reread_config`) and applies only its
+  `allow:` lists; every other key needs a restart.
   It also writes it: `register_provider` adds one entry for `login
   --base-url`, and refuses an id already present with a different URL
   rather than overwriting it. The write is a read-modify-write on one

@@ -431,11 +431,16 @@ fn a_built_in_entry_that_states_more_than_an_allow_list_is_refused() {
 
 /// An empty list would advertise and serve nothing of the Provider while it still looks
 /// configured, so it is refused rather than read as "allow everything" or "allow nothing".
+/// An `allow:` whose entries are all commented out is the same empty list.
 #[test]
 fn an_empty_allow_list_is_refused_at_load() {
     for entry in [
         "commandcode:\n    base-url: https://api.commandcode.ai/v1\n    allow: []\n",
+        "commandcode:\n    base-url: https://api.commandcode.ai/v1\n    allow:\n      # - deepseek/deepseek-v4.1-flash\n",
+        "commandcode:\n    base-url: https://api.commandcode.ai/v1\n    allow: ~\n",
         "anthropic:\n    allow: []\n",
+        "anthropic:\n    allow:\n",
+        "anthropic:\n    allow: null\n",
     ] {
         let (_tmp, home, config_path) =
             write_config_with(&format!("api-keys:\n  - sk-local\nproviders:\n  {entry}"));

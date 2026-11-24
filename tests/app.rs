@@ -674,8 +674,8 @@ async fn a_model_outside_its_providers_allow_list_is_refused_on_every_route() {
             "claude-sonnet-5-5",
             "anthropic",
         ),
-        // bare, resolved by the prefix heuristic
-        ("claude-sonnet-5-5", "claude-sonnet-5-5", "anthropic"),
+        // bare, listed nowhere, resolved by the prefix heuristic
+        ("claude-haiku-9", "claude-haiku-9", "anthropic"),
         // bare, resolved by the fetched list
         ("mythos-preview", "mythos-preview", "anthropic"),
         ("groq/llama-3.1-8b", "llama-3.1-8b", "groq"),
@@ -768,17 +768,20 @@ async fn admin_reload_rereads_the_allow_lists() {
     let tmp = tempfile::tempdir().expect("tempdir");
     save_provider_token(tmp.path(), ProviderId::anthropic(), "alice@example.com");
     let config_path = tmp.path().join("config.yaml");
-    let write = |allow: &str| {
+    let write = |rest: &str| {
         std::fs::write(
             &config_path,
             format!(
-                "auth-dir: {}\napi-keys: [sk-test]\nquota:\n  poll: false\nproviders:\n  anthropic:\n    allow: {allow}\n",
+                "auth-dir: {}\napi-keys: [sk-test]\nquota:\n  poll: false\n{rest}",
                 tmp.path().display()
             ),
         )
         .expect("write config");
     };
-    write("[claude-opus-5-5]");
+    let groq = "  groq:\n    base-url: https://api.groq.com/openai/v1\n";
+    write(&format!(
+        "providers:\n  anthropic:\n    allow: [claude-opus-5-5]\n{groq}"
+    ));
     let config = load_config(Some(&config_path), Some(tmp.path()), tmp.path()).expect("load");
     let app = create_app_with_upstream(config, listing_anthropic_and_codex());
     let reload = || async {
@@ -794,33 +797,152 @@ async fn admin_reload_rereads_the_allow_lists() {
         .await
     };
     let sonnet = "anthropic/claude-sonnet-5-5";
+    let opus = "anthropic/claude-opus-5-5";
     assert_eq!(post_model(&app, "/v1/messages", sonnet).await.0, 400);
 
-    write("[claude-sonnet-5-5]");
+    write(&format!(
+        "providers:\n  anthropic:\n    allow: [claude-sonnet-5-5]\n{groq}"
+    ));
     assert_eq!(reload().await.0, 200);
 
     assert_eq!(post_model(&app, "/v1/messages", sonnet).await.0, 200);
-    let opus = "anthropic/claude-opus-5-5";
     assert_eq!(post_model(&app, "/v1/messages", opus).await.0, 400);
-    assert!(
-        !advertised_once(&app, "anthropic/claude-sonnet-5-5")
+    assert_eq!(advertised_once(&app, sonnet).await, [sonnet]);
+
+    // A config that would not load is refused whole, and the lists in force stay: an empty
+    // list, a setting outside `providers:`, and a running Provider whose entry is gone, which
+    // would otherwise lose its list while it still serves.
+    for (rest, reason) in [
+        (
+            format!("providers:\n  anthropic:\n    allow: []\n{groq}"),
+            "anthropic.allow is empty",
+        ),
+        (
+            format!(
+                "body-limit: lots\nproviders:\n  anthropic:\n    allow: [claude-opus-5-5]\n{groq}"
+            ),
+            "body-limit",
+        ),
+        (
+            "providers:\n  anthropic:\n    allow: [claude-opus-5-5]\n".to_string(),
+            "groq serves until a restart",
+        ),
+    ] {
+        write(&rest);
+        let (status, body) = reload().await;
+        assert_eq!(status, 500, "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(reason)),
+            "{reason}: {body}"
+        );
+        assert_eq!(
+            post_model(&app, "/v1/messages", sonnet).await.0,
+            200,
+            "{reason}"
+        );
+        assert_eq!(
+            post_model(&app, "/v1/messages", opus).await.0,
+            400,
+            "{reason}"
+        );
+    }
+}
+
+/// A gateway can serve a Chat body's `models` as fallbacks when `model` fails (openrouter
+/// does), and a configured Provider's body travels as the client wrote it: a fallback is a
+/// model the request names.
+#[tokio::test]
+async fn a_fallback_list_must_name_allowed_models_only() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &groq_key_token()).expect("save groq key");
+    let upstream = Arc::new(GenericUpstream::default());
+    let app = create_app_with_upstream(
+        allowing(
+            config_with_groq(tmp.path().to_path_buf()),
+            "groq",
+            &["llama-3.3-70b"],
+        ),
+        upstream.clone(),
+    );
+    let chat = |models: Value| {
+        let app = app.clone();
+        async move {
+            json_response(
+                app,
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer sk-test")
+                    .header("content-type", "application/json")
+                    .header("content-length", "256")
+                    .body(Body::from(
+                        json!({
+                            "model": "groq/llama-3.3-70b",
+                            "models": models,
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
             .await
-            .iter()
-            .any(|id| id == opus)
+        }
+    };
+
+    for models in [
+        json!(["llama-3.1-8b"]),
+        json!(["llama-3.3-70b", 7]),
+        json!("llama-3.1-8b"),
+    ] {
+        let (status, body) = chat(models.clone()).await;
+        assert_eq!(status, 400, "{models}: {body}");
+        assert_eq!(body["error"]["type"], "model_not_allowed", "{models}");
+    }
+    assert!(
+        upstream.calls().is_empty(),
+        "a refused fallback reached the upstream"
     );
 
-    // A config that no longer loads is refused, and the lists in force stay.
-    write("[]");
-    let (status, body) = reload().await;
-    assert_eq!(status, 500, "{body}");
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("anthropic.allow is empty")),
-        "{body}"
+    let (status, body) = chat(json!(["llama-3.3-70b"])).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(upstream.calls()[0].body["models"], json!(["llama-3.3-70b"]));
+}
+
+#[tokio::test]
+async fn a_fallback_list_on_a_provider_without_an_allow_list_travels_as_before() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &groq_key_token()).expect("save groq key");
+    let upstream = Arc::new(GenericUpstream::default());
+    let app =
+        create_app_with_upstream(config_with_groq(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, body) = json_response(
+        app,
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", "256")
+            .body(Body::from(
+                json!({
+                    "model": "groq/llama-3.3-70b",
+                    "models": ["anything-at-all", 7],
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        upstream.calls()[0].body["models"],
+        json!(["anything-at-all", 7])
     );
-    assert_eq!(post_model(&app, "/v1/messages", sonnet).await.0, 200);
-    assert_eq!(post_model(&app, "/v1/messages", opus).await.0, 400);
 }
 
 #[tokio::test]

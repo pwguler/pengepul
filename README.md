@@ -116,8 +116,9 @@ list is not advertised, and an unknown field or a zero limit stops the relay at 
 
 A provider's `allow:` narrows it to the models it names. `/v1/models` advertises only the
 named models its upstream lists, and a request for any other model of that provider,
-prefixed or bare, answers 400 `model_not_allowed` before any account is used. A provider
-without `allow:` serves every model its upstream lists. An entry is a model id exactly as
+prefixed or bare, answers 400 `model_not_allowed` before any account is used. So does a
+Chat request whose `models` fallback list (OpenRouter's) names one. A provider without
+`allow:` serves every model its upstream lists. An entry is a model id exactly as
 the provider lists it, without the `<provider>/` prefix; there are no wildcards. A built-in
 takes an entry of its own that carries only `allow:`:
 
@@ -133,9 +134,11 @@ providers:
 ```
 
 An entry the upstream does not list is not advertised, and every model-list refresh logs it
-as a warning, so a typo shows. `allow: []` stops the relay at load, since it would serve
-none of the provider's models. `pengepul accounts --reload` reads the lists again without a
-restart; a config that no longer loads is refused there, and the lists in force stay.
+as a warning, so a typo shows. An empty `allow:`, including one whose entries are all
+commented out, stops the relay at load, since it would serve none of the provider's models.
+`pengepul accounts --reload` reads the lists again without a restart. A config that would not
+load is refused there and the lists in force stay, as is one that drops a running provider's
+entry: removing a provider still takes a restart.
 
 Login opens a browser and finishes on a localhost callback. On a remote host, forward the
 port first:

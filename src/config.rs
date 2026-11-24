@@ -197,8 +197,23 @@ struct RawConfiguredProvider {
     base_url: String,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     models: BTreeMap<String, ConfiguredModel>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    // `deserialize_with` runs only for a key that is present, so an `allow:` whose entries are
+    // all commented out (a YAML null) is the empty list `validate_providers` refuses, never
+    // the absent key that serves every model.
+    #[serde(
+        default,
+        deserialize_with = "present_list",
+        skip_serializing_if = "Option::is_none"
+    )]
     allow: Option<Vec<String>>,
+}
+
+fn present_list<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error> {
+    Ok(Some(
+        Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default(),
+    ))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -423,12 +438,29 @@ pub fn load_config(
         write_config(&write_path, &raw, true)?;
     }
 
-    let (providers, allow) = validate_providers(&raw.providers)?;
+    config_from_raw(raw, &home, write_path)
+}
 
+/// Read the config file the relay loaded again, for `/admin/reload`: every check `load_config`
+/// applies, and nothing written. A `~` in `auth-dir` expands against `HOME` as it is now.
+///
+/// # Errors
+///
+/// Returns an error when `HOME` is not set, or when the file cannot be read or would be
+/// refused at load.
+pub fn reread_config(path: &Path) -> Result<Config> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is not set")?;
+    config_from_raw(read_raw(path)?, &home, path.to_path_buf())
+}
+
+fn config_from_raw(raw: RawConfig, home: &Path, path: PathBuf) -> Result<Config> {
+    let (providers, allow) = validate_providers(&raw.providers)?;
     Ok(Config {
         host: raw.host,
         port: raw.port,
-        auth_dir: resolve_auth_dir(&raw.auth_dir, &home),
+        auth_dir: resolve_auth_dir(&raw.auth_dir, home),
         api_keys: raw.api_keys.into_iter().collect(),
         body_limit: parse_body_limit(&raw.body_limit)
             .with_context(|| format!("body-limit: {:?}", raw.body_limit))?,
@@ -454,20 +486,8 @@ pub fn load_config(
         },
         priority: raw.priority,
         allow,
-        path: Some(write_path),
+        path: Some(path),
     })
-}
-
-/// Read the `allow:` lists from the config file at `path` again, under every check
-/// `load_config` applies to the `providers:` section.
-///
-/// # Errors
-///
-/// Returns an error when the file cannot be read or parsed, or when its `providers:` section
-/// would be refused at load.
-pub fn load_allow(path: &Path) -> Result<AllowLists> {
-    let (_, allow) = validate_providers(&read_raw(path)?.providers)?;
-    Ok(allow)
 }
 
 fn read_raw(path: &Path) -> Result<RawConfig> {

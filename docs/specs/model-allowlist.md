@@ -23,7 +23,8 @@ as before: it advertises everything its Upstream lists (automatic-model-coverage
   An alias of a built-in (`claude`) is refused as before. `login` and `register_provider`
   keep refusing every built-in name.
 - AC-2: `allow: []` is refused at load, with an error that says an empty list would serve
-  none of the Provider's models.
+  none of the Provider's models. An `allow:` with no entries (all commented out, or `~`) is
+  the same empty list.
 - AC-3: `/v1/models` advertises, for a Provider with `allow:`, only the ids in both its
   fetched list and its `allow:`; a Provider without `allow:` advertises its whole fetched list.
 - AC-4: An entry matches a model when it equals the model's id without the `<provider>/`
@@ -34,15 +35,20 @@ as before: it advertises everything its Upstream lists (automatic-model-coverage
   is chosen, so no Account is charged and nothing is counted. This holds for an explicit
   `<provider>/<model>` id and for a bare id that resolves by a fetched list or by the prefix
   heuristic, on every route that resolves a model: `/v1/chat/completions`, `/v1/responses`,
-  `/v1/messages` and `/v1/messages/count_tokens`. An allowed model is served as before.
+  `/v1/messages` and `/v1/messages/count_tokens`. An allowed model is served as before. A
+  body's `models` list, which OpenRouter serves as fallbacks when `model` fails, names models
+  too: on a Provider with `allow:` every entry must be on the list, or the request answers
+  the same 400.
 - AC-6: Each catalog refresh that fetches a Provider's list logs one warning naming the
   `allow:` entries that list does not contain, so a typo is visible.
 - AC-7: `POST /admin/reload` re-reads `allow:` from the config file the relay loaded, and
-  `/v1/models` and routing follow the new lists. A config that no longer loads refuses the
-  reload with the load error and leaves the lists in force unchanged.
+  `/v1/models` and routing follow the new lists. A config that would not load refuses the
+  reload with the load error and leaves the lists in force unchanged, and so does a config
+  that drops the entry of a configured Provider still serving, whose list would otherwise go
+  with it.
 - AC-8: `cargo fmt --check`, `cargo clippy --locked --all-targets --all-features -- -D
   warnings` and `cargo test --locked` pass. Tests cover AC-1 to AC-5 and AC-7, and a Provider
-  without `allow:` advertising and serving as before.
+  without `allow:` advertising and serving as before, its `models` list included.
 
 ## Verification
 ```sh

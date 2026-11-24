@@ -1523,20 +1523,27 @@ async fn admin_reload(State(state): State<AppState>, headers: HeaderMap) -> Resp
 
     // First, so a config that no longer loads refuses the reload before anything changes.
     if let Some(path) = &state.config.path {
-        match crate::config::load_allow(path) {
-            Ok(allow) => state
-                .catalog
-                .write()
-                .expect("catalog lock poisoned")
-                .set_allow(allow),
-            Err(error) => {
-                return AppError::simple(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to reload config: {error:#}"),
-                )
-                .into_response();
-            }
+        let reread = match crate::config::reread_config(path) {
+            Ok(reread) => reread,
+            Err(error) => return config_reload_refused(&format!("{error:#}")),
+        };
+        // A configured Provider serves until a restart, so its allow list cannot leave with
+        // its entry.
+        if let Some(gone) = state
+            .config
+            .providers
+            .keys()
+            .find(|id| !reread.providers.contains_key(*id))
+        {
+            return config_reload_refused(&format!(
+                "providers: {gone} serves until a restart and is gone from the config; restart to remove it"
+            ));
         }
+        state
+            .catalog
+            .write()
+            .expect("catalog lock poisoned")
+            .set_allow(reread.allow);
     }
 
     // Every pool is reloaded here, built-ins included. A hand-written list of
@@ -1585,6 +1592,14 @@ async fn admin_reload(State(state): State<AppState>, headers: HeaderMap) -> Resp
     tokio::spawn(async move { refresh_model_catalog(&refresh_state).await });
 
     Json(json!({"reloaded": reloaded, "generated_at": now_iso()})).into_response()
+}
+
+fn config_reload_refused(reason: &str) -> Response {
+    AppError::simple(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("failed to reload config: {reason}"),
+    )
+    .into_response()
 }
 
 async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1759,14 +1774,44 @@ fn resolve_model(state: &AppState, model_id: &str) -> Result<(ProviderId, String
         })?;
     let model = upstream_model(model_id, &provider);
     if !catalog.allows(&provider, model) {
-        return Err(AppError::provider(
-            StatusCode::BAD_REQUEST,
-            format!("model not allowed: {model_id} ({model} is not in the {provider} allow list)"),
-            "model_not_allowed",
-            provider,
-        ));
+        return Err(model_not_allowed(model_id, model, provider));
     }
     Ok((provider, model.to_string()))
+}
+
+/// A gateway can serve a body's `models` as fallbacks when `model` fails (openrouter does), and
+/// a configured Provider's Chat body travels as the client wrote it, so each entry must be
+/// allowed too.
+fn check_fallback_models(
+    state: &AppState,
+    provider: &ProviderId,
+    body: &Value,
+) -> Result<(), AppError> {
+    let Some(models) = body.get("models").filter(|models| !models.is_null()) else {
+        return Ok(());
+    };
+    let catalog = state.catalog.read().expect("catalog lock poisoned");
+    let entries = models
+        .as_array()
+        .map_or_else(|| vec![models], |entries| entries.iter().collect());
+    for entry in entries {
+        let name = entry
+            .as_str()
+            .map_or_else(|| entry.to_string(), str::to_string);
+        if !catalog.allows(provider, &name) {
+            return Err(model_not_allowed(&name, &name, provider.clone()));
+        }
+    }
+    Ok(())
+}
+
+fn model_not_allowed(model_id: &str, model: &str, provider: ProviderId) -> AppError {
+    AppError::provider(
+        StatusCode::BAD_REQUEST,
+        format!("model not allowed: {model_id} ({model} is not in the {provider} allow list)"),
+        "model_not_allowed",
+        provider,
+    )
 }
 
 /// The parts of a client request routing needs: the provider its model
@@ -1795,6 +1840,7 @@ fn resolve_route_request(
         ));
     };
     let (provider, model) = resolve_model(state, model_id)?;
+    check_fallback_models(state, &provider, body)?;
     Ok(ResolvedRequest {
         model,
         client_wants_stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
