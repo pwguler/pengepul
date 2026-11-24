@@ -31,7 +31,7 @@ only, so a restart starts at the first key. `/admin/reload` re-reads `rotation:`
   conversation re-bills the prefix that its last Account cached.
 - **Weights or shares.** Rejected for the reason ADR-0031 gives: the request is an even spread,
   and a share is a second number to keep in step with the first.
-- **Persist the cursor.** Rejected: one restart skews the spread by at most one conversation
+- **Persist the turn.** Rejected: one restart skews the spread by at most one conversation
   per Account, and a fresh start at the first key is the deterministic answer ADR-0031 wanted
   from a relay that has just started.
 - **One switch for the whole relay.** Rejected: Priority is already per Pool, and one Pool's
@@ -45,10 +45,17 @@ only, so a restart starts at the first key. `/admin/reload` re-reads `rotation:`
 - The turn is a key, not an index, so a reload that adds an Account or a `disable` that removes
   one does not shift it. The last placement is recorded in both modes, so a Pool switched to
   round-robin continues after the Account that the Priority order placed last.
-- `/admin/reload` re-reads `rotation:` from the file the relay loaded. A file that no longer
-  parses refuses the reload and changes nothing. `priority:` still needs a restart (ADR-0031).
+- `/admin/reload` re-reads `rotation:` from the file the relay loaded. A file that is gone, or
+  that would be refused at load, refuses the reload and changes nothing. `priority:` still needs
+  a restart (ADR-0031).
+- **A restart, or the affinity map's wholesale flush at 1024 conversations (ADR-0017), re-deals
+  a round-robin Pool's running conversations.** The relay forgets which Account each one used,
+  so its next turn is placed like a new conversation's: with k serving Accounts, about (k-1)/k
+  of them land on another Account and pay one cold read. By Priority the same miss falls on the
+  preferred Account, where most of them already were, so ADR-0017's price of one cold read per
+  conversation is paid in full only by an opted-in Pool. The bound and its flush are unchanged.
 - `priority:` stays valid for a round-robin Pool and is not read. The admin payload names each
-  Pool's rotation, and `pengepul accounts` lists a round-robin Pool's Accounts in turn order
-  with no Priority beside them, so no number that decides nothing is printed.
+  Pool's rotation, and `pengepul accounts` lists a round-robin Pool's Accounts in Account-key
+  order with no Priority beside them, so no number that decides nothing is printed.
 - `rotation:` is a forward-only key, like `priority:`: a build older than this change refuses
   a config that carries it.
