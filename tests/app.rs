@@ -297,6 +297,7 @@ fn config(auth_dir: PathBuf) -> Config {
             poll_minutes: 15,
         },
         priority: BTreeMap::default(),
+        allow: BTreeMap::default(),
     }
 }
 

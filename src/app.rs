@@ -5783,6 +5783,7 @@ mod tests {
                 poll_minutes: 15,
             },
             priority: BTreeMap::default(),
+            allow: BTreeMap::default(),
         }
     }
 

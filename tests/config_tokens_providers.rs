@@ -338,9 +338,114 @@ fn provider_entry_named_like_a_builtin_is_rejected() {
 
         let error = load_config(Some(&config_path), Some(&home), &home)
             .expect_err(&format!("a configured {reserved} entry was accepted"));
-        assert_eq!(
-            error.to_string(),
-            format!("providers: {reserved} is a built-in provider name")
+        assert!(
+            error.to_string().starts_with(&format!(
+                "providers: {reserved} is a built-in provider name"
+            )),
+            "{error:#}"
+        );
+    }
+}
+
+#[test]
+fn an_allow_list_loads_on_a_configured_provider() {
+    let (_tmp, home, config_path) = write_config_with(
+        r"api-keys:
+  - sk-local
+providers:
+  commandcode:
+    base-url: https://api.commandcode.ai/v1
+    allow:
+      - deepseek/deepseek-v4.1-flash
+      - kimi-k3
+  groq:
+    base-url: https://api.groq.com/openai/v1
+",
+    );
+
+    let config = load_config(Some(&config_path), Some(&home), &home).expect("load config");
+
+    assert_eq!(
+        config.allow["commandcode"],
+        ["deepseek/deepseek-v4.1-flash", "kimi-k3"]
+            .map(String::from)
+            .into()
+    );
+    assert!(!config.allow.contains_key("groq"), "{:?}", config.allow);
+    assert_eq!(
+        config.providers["commandcode"].base_url,
+        "https://api.commandcode.ai/v1"
+    );
+}
+
+/// A built-in has no endpoint to configure, so its entry may carry `allow:` and nothing
+/// else; it narrows the built-in Pool and adds no configured Provider.
+#[test]
+fn a_built_in_entry_may_carry_only_an_allow_list() {
+    let (_tmp, home, config_path) = write_config_with(
+        r"api-keys:
+  - sk-local
+providers:
+  anthropic:
+    allow: [claude-opus-5-5, claude-sonnet-5-5]
+  codex:
+    allow: [gpt-5.5]
+  grok:
+    allow: [grok-4.6]
+",
+    );
+
+    let config = load_config(Some(&config_path), Some(&home), &home).expect("load config");
+
+    assert_eq!(
+        config.allow["anthropic"],
+        ["claude-opus-5-5", "claude-sonnet-5-5"]
+            .map(String::from)
+            .into()
+    );
+    assert_eq!(config.allow["codex"], ["gpt-5.5"].map(String::from).into());
+    assert_eq!(config.allow["grok"], ["grok-4.6"].map(String::from).into());
+    assert!(config.providers.is_empty(), "{:?}", config.providers);
+}
+
+#[test]
+fn a_built_in_entry_that_states_more_than_an_allow_list_is_refused() {
+    for entry in [
+        "anthropic:\n    base-url: https://example.com/v1\n    allow: [claude-opus-5-5]\n",
+        "codex:\n    allow: [gpt-5.5]\n    models:\n      gpt-5.5:\n        reasoning: true\n",
+        "grok: {}\n",
+        // The glossary's one spelling: an alias is not a built-in entry.
+        "claude:\n    allow: [claude-opus-5-5]\n",
+    ] {
+        let (_tmp, home, config_path) =
+            write_config_with(&format!("api-keys:\n  - sk-local\nproviders:\n  {entry}"));
+
+        let error = load_config(Some(&config_path), Some(&home), &home)
+            .expect_err(&format!("accepted: {entry}"));
+        assert!(
+            error.to_string().contains("is a built-in provider name"),
+            "{entry}: {error:#}"
+        );
+    }
+}
+
+/// An empty list would advertise and serve nothing of the Provider while it still looks
+/// configured, so it is refused rather than read as "allow everything" or "allow nothing".
+#[test]
+fn an_empty_allow_list_is_refused_at_load() {
+    for entry in [
+        "commandcode:\n    base-url: https://api.commandcode.ai/v1\n    allow: []\n",
+        "anthropic:\n    allow: []\n",
+    ] {
+        let (_tmp, home, config_path) =
+            write_config_with(&format!("api-keys:\n  - sk-local\nproviders:\n  {entry}"));
+
+        let error = load_config(Some(&config_path), Some(&home), &home)
+            .expect_err(&format!("accepted: {entry}"));
+        let message = error.to_string();
+        assert!(
+            message.contains(".allow is empty") && message.contains("none of its models"),
+            "{entry}: {message}"
         );
     }
 }
