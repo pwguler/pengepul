@@ -469,6 +469,7 @@ impl AccountManager {
         auth_dir: PathBuf,
         provider: ProviderId,
         priorities: BTreeMap<String, i64>,
+        rotation: RotationMode,
         refresh: impl Fn(String) -> RefreshFuture + Send + Sync + 'static,
         refresh_policy: RefreshPolicy,
     ) -> Self {
@@ -480,7 +481,7 @@ impl AccountManager {
             accounts: BTreeMap::new(),
             order: Vec::new(),
             priorities,
-            rotation: RotationMode::default(),
+            rotation,
             last_placed: None,
             persisted_usage: BTreeMap::new(),
             affinity: BTreeMap::new(),
@@ -488,7 +489,8 @@ impl AccountManager {
         }
     }
 
-    /// Set how this Pool hands out new conversations, at startup and on every reload.
+    /// Change how this Pool hands out new conversations: `/admin/reload` applies the `rotation:`
+    /// the config file holds now. A Pool takes its first rotation at construction.
     pub fn set_rotation(&mut self, rotation: RotationMode) {
         self.rotation = rotation;
     }
