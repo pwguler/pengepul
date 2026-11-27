@@ -709,7 +709,7 @@ impl ModelCatalog {
         &self,
         model: &str,
         providers: &BTreeMap<String, ConfiguredProvider>,
-        origin_has_account: bool,
+        pool: MakerPool,
     ) -> Result<Option<ProviderId>, String> {
         if let Some(prefixed) = prefixed_provider(model, providers) {
             return Ok(Some(prefixed));
@@ -723,20 +723,28 @@ impl ModelCatalog {
         };
         let elsewhere = self.served_elsewhere(model, origin);
         let maker = origin.canonical_id();
-        // With no other provider to name, the maker's pool answers for itself:
-        // its `503 no_account_for_provider` says to log in.
-        if !origin_has_account && !elsewhere.is_empty() {
-            return Err(format!(
-                "{model} is not served by {maker}: the {maker} pool has no account; use {}",
-                elsewhere.join(" or ")
-            ));
+        let why = match pool {
+            MakerPool::Serving => None,
+            MakerPool::AllDisabled => Some(format!("every {maker} account is disabled")),
+            MakerPool::Empty => Some(format!("no {maker} account")),
+        };
+        if let Some(why) = why {
+            let next = if elsewhere.is_empty() {
+                match pool {
+                    MakerPool::AllDisabled => {
+                        format!(
+                            "enable one with `pengepul accounts enable <account> --provider {maker}`"
+                        )
+                    }
+                    _ => format!("run `pengepul login --provider {maker}`"),
+                }
+            } else {
+                format!("use {}", elsewhere.join(" or "))
+            };
+            return Err(format!("{model} is not served by {maker}: {why}; {next}"));
         }
-        let unlisted = self.live.contains(&origin)
-            && !self
-                .direct
-                .get(model)
-                .is_some_and(|entries| entries.iter().any(|entry| entry.kind == origin));
-        if unlisted && !elsewhere.is_empty() {
+        if self.live.contains(&origin) && !self.maker_lists(origin, model) && !elsewhere.is_empty()
+        {
             return Err(format!(
                 "{model} is not served by {maker}; use {}",
                 elsewhere.join(" or ")
@@ -745,19 +753,40 @@ impl ModelCatalog {
         Ok(Some(ProviderId::for_kind(origin)))
     }
 
-    /// The prefixed ids that serve `model` on a provider other than `origin`.
+    /// Whether `origin`'s list names `model`'s model: the same id, a dated
+    /// release of it or its dateless alias, with or without a `[1m]` marker, in
+    /// any case. A maker serves the alias of what it lists by date, so a
+    /// listing elsewhere cannot take that alias from it.
+    fn maker_lists(&self, origin: ProviderKind, model: &str) -> bool {
+        let wanted = model_family(model);
+        self.direct.iter().any(|(id, entries)| {
+            entries.iter().any(|entry| entry.kind == origin) && model_family(id) == wanted
+        })
+    }
+
+    /// The prefixed ids that serve `model` on a provider other than `origin`
+    /// and that the operator's allow lists admit, matched in any case.
     fn served_elsewhere(&self, model: &str, origin: ProviderKind) -> Vec<String> {
-        let mut ids = self
-            .direct
-            .get(model)
-            .into_iter()
-            .flatten()
-            .filter(|entry| entry.kind != origin)
-            .map(|entry| format!("{}/{model}", entry.kind.canonical_id()))
-            .collect::<Vec<_>>();
+        let mut ids = Vec::new();
+        for (id, entries) in &self.direct {
+            if !id.eq_ignore_ascii_case(model) {
+                continue;
+            }
+            for entry in entries.iter().filter(|entry| entry.kind != origin) {
+                if self.allows(&ProviderId::for_kind(entry.kind), id) {
+                    ids.push(format!("{}/{id}", entry.kind.canonical_id()));
+                }
+            }
+        }
         for (provider_id, models) in &self.generic {
-            if models.iter().any(|listed| listed.id == model) {
-                ids.push(format!("{provider_id}/{model}"));
+            let provider = ProviderId::generic(provider_id.as_str());
+            for listed in models
+                .iter()
+                .filter(|listed| listed.id.eq_ignore_ascii_case(model))
+            {
+                if self.allows(&provider, &listed.id) {
+                    ids.push(format!("{provider_id}/{}", listed.id));
+                }
             }
         }
         ids
@@ -771,7 +800,9 @@ impl ModelCatalog {
         model: &str,
         providers: &BTreeMap<String, ConfiguredProvider>,
     ) -> Option<ProviderId> {
-        self.resolve(model, providers, true).ok().flatten()
+        self.resolve(model, providers, MakerPool::Serving)
+            .ok()
+            .flatten()
     }
 
     /// The advertised catalog for `/v1/models`: every id carries its `<provider>/<model>`
@@ -833,6 +864,30 @@ const fn bare_id_precedence(kind: ProviderKind) -> u8 {
         ProviderKind::Antigravity => 3,
         ProviderKind::Generic => 4,
     }
+}
+
+/// A model id with its case, a trailing `[1m]` context marker and a
+/// `-YYYYMMDD` release date set aside: the model it names, whichever form.
+fn model_family(model: &str) -> String {
+    let lower = model.trim().to_ascii_lowercase();
+    let lower = lower.strip_suffix("[1m]").unwrap_or(&lower);
+    match lower.rsplit_once('-') {
+        Some((family, date)) if date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()) => {
+            family.to_string()
+        }
+        _ => lower.to_string(),
+    }
+}
+
+/// What the pool of a bare id's maker can do now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MakerPool {
+    /// At least one account can be handed a request (cooling down counts).
+    Serving,
+    /// Every account it holds is Disabled.
+    AllDisabled,
+    /// It holds no account.
+    Empty,
 }
 
 /// The provider a `<provider>/<model>` id names, if its prefix is one.
@@ -2124,6 +2179,34 @@ fn parse_antigravity_without_a_models_map_is_empty() {
     );
 }
 
+/// F6 and S3: an id of no known maker that both the anthropic and the
+/// antigravity catalogs list goes to anthropic, the earlier built-in, whichever
+/// was fetched last — including on a later refresh that fetches anthropic
+/// again. The maker rule does not decide it: `mythos-preview` names no maker.
+#[test]
+fn an_id_of_no_known_maker_follows_built_in_precedence_across_refreshes() {
+    let providers = BTreeMap::new();
+    let anthropic = || FetchedModels::new(vec!["mythos-preview".to_string()]);
+    let antigravity = || FetchedModels::new(vec!["mythos-preview".to_string()]);
+    for anthropic_first in [true, false] {
+        let mut catalog = ModelCatalog::default();
+        if anthropic_first {
+            catalog.set_direct(ProviderKind::Anthropic, anthropic());
+            catalog.set_direct(ProviderKind::Antigravity, antigravity());
+        } else {
+            catalog.set_direct(ProviderKind::Antigravity, antigravity());
+            catalog.set_direct(ProviderKind::Anthropic, anthropic());
+        }
+        // The next refresh cycle fetches anthropic again.
+        catalog.set_direct(ProviderKind::Anthropic, anthropic());
+        assert_eq!(
+            catalog.resolve_id("mythos-preview", &providers),
+            Some(ProviderId::anthropic()),
+            "anthropic first: {anthropic_first}"
+        );
+    }
+}
+
 /// F6: an id both the anthropic and the antigravity catalogs list stays with
 /// anthropic whichever was fetched last; the antigravity copy is reachable only
 /// by its prefix, and both stay advertised.
@@ -2239,22 +2322,22 @@ fn a_bare_claude_id_goes_to_anthropic_or_names_who_serves_it() {
     let providers = BTreeMap::new();
     let listed = origin_catalog(Some(&["claude-sonnet-4-6"]), None);
     assert_eq!(
-        listed.resolve("claude-sonnet-4-6", &providers, true),
+        listed.resolve("claude-sonnet-4-6", &providers, MakerPool::Serving),
         Ok(Some(ProviderId::anthropic()))
     );
     let unloaded = origin_catalog(None, None);
     let empty = origin_catalog(Some(&[]), None);
     assert_eq!(
-        empty.resolve("claude-sonnet-4-6", &providers, true),
+        empty.resolve("claude-sonnet-4-6", &providers, MakerPool::Serving),
         Ok(Some(ProviderId::anthropic()))
     );
     assert_eq!(
-        unloaded.resolve("claude-sonnet-4-6", &providers, true),
+        unloaded.resolve("claude-sonnet-4-6", &providers, MakerPool::Serving),
         Ok(Some(ProviderId::anthropic()))
     );
     let elsewhere = origin_catalog(Some(&["claude-opus-5"]), None);
     let refused = elsewhere
-        .resolve("claude-sonnet-4-6", &providers, true)
+        .resolve("claude-sonnet-4-6", &providers, MakerPool::Serving)
         .expect_err("anthropic does not list it");
     assert!(refused.contains("not served by anthropic"), "{refused}");
     assert!(
@@ -2262,7 +2345,7 @@ fn a_bare_claude_id_goes_to_anthropic_or_names_who_serves_it() {
         "{refused}"
     );
     let no_account = unloaded
-        .resolve("claude-sonnet-4-6", &providers, false)
+        .resolve("claude-sonnet-4-6", &providers, MakerPool::Empty)
         .expect_err("no anthropic account");
     assert!(
         no_account.contains("antigravity/claude-sonnet-4-6"),
@@ -2278,11 +2361,11 @@ fn a_bare_id_no_one_else_lists_still_goes_to_its_maker() {
     let providers = BTreeMap::new();
     let catalog = origin_catalog(Some(&["claude-opus-5"]), Some(&["gpt-5.5"]));
     assert_eq!(
-        catalog.resolve("claude-opus-5:high", &providers, true),
+        catalog.resolve("claude-opus-5:high", &providers, MakerPool::Serving),
         Ok(Some(ProviderId::anthropic()))
     );
     assert_eq!(
-        catalog.resolve("gpt-5.7", &providers, true),
+        catalog.resolve("gpt-5.7", &providers, MakerPool::Serving),
         Ok(Some(ProviderId::codex()))
     );
 }
@@ -2295,14 +2378,14 @@ fn a_bare_gpt_oss_id_goes_to_codex_or_names_antigravity() {
     let providers = BTreeMap::new();
     let catalog = origin_catalog(None, Some(&["gpt-5.5"]));
     let with_account = catalog
-        .resolve("gpt-oss-120b-medium", &providers, true)
+        .resolve("gpt-oss-120b-medium", &providers, MakerPool::Serving)
         .expect_err("codex does not serve it");
     assert_eq!(
         with_account,
         "gpt-oss-120b-medium is not served by codex; use antigravity/gpt-oss-120b-medium"
     );
     let without_account = catalog
-        .resolve("gpt-oss-120b-medium", &providers, false)
+        .resolve("gpt-oss-120b-medium", &providers, MakerPool::Empty)
         .expect_err("no codex account");
     assert!(without_account.contains("codex"), "{without_account}");
     assert!(
@@ -2311,29 +2394,34 @@ fn a_bare_gpt_oss_id_goes_to_codex_or_names_antigravity() {
     );
     // The prefixed id is served where it says.
     assert_eq!(
-        catalog.resolve("antigravity/gpt-oss-120b-medium", &providers, false),
+        catalog.resolve(
+            "antigravity/gpt-oss-120b-medium",
+            &providers,
+            MakerPool::Empty
+        ),
         Ok(Some(ProviderId::antigravity()))
     );
 }
 
-/// R3: every bare `gemini-*` id is antigravity's, listed or not, with an
-/// antigravity account or without one.
+/// R3: every bare `gemini-*` id is antigravity's, listed or not.
 #[test]
 fn a_bare_gemini_id_goes_to_antigravity() {
     let providers = BTreeMap::new();
     let catalog = origin_catalog(None, None);
     for id in ["gemini-4-neon-medium", "gemini-3-flash"] {
         assert_eq!(
-            catalog.resolve(id, &providers, true),
+            catalog.resolve(id, &providers, MakerPool::Serving),
             Ok(Some(ProviderId::antigravity())),
             "{id}"
         );
     }
-    // With no antigravity account and no one else serving it, the id still
-    // goes to antigravity, whose pool answers that it has no account.
-    assert_eq!(
-        catalog.resolve("gemini-3-flash", &providers, false),
-        Ok(Some(ProviderId::antigravity()))
+    // C1: with no antigravity account, the refusal says which login is missing.
+    let refused = catalog
+        .resolve("gemini-3-flash", &providers, MakerPool::Empty)
+        .expect_err("no antigravity account");
+    assert!(
+        refused.contains("pengepul login --provider antigravity"),
+        "{refused}"
     );
 }
 
@@ -2343,11 +2431,15 @@ fn a_prefixed_id_goes_to_its_prefix() {
     let providers = BTreeMap::new();
     let catalog = origin_catalog(Some(&["claude-sonnet-4-6"]), None);
     assert_eq!(
-        catalog.resolve("antigravity/claude-sonnet-4-6", &providers, false),
+        catalog.resolve(
+            "antigravity/claude-sonnet-4-6",
+            &providers,
+            MakerPool::Empty
+        ),
         Ok(Some(ProviderId::antigravity()))
     );
     assert_eq!(
-        catalog.resolve("anthropic/claude-sonnet-4-6", &providers, false),
+        catalog.resolve("anthropic/claude-sonnet-4-6", &providers, MakerPool::Empty),
         Ok(Some(ProviderId::anthropic()))
     );
 }
@@ -2359,8 +2451,151 @@ fn an_id_of_no_known_maker_keeps_catalog_routing() {
     let providers = BTreeMap::new();
     let catalog = origin_catalog(None, None);
     assert_eq!(
-        catalog.resolve("llama-x", &providers, false),
+        catalog.resolve("llama-x", &providers, MakerPool::Empty),
         Ok(Some(ProviderId::antigravity()))
     );
-    assert_eq!(catalog.resolve("deepseek-x", &providers, true), Ok(None));
+    assert_eq!(
+        catalog.resolve("deepseek-x", &providers, MakerPool::Serving),
+        Ok(None)
+    );
+}
+
+/// A catalog with a configured `opencode` listing `ids` bare.
+#[cfg(test)]
+fn with_configured(mut catalog: ModelCatalog, ids: &[&str]) -> ModelCatalog {
+    catalog.set_generic(
+        "opencode",
+        FetchedModels::new(ids.iter().map(|id| (*id).to_string()).collect()),
+    );
+    catalog
+}
+
+/// S1: anthropic lists a pre-4.6 model only by its dated id, and serves the
+/// dateless alias too. A configured provider that lists the alias does not take
+/// it from anthropic; nor does a dated id anthropic lists dateless, a `[1m]`
+/// marker, or a case the list does not use (N3).
+#[test]
+fn a_maker_serves_the_dated_and_dateless_forms_of_what_it_lists() {
+    let providers = BTreeMap::new();
+    let catalog = with_configured(
+        origin_catalog(Some(&["claude-haiku-4-5-20251001", "claude-opus-5"]), None),
+        &[
+            "claude-haiku-4-5",
+            "claude-opus-5-20260101",
+            "claude-haiku-4-5[1m]",
+            "Claude-Haiku-4-5",
+        ],
+    );
+    for id in [
+        "claude-haiku-4-5",
+        "claude-opus-5-20260101",
+        "claude-haiku-4-5[1m]",
+        "Claude-Haiku-4-5",
+    ] {
+        assert_eq!(
+            catalog.resolve(id, &providers, MakerPool::Serving),
+            Ok(Some(ProviderId::anthropic())),
+            "{id}"
+        );
+    }
+}
+
+/// S3: a configured provider's listing is one the refusal names; with it the
+/// only other lister, the 404 says `opencode/<id>`.
+#[test]
+fn the_refusal_names_a_configured_lister() {
+    let providers = BTreeMap::new();
+    let catalog = with_configured(
+        origin_catalog(Some(&["claude-opus-5"]), None),
+        &["claude-x-1"],
+    );
+    let refused = catalog
+        .resolve("claude-x-1", &providers, MakerPool::Serving)
+        .expect_err("anthropic does not list it");
+    assert_eq!(
+        refused,
+        "claude-x-1 is not served by anthropic; use opencode/claude-x-1"
+    );
+}
+
+/// S2: a prefixed id the operator's allow list refuses is not offered; with no
+/// allowed lister left, the id goes to its maker as if no one else listed it.
+#[test]
+fn the_refusal_offers_only_ids_the_allow_lists_admit() {
+    let providers = BTreeMap::new();
+    let mut catalog = with_configured(
+        origin_catalog(Some(&["claude-opus-5"]), None),
+        &["claude-x-1"],
+    );
+    catalog.set_allow(BTreeMap::from([(
+        "opencode".to_string(),
+        std::collections::BTreeSet::from(["llama-3.3-70b".to_string()]),
+    )]));
+    assert_eq!(
+        catalog.resolve("claude-x-1", &providers, MakerPool::Serving),
+        Ok(Some(ProviderId::anthropic()))
+    );
+    let refused = catalog
+        .resolve("claude-x-1", &providers, MakerPool::Empty)
+        .expect_err("no anthropic account");
+    assert!(!refused.contains("opencode/"), "{refused}");
+}
+
+/// S3: the antigravity floor is not a list the upstream gave, so it cannot say
+/// antigravity lacks an id; a configured lister of a Gemini id does not take
+/// it while only the floor is in place.
+#[test]
+fn the_floor_never_says_the_maker_lacks_an_id() {
+    let providers = BTreeMap::new();
+    let mut catalog = with_configured(ModelCatalog::default(), &["gemini-3-flash"]);
+    catalog.set_floor(ProviderKind::Antigravity, antigravity_static_models());
+    assert_eq!(
+        catalog.resolve("gemini-3-flash", &providers, MakerPool::Serving),
+        Ok(Some(ProviderId::antigravity()))
+    );
+}
+
+/// S3: grok's static list is not fetched, so it cannot say grok lacks an id.
+#[test]
+fn grok_s_static_list_never_says_grok_lacks_an_id() {
+    let providers = BTreeMap::new();
+    let mut catalog = with_configured(ModelCatalog::default(), &["grok-code"]);
+    catalog.set_direct(ProviderKind::Grok, grok_static_models());
+    assert_eq!(
+        catalog.resolve("grok-code", &providers, MakerPool::Serving),
+        Ok(Some(ProviderId::grok()))
+    );
+}
+
+/// C1 and N4: a bare id whose maker's pool cannot serve is a refusal that
+/// says why — no account, or every account disabled — and what to do, even
+/// when no other provider lists it.
+#[test]
+fn a_maker_pool_that_cannot_serve_is_named_in_the_refusal() {
+    let providers = BTreeMap::new();
+    let catalog = origin_catalog(None, None);
+    assert_eq!(
+        catalog.resolve("claude-opus-5", &providers, MakerPool::Empty),
+        Err(
+            "claude-opus-5 is not served by anthropic: no anthropic account; \
+             run `pengepul login --provider anthropic`"
+                .to_string()
+        )
+    );
+    let disabled = catalog
+        .resolve("claude-opus-5", &providers, MakerPool::AllDisabled)
+        .expect_err("every anthropic account disabled");
+    assert!(
+        disabled.contains("every anthropic account is disabled"),
+        "{disabled}"
+    );
+    // With another lister, the refusal names it instead of the login.
+    let elsewhere = catalog
+        .resolve("claude-sonnet-4-6", &providers, MakerPool::Empty)
+        .expect_err("no anthropic account");
+    assert_eq!(
+        elsewhere,
+        "claude-sonnet-4-6 is not served by anthropic: no anthropic account; \
+         use antigravity/claude-sonnet-4-6"
+    );
 }

@@ -1119,3 +1119,17 @@ fn a_stream_cut_before_it_started_still_ends_in_an_error_event() {
     assert!(!tail.contains("message_stop"), "{tail}");
     assert!(cut_chat_stream(&mut state).is_empty());
 }
+
+#[test]
+fn a_finished_stream_that_carried_nothing_is_still_a_whole_message() {
+    // N1: a gateway that answers 200 with `[DONE]` alone finished an empty
+    // reply. The Messages client gets the whole empty message, once, instead
+    // of no event at all.
+    let mut state = AnthropicStreamState::new("glm-5.3");
+    let tail = finish_chat_stream(&mut state).join("");
+    let start = tail.find("event: message_start").expect("message_start");
+    let stop = tail.find("event: message_stop").expect("message_stop");
+    assert!(start < stop, "{tail}");
+    assert!(tail.contains("\"stop_reason\":\"end_turn\""), "{tail}");
+    assert!(finish_chat_stream(&mut state).is_empty());
+}

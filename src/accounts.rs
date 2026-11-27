@@ -506,6 +506,15 @@ impl AccountManager {
         self.order.len()
     }
 
+    /// How many accounts the pool holds Disabled.
+    #[must_use]
+    pub fn disabled_count(&self) -> usize {
+        self.accounts
+            .values()
+            .filter(|state| state.disabled)
+            .count()
+    }
+
     /// Whether a Cooldown has a sibling to send the next request to.
     ///
     /// It does not, for a Pool that holds one account: withholding that account is

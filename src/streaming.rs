@@ -1382,11 +1382,18 @@ impl AnthropicStreamState {
 /// [`cut_chat_stream`]'s.
 #[must_use]
 pub fn finish_chat_stream(state: &mut AnthropicStreamState) -> Vec<String> {
-    if !state.started || state.from_chat.closed {
+    if state.from_chat.closed {
         return Vec::new();
     }
+    // A finished stream that carried no chunk (`[DONE]` alone) is an empty
+    // reply: it still opens, as its first chunk would have, so it can close.
+    let mut chunks = if state.started {
+        Vec::new()
+    } else {
+        chat_sse_to_anthropic(&json!({"choices": []}), state)
+    };
     state.from_chat.closed = true;
-    let mut chunks = flush_chat_tool_calls(state);
+    chunks.extend(flush_chat_tool_calls(state));
     chunks.extend(stop_active_block(state));
     let stop_reason = state
         .from_chat

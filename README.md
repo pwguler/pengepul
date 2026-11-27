@@ -48,13 +48,19 @@ written, so the effort tier is part of the name: there is no bare `gemini-4-neon
 A model id without a provider prefix goes to the company that makes the model:
 `claude-*` to anthropic, `gpt-*`, `o<digit>*` and `codex-*` to codex, `gemini-*` to
 antigravity, `grok-*` to grok. It never falls through to another provider. When that
-pool has no account, or its list does not name the id while another provider's does, the
-relay answers 404 with the prefixed ids that serve it, for example
-`gpt-oss-120b-medium is not served by codex; use antigravity/gpt-oss-120b-medium`. So
-the Claude and GPT-OSS models of an antigravity account are named with their prefix,
-`antigravity/claude-sonnet-4-6` or `antigravity/gpt-oss-120b-medium`. A prefixed id
-goes to that provider exactly, and an id of no known maker goes wherever the live
-catalogs list it.
+pool has no account, the relay answers 404 with what to do: use a prefixed id another
+provider serves it under, or log in (`claude-opus-5 is not served by anthropic: no
+anthropic account; run pengepul login --provider anthropic`). When the maker's fetched
+list lacks the id while another provider lists it, the 404 names those prefixed ids, for
+example `gpt-oss-120b-medium is not served by codex; use antigravity/gpt-oss-120b-medium`.
+The maker's list counts a dated release and its dateless alias as one model, so
+`claude-haiku-4-5` stays with anthropic when anthropic lists `claude-haiku-4-5-20251001`;
+an id that no other provider lists always goes to the maker, which answers for it. Only
+ids your `allow:` lists admit are offered. So the Claude and GPT-OSS models of an
+antigravity account are named with their prefix, `antigravity/claude-sonnet-5-5-low` or
+`antigravity/gpt-oss-120b-medium`. A prefixed id goes to that provider exactly, and an id
+of no known maker goes wherever the live catalogs list it. An upstream 404 (a model the
+upstream does not have) is passed to the client and never cools the account.
 Credentials live in `~/.pengepul` (`0600`); a running relay picks up a
 fresh login on restart or `pengepul accounts --reload`. Read the key clients use with
 `pengepul config api-key`. That key alone guards your subscriptions, so keep it secret and

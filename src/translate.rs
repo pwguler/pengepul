@@ -1697,8 +1697,9 @@ pub fn antigravity_request_checked(chat: &Value) -> Result<Value, String> {
     match too_deep.first() {
         None => Ok(request),
         Some(tool) => Err(format!(
-            "tool `{tool}`: its parameters schema nests more than {GEMINI_SCHEMA_DEPTH} levels \
-             deep once its $refs are inlined, which the antigravity upstream cannot take"
+            "tool `{tool}`: its parameters schema nests more than {GEMINI_SCHEMA_DEPTH} schema \
+             levels once its $refs are inlined (each $ref, anyOf branch and property counts), \
+             which the relay does not send to the antigravity upstream"
         )),
     }
 }
@@ -2169,6 +2170,13 @@ fn gemini_schema_level(node: &Value, walk: &mut SchemaWalk<'_>) -> Value {
         return inlined;
     }
 
+    // `Optional[X]`: one real branch beside `null`. It stands for that branch
+    // with the node's own keys on top, as a `$ref` with siblings does, so the
+    // field's description and the branch's allowed values meet in one node.
+    if let Some(lone) = lone_branch(map) {
+        return gemini_schema_node(&Value::Object(lone), walk);
+    }
+
     let mut out = Map::new();
     let mut nullable = map.get("nullable").and_then(Value::as_bool) == Some(true);
     let mut types = schema_types(map, &mut nullable);
@@ -2325,28 +2333,56 @@ fn fold_schema_branches(
             }
         }
     }
-    if branches.len() == 1 {
-        if let Some(Value::Object(only)) = branches.pop() {
-            for (key, value) in only {
-                // The field's own words describe the field; the model's are
-                // its fallback, as with a plain `$ref` and its siblings.
-                let own = matches!(key.as_str(), "description" | "title")
-                    && map.get(&key).is_some_and(Value::is_string);
-                if !own {
-                    out.entry(key).or_insert(value);
-                }
-            }
-        }
-    } else if !branches.is_empty() {
+    // A lone real branch was folded before this node was cleaned.
+    if !branches.is_empty() {
         out.insert("anyOf".to_string(), Value::Array(branches));
     }
     for branch in value_array(map.get("allOf")) {
         if let Value::Object(part) = gemini_schema_node(branch, walk) {
             for (key, value) in part {
-                merge_schema_key(out, key, value);
+                // The field's own words describe the field; the model's are
+                // its fallback, as with a `$ref` and its siblings.
+                if !is_own_words(map, &key) {
+                    merge_schema_key(out, key, value);
+                }
             }
         }
     }
+}
+
+/// Whether `key` is a description or title the node states itself.
+fn is_own_words(map: &Map<String, Value>, key: &str) -> bool {
+    matches!(key, "description" | "title") && map.get(key).is_some_and(Value::is_string)
+}
+
+/// For a node whose `anyOf`/`oneOf` holds exactly one branch besides `null`:
+/// that branch with the node's other keys laid over it, `nullable` when a
+/// `null` branch was there. `None` for any other node.
+fn lone_branch(map: &Map<String, Value>) -> Option<Map<String, Value>> {
+    let mut real = Vec::new();
+    let mut null = false;
+    for key in ["anyOf", "oneOf"] {
+        for branch in value_array(map.get(key)) {
+            if branch.get("type").and_then(Value::as_str) == Some("null") {
+                null = true;
+            } else {
+                real.push(branch);
+            }
+        }
+    }
+    let [only] = real.as_slice() else {
+        return None;
+    };
+    let mut merged = only.as_object()?.clone();
+    for (key, value) in map {
+        if key != "anyOf" && key != "oneOf" {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    if null {
+        merged.insert("nullable".to_string(), json!(true));
+    }
+    Some(merged)
 }
 
 /// `const` and `enum`. The proto's enum is strings only: a string enum stays
@@ -3353,6 +3389,52 @@ mod antigravity_translation_tests {
                        "function": {"name": "t", "parameters": ref_chain(3, 4)}}]
         });
         assert!(super::antigravity_request_checked(&chat).is_ok());
+    }
+
+    /// S4: an `Optional` integer enum with its own description keeps both the
+    /// field's words and the allowed values, which the proto can carry only in
+    /// the description — as a plain `$ref` with the same sibling does.
+    #[test]
+    fn an_optional_integer_enum_keeps_its_allowed_values_and_description() {
+        let parameters = declared_parameters(&json!({
+            "$defs": {"Level": {"type": "integer", "enum": [1, 2, 3], "title": "Level"}},
+            "type": "object",
+            "properties": {
+                "level": {"anyOf": [{"$ref": "#/$defs/Level"}, {"type": "null"}],
+                          "description": "Pick a level."},
+                "plain": {"$ref": "#/$defs/Level", "description": "Pick a level."}
+            }
+        }));
+        for name in ["level", "plain"] {
+            let field = &parameters["properties"][name];
+            assert_eq!(field["type"], "integer", "{name}: {field}");
+            assert_eq!(
+                field["description"], "Pick a level. Allowed: 1, 2, 3",
+                "{name}: {field}"
+            );
+        }
+        assert_eq!(parameters["properties"]["level"]["nullable"], true);
+    }
+
+    /// C3: the `allOf` wrapper pydantic v1 and schemars put around a referenced
+    /// model keeps the field's own description and title, as the `anyOf` fold
+    /// does.
+    #[test]
+    fn an_all_of_wrapped_model_keeps_the_fields_own_description() {
+        let parameters = declared_parameters(&json!({
+            "definitions": {"Address": {"type": "object", "title": "Address",
+                                        "description": "A postal address.",
+                                        "properties": {"city": {"type": "string"}}}},
+            "type": "object",
+            "properties": {
+                "ship_to": {"title": "Ship To", "description": "Where the parcel goes.",
+                            "allOf": [{"$ref": "#/definitions/Address"}]}
+            }
+        }));
+        let field = &parameters["properties"]["ship_to"];
+        assert_eq!(field["description"], "Where the parcel goes.", "{field}");
+        assert_eq!(field["title"], "Ship To", "{field}");
+        assert_eq!(field["properties"]["city"]["type"], "string", "{field}");
     }
 
     /// R7: folding `Optional[Model]` keeps the field's own description and

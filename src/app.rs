@@ -28,8 +28,8 @@ use crate::cloaking_versions::{CliVersions, codex_release, effective, npm_latest
 use crate::config::{BodyLimit, Config, RotationMode};
 use crate::masquerade::{masquerade_request, restore_tool_use_names};
 use crate::models::{
-    FetchedModels, ModelCatalog, antigravity_static_models, grok_static_models, parse_anthropic,
-    parse_antigravity, parse_codex, parse_openai, upstream_model,
+    FetchedModels, MakerPool, ModelCatalog, antigravity_static_models, grok_static_models,
+    parse_anthropic, parse_antigravity, parse_codex, parse_openai, upstream_model,
 };
 use crate::oauth::{
     refresh_anthropic_tokens, refresh_antigravity_tokens, refresh_codex_tokens, refresh_grok_tokens,
@@ -614,13 +614,7 @@ impl UpstreamClient for HttpUpstreamClient {
                         ("anthropic-version".to_string(), "2023-06-01".to_string()),
                         ("anthropic-beta".to_string(), "oauth-2025-04-20".to_string()),
                     ]);
-                    let body = send_get(
-                        client,
-                        format!("{ANTHROPIC_BASE_URL}/v1/models"),
-                        headers,
-                        timeout,
-                    )
-                    .await?;
+                    let body = send_get(client, anthropic_models_url(), headers, timeout).await?;
                     Ok(parse_anthropic(&body, &account.provider))
                 }
                 ProviderKind::Codex => {
@@ -1238,6 +1232,15 @@ async fn refresh_model_catalog(state: &AppState) {
                 state.upstream.fetch_antigravity_version(),
                 crate::upstream::ANTIGRAVITY_MANIFEST_TIMEOUT,
             ));
+            // An account with no project cannot ask for a catalog; it shows
+            // the floor, which is not a list the upstream gave.
+            if account.token.project_id.is_none() {
+                let mut catalog = state.catalog.write().expect("catalog lock poisoned");
+                if !catalog.lists(kind) {
+                    catalog.set_floor(kind, antigravity_static_models());
+                }
+                continue;
+            }
         }
         match state
             .upstream
@@ -1770,10 +1773,11 @@ async fn admin_reload(State(state): State<AppState>, headers: HeaderMap) -> Resp
             Ok(value) => {
                 reloaded.insert(provider.to_string(), value);
             }
-            Err(error) => {
+            // The first failure is logged where it is answered; the rest here.
+            Err(error) if first_failure.is_some() => {
                 tracing::warn!(%provider, error = %error_chain(&error), "account pool reload failed");
-                first_failure.get_or_insert((provider, error));
             }
+            Err(error) => first_failure = Some((provider, error)),
         }
     }
 
@@ -1978,12 +1982,12 @@ async fn resolve_model(state: &AppState, model_id: &str) -> Result<(ProviderId, 
     // Whether the pool of the model's maker can serve now, read before the
     // catalog lock: the account managers are behind async locks.
     let origin = crate::models::bare_origin(model_id, &state.config.providers);
-    let origin_has_account = match origin {
-        Some(kind) => provider_account_count(state, ProviderId::for_kind(kind)).await > 0,
-        None => false,
+    let pool = match origin {
+        Some(kind) => maker_pool(state, kind).await,
+        None => MakerPool::Empty,
     };
     let catalog = state.catalog.read().expect("catalog lock poisoned");
-    let provider = match catalog.resolve(model_id, &state.config.providers, origin_has_account) {
+    let provider = match catalog.resolve(model_id, &state.config.providers, pool) {
         Ok(Some(provider)) => provider,
         Ok(None) => {
             return Err(AppError::simple(
@@ -1991,14 +1995,14 @@ async fn resolve_model(state: &AppState, model_id: &str) -> Result<(ProviderId, 
                 format!("unknown model: {model_id}"),
             ));
         }
+        // Only a bare id with a maker is refused, so `origin` names who.
         Err(message) => {
-            let maker = ProviderId::for_kind(origin.unwrap_or(ProviderKind::Antigravity));
-            return Err(AppError::provider(
-                StatusCode::NOT_FOUND,
+            return Err(AppError {
+                status: StatusCode::NOT_FOUND,
                 message,
-                "model_not_served",
-                maker,
-            ));
+                error_type: Some("model_not_served"),
+                provider: origin.map(ProviderId::for_kind),
+            });
         }
     };
     let model = upstream_model(model_id, &provider);
@@ -2210,6 +2214,27 @@ async fn route_refusal(
         provider.clone(),
     )
     .into_response()
+}
+
+/// What a built-in maker's pool can do now, for bare-id routing. The serving
+/// count leaves Disabled accounts out, so a pool with none serving is either
+/// all Disabled or empty.
+async fn maker_pool(state: &AppState, kind: ProviderKind) -> MakerPool {
+    let manager = match kind {
+        ProviderKind::Anthropic => &state.account_managers.anthropic,
+        ProviderKind::Codex => &state.account_managers.codex,
+        ProviderKind::Grok => &state.account_managers.grok,
+        ProviderKind::Antigravity => &state.account_managers.antigravity,
+        ProviderKind::Generic => return MakerPool::Empty,
+    };
+    let manager = manager.lock().await;
+    if manager.account_count() > 0 {
+        MakerPool::Serving
+    } else if manager.disabled_count() > 0 {
+        MakerPool::AllDisabled
+    } else {
+        MakerPool::Empty
+    }
 }
 
 async fn provider_account_count(state: &AppState, provider: ProviderId) -> usize {
@@ -3682,12 +3707,13 @@ async fn record_provider_failure(
     detail: Option<&str>,
     retry_hint: Option<Duration>,
 ) {
-    // 400/402 by themselves say nothing about account health — a malformed request is
-    // the client's fault, and a drained balance is recorded by the failover path with
-    // the billing kind instead. Recording both would count the failure twice, widening
-    // one request's cooldown. The request still happened, though: count it as a refusal
-    // so it reaches an outcome without touching the account's health.
-    if status == StatusCode::BAD_REQUEST || status == StatusCode::PAYMENT_REQUIRED {
+    // 400/402/404 by themselves say nothing about account health — a malformed request
+    // is the client's fault, a 404 is the upstream refusing a model or path it does not
+    // have (ADR-0034), and a drained balance is recorded by the failover path with the
+    // billing kind instead. Recording both would count the failure twice, widening one
+    // request's cooldown. The request still happened, though: count it as a refusal so
+    // it reaches an outcome without touching the account's health.
+    if matches!(status.as_u16(), 400 | 402 | 404) {
         // The request reached an outcome here. If the body turns out to be
         // billing-scoped, the failover path adds the cooldown without
         // recording a second outcome (`record_billing_cooldown`).
@@ -4719,6 +4745,13 @@ async fn send_json_ref(
         retry_hint,
         quota,
     })
+}
+
+/// Anthropic's model list, in one page. The API's default page is 20 models,
+/// and a model past it would read as one anthropic does not serve; 1000 is the
+/// largest page the List Models API takes.
+fn anthropic_models_url() -> String {
+    format!("{ANTHROPIC_BASE_URL}/v1/models?limit=1000")
 }
 
 async fn send_get(
@@ -7943,6 +7976,81 @@ mod tests {
         assert_eq!(
             advertised_antigravity(&state),
             vec!["antigravity/gemini-4-argon-medium".to_string()]
+        );
+    }
+
+    /// S1: anthropic's list is asked for in one page of up to 1000 models, not
+    /// the API's default 20.
+    #[test]
+    fn anthropic_s_model_list_is_asked_for_in_one_large_page() {
+        let url = url::Url::parse(&super::anthropic_models_url()).expect("url");
+        assert_eq!(url.path(), "/v1/models");
+        assert_eq!(
+            url.query_pairs()
+                .find(|(key, _)| key == "limit")
+                .map(|(_, v)| v.into_owned()),
+            Some("1000".to_string())
+        );
+    }
+
+    /// A double that answers a catalog fetch as the real client does for an
+    /// account with no project: with the floor.
+    struct NoProjectUpstream;
+
+    impl UpstreamClient for NoProjectUpstream {
+        fn generic_chat(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn generic_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!()
+        }
+        fn anthropic_messages(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn anthropic_messages_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!()
+        }
+        fn anthropic_count_tokens(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn codex_responses(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn codex_responses_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!()
+        }
+        fn fetch_models(
+            &self,
+            _kind: ProviderKind,
+            _account: AvailableAccount,
+            _config: Arc<Config>,
+        ) -> super::ModelsFuture {
+            Box::pin(async { Ok(super::antigravity_static_models()) })
+        }
+    }
+
+    /// N2: an account with no project gets the floor, and the floor is not a
+    /// list the upstream gave, so it cannot say antigravity lacks an id that a
+    /// configured endpoint lists.
+    #[tokio::test]
+    async fn a_no_project_account_s_floor_is_not_a_live_list() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        save_token(tmp.path(), &antigravity_account(None).token).expect("save");
+        let state = test_state(tmp.path(), Arc::new(NoProjectUpstream));
+        super::refresh_model_catalog(&state).await;
+        let mut catalog = state.catalog.write().expect("catalog");
+        assert!(catalog.lists(ProviderKind::Antigravity));
+        catalog.set_generic(
+            "opencode",
+            FetchedModels::new(vec!["gemini-3-flash".to_string()]),
+        );
+        assert_eq!(
+            catalog.resolve(
+                "gemini-3-flash",
+                &std::collections::BTreeMap::new(),
+                super::MakerPool::Serving
+            ),
+            Ok(Some(ProviderId::antigravity()))
         );
     }
 }

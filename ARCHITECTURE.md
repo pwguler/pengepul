@@ -99,9 +99,12 @@ in files.
   tiers (`antigravity_static_models`), shows until a live list lands — for an
   account with no project, or after a failed first fetch — and never replaces
   one. A bare id goes to its maker's built-in by name (`bare_origin`: `claude-*`,
-  `gpt-*`/`o<digit>*`/`codex-*`, `gemini-*`, `grok-*`) and never falls through; the
-  maker's pool with no account, or its live list lacking an id another provider lists,
-  is a 404 naming the prefixed ids (`ModelCatalog::resolve`). A bare id of no known
+  `gpt-*`/`o<digit>*`/`codex-*`, `gemini-*`, `grok-*`) and never falls through
+  (`ModelCatalog::resolve`). A maker pool with no serving account is a 404 naming the
+  prefixed ids the allow lists admit elsewhere, or the missing login or `accounts
+  enable`; a maker whose fetched list lacks the id, matched by model (case, date and
+  `[1m]` aside), is a 404 only when another provider lists it. Only a non-empty fetched
+  list speaks for its maker: the floor and grok's static list do not. A bare id of no known
   maker goes to the earliest built-in that lists it (anthropic, codex, grok,
   antigravity). It also holds the operator's `allow:` lists: a Provider
   with one advertises only the listed ids its Upstream lists, matched exactly on the
@@ -221,7 +224,8 @@ in files.
 - **One model id resolves to exactly one Provider**, and an id nobody claims is
   refused 400 before any Account is touched, as is an id outside its Provider's
   `allow:` list (`resolve_model`, the one resolution every route calls); a bare id
-  its maker cannot serve is refused 404 with the prefixed ids that can. A bare id
+  its maker cannot serve is refused 404 with the prefixed ids that can, or the
+  login it lacks. A bare id
   never routes to a configured endpoint — only an explicit `<provider>/` prefix does.
 - **The `<provider>/` prefix is the only rewrite of a model id.** `upstream_model` removes
   it so the request asks the vendor for a model by the name the client gave after the prefix,
@@ -342,8 +346,8 @@ in files.
   including a client that hangs up mid-stream, whose outcome is paid by a
   `Drop` guard because the code after the stream loop never runs. A
   Refusal counts as a failed request but earns no Cooldown: a dialect the
-  Provider cannot serve, or a 400 the client malformed, is not the
-  Account's fault. Counters written by the earlier scheme, which counted
+  Provider cannot serve, a 400 the client malformed, or a 404 for a model or
+  path the upstream does not have (ADR-0034), is not the Account's fault. Counters written by the earlier scheme, which counted
   at dispatch, are repaired once at load and never again: a gap can no
   longer be created, so the repair is a migration with an end.
 - **A number the panels cannot attribute is not invented.** Every success

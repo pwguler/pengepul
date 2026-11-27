@@ -412,7 +412,7 @@ async fn app_auth_and_no_account_responses() {
             .header("content-type", "application/json")
             .header("content-length", "1")
             .body(Body::from(
-                json!({"model": "claude-sonnet-4-6", "messages": [{"role": "user", "content": "hi"}]})
+                json!({"model": "anthropic/claude-sonnet-4-6", "messages": [{"role": "user", "content": "hi"}]})
                     .to_string(),
             ))
             .unwrap(),
@@ -420,6 +420,17 @@ async fn app_auth_and_no_account_responses() {
     .await;
     assert_eq!(status, 503);
     assert_eq!(body["error"]["type"], "no_account_for_provider");
+
+    // C1: a bare id names its maker's missing login instead, as a 404 a client
+    // does not retry.
+    let (status, body) = post_model(&app, "/v1/messages", "claude-sonnet-4-6").await;
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(body["error"]["type"], "model_not_served");
+    assert_eq!(
+        body["error"]["message"],
+        "claude-sonnet-4-6 is not served by anthropic: no anthropic account; \
+         run `pengepul login --provider anthropic`"
+    );
 
     let (status, body) = json_response(
         app,
@@ -430,7 +441,7 @@ async fn app_auth_and_no_account_responses() {
             .header("content-type", "application/json")
             .header("content-length", "1")
             .body(Body::from(
-                json!({"model": "gpt-5.4", "messages": [{"role": "user", "content": "hi"}]})
+                json!({"model": "codex/gpt-5.4", "messages": [{"role": "user", "content": "hi"}]})
                     .to_string(),
             ))
             .unwrap(),
@@ -974,7 +985,7 @@ async fn app_codex_count_tokens_is_unsupported() {
             .header("content-length", "256")
             .body(Body::from(
                 json!({
-                    "model": "gpt-5.4",
+                    "model": "codex/gpt-5.4",
                     "messages": [{"role": "user", "content": "hi"}]
                 })
                 .to_string(),
@@ -9692,7 +9703,8 @@ async fn a_failing_pool_does_not_stop_the_others_from_reloading() {
 }
 
 /// R1: a tool whose `$ref` chain nests past the walk's bound is answered with a
-/// 400 that names the tool, on a stack a tokio worker has, and is never sent.
+/// 400 that names the tool and is never sent. The test thread's 2 MiB stack is
+/// the size a tokio worker has.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_too_deep_tool_schema_is_a_400_not_a_crash() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -10146,4 +10158,280 @@ async fn an_id_of_no_known_maker_follows_the_catalog() {
         upstream.calls()[0].account.provider,
         ProviderId::antigravity()
     );
+}
+
+/// S1: anthropic lists `claude-haiku-4-5` only by its dated id. A configured
+/// endpoint that lists the bare alias does not take it: the bare alias reaches
+/// anthropic, on Messages and on Chat, as it did before the origin rule.
+#[tokio::test]
+async fn a_dateless_alias_the_maker_lists_by_date_reaches_the_maker() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(
+        tmp.path(),
+        &built_in_token(ProviderId::anthropic(), "anthropic"),
+    )
+    .expect("save anthropic");
+    save_token(tmp.path(), &groq_key_token()).expect("save groq key");
+    let mut cfg = config(tmp.path().to_path_buf());
+    cfg.providers.insert(
+        "groq".to_string(),
+        pengepul::config::ConfiguredProvider {
+            base_url: "https://api.groq.com/openai/v1".to_string(),
+            models: std::collections::BTreeMap::new(),
+        },
+    );
+    let upstream = Arc::new(FakeUpstream {
+        listed: vec![
+            (ProviderKind::Anthropic, vec!["claude-haiku-4-5-20251001"]),
+            (ProviderKind::Generic, vec!["claude-haiku-4-5"]),
+        ],
+        ..FakeUpstream::default()
+    });
+    let app = create_app_with_upstream(cfg, upstream.clone());
+    advertised_once(&app, "groq/claude-haiku-4-5").await;
+    advertised_once(&app, "anthropic/claude-haiku-4-5-20251001").await;
+
+    let (status, body) = post_model(&app, "/v1/messages", "claude-haiku-4-5").await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = post_model(&app, "/v1/chat/completions", "claude-haiku-4-5").await;
+    assert_eq!(status, 200, "{body}");
+    let calls = upstream.calls();
+    assert_eq!(calls.len(), 2);
+    assert!(
+        calls
+            .iter()
+            .all(|call| call.account.provider == ProviderId::anthropic())
+    );
+}
+
+/// N4: a maker pool whose accounts are all Disabled is told apart from an
+/// empty one, and the 404 says how to put one back.
+#[tokio::test]
+async fn a_bare_id_whose_maker_accounts_are_all_disabled_says_so() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let token = built_in_token(ProviderId::anthropic(), "anthropic");
+    save_token(tmp.path(), &token).expect("save anthropic");
+    assert!(
+        pengepul::tokens::set_credential_disabled(
+            tmp.path(),
+            &ProviderId::anthropic(),
+            &token.email,
+            true
+        )
+        .expect("disable")
+    );
+    let upstream = Arc::new(FakeUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    let (status, body) = post_model(&app, "/v1/messages", "claude-opus-5").await;
+    assert_eq!(status, 404, "{body}");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("every anthropic account is disabled"),
+        "{body}"
+    );
+    assert!(message.contains("pengepul accounts enable"), "{body}");
+    assert!(upstream.calls().is_empty());
+}
+
+// ---- C2: an upstream 404 is a refusal, not an account failure --------------
+
+/// Every send answers 404, as an upstream does for a model it does not have.
+struct NotFoundUpstream;
+
+impl NotFoundUpstream {
+    fn json() -> UpstreamFuture {
+        Box::pin(async {
+            Ok(UpstreamJsonResponse {
+                quota: None,
+                retry_hint: None,
+                status: axum::http::StatusCode::NOT_FOUND,
+                body: json!({"error": {"code": 404, "message": "Requested entity was not found."}}),
+            })
+        })
+    }
+
+    fn sse() -> UpstreamSseFuture {
+        Box::pin(async {
+            Ok(UpstreamSseResponse {
+                quota: None,
+                retry_hint: None,
+                status: axum::http::StatusCode::NOT_FOUND,
+                body: Box::pin(futures_util::stream::iter([Ok(Bytes::from_static(
+                    br#"{"error":{"code":404,"message":"Requested entity was not found."}}"#,
+                ))])),
+            })
+        })
+    }
+}
+
+impl UpstreamClient for NotFoundUpstream {
+    fn anthropic_messages(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        Self::json()
+    }
+    fn anthropic_messages_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        Self::sse()
+    }
+    fn anthropic_count_tokens(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        Self::json()
+    }
+    fn codex_responses(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        Self::json()
+    }
+    fn codex_responses_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        Self::sse()
+    }
+    fn generic_chat(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        Self::json()
+    }
+    fn generic_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        Self::sse()
+    }
+    fn grok_chat(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        Self::json()
+    }
+    fn grok_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        Self::sse()
+    }
+    fn antigravity_generate(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        Self::json()
+    }
+    fn antigravity_generate_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        Self::sse()
+    }
+    fn fetch_models(
+        &self,
+        _kind: ProviderKind,
+        _account: AvailableAccount,
+        _config: Arc<Config>,
+    ) -> ModelsFuture {
+        Box::pin(async { Ok(FetchedModels::new(vec![])) })
+    }
+}
+
+/// Two accounts in `provider`'s pool (a Cooldown needs a sibling to apply),
+/// and the app over [`NotFoundUpstream`].
+fn not_found_app(provider: &ProviderId) -> (tempfile::TempDir, axum::Router) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut cfg = config(tmp.path().to_path_buf());
+    if provider.kind == ProviderKind::Generic {
+        cfg.providers.insert(
+            provider.id.to_string(),
+            pengepul::config::ConfiguredProvider {
+                base_url: "https://api.groq.com/openai/v1".to_string(),
+                models: std::collections::BTreeMap::new(),
+            },
+        );
+    }
+    for name in ["one", "two"] {
+        save_token(
+            tmp.path(),
+            &built_in_token(provider.clone(), &format!("{name}@{}", provider.id)),
+        )
+        .expect("save token");
+    }
+    let app = create_app_with_upstream(cfg, Arc::new(NotFoundUpstream));
+    (tmp, app)
+}
+
+/// C2: on every provider's path, a 404 from the upstream reaches the client as
+/// a 404 and leaves both accounts healthy: no Cooldown, no failure streak, no
+/// `lastError`. It still counts as a failed request.
+#[tokio::test]
+async fn an_upstream_404_cools_no_account_on_any_provider() {
+    for (provider, uri, model, stream) in [
+        (
+            ProviderId::antigravity(),
+            "/v1/chat/completions",
+            "gemini-0-nonexistent",
+            false,
+        ),
+        (
+            ProviderId::antigravity(),
+            "/v1/chat/completions",
+            "gemini-0-nonexistent",
+            true,
+        ),
+        (
+            ProviderId::anthropic(),
+            "/v1/messages",
+            "claude-nonexistent-1",
+            false,
+        ),
+        (
+            ProviderId::anthropic(),
+            "/v1/messages",
+            "claude-nonexistent-1",
+            true,
+        ),
+        (
+            ProviderId::codex(),
+            "/v1/responses",
+            "gpt-nonexistent",
+            false,
+        ),
+        (
+            ProviderId::codex(),
+            "/v1/responses",
+            "gpt-nonexistent",
+            true,
+        ),
+        (
+            ProviderId::grok(),
+            "/v1/chat/completions",
+            "grok-nonexistent",
+            false,
+        ),
+        (
+            ProviderId::grok(),
+            "/v1/chat/completions",
+            "grok-nonexistent",
+            true,
+        ),
+        (
+            ProviderId::generic("groq"),
+            "/v1/chat/completions",
+            "groq/nonexistent",
+            false,
+        ),
+        (
+            ProviderId::generic("groq"),
+            "/v1/chat/completions",
+            "groq/nonexistent",
+            true,
+        ),
+    ] {
+        let label = format!("{provider} {uri} stream={stream}");
+        let (_tmp, app) = not_found_app(&provider);
+        let body = if uri == "/v1/responses" {
+            json!({"model": model, "input": "hi", "stream": stream})
+        } else {
+            json!({"model": model, "max_tokens": 16, "stream": stream,
+                   "messages": [{"role": "user", "content": "hi"}]})
+        };
+        let (status, _, reply) = raw_response(app.clone(), post(uri, &body)).await;
+        assert_eq!(status, 404, "{label}: {reply}");
+
+        let (_, accounts) = json_response(
+            app,
+            axum::http::Request::builder()
+                .uri("/admin/accounts")
+                .header("authorization", "Bearer sk-test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        let pool = &accounts["providers"][provider.id.as_ref()];
+        let accounts = pool["accounts"].as_array().expect("accounts");
+        assert_eq!(accounts.len(), 2, "{label}: {pool}");
+        let failed: i64 = accounts
+            .iter()
+            .map(|account| account["totalFailures"].as_i64().unwrap_or_default())
+            .sum();
+        assert_eq!(failed, 1, "{label}: one failed request: {pool}");
+        for account in accounts {
+            assert_eq!(account["available"], true, "{label}: {account}");
+            assert_eq!(account["failureCount"], 0, "{label}: {account}");
+            assert!(account["lastError"].is_null(), "{label}: {account}");
+        }
+    }
 }

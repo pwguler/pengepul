@@ -87,7 +87,7 @@ One 64-column box of rich CLI output. Its header is `<subject>` or `<subject> â”
 _Avoid_: card, box, widget
 
 **Refusal**:
-A request that reached an outcome no Account is at fault for: a dialect the Provider cannot serve, a body the upstream rejected as malformed, or a client that hung up before its stream completed. It counts as a failed request so `requests` still equals `successes + failures`, but it never touches the Account's health: no Cooldown, no failure streak, no change to Rotation. Defined by its effect, not by whether the relay asked upstream first.
+A request that reached an outcome no Account is at fault for: a dialect the Provider cannot serve, a body the upstream rejected as malformed, a model or path the upstream answered 404 for (ADR-0034), or a client that hung up before its stream completed. It counts as a failed request so `requests` still equals `successes + failures`, but it never touches the Account's health: no Cooldown, no failure streak, no change to Rotation. Defined by its effect, not by whether the relay asked upstream first.
 _Avoid_: rejection, refused request, bad request
 
 **Usage counters**:

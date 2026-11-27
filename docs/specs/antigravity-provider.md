@@ -22,10 +22,11 @@ sources live in `docs/research/antigravity-provider.md`.
   the 426 and refreshed from the public manifest, the host is a constant.
 - No change to anthropic, codex, grok or configured-provider behaviour, metadata
   or rotation, and no network call for an install with no antigravity account,
-  with two exceptions. Bare-id routing follows the origin rule in AC-2 for every
-  provider. A Messages stream from a configured endpoint or grok that the
+  with three exceptions. Bare-id routing follows the origin rule in AC-2 for
+  every provider. A Messages stream from a configured endpoint or grok that the
   upstream cut before a `finish_reason` or `[DONE]` ends in an `error` event,
-  not `message_stop` (AC-3).
+  not `message_stop` (AC-3). An upstream 404 is a Refusal on every provider and
+  cools no account (ADR-0034).
 
 ## Acceptance criteria
 
@@ -53,12 +54,19 @@ sources live in `docs/research/antigravity-provider.md`.
   goes to that provider exactly. A bare id goes to the company that makes the
   model: `claude-*` to anthropic, `gpt-*`, `o<digit>*` and `codex-*` to codex,
   `gemini-*` to antigravity, `grok-*` to grok, and never falls through to
-  another provider. When that pool has no account, or its live list lacks the
-  id while another provider lists it, the answer is a 404 naming the prefixed
-  ids that serve it (`gpt-oss-120b-medium is not served by codex; use
-  antigravity/gpt-oss-120b-medium`); an id no other provider lists goes to the
-  maker, which answers for it. So an antigravity account's Claude and GPT-OSS
-  models are named `antigravity/<id>`. A bare id of no known maker keeps the
+  another provider. When that pool has no account, or only Disabled ones, the
+  answer is a 404 `model_not_served` that names the prefixed ids that serve the
+  id elsewhere, or else the missing login (`run pengepul login --provider
+  anthropic`) or the `accounts enable` that puts one back; never the pool's
+  503. When the maker's live list lacks the id while another provider lists
+  it, the 404 names those prefixed ids (`gpt-oss-120b-medium is not served by
+  codex; use antigravity/gpt-oss-120b-medium`). The maker's list is matched by
+  model, ignoring case, a `-YYYYMMDD` date and a `[1m]` marker, so a dateless
+  alias of an id it lists by date stays with it; anthropic's list is fetched in
+  one page of up to 1000. Only prefixed ids the operator's `allow:` lists admit
+  are named. An id no other provider lists goes to the maker, which answers for
+  it; an upstream 404 is a Refusal that cools no account (ADR-0034). So an
+  antigravity account's Claude and GPT-OSS models are named `antigravity/<id>`. A bare id of no known maker keeps the
   live-catalog routing: the first built-in by precedence (anthropic, codex,
   grok, antigravity) that lists it. A tool schema that nests more than 64
   levels once its `$ref`s are inlined is refused 400, naming the tool.
