@@ -98,9 +98,12 @@ in files.
   (`parse_antigravity`). Its floor, the four `gemini-4-neon-{low,medium,high,xhigh}`
   tiers (`antigravity_static_models`), shows until a live list lands — for an
   account with no project, or after a failed first fetch — and never replaces
-  one. A bare id more than one built-in lists goes to the earliest
-  (anthropic, codex, grok, antigravity), and one the name heuristic gives to a
-  built-in stays there while that pool has an account. It also holds the operator's `allow:` lists: a Provider
+  one. A bare id goes to its maker's built-in by name (`bare_origin`: `claude-*`,
+  `gpt-*`/`o<digit>*`/`codex-*`, `gemini-*`, `grok-*`) and never falls through; the
+  maker's pool with no account, or its live list lacking an id another provider lists,
+  is a 404 naming the prefixed ids (`ModelCatalog::resolve`). A bare id of no known
+  maker goes to the earliest built-in that lists it (anthropic, codex, grok,
+  antigravity). It also holds the operator's `allow:` lists: a Provider
   with one advertises only the listed ids its Upstream lists, matched exactly on the
   id `upstream_model` produces, while its fetched list stays whole so a bare id still
   resolves to it and is refused by name.
@@ -217,7 +220,8 @@ in files.
   log line, so the rules bias toward failing loud over deleting operator content.
 - **One model id resolves to exactly one Provider**, and an id nobody claims is
   refused 400 before any Account is touched, as is an id outside its Provider's
-  `allow:` list (`resolve_model`, the one resolution every route calls). A bare id
+  `allow:` list (`resolve_model`, the one resolution every route calls); a bare id
+  its maker cannot serve is refused 404 with the prefixed ids that can. A bare id
   never routes to a configured endpoint — only an explicit `<provider>/` prefix does.
 - **The `<provider>/` prefix is the only rewrite of a model id.** `upstream_model` removes
   it so the request asks the vendor for a model by the name the client gave after the prefix,

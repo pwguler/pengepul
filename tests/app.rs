@@ -263,6 +263,20 @@ impl UpstreamClient for FakeUpstream {
         })
     }
 
+    fn antigravity_generate(&self, request: UpstreamRequest) -> UpstreamFuture {
+        self.calls.lock().expect("calls lock").push(request);
+        Box::pin(async {
+            Ok(UpstreamJsonResponse {
+                quota: None,
+                retry_hint: None,
+                status: axum::http::StatusCode::OK,
+                body: json!({"response": {"candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "ok"}]},
+                    "finishReason": "STOP"}]}}),
+            })
+        })
+    }
+
     fn fetch_models(
         &self,
         kind: ProviderKind,
@@ -533,7 +547,7 @@ async fn app_rejects_an_unknown_model() {
     let upstream = Arc::new(FakeUpstream::default());
     let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream);
 
-    // An id no fetched list and no heuristic claims is rejected, not silently routed.
+    // An id no fetched list and no maker rule claims is rejected, not silently routed.
     let (status, body) = json_response(
         app,
         axum::http::Request::builder()
@@ -543,7 +557,7 @@ async fn app_rejects_an_unknown_model() {
             .header("content-type", "application/json")
             .header("content-length", "1")
             .body(Body::from(
-                json!({"model": "gemini-3", "messages": [{"role": "user", "content": "hi"}]})
+                json!({"model": "mistral-large-9", "messages": [{"role": "user", "content": "hi"}]})
                     .to_string(),
             ))
             .unwrap(),
@@ -551,7 +565,7 @@ async fn app_rejects_an_unknown_model() {
     .await;
 
     assert_eq!(status, 400);
-    assert_eq!(body["error"]["message"], "unknown model: gemini-3");
+    assert_eq!(body["error"]["message"], "unknown model: mistral-large-9");
 }
 
 /// A client request for `model` on `uri`, carrying what every model route requires.
@@ -9597,6 +9611,43 @@ async fn an_antigravity_429_retry_delay_sets_the_cooldown() {
     assert!(until - now > 3000.0, "cooldown {} s", until - now);
 }
 
+/// R6: a reload that fails for one pool still refreshes the catalog, so a
+/// first antigravity login beside an unreadable anthropic directory gets its
+/// catalog fetch (seen here by the Hub version read, which the refresh makes
+/// only for a pool with an account), not only a place in rotation.
+#[tokio::test]
+async fn a_partly_failed_reload_still_refreshes_the_catalog() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let upstream = Arc::new(AntigravityUpstream::new());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    // The startup refresh found no antigravity account, so it read no version.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(*upstream.version_fetches.lock().expect("fetches"), 0);
+    std::fs::write(tmp.path().join("anthropic"), b"not a directory").expect("block anthropic");
+    save_antigravity_account(tmp.path());
+
+    let (status, body) = json_response(
+        app,
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/admin/reload")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 500, "{body}");
+    let mut refreshed = false;
+    for _ in 0..100 {
+        if *upstream.version_fetches.lock().expect("fetches") > 0 {
+            refreshed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(refreshed, "the catalog was not refreshed after the reload");
+}
+
 /// N10: a pool that fails to reload does not stop the others: the reload still
 /// answers with the error, but a fresh antigravity login after it is in use.
 #[tokio::test]
@@ -9638,6 +9689,49 @@ async fn a_failing_pool_does_not_stop_the_others_from_reloading() {
     assert_eq!(status, 200);
     let calls = upstream.calls.lock().expect("calls");
     assert_eq!(calls[0].account.token.access_token, "google-relogged-token");
+}
+
+/// R1: a tool whose `$ref` chain nests past the walk's bound is answered with a
+/// 400 that names the tool, on a stack a tokio worker has, and is never sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_too_deep_tool_schema_is_a_400_not_a_crash() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_antigravity_account(tmp.path());
+    let upstream = Arc::new(AntigravityUpstream::new());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    let mut definitions = serde_json::Map::new();
+    for def in 0..100 {
+        let mut node = if def < 99 {
+            json!({"$ref": format!("#/$defs/D{}", def + 1)})
+        } else {
+            json!({"type": "string"})
+        };
+        for _ in 0..20 {
+            node = json!({"type": "object", "properties": {"next": node}});
+        }
+        definitions.insert(format!("D{def}"), node);
+    }
+    let parameters = json!({"$defs": definitions, "type": "object",
+                            "properties": {"root": {"$ref": "#/$defs/D0"}}});
+
+    let (status, body) = json_response(
+        app,
+        post(
+            "/v1/chat/completions",
+            &json!({"model": "gemini-4-neon-low",
+                    "messages": [{"role": "user", "content": "x"}],
+                    "tools": [{"type": "function",
+                               "function": {"name": "deep_tool", "parameters": parameters}}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("deep_tool"), "{body}");
+    assert!(
+        upstream.calls.lock().expect("calls").is_empty(),
+        "the request was sent"
+    );
 }
 
 /// F3: a fresh antigravity login is picked up without a restart.
@@ -9838,6 +9932,21 @@ async fn a_cut_messages_stream_ends_in_an_error_not_a_finished_turn() {
     }
 }
 
+/// R5: a gateway that sends its `finish_reason` and then closes the
+/// connection without `[DONE]` finished the reply; its Messages stream closes
+/// with `message_stop` and the stop reason, not an error.
+#[tokio::test]
+async fn a_messages_stream_with_a_finish_reason_and_no_done_still_closes() {
+    const CHAT_FINISH: &str = "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+    for path in ["generic", "grok"] {
+        let (_tmp, app, model) = cut_stream_app(path, &[CHAT_HALF, CHAT_FINISH]);
+        let body = messages_stream(app, model).await;
+        assert!(body.contains("event: message_stop"), "{path}: {body}");
+        assert!(body.contains("end_turn"), "{path}: {body}");
+        assert!(!body.contains("event: error"), "{path}: {body}");
+    }
+}
+
 /// N13: a gateway that ends on `[DONE]` alone, with no `finish_reason`,
 /// finished the reply; its Messages stream still closes.
 #[tokio::test]
@@ -9848,4 +9957,193 @@ async fn a_messages_stream_ended_by_done_alone_still_closes() {
         assert!(body.contains("event: message_stop"), "{path}: {body}");
         assert!(!body.contains("event: error"), "{path}: {body}");
     }
+}
+
+// ---- R3: a bare id goes to the company that makes the model ----------------
+
+fn built_in_token(provider: ProviderId, email: &str) -> TokenData {
+    TokenData {
+        access_token: format!("{email}-access"),
+        refresh_token: format!("{email}-refresh"),
+        email: email.to_string(),
+        expires_at: "2030-01-01T00:00:00Z".to_string(),
+        account_uuid: format!("acct-{email}"),
+        project_id: (provider.kind == ProviderKind::Antigravity).then(|| "p".to_string()),
+        provider,
+        id_token: None,
+        last_refresh_at: None,
+        plan_type: None,
+    }
+}
+
+/// An app with an account in each of `pools`, whose catalog fetches return
+/// `listed`, once its first catalog refresh has advertised `ready`.
+async fn origin_app(
+    pools: &[ProviderId],
+    listed: Vec<(ProviderKind, Vec<&'static str>)>,
+    ready: &str,
+) -> (tempfile::TempDir, axum::Router, Arc<FakeUpstream>) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for provider in pools {
+        save_token(tmp.path(), &built_in_token(provider.clone(), &provider.id))
+            .expect("save token");
+    }
+    let upstream = Arc::new(FakeUpstream {
+        listed,
+        ..FakeUpstream::default()
+    });
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    let ids = advertised_once(&app, ready).await;
+    assert!(ids.iter().any(|id| id == ready), "{ids:?}");
+    (tmp, app, upstream)
+}
+
+/// R3 and R5: with an anthropic account, a bare Claude id that antigravity
+/// lists reaches anthropic — whether anthropic's list names it or came back
+/// empty (a failed fetch leaves no list at all, which the catalog's own test
+/// covers).
+/// The routing reads the pool's account at request time, so this is the
+/// wiring test too.
+#[tokio::test]
+async fn a_bare_claude_id_reaches_anthropic_with_or_without_its_list() {
+    for anthropic_list in [vec!["claude-sonnet-4-6"], vec![]] {
+        let (_tmp, app, upstream) = origin_app(
+            &[ProviderId::anthropic(), ProviderId::antigravity()],
+            vec![
+                (ProviderKind::Anthropic, anthropic_list.clone()),
+                (ProviderKind::Antigravity, vec!["claude-sonnet-4-6"]),
+            ],
+            "antigravity/claude-sonnet-4-6",
+        )
+        .await;
+        let (status, body) = post_model(&app, "/v1/messages", "claude-sonnet-4-6").await;
+        assert_eq!(status, 200, "{anthropic_list:?}: {body}");
+        let calls = upstream.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].account.provider, ProviderId::anthropic());
+    }
+}
+
+/// R3: with no anthropic account, a bare Claude id that only antigravity
+/// serves is a 404 naming the prefixed id, and nothing is sent.
+#[tokio::test]
+async fn a_bare_claude_id_without_an_anthropic_account_names_the_prefixed_id() {
+    let (_tmp, app, upstream) = origin_app(
+        &[ProviderId::antigravity()],
+        vec![(ProviderKind::Antigravity, vec!["claude-sonnet-4-6"])],
+        "antigravity/claude-sonnet-4-6",
+    )
+    .await;
+    let (status, body) = post_model(&app, "/v1/messages", "claude-sonnet-4-6").await;
+    assert_eq!(status, 404, "{body}");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("antigravity/claude-sonnet-4-6"), "{body}");
+    assert!(upstream.calls().is_empty());
+}
+
+/// R3: a bare `gpt-oss-*` id is `OpenAI`'s, so it never reaches antigravity: with a
+/// codex account that does not list it, and with no codex account, the 404
+/// names `antigravity/gpt-oss-120b-medium`; the prefixed id is served.
+#[tokio::test]
+async fn a_bare_gpt_oss_id_is_refused_with_its_prefixed_id() {
+    for pools in [
+        vec![ProviderId::codex(), ProviderId::antigravity()],
+        vec![ProviderId::antigravity()],
+    ] {
+        let (_tmp, app, upstream) = origin_app(
+            &pools,
+            vec![
+                (ProviderKind::Codex, vec!["gpt-5.5"]),
+                (ProviderKind::Antigravity, vec!["gpt-oss-120b-medium"]),
+            ],
+            "antigravity/gpt-oss-120b-medium",
+        )
+        .await;
+        let (status, body) = post_model(&app, "/v1/chat/completions", "gpt-oss-120b-medium").await;
+        assert_eq!(status, 404, "{pools:?}: {body}");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("codex"), "{body}");
+        assert!(
+            message.contains("antigravity/gpt-oss-120b-medium"),
+            "{body}"
+        );
+        assert!(upstream.calls().is_empty());
+
+        let (status, body) = post_model(
+            &app,
+            "/v1/chat/completions",
+            "antigravity/gpt-oss-120b-medium",
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let calls = upstream.calls();
+        assert_eq!(calls[0].account.provider, ProviderId::antigravity());
+        assert_eq!(calls[0].body["model"], "gpt-oss-120b-medium");
+    }
+}
+
+/// R3: a bare Gemini id reaches antigravity, listed there or not.
+#[tokio::test]
+async fn a_bare_gemini_id_reaches_antigravity() {
+    let (_tmp, app, upstream) = origin_app(
+        &[ProviderId::antigravity()],
+        vec![(ProviderKind::Antigravity, vec!["gemini-4-neon-medium"])],
+        "antigravity/gemini-4-neon-medium",
+    )
+    .await;
+    for id in ["gemini-4-neon-medium", "gemini-3-flash"] {
+        let (status, body) = post_model(&app, "/v1/chat/completions", id).await;
+        assert_eq!(status, 200, "{id}: {body}");
+    }
+    let calls = upstream.calls();
+    assert_eq!(calls.len(), 2);
+    assert!(
+        calls
+            .iter()
+            .all(|call| call.account.provider == ProviderId::antigravity())
+    );
+}
+
+/// R3: a prefixed id reaches that provider exactly, even where a bare id of
+/// the same model would go to its maker.
+#[tokio::test]
+async fn a_prefixed_id_reaches_its_prefix() {
+    let (_tmp, app, upstream) = origin_app(
+        &[ProviderId::anthropic(), ProviderId::antigravity()],
+        vec![
+            (ProviderKind::Anthropic, vec!["claude-sonnet-4-6"]),
+            (ProviderKind::Antigravity, vec!["claude-sonnet-4-6"]),
+        ],
+        "antigravity/claude-sonnet-4-6",
+    )
+    .await;
+    let (status, body) = post_model(
+        &app,
+        "/v1/chat/completions",
+        "antigravity/claude-sonnet-4-6",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = post_model(&app, "/v1/messages", "anthropic/claude-sonnet-4-6").await;
+    assert_eq!(status, 200, "{body}");
+    let calls = upstream.calls();
+    assert_eq!(calls[0].account.provider, ProviderId::antigravity());
+    assert_eq!(calls[1].account.provider, ProviderId::anthropic());
+}
+
+/// R3: an id no maker rule claims keeps the live catalog's routing.
+#[tokio::test]
+async fn an_id_of_no_known_maker_follows_the_catalog() {
+    let (_tmp, app, upstream) = origin_app(
+        &[ProviderId::antigravity()],
+        vec![(ProviderKind::Antigravity, vec!["llama-x"])],
+        "antigravity/llama-x",
+    )
+    .await;
+    let (status, body) = post_model(&app, "/v1/chat/completions", "llama-x").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        upstream.calls()[0].account.provider,
+        ProviderId::antigravity()
+    );
 }

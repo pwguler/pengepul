@@ -1683,6 +1683,30 @@ fn copy_value_field(source: &Value, target: &mut Value, key: &str) {
 /// existing translators rather than through a second matrix.
 #[must_use]
 pub fn antigravity_request(chat: &Value) -> Value {
+    build_antigravity_request(chat).0
+}
+
+/// [`antigravity_request`], refusing a tool schema the relay will not inline
+/// in full: one that nests deeper than the walk's bound.
+///
+/// # Errors
+///
+/// Names the tool whose parameters nest too deep.
+pub fn antigravity_request_checked(chat: &Value) -> Result<Value, String> {
+    let (request, too_deep) = build_antigravity_request(chat);
+    match too_deep.first() {
+        None => Ok(request),
+        Some(tool) => Err(format!(
+            "tool `{tool}`: its parameters schema nests more than {GEMINI_SCHEMA_DEPTH} levels \
+             deep once its $refs are inlined, which the antigravity upstream cannot take"
+        )),
+    }
+}
+
+/// The Gemini request and the names of the tools whose schema hit the depth
+/// bound (they were sent cut short at it).
+fn build_antigravity_request(chat: &Value) -> (Value, Vec<String>) {
+    let mut too_deep = Vec::new();
     let mut system = Vec::new();
     let mut contents: Vec<Value> = Vec::new();
     let mut tool_names: std::collections::BTreeMap<String, String> =
@@ -1727,7 +1751,7 @@ pub fn antigravity_request(chat: &Value) -> Value {
     }
     let tools = value_array(chat.get("tools"))
         .into_iter()
-        .filter_map(gemini_function_declaration)
+        .filter_map(|tool| gemini_function_declaration(tool, &mut too_deep))
         .collect::<Vec<_>>();
     if !tools.is_empty() {
         out.insert(
@@ -1738,7 +1762,7 @@ pub fn antigravity_request(chat: &Value) -> Value {
             out.insert("toolConfig".to_string(), config);
         }
     }
-    Value::Object(out)
+    (Value::Object(out), too_deep)
 }
 
 /// One assistant message as the parts of a Gemini model turn: returned
@@ -2015,7 +2039,7 @@ fn gemini_thinking_budget(effort: &str) -> Option<i64> {
     }
 }
 
-fn gemini_function_declaration(tool: &Value) -> Option<Value> {
+fn gemini_function_declaration(tool: &Value, too_deep: &mut Vec<String>) -> Option<Value> {
     let function = tool.get("function").unwrap_or(tool);
     let name = function.get("name").and_then(Value::as_str)?;
     let mut out = Map::new();
@@ -2024,7 +2048,11 @@ fn gemini_function_declaration(tool: &Value) -> Option<Value> {
         out.insert("description".to_string(), json!(description));
     }
     if let Some(parameters) = function.get("parameters").filter(|value| value.is_object()) {
-        out.insert("parameters".to_string(), gemini_schema(parameters));
+        let (schema, cut) = gemini_schema(parameters);
+        if cut {
+            too_deep.push(name.to_string());
+        }
+        out.insert("parameters".to_string(), schema);
     }
     Some(Value::Object(out))
 }
@@ -2060,12 +2088,20 @@ const GEMINI_SCHEMA_FIELDS: [&str; 21] = [
 /// can make every turn's request explode.
 const GEMINI_REF_EXPANSIONS: usize = 256;
 
+/// How deep the cleaned schema may nest. The walk recurses once per level, on
+/// a worker's stack, so without a bound a long chain of distinct `$ref`s
+/// overflows it and aborts the relay; real tool schemas nest far less.
+pub const GEMINI_SCHEMA_DEPTH: usize = 64;
+
 /// What one schema walk carries: the root `$ref`s resolve against, the refs
-/// being expanded on the current path, and how many have been inlined.
+/// being expanded on the current path, how many have been inlined, how deep it
+/// is, and whether it stopped at the depth bound.
 struct SchemaWalk<'a> {
     root: &'a Value,
     active: Vec<String>,
     expansions: usize,
+    depth: usize,
+    too_deep: bool,
 }
 
 /// A JSON Schema as the Gemini `Schema` proto accepts it. Local `$ref`s are
@@ -2074,16 +2110,33 @@ struct SchemaWalk<'a> {
 /// `null` becomes `nullable`; a string enum stays, a non-string one keeps its
 /// type and moves into the description; an array gets `items`; exclusive
 /// bounds become inclusive ones; and every key the proto lacks is dropped.
-fn gemini_schema(schema: &Value) -> Value {
+/// Returns the cleaned schema and whether the walk stopped at its depth bound.
+fn gemini_schema(schema: &Value) -> (Value, bool) {
     let mut walk = SchemaWalk {
         root: schema,
         active: Vec::new(),
         expansions: 0,
+        depth: 0,
+        too_deep: false,
     };
-    gemini_schema_node(schema, &mut walk)
+    let cleaned = gemini_schema_node(schema, &mut walk);
+    (cleaned, walk.too_deep)
 }
 
+/// One schema node, at most [`GEMINI_SCHEMA_DEPTH`] levels down; past that the
+/// walk stops with an open object and records that it did.
 fn gemini_schema_node(node: &Value, walk: &mut SchemaWalk<'_>) -> Value {
+    if walk.depth >= GEMINI_SCHEMA_DEPTH {
+        walk.too_deep = true;
+        return json!({"type": "object"});
+    }
+    walk.depth += 1;
+    let cleaned = gemini_schema_level(node, walk);
+    walk.depth -= 1;
+    cleaned
+}
+
+fn gemini_schema_level(node: &Value, walk: &mut SchemaWalk<'_>) -> Value {
     let Some(map) = node.as_object() else {
         return json!({});
     };
@@ -2119,18 +2172,15 @@ fn gemini_schema_node(node: &Value, walk: &mut SchemaWalk<'_>) -> Value {
     let mut out = Map::new();
     let mut nullable = map.get("nullable").and_then(Value::as_bool) == Some(true);
     let mut types = schema_types(map, &mut nullable);
+    if types.len() > 1 {
+        return schema_type_union(map, &types, nullable, walk);
+    }
     fold_schema_branches(map, walk, &mut out, &mut nullable);
     schema_enum(map, &mut out, &mut nullable, &mut types);
-    match types.as_slice() {
-        [] => {}
-        [one] => {
-            out.insert("type".to_string(), json!(one));
-        }
-        // Several real types: one branch each.
-        many => {
-            let branches = many.iter().map(|kind| json!({"type": kind})).collect();
-            out.insert("anyOf".to_string(), Value::Array(branches));
-        }
+    // Several declared types were split into branches above; an enum may still
+    // have settled the type here.
+    if let Some(kind) = types.first() {
+        out.insert("type".to_string(), json!(kind));
     }
     // An exclusive bound becomes the inclusive one; for the integers coding
     // tools bound, that is off by one in the permissive direction only.
@@ -2156,6 +2206,86 @@ fn gemini_schema_node(node: &Value, walk: &mut SchemaWalk<'_>) -> Value {
         out.insert("nullable".to_string(), json!(true));
     }
     Value::Object(out)
+}
+
+/// A node with several real types (`["string", "array"]`) as an `anyOf` with one
+/// branch per type. Each branch carries the node's keywords that apply to its
+/// kind — `items` on the array branch, `properties` on the object branch, string
+/// bounds on the string branch — and is cleaned like any node, so an array
+/// branch gets `items` too. The node keeps only its description, title and
+/// nullability.
+fn schema_type_union(
+    map: &Map<String, Value>,
+    types: &[String],
+    nullable: bool,
+    walk: &mut SchemaWalk<'_>,
+) -> Value {
+    let enum_kind = map
+        .get("enum")
+        .and_then(Value::as_array)
+        .and_then(|values| values.iter().find(|value| !value.is_null()))
+        .or_else(|| map.get("const"))
+        .map(json_kind);
+    let branches = types
+        .iter()
+        .map(|kind| {
+            let mut branch = map
+                .iter()
+                .filter(|(key, _)| schema_keyword_applies(key, kind, enum_kind))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<Map<String, Value>>();
+            branch.insert("type".to_string(), json!(kind));
+            gemini_schema_node(&Value::Object(branch), walk)
+        })
+        .collect();
+    let mut out = Map::new();
+    out.insert("anyOf".to_string(), Value::Array(branches));
+    for key in ["description", "title"] {
+        if let Some(text) = map.get(key).filter(|value| value.is_string()) {
+            out.insert(key.to_string(), text.clone());
+        }
+    }
+    if nullable {
+        out.insert("nullable".to_string(), json!(true));
+    }
+    Value::Object(out)
+}
+
+/// The JSON Schema kind a value is.
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Bool(_) => "boolean",
+        Value::Number(number) if number.is_i64() || number.is_u64() => "integer",
+        Value::Number(_) => "number",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+        Value::String(_) | Value::Null => "string",
+    }
+}
+
+/// Whether a keyword of a union node belongs on its `kind` branch. Keywords
+/// that bind one kind go only there; an enum goes to the branch of its members'
+/// kind; the node's own description, title and nullability stay on the node.
+fn schema_keyword_applies(key: &str, kind: &str, enum_kind: Option<&str>) -> bool {
+    match key {
+        "type" | "anyOf" | "oneOf" | "allOf" | "description" | "title" | "nullable" => false,
+        "items" | "prefixItems" | "minItems" | "maxItems" => kind == "array",
+        "properties"
+        | "required"
+        | "minProperties"
+        | "maxProperties"
+        | "additionalProperties"
+        | "propertyOrdering" => kind == "object",
+        "minLength" | "maxLength" | "pattern" => kind == "string",
+        "minimum" | "maximum" | "exclusiveMinimum" | "exclusiveMaximum" => {
+            matches!(kind, "number" | "integer")
+        }
+        "format" => matches!(kind, "string" | "number" | "integer"),
+        "enum" | "const" => {
+            enum_kind == Some(kind) || (kind == "number" && enum_kind == Some("integer"))
+        }
+        _ => true,
+    }
 }
 
 /// The node's real types; a `null` among them (`["boolean", "null"]`) marks it
@@ -2198,7 +2328,13 @@ fn fold_schema_branches(
     if branches.len() == 1 {
         if let Some(Value::Object(only)) = branches.pop() {
             for (key, value) in only {
-                out.entry(key).or_insert(value);
+                // The field's own words describe the field; the model's are
+                // its fallback, as with a plain `$ref` and its siblings.
+                let own = matches!(key.as_str(), "description" | "title")
+                    && map.get(&key).is_some_and(Value::is_string);
+                if !own {
+                    out.entry(key).or_insert(value);
+                }
             }
         }
     } else if !branches.is_empty() {
@@ -3036,6 +3172,11 @@ mod antigravity_translation_tests {
                 "timeout": {"type": "number", "exclusiveMaximum": 600_000},
                 "url": {"type": "string", "format": "uri", "minLength": 1},
                 "tags": {"type": "array", "description": "labels"},
+                "paths": {"type": ["string", "array"], "items": {"type": "string"},
+                          "description": "one path or several", "minLength": 1},
+                "target": {"type": ["string", "object"],
+                           "properties": {"x": {"type": "number"}}, "required": ["x"]},
+                "loose": {"type": ["string", "array"]},
                 "todos": {"type": "array", "items": {
                     "type": "object",
                     "properties": {"status": {"type": "string",
@@ -3055,6 +3196,34 @@ mod antigravity_translation_tests {
         assert_eq!(properties["timeout"]["maximum"], 600_000);
         assert_eq!(properties["url"]["minLength"], 1);
         assert_eq!(properties["tags"]["items"]["type"], "string");
+        // R2: a union keeps each kind's keywords on its own branch, so the
+        // array branch has `items` and the object branch its `properties`.
+        let branch = |name: &str, kind: &str| {
+            properties[name]["anyOf"]
+                .as_array()
+                .expect("anyOf")
+                .iter()
+                .find(|branch| branch["type"] == kind)
+                .cloned()
+                .unwrap_or_else(|| panic!("{name} has no {kind} branch"))
+        };
+        assert_eq!(branch("paths", "array")["items"]["type"], "string");
+        assert_eq!(branch("paths", "string")["minLength"], 1);
+        assert!(branch("paths", "array").get("minLength").is_none());
+        assert!(
+            properties["paths"].get("items").is_none(),
+            "{}",
+            properties["paths"]
+        );
+        assert_eq!(properties["paths"]["description"], "one path or several");
+        assert_eq!(
+            branch("target", "object")["properties"]["x"]["type"],
+            "number"
+        );
+        assert_eq!(branch("target", "object")["required"], json!(["x"]));
+        assert!(properties["target"].get("properties").is_none());
+        // An array branch that names no members still gets `items` (N1).
+        assert_eq!(branch("loose", "array")["items"]["type"], "string");
         assert_eq!(parameters["required"], json!(["file_path"]));
         assert_eq!(properties["todos"]["items"]["required"], json!(["status"]));
     }
@@ -3130,6 +3299,89 @@ mod antigravity_translation_tests {
         assert_eq!(properties["count"]["type"], "integer");
         assert_eq!(properties["mode"]["enum"], json!(["fast", "slow"]));
         assert_eq!(properties["mode"]["type"], "string");
+    }
+
+    /// A chain of `defs` distinct definitions, each nesting `levels` objects
+    /// deep before it refers to the next.
+    fn ref_chain(defs: usize, levels: usize) -> serde_json::Value {
+        let mut definitions = serde_json::Map::new();
+        for def in 0..defs {
+            let mut node = if def + 1 < defs {
+                json!({"$ref": format!("#/$defs/D{}", def + 1)})
+            } else {
+                json!({"type": "string"})
+            };
+            for _ in 0..levels {
+                node = json!({"type": "object", "properties": {"next": node}});
+            }
+            definitions.insert(format!("D{def}"), node);
+        }
+        json!({"$defs": definitions, "type": "object",
+               "properties": {"root": {"$ref": "#/$defs/D0"}}})
+    }
+
+    /// R1: a long chain of distinct refs no longer recurses without bound. On a
+    /// tokio worker's 2 MiB stack it returns instead of aborting the process,
+    /// and the request it came in says it is too deep.
+    #[test]
+    fn a_long_ref_chain_is_bounded_and_refused_not_a_stack_overflow() {
+        let parameters = ref_chain(100, 20);
+        let outcome = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let chat = json!({
+                    "messages": [{"role": "user", "content": "x"}],
+                    "tools": [{"type": "function",
+                               "function": {"name": "deep_tool", "parameters": parameters}}]
+                });
+                super::antigravity_request_checked(&chat).map(|_| ())
+            })
+            .expect("spawn")
+            .join()
+            .expect("the schema walk overflowed its stack");
+        let error = outcome.expect_err("a schema past the depth bound");
+        assert!(error.contains("deep_tool"), "{error}");
+        assert!(error.contains("64"), "{error}");
+    }
+
+    /// R1: ordinary nesting is far below the bound and passes the check.
+    #[test]
+    fn a_shallow_ref_chain_passes_the_depth_check() {
+        let chat = json!({
+            "messages": [{"role": "user", "content": "x"}],
+            "tools": [{"type": "function",
+                       "function": {"name": "t", "parameters": ref_chain(3, 4)}}]
+        });
+        assert!(super::antigravity_request_checked(&chat).is_ok());
+    }
+
+    /// R7: folding `Optional[Model]` keeps the field's own description and
+    /// title, as a plain `$ref` with siblings does.
+    #[test]
+    fn an_optional_model_keeps_the_fields_own_description() {
+        let parameters = declared_parameters(&json!({
+            "$defs": {"Address": {"type": "object", "title": "Address",
+                                  "description": "A postal address.",
+                                  "properties": {"city": {"type": "string"}}}},
+            "type": "object",
+            "properties": {
+                "ship_to": {"anyOf": [{"$ref": "#/$defs/Address"}, {"type": "null"}],
+                            "title": "Ship To", "description": "Where the parcel goes."},
+                "bill_to": {"$ref": "#/$defs/Address", "description": "Who pays."}
+            }
+        }));
+        let properties = &parameters["properties"];
+        assert_eq!(
+            properties["ship_to"]["description"],
+            "Where the parcel goes."
+        );
+        assert_eq!(properties["ship_to"]["title"], "Ship To");
+        assert_eq!(properties["ship_to"]["nullable"], true);
+        assert_eq!(
+            properties["ship_to"]["properties"]["city"]["type"],
+            "string"
+        );
+        assert_eq!(properties["bill_to"]["description"], "Who pays.");
     }
 
     /// N3: depth is not a limit. Three nested optional models, the ordinary

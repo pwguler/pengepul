@@ -42,11 +42,19 @@ turn instead. A grok
 account serves `grok-4.6` and `grok-4.5`, each with a 500k context window, named bare or
 as `grok/grok-4.6`. An antigravity account serves the Google Antigravity catalog as the
 upstream lists it — `gemini-4-neon-low`, `-medium`, `-high` and `-xhigh`, the other
-Gemini 4 and Gemini 3 ids, and Claude and GPT-OSS models — named bare or as
-`antigravity/gemini-4-neon-medium`. Model ids reach the vendor as written, so the effort
-tier is part of the name: there is no bare `gemini-4-neon`. An id another built-in also
-lists stays with that built-in when named bare, and so does a `claude-*` id while the
-anthropic pool has an account; the antigravity copy is `antigravity/<id>`.
+Gemini 4 and Gemini 3 ids, and Claude and GPT-OSS models. Model ids reach the vendor as
+written, so the effort tier is part of the name: there is no bare `gemini-4-neon`.
+
+A model id without a provider prefix goes to the company that makes the model:
+`claude-*` to anthropic, `gpt-*`, `o<digit>*` and `codex-*` to codex, `gemini-*` to
+antigravity, `grok-*` to grok. It never falls through to another provider. When that
+pool has no account, or its list does not name the id while another provider's does, the
+relay answers 404 with the prefixed ids that serve it, for example
+`gpt-oss-120b-medium is not served by codex; use antigravity/gpt-oss-120b-medium`. So
+the Claude and GPT-OSS models of an antigravity account are named with their prefix,
+`antigravity/claude-sonnet-4-6` or `antigravity/gpt-oss-120b-medium`. A prefixed id
+goes to that provider exactly, and an id of no known maker goes wherever the live
+catalogs list it.
 Credentials live in `~/.pengepul` (`0600`); a running relay picks up a
 fresh login on restart or `pengepul accounts --reload`. Read the key clients use with
 `pengepul config api-key`. That key alone guards your subscriptions, so keep it secret and

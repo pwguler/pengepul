@@ -1223,14 +1223,6 @@ async fn refresh_model_catalog(state: &AppState) {
         // lands, the pool advertises the static floor.
         ProviderKind::Antigravity,
     ] {
-        // Whether the pool holds an account at all, cooling down or not: a bare
-        // id its name gives this built-in stays with it while it does.
-        let pooled = provider_account_count(state, ProviderId::for_kind(kind)).await > 0;
-        state
-            .catalog
-            .write()
-            .expect("catalog lock poisoned")
-            .set_pooled(kind, pooled);
         let Some(account) = catalog_account(state, kind).await else {
             continue;
         };
@@ -1268,7 +1260,7 @@ async fn refresh_model_catalog(state: &AppState) {
                 if kind == ProviderKind::Antigravity {
                     let mut catalog = state.catalog.write().expect("catalog lock poisoned");
                     if !catalog.lists(kind) {
-                        catalog.set_direct(kind, antigravity_static_models());
+                        catalog.set_floor(kind, antigravity_static_models());
                     }
                 }
             }
@@ -1779,17 +1771,19 @@ async fn admin_reload(State(state): State<AppState>, headers: HeaderMap) -> Resp
                 reloaded.insert(provider.to_string(), value);
             }
             Err(error) => {
+                tracing::warn!(%provider, error = %error_chain(&error), "account pool reload failed");
                 first_failure.get_or_insert((provider, error));
             }
         }
     }
+
+    // Reloading accounts can add a provider that now has credentials to fetch
+    // models with; that holds for the pools that reloaded even when one failed.
+    let refresh_state = state.clone();
+    tokio::spawn(async move { refresh_model_catalog(&refresh_state).await });
     if let Some((provider, error)) = first_failure {
         return accounts_reload_failed(&provider, &error);
     }
-
-    // Reloading accounts can add a provider that now has credentials to fetch models with.
-    let refresh_state = state.clone();
-    tokio::spawn(async move { refresh_model_catalog(&refresh_state).await });
 
     Json(json!({"reloaded": reloaded, "generated_at": now_iso()})).into_response()
 }
@@ -1905,7 +1899,7 @@ async fn count_tokens(State(state): State<AppState>, headers: HeaderMap, body: B
     let Some(model_id) = required_model(&body) else {
         return AppError::simple(StatusCode::BAD_REQUEST, "model is required").into_response();
     };
-    let (provider, model) = match resolve_model(&state, model_id) {
+    let (provider, model) = match resolve_model(&state, model_id).await {
         Ok(resolved) => resolved,
         Err(error) => return error.into_response(),
     };
@@ -1978,17 +1972,35 @@ fn parse_request(state: &AppState, headers: &HeaderMap, body: &[u8]) -> Result<V
 }
 
 /// The Provider a client's model id resolves to and the id that Provider is asked for, or the
-/// 400 that refuses it: an id nobody claims, or one outside its Provider's allow list.
-fn resolve_model(state: &AppState, model_id: &str) -> Result<(ProviderId, String), AppError> {
+/// 4xx that refuses it: an id nobody claims (400), a bare id its maker cannot serve (404, naming
+/// the prefixed ids that can), or one outside its Provider's allow list (400).
+async fn resolve_model(state: &AppState, model_id: &str) -> Result<(ProviderId, String), AppError> {
+    // Whether the pool of the model's maker can serve now, read before the
+    // catalog lock: the account managers are behind async locks.
+    let origin = crate::models::bare_origin(model_id, &state.config.providers);
+    let origin_has_account = match origin {
+        Some(kind) => provider_account_count(state, ProviderId::for_kind(kind)).await > 0,
+        None => false,
+    };
     let catalog = state.catalog.read().expect("catalog lock poisoned");
-    let provider = catalog
-        .resolve_id(model_id, &state.config.providers)
-        .ok_or_else(|| {
-            AppError::simple(
+    let provider = match catalog.resolve(model_id, &state.config.providers, origin_has_account) {
+        Ok(Some(provider)) => provider,
+        Ok(None) => {
+            return Err(AppError::simple(
                 StatusCode::BAD_REQUEST,
                 format!("unknown model: {model_id}"),
-            )
-        })?;
+            ));
+        }
+        Err(message) => {
+            let maker = ProviderId::for_kind(origin.unwrap_or(ProviderKind::Antigravity));
+            return Err(AppError::provider(
+                StatusCode::NOT_FOUND,
+                message,
+                "model_not_served",
+                maker,
+            ));
+        }
+    };
     let model = upstream_model(model_id, &provider);
     if !catalog.allows(&provider, model) {
         return Err(model_not_allowed(model_id, model, provider));
@@ -2044,7 +2056,7 @@ struct ResolvedRequest {
 }
 
 /// Resolve a client body to a routed request, or the error to return.
-fn resolve_route_request(
+async fn resolve_route_request(
     state: &AppState,
     headers: &HeaderMap,
     body: &Value,
@@ -2056,7 +2068,7 @@ fn resolve_route_request(
             "model is required",
         ));
     };
-    let (provider, model) = resolve_model(state, model_id)?;
+    let (provider, model) = resolve_model(state, model_id).await?;
     check_fallback_models(state, &provider, body)?;
     Ok(ResolvedRequest {
         model,
@@ -2072,7 +2084,7 @@ async fn route_provider_request(
     body: &Value,
     route: RequestRoute,
 ) -> Response {
-    let request = match resolve_route_request(state, headers, body, route) {
+    let request = match resolve_route_request(state, headers, body, route).await {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
@@ -2465,7 +2477,21 @@ async fn route_antigravity_request(
 ) -> Response {
     let model = request.model.as_str();
     let chat = upstream_request_body(ProviderKind::Antigravity, route, body, model);
-    let upstream_body = antigravity_envelope(&chat, model, account.token.project_id.as_deref());
+    let upstream_body =
+        match antigravity_envelope(&chat, model, account.token.project_id.as_deref()) {
+            Ok(envelope) => envelope,
+            Err(reason) => {
+                // The relay's own refusal of the body: the account is not at fault.
+                record_provider_refusal(state, &account.provider, account).await;
+                return AppError::provider(
+                    StatusCode::BAD_REQUEST,
+                    reason,
+                    "invalid_request_error",
+                    account.provider.clone(),
+                )
+                .into_response();
+            }
+        };
     if request.client_wants_stream {
         return match state
             .upstream
@@ -4064,11 +4090,9 @@ fn transformed_sse_stream(
                 yield Bytes::from(chunk);
             }
         }
-        // The Messages message a generic endpoint's stream became is closed
-        // here and nowhere else: a stream that stopped before any
-        // finish_reason still owes the client the tool calls it announced
-        // and a message_stop, and usage often arrives after finish_reason.
-        // An error event ends a Messages stream; nothing follows it.
+        // The Messages message a chat-shaped stream became is closed here and
+        // nowhere else, because usage often arrives after finish_reason. A
+        // stream that already sent an error event gets nothing more.
         if Translation::between(provider.kind, route).closes_its_own_stream()
             && states.stream_error.is_none()
         {

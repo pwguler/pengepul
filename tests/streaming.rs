@@ -1,7 +1,7 @@
 use pengepul::streaming::{
     AnthropicStreamState, ChatStreamState, ResponsesStreamState, anthropic_sse_to_chat,
-    anthropic_sse_to_responses, chat_sse_to_anthropic, finish_chat_stream, parse_sse_events,
-    responses_sse_to_anthropic, responses_sse_to_chat, responses_sse_to_payload,
+    anthropic_sse_to_responses, chat_sse_to_anthropic, cut_chat_stream, finish_chat_stream,
+    parse_sse_events, responses_sse_to_anthropic, responses_sse_to_chat, responses_sse_to_payload,
 };
 use serde_json::{Value, json};
 
@@ -1107,4 +1107,15 @@ fn a_chat_stream_reasoning_delta_becomes_a_thinking_block() {
         chunks.iter().any(|c| c.contains("thinking_delta")),
         "{chunks:?}"
     );
+}
+
+#[test]
+fn a_stream_cut_before_it_started_still_ends_in_an_error_event() {
+    // R8: a 200 whose body carried nothing (or only empty chunks) left the
+    // client an empty stream with no reason. It gets the error event, once.
+    let mut state = AnthropicStreamState::new("glm-5.3");
+    let tail = cut_chat_stream(&mut state).join("");
+    assert!(tail.contains("event: error"), "{tail}");
+    assert!(!tail.contains("message_stop"), "{tail}");
+    assert!(cut_chat_stream(&mut state).is_empty());
 }

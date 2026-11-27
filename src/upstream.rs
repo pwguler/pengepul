@@ -1308,8 +1308,17 @@ pub fn antigravity_manifest_version(manifest: &str) -> Option<String> {
 
 /// Wrap a Chat Completions body in the Antigravity envelope: the Gemini request
 /// one level down, and the identity, project and request type beside it.
-#[must_use]
-pub fn antigravity_envelope(chat_body: &Value, model: &str, project: Option<&str>) -> Value {
+///
+/// # Errors
+///
+/// Names a tool whose parameters schema nests past the walk's bound; the
+/// request is refused rather than sent with that schema cut short.
+pub fn antigravity_envelope(
+    chat_body: &Value,
+    model: &str,
+    project: Option<&str>,
+) -> Result<Value, String> {
+    let request = crate::translate::antigravity_request_checked(chat_body)?;
     let mut envelope = serde_json::Map::new();
     if let Some(project) = project {
         envelope.insert("project".to_string(), json!(project));
@@ -1321,11 +1330,8 @@ pub fn antigravity_envelope(chat_body: &Value, model: &str, project: Option<&str
         "requestId".to_string(),
         json!(format!("agent/{}", Uuid::new_v4())),
     );
-    envelope.insert(
-        "request".to_string(),
-        crate::translate::antigravity_request(chat_body),
-    );
-    Value::Object(envelope)
+    envelope.insert("request".to_string(), request);
+    Ok(Value::Object(envelope))
 }
 
 /// The Gemini object inside the Antigravity envelope. A reply that arrives
@@ -1363,8 +1369,9 @@ fn parse_proto_duration(raw: &str) -> Option<Duration> {
     Duration::try_from_secs_f64(seconds.parse().ok()?).ok()
 }
 
-/// How long a Hub manifest read may take. The version is a nicety: nothing a
-/// user waits on waits on it.
+/// How long a Hub manifest read may take. No catalog refresh and no login URL
+/// waits on it; a login waits at most this long, after the browser step and
+/// before its control-plane calls.
 pub const ANTIGRAVITY_MANIFEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Read the Hub version on `runtime`'s own task, giving up after `limit`, and
@@ -1517,7 +1524,8 @@ mod antigravity_tests {
             }),
             "gemini-4-neon-high",
             Some("cloud-code-project"),
-        );
+        )
+        .expect("a shallow schema");
         assert_eq!(envelope["project"], "cloud-code-project");
         assert_eq!(envelope["model"], "gemini-4-neon-high");
         assert_eq!(envelope["userAgent"], "antigravity");

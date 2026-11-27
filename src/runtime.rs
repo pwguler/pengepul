@@ -509,9 +509,8 @@ struct CallbackResult {
     code: String,
     state: String,
     /// True when the credential arrived by paste rather than through the
-    /// loopback callback. A pasted callback URL carries its `state`, which is
-    /// checked; a bare pasted code has none, and the PKCE verifier still binds
-    /// it.
+    /// loopback callback. Grok exchanges a paste without comparing its `state`;
+    /// the PKCE verifier still binds the code.
     pasted: bool,
     /// What was pasted, as typed, for a provider that tells a pasted URL from
     /// a bare code (antigravity refuses a URL without its state).

@@ -20,9 +20,12 @@ sources live in `docs/research/antigravity-provider.md`.
   fallback project id.
 - No config knob for the client version or the host: the version is learned from
   the 426 and refreshed from the public manifest, the host is a constant.
-- No change to anthropic, codex, grok or configured-provider behaviour, metadata,
-  routing or rotation, and no network call for an install with no antigravity
-  account.
+- No change to anthropic, codex, grok or configured-provider behaviour, metadata
+  or rotation, and no network call for an install with no antigravity account,
+  with two exceptions. Bare-id routing follows the origin rule in AC-2 for every
+  provider. A Messages stream from a configured endpoint or grok that the
+  upstream cut before a `finish_reason` or `[DONE]` ends in an `error` event,
+  not `message_stop` (AC-3).
 
 ## Acceptance criteria
 
@@ -45,13 +48,20 @@ sources live in `docs/research/antigravity-provider.md`.
   (`tab_*`, `chat_*`, image models). Before a live list arrives the floor is the
   Gemini 4 Neon effort tiers `gemini-4-neon-low`, `-medium`, `-high`, `-xhigh`;
   the bare `gemini-4-neon` is not an upstream id and is not advertised. A failed
-  fetch keeps the last list. Requests may address an id bare or prefixed; the id
-  reaches the vendor as the client wrote it (ADR-0025). A bare id that another
-  built-in also serves stays with that built-in, and the antigravity copy is
-  reachable only with its prefix. A bare id the name heuristic gives to an
-  earlier built-in (`claude-*` to anthropic) stays with it while its pool has an
-  account, even when its list is missing; an antigravity-only `claude-*` id
-  then needs its `antigravity/` prefix.
+  fetch keeps the last list. The id reaches the vendor as the client wrote it,
+  less its prefix (ADR-0025). A prefixed id (`antigravity/…`, `anthropic/…`)
+  goes to that provider exactly. A bare id goes to the company that makes the
+  model: `claude-*` to anthropic, `gpt-*`, `o<digit>*` and `codex-*` to codex,
+  `gemini-*` to antigravity, `grok-*` to grok, and never falls through to
+  another provider. When that pool has no account, or its live list lacks the
+  id while another provider lists it, the answer is a 404 naming the prefixed
+  ids that serve it (`gpt-oss-120b-medium is not served by codex; use
+  antigravity/gpt-oss-120b-medium`); an id no other provider lists goes to the
+  maker, which answers for it. So an antigravity account's Claude and GPT-OSS
+  models are named `antigravity/<id>`. A bare id of no known maker keeps the
+  live-catalog routing: the first built-in by precedence (anthropic, codex,
+  grok, antigravity) that lists it. A tool schema that nests more than 64
+  levels once its `$ref`s are inlined is refused 400, naming the tool.
 - AC-3: A Chat Completions request naming an antigravity model is answered in
   standard OpenAI shape, streaming and non-streaming, with reasoning delivered as
   `reasoning_content` and usage reported from `usageMetadata`, thinking counted

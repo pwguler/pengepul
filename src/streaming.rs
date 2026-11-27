@@ -1350,7 +1350,9 @@ pub fn chat_sse_to_anthropic(data: &Value, state: &mut AnthropicStreamState) -> 
 /// handed over half-built.
 #[must_use]
 pub fn cut_chat_stream(state: &mut AnthropicStreamState) -> Vec<String> {
-    if !state.started || state.from_chat.closed {
+    // A stream that never started still ends with the reason, or the client
+    // is left an empty body.
+    if state.from_chat.closed {
         return Vec::new();
     }
     state.from_chat.closed = true;

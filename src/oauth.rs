@@ -631,7 +631,13 @@ async fn antigravity_discover_project(access_token: &str) -> Result<(String, Opt
         return Ok((project, plan));
     }
     let project = antigravity_onboard_user(access_token, &onboarding_tier).await?;
-    Ok((project, plan))
+    Ok((project, antigravity_onboarded_plan(plan, &onboarding_tier)))
+}
+
+/// The plan label of an account just onboarded onto `tier`: the label it
+/// already had (a paid tier), else that tier, which it is now on.
+fn antigravity_onboarded_plan(plan: Option<String>, tier: &str) -> Option<String> {
+    plan.or_else(|| Some(tier.to_string()))
 }
 
 /// The plan label an account shows and the tier id a first-time account is
@@ -1355,7 +1361,8 @@ mod antigravity_oauth_tests {
             antigravity_plan_and_onboarding_tier(&json!({"currentTier": {"id": "free-tier"}})),
             (Some("free-tier".to_string()), "free-tier".to_string())
         );
-        // A new account is on no tier yet: no plan label until it has one.
+        // A new account is on no tier yet: no label from this body. R9: once
+        // onboarded, it is on the onboarding tier, which becomes its label.
         assert_eq!(
             antigravity_plan_and_onboarding_tier(&json!({
                 "allowedTiers": [{"id": "standard-tier", "isDefault": true}]
@@ -1366,6 +1373,20 @@ mod antigravity_oauth_tests {
         assert_eq!(
             antigravity_plan_and_onboarding_tier(&json!({})),
             (None, "free-tier".to_string())
+        );
+    }
+
+    /// R9: an account onboarded onto a tier is labelled with it; a label it
+    /// already had is kept.
+    #[test]
+    fn an_onboarded_account_is_labelled_with_its_onboarding_tier() {
+        assert_eq!(
+            super::antigravity_onboarded_plan(None, "standard-tier"),
+            Some("standard-tier".to_string())
+        );
+        assert_eq!(
+            super::antigravity_onboarded_plan(Some("g1-pro-tier".to_string()), "standard-tier"),
+            Some("g1-pro-tier".to_string())
         );
     }
 
