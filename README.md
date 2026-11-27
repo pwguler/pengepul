@@ -40,10 +40,13 @@ while that account can serve. A pool set to round-robin (`rotation: { anthropic:
 in `config.yaml`) reads no `priority:` and hands each new conversation to the next account in
 turn instead. A grok
 account serves `grok-4.6` and `grok-4.5`, each with a 500k context window, named bare or
-as `grok/grok-4.6`. An antigravity account serves the Google Antigravity catalog —
-`gemini-4-neon` and its `-low`, `-medium`, `-high` and `-xhigh` effort tiers among them,
-plus whatever else the upstream lists — named bare or as `antigravity/gemini-4-neon`.
-Model ids reach the vendor as written, so a tier is part of the name it names.
+as `grok/grok-4.6`. An antigravity account serves the Google Antigravity catalog as the
+upstream lists it — `gemini-4-neon-low`, `-medium`, `-high` and `-xhigh`, the other
+Gemini 4 and Gemini 3 ids, and Claude and GPT-OSS models — named bare or as
+`antigravity/gemini-4-neon-medium`. Model ids reach the vendor as written, so the effort
+tier is part of the name: there is no bare `gemini-4-neon`. An id another built-in also
+lists stays with that built-in when named bare; the antigravity copy is
+`antigravity/<id>`.
 Credentials live in `~/.pengepul` (`0600`); a running relay picks up a
 fresh login on restart or `pengepul accounts --reload`. Read the key clients use with
 `pengepul config api-key`. That key alone guards your subscriptions, so keep it secret and
@@ -63,7 +66,9 @@ systemctl --user restart pengepul   # or: pengepul service restart
 A provider id becomes a directory under the auth dir: letters, digits, `.`, `-`, `_`;
 never `.` or `..`, which a filesystem reads as somewhere else, and never a built-in's
 name (`anthropic`, `claude`, `codex`, `grok`, `antigravity`). Providers load at startup, so a new one
-needs a restart. Registration only adds: an id already present with a different
+needs a restart. Upgrading: `antigravity` became a built-in in this release, so a config
+that already registers a `providers: antigravity:` entry with a `base-url` no longer
+loads; rename that entry (and its directory under the auth dir) before upgrading. Registration only adds: an id already present with a different
 `base-url` errors, naming the URL it kept, so a mistyped flag cannot move live traffic.
 Repeating is safe; changing or removing one means editing the file.
 
@@ -160,9 +165,10 @@ ssh -L 14550:127.0.0.1:14550 user@host # grok
 ssh -L 51121:localhost:51121 user@host # antigravity
 ```
 
-For grok and antigravity the tunnel is optional: when the browser cannot reach its
-callback, the consent page shows a code instead, and pasting that code, or the full
-callback URL, at the login prompt finishes the same login.
+For grok and antigravity the tunnel is optional. When the browser cannot reach the
+callback, auth.x.ai shows a code; Google shows nothing, and the browser ends on a page
+that does not load, with the full callback URL in its address bar. Pasting that code, or
+that URL, at the login prompt finishes the same login.
 
 ## Clients
 

@@ -169,10 +169,11 @@ in files.
   are advertised as it returns them (ADR-0029). So do a stream's Silence limit
   and the Retry hint's parse: a test double hands back a parsed hint, and only a
   test that streams from a real HTTP server can show where a stream is cut.
-- **`ProviderKind`** — a closed enum (Anthropic, Codex, Grok, Generic) that
-  switches the credential lifecycle, the OAuth flow, and whether Cloaking runs,
-  and names the ids a configured Provider may not take; the compiler is the
-  checklist when a fifth kind arrives.
+- **`ProviderKind`** — a closed enum (Anthropic, Codex, Grok, Antigravity,
+  Generic) that switches the credential lifecycle, the OAuth flow, and whether
+  Cloaking runs, and names the ids a configured Provider may not take. The
+  compiler checks every `match` on it, not every list: code that walks the pools
+  reads `AccountManagers::pools()`, which is the one list a new kind joins.
 - **`CliRuntime`** — every side effect a CLI verb performs, so `cli.rs` stays
   pure argument handling.
 - **`Style`** — decided once from the TTY and environment in `main.rs` and
