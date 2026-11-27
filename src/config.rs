@@ -595,6 +595,7 @@ impl Config {
             ProviderKind::Anthropic,
             ProviderKind::Codex,
             ProviderKind::Grok,
+            ProviderKind::Antigravity,
         ]
         .into_iter()
         .map(ProviderKind::canonical_id)

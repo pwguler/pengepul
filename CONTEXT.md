@@ -7,7 +7,7 @@ pengepul pools several AI-vendor accounts behind one local API and hands each co
 ### Providers
 
 **Provider**:
-An upstream vendor family pengepul relays to — anthropic, codex, grok, or a configured OpenAI-compatible endpoint (e.g. groq) — and the top-level axis by which accounts, credentials, models and admin output are partitioned.
+An upstream vendor family pengepul relays to — anthropic, codex, grok, antigravity, or a configured OpenAI-compatible endpoint (e.g. groq) — and the top-level axis by which accounts, credentials, models and admin output are partitioned.
 _Avoid_: kind, provider id, backend, owned_by
 
 **Upstream**:
@@ -37,6 +37,10 @@ _Avoid_: conversion, adapter, mapping, shim
 **Account**:
 One authorized identity at a provider, keyed by email (or by a derived label for static-key providers), holding the credential pengepul rotates through and the usage and failure record kept against it. The identity and its record outlive the credential: a removed credential file removes the way to serve, not the account, which stays listed and counted — in `status`, in `usage` and in `accounts` — as one that cannot serve, printed `unavailable` in rich and plain alike.
 _Avoid_: credential, token, token file, snapshot
+
+**Project**:
+The Cloud Code Assist project a Google **Account** is bound to, discovered through `loadCodeAssist` (or provisioned through `onboardUser`) when the account logs in and stored beside its credential, because every antigravity request carries it. It is not the operator's own Google Cloud project and is never configured by hand; a Refresh keeps it, and a login that cannot discover one fails rather than borrowing a shared project.
+_Avoid_: project id, gcp project, workspace
 
 **Refresh**:
 Replacement of an account's expiring access token using its refresh token, done by pengepul without operator involvement.
@@ -83,7 +87,7 @@ One 64-column box of rich CLI output. Its header is `<subject>` or `<subject> �
 _Avoid_: card, box, widget
 
 **Refusal**:
-A request that reached an outcome no Account is at fault for: a dialect the Provider cannot serve, a body the upstream rejected as malformed, or a client that hung up before its stream completed. It counts as a failed request so `requests` still equals `successes + failures`, but it never touches the Account's health: no Cooldown, no failure streak, no change to Rotation. Defined by its effect, not by whether the relay asked upstream first.
+A request that reached an outcome no Account is at fault for: a dialect the Provider cannot serve, a body the upstream rejected as malformed, a model or path the upstream answered 404 for (ADR-0034), or a client that hung up before its stream completed. It counts as a failed request so `requests` still equals `successes + failures`, but it never touches the Account's health: no Cooldown, no failure streak, no change to Rotation. Defined by its effect, not by whether the relay asked upstream first.
 _Avoid_: rejection, refused request, bad request
 
 **Usage counters**:
@@ -138,23 +142,24 @@ _Avoid_: billing classifier, detector, filter
 
 ## Relationships
 
-- pengepul has three built-in **Providers** — anthropic, codex, grok — plus one configured **Provider** per `providers:` config entry with a `base-url`, which may not take a built-in's name. An entry under a built-in's name carries only `allow:`: it narrows the models that built-in serves and is not a **Provider** of its own.
+- pengepul has four built-in **Providers** — anthropic, codex, grok, antigravity — plus one configured **Provider** per `providers:` config entry with a `base-url`, which may not take a built-in's name. An entry under a built-in's name carries only `allow:`: it narrows the models that built-in serves and is not a **Provider** of its own.
 - One **Provider** has zero or more **Accounts**; one **Account** belongs to exactly one **Provider**.
-- Within one **Provider** an **Account** is keyed by exactly one email (anthropic, codex, grok) or by a label derived from the key (static-key providers), and keys are unique.
-- One **Account** holds exactly one credential: an access-token/refresh-token pair for anthropic, codex and grok, or one static API key for a configured OpenAI-compatible **Provider**.
+- Within one **Provider** an **Account** is keyed by exactly one email (anthropic, codex, grok, antigravity) or by a label derived from the key (static-key providers), and keys are unique.
+- One **Account** holds exactly one credential: an access-token/refresh-token pair for anthropic, codex, grok and antigravity, or one static API key for a configured OpenAI-compatible **Provider**.
 - One **Account** holds at most one **Priority**, and a **Pool** that rotates by **Priority** orders its **Accounts** by it; **Priority** never compares across **Pools** or **Providers**.
 - One **Pool** rotates one way at a time, set per **Provider** under `rotation:`: by **Priority**, the default, or **Round-robin**. A **Round-robin** **Pool** keeps one turn of its own and reads no **Priority**.
 - One **Account** has at most one **Cooldown** in effect, with three duration policies: an ordinary failure cooldown, a longer one for **Reauth**, and a separate ceiling of up to an hour for an account that has never once succeeded — shorter than Reauth's, because it bounds how often a dead key is probed while a Reauth waits for a human (ADR-0020). A **Retry hint** stretches whichever applies to the wait the vendor named, up to a day, and never shortens it. A **Pool** of one account has none of the three: the account keeps serving its failures, and the client sees the vendor's own error (ADR-0027).
 - One model id resolves to exactly one **Provider**.
 - One client request is served by one **Account** at a time, and **Failover** only moves it between **Accounts** of the same **Provider**.
-- **Cloaking** applies to requests bound for the anthropic and codex **Upstreams**; grok and configured OpenAI-compatible endpoints are never cloaked. The **Local API key** applies to requests arriving from a client.
+- **Cloaking** applies to requests bound for the anthropic and codex **Upstreams**; grok, antigravity and configured OpenAI-compatible endpoints are never cloaked. The **Local API key** applies to requests arriving from a client.
 - One pengepul endpoint accepts exactly one **Inbound dialect**; one **Provider** accepts exactly one **Dialect** upstream.
 - One **Thread** lives on exactly one **Account** and never moves: when **Rotation** or **Failover** hands a conversation to another **Account**, its turn goes there whole and opens a new **Thread** (ADR-0032).
 - A **Harness** never holds a **Thread**: it sends the whole conversation on every turn, the relay decides how much of it the **Upstream** already holds, and a **Harness** that names a **Thread** of its own is told to send the conversation whole (ADR-0032).
 - One client request records one outcome whatever was sent for it: a **Declined thread** and the request that answers it are one request, and only the answer to the last is counted.
 - A conversation whose **Thread** the vendor declined, and whose turn it then took **Plain**, is sent **Plain** on that **Account** from then on; three such conversations in a row rest the **Account**, which is then not asked for a **Thread** for an hour.
 - A **Harness** reaches the relay through its own configuration, never through a route made for it (ADR-0007). `pengepul launch` writes that configuration into one process instead of onto disk, so it covers only the **Harnesses** that can be redirected per-process.
-- Any **Inbound dialect** may be served by anthropic, codex or grok, and **Translation** is what closes the gap; grok speaks only Chat Completions upstream, and the other two dialects are translated onto it. A configured OpenAI-compatible endpoint speaks only Chat Completions upstream too, so Messages is translated onto it and Responses answers 501. count_tokens is anthropic-only and answers 501 elsewhere.
+- Any **Inbound dialect** may be served by anthropic, codex, grok or antigravity, and **Translation** is what closes the gap; grok speaks only Chat Completions upstream, and the other two dialects are translated onto it. A configured OpenAI-compatible endpoint speaks only Chat Completions upstream too, so Messages is translated onto it and Responses answers 501. count_tokens is anthropic-only and answers 501 elsewhere.
+- The antigravity **Upstream** speaks Gemini `generateContent` inside an Antigravity envelope, which is a shape the **Translation** matrix does not carry: its route wraps the Chat request in the envelope and unwraps the Gemini reply, so the matrix still sees Chat Completions and every **Inbound dialect** is served as it is for grok.
 
 ## Example dialogue
 
@@ -184,7 +189,7 @@ _Avoid_: billing classifier, detector, filter
 
 ## Flagged ambiguities
 
-- "provider" names both the vendor and a configured entry for that vendor. Resolved: **Provider** means the vendor. For a configured OpenAI-compatible endpoint, the config entry is the Provider; for anthropic, codex and grok no config entry registers them because they are built in, and an entry under their name carries only `allow:`.
+- "provider" names both the vendor and a configured entry for that vendor. Resolved: **Provider** means the vendor. For a configured OpenAI-compatible endpoint, the config entry is the Provider; for anthropic, codex, grok and antigravity no config entry registers them because they are built in, and an entry under their name carries only `allow:`.
 - "claude" appears as an alias for anthropic in stored credentials. Resolved: **anthropic** is the only spelling an operator uses or types.
 - "account", "credential" and "token" all name the same file under the auth directory across the README, the CLI and the source. Resolved: **Account** is the domain noun — the identity, its credential, and its record. Credential is the secret inside an account. Token is a wire artifact and never means the account.
 - Accounts are keyed by email. Resolved: read the field as the account key, not as an address.

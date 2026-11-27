@@ -263,6 +263,20 @@ impl UpstreamClient for FakeUpstream {
         })
     }
 
+    fn antigravity_generate(&self, request: UpstreamRequest) -> UpstreamFuture {
+        self.calls.lock().expect("calls lock").push(request);
+        Box::pin(async {
+            Ok(UpstreamJsonResponse {
+                quota: None,
+                retry_hint: None,
+                status: axum::http::StatusCode::OK,
+                body: json!({"response": {"candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "ok"}]},
+                    "finishReason": "STOP"}]}}),
+            })
+        })
+    }
+
     fn fetch_models(
         &self,
         kind: ProviderKind,
@@ -398,7 +412,7 @@ async fn app_auth_and_no_account_responses() {
             .header("content-type", "application/json")
             .header("content-length", "1")
             .body(Body::from(
-                json!({"model": "claude-sonnet-4-6", "messages": [{"role": "user", "content": "hi"}]})
+                json!({"model": "anthropic/claude-sonnet-4-6", "messages": [{"role": "user", "content": "hi"}]})
                     .to_string(),
             ))
             .unwrap(),
@@ -406,6 +420,17 @@ async fn app_auth_and_no_account_responses() {
     .await;
     assert_eq!(status, 503);
     assert_eq!(body["error"]["type"], "no_account_for_provider");
+
+    // C1: a bare id names its maker's missing login instead, as a 404 a client
+    // does not retry.
+    let (status, body) = post_model(&app, "/v1/messages", "claude-sonnet-4-6").await;
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(body["error"]["type"], "model_not_served");
+    assert_eq!(
+        body["error"]["message"],
+        "claude-sonnet-4-6 is not served by anthropic: no anthropic account; \
+         run `pengepul login --provider anthropic`"
+    );
 
     let (status, body) = json_response(
         app,
@@ -416,7 +441,7 @@ async fn app_auth_and_no_account_responses() {
             .header("content-type", "application/json")
             .header("content-length", "1")
             .body(Body::from(
-                json!({"model": "gpt-5.4", "messages": [{"role": "user", "content": "hi"}]})
+                json!({"model": "codex/gpt-5.4", "messages": [{"role": "user", "content": "hi"}]})
                     .to_string(),
             ))
             .unwrap(),
@@ -533,7 +558,7 @@ async fn app_rejects_an_unknown_model() {
     let upstream = Arc::new(FakeUpstream::default());
     let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream);
 
-    // An id no fetched list and no heuristic claims is rejected, not silently routed.
+    // An id no fetched list and no maker rule claims is rejected, not silently routed.
     let (status, body) = json_response(
         app,
         axum::http::Request::builder()
@@ -543,7 +568,7 @@ async fn app_rejects_an_unknown_model() {
             .header("content-type", "application/json")
             .header("content-length", "1")
             .body(Body::from(
-                json!({"model": "gemini-3", "messages": [{"role": "user", "content": "hi"}]})
+                json!({"model": "mistral-large-9", "messages": [{"role": "user", "content": "hi"}]})
                     .to_string(),
             ))
             .unwrap(),
@@ -551,7 +576,7 @@ async fn app_rejects_an_unknown_model() {
     .await;
 
     assert_eq!(status, 400);
-    assert_eq!(body["error"]["message"], "unknown model: gemini-3");
+    assert_eq!(body["error"]["message"], "unknown model: mistral-large-9");
 }
 
 /// A client request for `model` on `uri`, carrying what every model route requires.
@@ -960,7 +985,7 @@ async fn app_codex_count_tokens_is_unsupported() {
             .header("content-length", "256")
             .body(Body::from(
                 json!({
-                    "model": "gpt-5.4",
+                    "model": "codex/gpt-5.4",
                     "messages": [{"role": "user", "content": "hi"}]
                 })
                 .to_string(),
@@ -1268,6 +1293,7 @@ async fn messages_route_forwards_anthropic_account_with_resolved_model() {
             id_token: None,
             last_refresh_at: None,
             plan_type: None,
+            project_id: None,
         },
     )
     .expect("save token");
@@ -1529,6 +1555,7 @@ fn pool_account(dir: &Path, email: &str) {
             id_token: None,
             last_refresh_at: None,
             plan_type: None,
+            project_id: None,
         },
     )
     .expect("save token");
@@ -2771,6 +2798,7 @@ async fn messages_route_hands_new_conversations_to_the_configured_priority() {
                 id_token: None,
                 last_refresh_at: None,
                 plan_type: None,
+                project_id: None,
             },
         )
         .expect("save token");
@@ -2843,6 +2871,7 @@ async fn one_conversation_stays_on_one_account() {
                 id_token: None,
                 last_refresh_at: None,
                 plan_type: None,
+                project_id: None,
             },
         )
         .expect("save token");
@@ -2909,6 +2938,7 @@ async fn without_a_configured_priority_new_conversations_do_not_alternate() {
                 id_token: None,
                 last_refresh_at: None,
                 plan_type: None,
+                project_id: None,
             },
         )
         .expect("save token");
@@ -3263,6 +3293,7 @@ async fn messages_route_retries_next_account_after_retryable_upstream_failure() 
                 id_token: None,
                 last_refresh_at: None,
                 plan_type: None,
+                project_id: None,
             },
         )
         .expect("save token");
@@ -3417,6 +3448,7 @@ async fn a_lone_account_is_never_parked_out_of_rotation() {
             id_token: None,
             last_refresh_at: None,
             plan_type: None,
+            project_id: None,
         },
     )
     .expect("save token");
@@ -3494,6 +3526,7 @@ async fn chat_completions_route_adapts_anthropic_response_to_openai() {
             id_token: None,
             last_refresh_at: None,
             plan_type: None,
+            project_id: None,
         },
     )
     .expect("save token");
@@ -3540,6 +3573,7 @@ async fn chat_completions_route_streams_anthropic_response_to_openai() {
             id_token: None,
             last_refresh_at: None,
             plan_type: None,
+            project_id: None,
         },
     )
     .expect("save token");
@@ -3610,6 +3644,7 @@ async fn responses_route_adapts_anthropic_response_to_responses() {
             id_token: None,
             last_refresh_at: None,
             plan_type: None,
+            project_id: None,
         },
     )
     .expect("save token");
@@ -3651,6 +3686,7 @@ async fn responses_route_sends_web_search_and_reasoning_to_anthropic() {
             id_token: None,
             last_refresh_at: None,
             plan_type: None,
+            project_id: None,
         },
     )
     .expect("save token");
@@ -3704,6 +3740,7 @@ async fn count_tokens_route_forwards_anthropic_account_with_resolved_model() {
             id_token: None,
             last_refresh_at: None,
             plan_type: None,
+            project_id: None,
         },
     )
     .expect("save token");
@@ -3751,6 +3788,7 @@ async fn messages_route_translates_anthropic_payload_for_codex() {
             id_token: None,
             last_refresh_at: None,
             plan_type: None,
+            project_id: None,
         },
     )
     .expect("save token");
@@ -3809,6 +3847,7 @@ async fn messages_route_forwards_anthropic_tool_choice_for_codex() {
             id_token: None,
             last_refresh_at: None,
             plan_type: None,
+            project_id: None,
         },
     )
     .expect("save token");
@@ -3868,6 +3907,7 @@ async fn chat_completions_route_adapts_codex_response_to_openai() {
             id_token: None,
             last_refresh_at: None,
             plan_type: None,
+            project_id: None,
         },
     )
     .expect("save token");
@@ -3914,6 +3954,7 @@ async fn chat_completions_route_streams_codex_usage_to_account_stats() {
             id_token: None,
             last_refresh_at: None,
             plan_type: None,
+            project_id: None,
         },
     )
     .expect("save token");
@@ -4160,6 +4201,7 @@ fn save_provider_token(dir: &std::path::Path, provider: ProviderId, email: &str)
             id_token: None,
             last_refresh_at: None,
             plan_type: None,
+            project_id: None,
         },
     )
     .expect("save token");
@@ -4675,6 +4717,7 @@ async fn chat_route_preserves_responses_web_search_for_codex() {
             id_token: None,
             last_refresh_at: None,
             plan_type: None,
+            project_id: None,
         },
     )
     .expect("save token");
@@ -4728,6 +4771,7 @@ async fn responses_route_normalizes_string_input_for_codex() {
             id_token: None,
             last_refresh_at: None,
             plan_type: None,
+            project_id: None,
         },
     )
     .expect("save token");
@@ -4779,6 +4823,7 @@ async fn admin_accounts_lists_configured_provider_keys_loaded_at_startup() {
             id_token: None,
             last_refresh_at: None,
             plan_type: None,
+            project_id: None,
         },
     )
     .expect("save groq key");
@@ -4927,6 +4972,7 @@ fn static_key_token(provider: &str, label: &str) -> TokenData {
         id_token: None,
         last_refresh_at: None,
         plan_type: None,
+        project_id: None,
     }
 }
 
@@ -4941,6 +4987,7 @@ fn groq_key_token() -> TokenData {
         id_token: None,
         last_refresh_at: None,
         plan_type: None,
+        project_id: None,
     }
 }
 
@@ -5230,6 +5277,7 @@ async fn generic_failover_moves_between_keys_of_the_same_endpoint_only() {
             id_token: None,
             last_refresh_at: None,
             plan_type: None,
+            project_id: None,
         },
     )
     .expect("save second key");
@@ -5655,6 +5703,7 @@ async fn admin_reload_picks_up_a_newly_saved_key_for_a_configured_provider() {
             id_token: None,
             last_refresh_at: None,
             plan_type: None,
+            project_id: None,
         },
     )
     .expect("save second key");
@@ -5815,6 +5864,7 @@ fn anthropic_account(dir: &std::path::Path) {
             id_token: None,
             last_refresh_at: None,
             plan_type: None,
+            project_id: None,
         },
     )
     .expect("save token");
@@ -5962,6 +6012,7 @@ async fn a_client_disconnect_mid_stream_still_reaches_an_outcome() {
             id_token: None,
             last_refresh_at: None,
             plan_type: None,
+            project_id: None,
         },
     )
     .expect("save token");
@@ -6243,6 +6294,7 @@ async fn six_concurrent_requests_each_count_exactly_once() {
             id_token: None,
             last_refresh_at: None,
             plan_type: None,
+            project_id: None,
         },
     )
     .expect("save token");
@@ -6328,6 +6380,7 @@ async fn a_model_id_reaches_the_vendor_whole_and_keys_its_own_usage_row() {
             id_token: None,
             last_refresh_at: None,
             plan_type: None,
+            project_id: None,
         },
     )
     .expect("save token");
@@ -6543,6 +6596,7 @@ fn save_grok_account(dir: &std::path::Path) {
             id_token: None,
             last_refresh_at: None,
             plan_type: Some("tier-3".to_string()),
+            project_id: None,
         },
     )
     .expect("save grok token");
@@ -6802,6 +6856,7 @@ async fn admin_reload_picks_up_a_relogged_grok_token_without_a_restart() {
         id_token: None,
         last_refresh_at: None,
         plan_type: Some("tier-3".to_string()),
+        project_id: None,
     };
     save_token(tmp.path(), &relogged).expect("save relogged token");
 
@@ -7501,7 +7556,7 @@ async fn admin_toggle_resolves_the_provider_from_the_id() {
     assert_eq!(status, 404, "{body}");
     assert_eq!(
         body["error"]["message"],
-        "no pool gorq; pools: anthropic, codex, grok, cerebras, groq"
+        "no pool gorq; pools: anthropic, codex, grok, antigravity, cerebras, groq"
     );
 }
 
@@ -8814,4 +8869,1569 @@ async fn messages_route_masks_custom_typed_tools_and_restores_them_in_a_stream()
     assert_eq!(calls[0].body["tools"][0]["name"], "DelegateTask");
     assert!(body.contains("\"name\":\"delegate_task\""), "{body}");
     assert!(!body.contains("DelegateTask"), "{body}");
+}
+
+// ---- antigravity: the pool serves every inbound dialect ----------------------
+
+/// A scripted Cloud Code double. It speaks the upstream's own wire shapes
+/// (`{"response": <Gemini>}` and Gemini SSE frames), so every route test runs
+/// the relay's envelope, unwrap and translation, and it records each envelope
+/// it was sent.
+struct AntigravityUpstream {
+    calls: Mutex<Vec<UpstreamRequest>>,
+    replies: Mutex<std::collections::VecDeque<(u16, Value)>>,
+    streams: Mutex<std::collections::VecDeque<Vec<String>>>,
+    version_fetches: Mutex<usize>,
+}
+
+impl AntigravityUpstream {
+    fn new() -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            replies: Mutex::new(std::collections::VecDeque::new()),
+            streams: Mutex::new(std::collections::VecDeque::new()),
+            version_fetches: Mutex::new(0),
+        }
+    }
+
+    fn reply(self, status: u16, body: Value) -> Self {
+        self.replies
+            .lock()
+            .expect("replies")
+            .push_back((status, body));
+        self
+    }
+
+    fn stream(self, frames: &[Value]) -> Self {
+        let frames = frames
+            .iter()
+            .map(|frame| format!("data: {frame}\n\n"))
+            .collect();
+        self.streams.lock().expect("streams").push_back(frames);
+        self
+    }
+
+    fn envelopes(&self) -> Vec<Value> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .iter()
+            .map(|call| call.body.clone())
+            .collect()
+    }
+}
+
+/// `{"response": {...}}` around one candidate.
+fn gemini(parts: Value, finish: Option<&str>, usage: Option<Value>) -> Value {
+    let mut candidate = json!({"content": {"role": "model"}});
+    candidate["content"]["parts"] = parts;
+    if let Some(finish) = finish {
+        candidate["finishReason"] = json!(finish);
+    }
+    let mut response = json!({"responseId": "resp-1", "candidates": [candidate]});
+    if let Some(usage) = usage {
+        response["usageMetadata"] = usage;
+    }
+    json!({"response": response, "traceId": "t"})
+}
+
+fn answer_with_thinking() -> Value {
+    gemini(
+        json!([
+            {"text": "the user asked for pong", "thought": true},
+            {"text": "pong"}
+        ]),
+        Some("STOP"),
+        Some(json!({"promptTokenCount": 211, "candidatesTokenCount": 1,
+                    "thoughtsTokenCount": 9, "totalTokenCount": 221})),
+    )
+}
+
+impl UpstreamClient for AntigravityUpstream {
+    fn anthropic_messages(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("anthropic not used in antigravity tests")
+    }
+
+    fn anthropic_messages_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!("anthropic stream not used in antigravity tests")
+    }
+
+    fn anthropic_count_tokens(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("count_tokens not used in antigravity tests")
+    }
+
+    fn codex_responses(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("codex not used in antigravity tests")
+    }
+
+    fn codex_responses_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!("codex stream not used in antigravity tests")
+    }
+
+    fn generic_chat(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!("generic chat not used in antigravity tests")
+    }
+
+    fn generic_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!("generic stream not used in antigravity tests")
+    }
+
+    fn antigravity_generate(&self, request: UpstreamRequest) -> UpstreamFuture {
+        self.calls.lock().expect("calls lock").push(request);
+        let (status, body) = self
+            .replies
+            .lock()
+            .expect("replies")
+            .pop_front()
+            .unwrap_or_else(|| (200, answer_with_thinking()));
+        Box::pin(async move {
+            Ok(UpstreamJsonResponse {
+                quota: None,
+                retry_hint: None,
+                status: axum::http::StatusCode::from_u16(status).expect("status"),
+                body,
+            })
+        })
+    }
+
+    fn antigravity_generate_stream(&self, request: UpstreamRequest) -> UpstreamSseFuture {
+        self.calls.lock().expect("calls lock").push(request);
+        let frames = self
+            .streams
+            .lock()
+            .expect("streams")
+            .pop_front()
+            .unwrap_or_else(|| {
+                [
+                    gemini(
+                        json!([{"text": "thin", "thought": true}]),
+                        None,
+                        Some(json!({"promptTokenCount": 211, "candidatesTokenCount": 0,
+                                    "totalTokenCount": 211})),
+                    ),
+                    gemini(json!([{"text": "pong"}]), None, None),
+                    gemini(
+                        json!([]),
+                        Some("STOP"),
+                        Some(json!({"promptTokenCount": 211, "candidatesTokenCount": 1,
+                                    "totalTokenCount": 212})),
+                    ),
+                ]
+                .iter()
+                .map(|frame| format!("data: {frame}\n\n"))
+                .collect()
+            });
+        Box::pin(async move {
+            Ok(UpstreamSseResponse {
+                quota: None,
+                retry_hint: None,
+                status: axum::http::StatusCode::OK,
+                body: Box::pin(futures_util::stream::iter(
+                    frames.into_iter().map(|frame| Ok(Bytes::from(frame))),
+                )),
+            })
+        })
+    }
+
+    fn fetch_models(
+        &self,
+        kind: ProviderKind,
+        _account: AvailableAccount,
+        _config: Arc<Config>,
+    ) -> ModelsFuture {
+        assert_eq!(kind, ProviderKind::Antigravity);
+        Box::pin(async { Ok(FetchedModels::new(vec![])) })
+    }
+
+    fn fetch_antigravity_version(&self) -> pengepul::app::VersionFuture {
+        *self.version_fetches.lock().expect("fetches") += 1;
+        Box::pin(async { Ok("2.35.2".to_string()) })
+    }
+}
+
+fn antigravity_token(email: &str, access: &str) -> TokenData {
+    TokenData {
+        access_token: access.to_string(),
+        refresh_token: "google-refresh".to_string(),
+        email: email.to_string(),
+        expires_at: "2030-01-01T00:00:00Z".to_string(),
+        account_uuid: "google-account-id".to_string(),
+        provider: ProviderId::antigravity(),
+        id_token: None,
+        last_refresh_at: None,
+        plan_type: Some("g1-pro-tier".to_string()),
+        project_id: Some("cloud-code-project".to_string()),
+    }
+}
+
+fn save_antigravity_account(dir: &std::path::Path) {
+    save_token(
+        dir,
+        &antigravity_token("operator@example.com", "google-access-token"),
+    )
+    .expect("save antigravity token");
+}
+
+fn post(uri: &str, body: &Value) -> axum::http::Request<Body> {
+    axum::http::Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("authorization", "Bearer sk-test")
+        .header("content-type", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .header("content-length", "1")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+fn weather_tool() -> Value {
+    json!({"type": "function", "function": {
+        "name": "get_weather",
+        "description": "Current weather for a city",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
+                       "required": ["city"]}
+    }})
+}
+
+/// A turn-one reply that calls the tool, with the signature Gemini mints.
+fn tool_call_reply() -> Value {
+    gemini(
+        json!([{
+            "thoughtSignature": "c2lnbmF0dXJl+/=",
+            "functionCall": {"name": "get_weather", "args": {"city": "Paris"},
+                             "id": "call_7168"}
+        }]),
+        Some("STOP"),
+        Some(json!({"promptTokenCount": 101, "candidatesTokenCount": 19,
+                    "thoughtsTokenCount": 70, "totalTokenCount": 190})),
+    )
+}
+
+#[tokio::test]
+async fn antigravity_pool_serves_chat_completions_and_passes_reasoning_through() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_antigravity_account(tmp.path());
+    let upstream = Arc::new(AntigravityUpstream::new());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, body) = json_response(
+        app,
+        post(
+            "/v1/chat/completions",
+            &json!({
+                "model": "gemini-4-neon-medium",
+                "messages": [{"role": "user", "content": "reply exactly: pong"}],
+                "reasoning_effort": "low"
+            }),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["choices"][0]["message"]["content"], "pong");
+    assert_eq!(
+        body["choices"][0]["message"]["reasoning_content"],
+        "the user asked for pong"
+    );
+    assert_eq!(body["usage"]["prompt_tokens"], 211);
+    // F11: thinking is part of the output the client is told about.
+    assert_eq!(body["usage"]["completion_tokens"], 10);
+    assert_eq!(
+        body["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        9
+    );
+
+    let envelopes = upstream.envelopes();
+    let envelope = envelopes.first().expect("one antigravity upstream call");
+    assert_eq!(envelope["model"], "gemini-4-neon-medium");
+    assert_eq!(envelope["project"], "cloud-code-project");
+    assert_eq!(envelope["request"]["contents"][0]["role"], "user");
+    assert_eq!(
+        envelope["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+        4096
+    );
+    let calls = upstream.calls.lock().expect("calls");
+    assert_eq!(calls[0].account.token.access_token, "google-access-token");
+}
+
+#[tokio::test]
+async fn antigravity_messages_route_translates_onto_gemini_and_back() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_antigravity_account(tmp.path());
+    let upstream = Arc::new(AntigravityUpstream::new());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, body) = json_response(
+        app,
+        post(
+            "/v1/messages",
+            &json!({
+                "model": "antigravity/gemini-4-neon-high",
+                "max_tokens": 64,
+                "system": "You are terse.",
+                "messages": [{"role": "user", "content": "reply exactly: pong"}]
+            }),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["type"], "message");
+    assert_eq!(body["content"][0]["type"], "thinking");
+    assert_eq!(body["content"][0]["thinking"], "the user asked for pong");
+    assert_eq!(body["content"][1]["text"], "pong");
+    // F11: Messages counts thinking inside output_tokens.
+    assert_eq!(body["usage"]["output_tokens"], 10);
+
+    let envelope = &upstream.envelopes()[0];
+    // The prefix goes and the effort tier reaches the vendor as written.
+    assert_eq!(envelope["model"], "gemini-4-neon-high");
+    assert_eq!(
+        envelope["request"]["systemInstruction"]["parts"][0]["text"],
+        "You are terse."
+    );
+    assert_eq!(
+        envelope["request"]["generationConfig"]["maxOutputTokens"],
+        64
+    );
+}
+
+#[tokio::test]
+async fn antigravity_responses_route_is_served_not_refused() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_antigravity_account(tmp.path());
+    let upstream = Arc::new(AntigravityUpstream::new());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, body) = json_response(
+        app,
+        post(
+            "/v1/responses",
+            &json!({
+                "model": "gemini-4-neon-medium",
+                "instructions": "You are terse.",
+                "reasoning": {"effort": "low"},
+                "input": [{"role": "user", "content": [
+                    {"type": "input_text", "text": "reply exactly: pong"}]}]
+            }),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["object"], "response");
+    assert_eq!(body["output"][0]["type"], "reasoning");
+    assert_eq!(body["output"][1]["content"][0]["text"], "pong");
+    // F11: reasoning never exceeds the output it is part of.
+    assert_eq!(body["usage"]["output_tokens"], 10);
+    // F9: an effort with no client cap sends no invented cap.
+    let generation = &upstream.envelopes()[0]["request"]["generationConfig"];
+    assert!(generation.get("maxOutputTokens").is_none(), "{generation}");
+}
+
+#[tokio::test]
+async fn antigravity_chat_stream_rewrites_gemini_chunks_and_terminates() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_antigravity_account(tmp.path());
+    let upstream = Arc::new(AntigravityUpstream::new());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, _, body) = raw_response(
+        app,
+        post(
+            "/v1/chat/completions",
+            &json!({"model": "gemini-4-neon-xhigh", "stream": true,
+                    "messages": [{"role": "user", "content": "reply exactly: pong"}]}),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert!(body.contains("\"reasoning_content\":\"thin\""), "{body}");
+    assert!(body.contains("\"content\":\"pong\""), "{body}");
+    assert!(body.contains("\"finish_reason\":\"stop\""), "{body}");
+    // Gemini sends no terminator; the relay writes one for a Chat client.
+    assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+}
+
+/// L7: a Chat client is told usage once, on the final chunk, as `OpenAI` does;
+/// Gemini repeats its cumulative count on every chunk.
+#[tokio::test]
+async fn antigravity_chat_stream_reports_usage_once() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_antigravity_account(tmp.path());
+    let upstream = Arc::new(AntigravityUpstream::new());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    let (_, _, body) = raw_response(
+        app,
+        post(
+            "/v1/chat/completions",
+            &json!({"model": "gemini-4-neon-low", "stream": true,
+                    "messages": [{"role": "user", "content": "x"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(body.matches("\"usage\"").count(), 1, "{body}");
+    let last = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .rfind(|data| *data != "[DONE]")
+        .expect("a chunk");
+    assert!(last.contains("\"usage\""), "{last}");
+}
+
+/// The one account's record from `/admin/accounts`.
+async fn antigravity_record(app: axum::Router) -> Value {
+    let (_, accounts) = json_response(
+        app,
+        axum::http::Request::builder()
+            .uri("/admin/accounts")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    accounts["providers"]["antigravity"]["accounts"][0].clone()
+}
+
+/// N2: a prompt the upstream blocks ends the turn as finished, streamed as
+/// well as whole: the Chat client gets `[DONE]`, and the account is booked a
+/// success rather than charged a server failure.
+#[tokio::test]
+async fn a_blocked_antigravity_stream_is_a_finished_turn() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_antigravity_account(tmp.path());
+    let upstream = Arc::new(AntigravityUpstream::new().stream(&[json!({"response": {
+        "promptFeedback": {"blockReason": "PROHIBITED_CONTENT"}
+    }})]));
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, _, body) = raw_response(
+        app.clone(),
+        post(
+            "/v1/chat/completions",
+            &json!({"model": "gemini-4-neon-low", "stream": true,
+                    "messages": [{"role": "user", "content": "x"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        body.contains("\"finish_reason\":\"content_filter\""),
+        "{body}"
+    );
+    assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+
+    let record = antigravity_record(app).await;
+    assert_eq!(record["totalSuccesses"], 1, "{record}");
+    assert_eq!(record["failureCount"], 0, "{record}");
+}
+
+/// F8: a stream the upstream cut before any finishReason is not dressed up as
+/// complete.
+#[tokio::test]
+async fn a_cut_antigravity_chat_stream_gets_no_done() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_antigravity_account(tmp.path());
+    let upstream = Arc::new(AntigravityUpstream::new().stream(&[gemini(
+        json!([{"text": "half"}]),
+        None,
+        None,
+    )]));
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, _, body) = raw_response(
+        app,
+        post(
+            "/v1/chat/completions",
+            &json!({"model": "gemini-4-neon-low", "stream": true,
+                    "messages": [{"role": "user", "content": "x"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(body.contains("\"content\":\"half\""), "{body}");
+    assert!(!body.contains("[DONE]"), "{body}");
+}
+
+/// F8: an in-band error frame reaches the client instead of vanishing.
+#[tokio::test]
+async fn an_in_band_antigravity_error_reaches_the_client() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_antigravity_account(tmp.path());
+    let error = json!({"error": {"code": 503, "message": "backend overloaded",
+                                  "status": "UNAVAILABLE"}});
+    let upstream = Arc::new(
+        AntigravityUpstream::new()
+            .stream(&[gemini(json!([{"text": "par"}]), None, None), error.clone()])
+            .stream(&[gemini(json!([{"text": "par"}]), None, None), error]),
+    );
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (_, _, chat) = raw_response(
+        app.clone(),
+        post(
+            "/v1/chat/completions",
+            &json!({"model": "gemini-4-neon-low", "stream": true,
+                    "messages": [{"role": "user", "content": "x"}]}),
+        ),
+    )
+    .await;
+    assert!(chat.contains("backend overloaded"), "{chat}");
+    assert!(!chat.contains("[DONE]"), "{chat}");
+
+    let (_, _, messages) = raw_response(
+        app,
+        post(
+            "/v1/messages",
+            &json!({"model": "gemini-4-neon-low", "stream": true, "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "x"}]}),
+        ),
+    )
+    .await;
+    assert!(messages.contains("event: error"), "{messages}");
+    assert!(messages.contains("backend overloaded"), "{messages}");
+}
+
+#[tokio::test]
+async fn antigravity_messages_stream_closes_the_message() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_antigravity_account(tmp.path());
+    let upstream = Arc::new(AntigravityUpstream::new());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, _, body) = raw_response(
+        app,
+        post(
+            "/v1/messages",
+            &json!({"model": "gemini-4-neon-medium", "max_tokens": 64, "stream": true,
+                    "messages": [{"role": "user", "content": "reply exactly: pong"}]}),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert!(body.contains("event: message_start"), "{body}");
+    assert!(body.contains("\"thinking_delta\""), "{body}");
+    assert!(body.contains("\"text_delta\""), "{body}");
+    assert!(body.contains("event: message_stop"), "{body}");
+}
+
+/// F4: Gemini sends the call and the finish in separate chunks; the client
+/// still learns the turn ended on a tool call.
+#[tokio::test]
+async fn a_streamed_antigravity_tool_call_finishes_as_tool_calls() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_antigravity_account(tmp.path());
+    let upstream = Arc::new(AntigravityUpstream::new().stream(&[
+        gemini(
+            json!([{"functionCall": {"name": "get_weather", "args": {"city": "Paris"},
+                                     "id": "call_1"}}]),
+            None,
+            None,
+        ),
+        gemini(json!([]), Some("STOP"), None),
+    ]));
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (_, _, body) = raw_response(
+        app,
+        post(
+            "/v1/chat/completions",
+            &json!({"model": "gemini-4-neon-low", "stream": true, "tools": [weather_tool()],
+                    "messages": [{"role": "user", "content": "weather?"}]}),
+        ),
+    )
+    .await;
+    assert!(body.contains("\"finish_reason\":\"tool_calls\""), "{body}");
+    assert!(!body.contains("\"finish_reason\":\"stop\""), "{body}");
+}
+
+/// F1: a two-turn tool loop on Chat. The second request carries the call and
+/// its result with the vendor's id and the call's thought signature.
+#[tokio::test]
+async fn an_antigravity_chat_tool_loop_survives_its_second_turn() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_antigravity_account(tmp.path());
+    let upstream = Arc::new(AntigravityUpstream::new().reply(200, tool_call_reply()));
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    let first_turn = json!([{"role": "user", "content": "weather in Paris?"}]);
+
+    let (status, one) = json_response(
+        app.clone(),
+        post(
+            "/v1/chat/completions",
+            &json!({"model": "gemini-4-neon-medium", "tools": [weather_tool()],
+                    "messages": first_turn}),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{one}");
+    assert_eq!(one["choices"][0]["finish_reason"], "tool_calls");
+    let call = one["choices"][0]["message"]["tool_calls"][0].clone();
+    let id = call["id"].as_str().expect("id").to_string();
+
+    let (status, two) = json_response(
+        app,
+        post(
+            "/v1/chat/completions",
+            &json!({"model": "gemini-4-neon-medium", "tools": [weather_tool()],
+            "messages": [
+                {"role": "user", "content": "weather in Paris?"},
+                {"role": "assistant", "content": null, "tool_calls": [call]},
+                {"role": "tool", "tool_call_id": id, "content": "22C, sunny"}
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{two}");
+    assert_eq!(two["choices"][0]["message"]["content"], "pong");
+
+    let second = &upstream.envelopes()[1]["request"]["contents"];
+    let replayed = &second[1]["parts"][0];
+    assert_eq!(replayed["functionCall"]["id"], "call_7168");
+    assert_eq!(replayed["thoughtSignature"], "c2lnbmF0dXJl+/=");
+    assert_eq!(second[2]["parts"][0]["functionResponse"]["id"], "call_7168");
+    assert_eq!(
+        second[2]["parts"][0]["functionResponse"]["name"],
+        "get_weather"
+    );
+}
+
+/// F1: the same loop through a streamed Messages client, which hands the id
+/// back on `tool_use` and `tool_result`.
+#[tokio::test]
+async fn an_antigravity_messages_stream_tool_loop_survives_its_second_turn() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_antigravity_account(tmp.path());
+    let upstream = Arc::new(AntigravityUpstream::new().stream(&[
+        gemini(
+            json!([{"thoughtSignature": "c2lnbmF0dXJl+/=",
+                    "functionCall": {"name": "get_weather", "args": {"city": "Paris"},
+                                     "id": "call_7168"}}]),
+            None,
+            None,
+        ),
+        gemini(json!([]), Some("STOP"), None),
+    ]));
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    let tools = json!([{"name": "get_weather", "description": "weather",
+                        "input_schema": {"type": "object",
+                                         "properties": {"city": {"type": "string"}}}}]);
+
+    let (_, _, one) = raw_response(
+        app.clone(),
+        post(
+            "/v1/messages",
+            &json!({"model": "gemini-4-neon-medium", "max_tokens": 256, "stream": true,
+                    "tools": tools,
+                    "messages": [{"role": "user", "content": "weather in Paris?"}]}),
+        ),
+    )
+    .await;
+    assert!(one.contains("\"stop_reason\":\"tool_use\""), "{one}");
+    let id = one
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .find_map(|event| {
+            event["content_block"]["id"]
+                .as_str()
+                .filter(|_| event["content_block"]["type"] == "tool_use")
+                .map(ToString::to_string)
+        })
+        .expect("a tool_use block");
+
+    let (_, _, two) = raw_response(
+        app,
+        post(
+            "/v1/messages",
+            &json!({"model": "gemini-4-neon-medium", "max_tokens": 256, "stream": true,
+            "tools": tools,
+            "messages": [
+                {"role": "user", "content": "weather in Paris?"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": id,
+                    "name": "get_weather", "input": {"city": "Paris"}}]},
+                {"role": "user", "content": [{"type": "tool_result",
+                    "tool_use_id": id, "content": "22C, sunny"}]}
+            ]}),
+        ),
+    )
+    .await;
+    assert!(two.contains("event: message_stop"), "{two}");
+
+    let second = &upstream.envelopes()[1]["request"]["contents"];
+    assert_eq!(second[1]["parts"][0]["functionCall"]["id"], "call_7168");
+    assert_eq!(second[1]["parts"][0]["thoughtSignature"], "c2lnbmF0dXJl+/=");
+    assert_eq!(second[2]["parts"][0]["functionResponse"]["id"], "call_7168");
+}
+
+/// AC-8 / F13: a 429 whose wait lives in `retryDelay` cools the account for
+/// that long, and the request fails over to the sibling.
+#[tokio::test]
+async fn an_antigravity_429_retry_delay_sets_the_cooldown() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &antigravity_token("a@example.com", "token-a")).expect("save a");
+    save_token(tmp.path(), &antigravity_token("b@example.com", "token-b")).expect("save b");
+    let upstream = Arc::new(AntigravityUpstream::new().reply(
+        429,
+        json!({"error": {"code": 429, "status": "RESOURCE_EXHAUSTED",
+            "message": "You have exhausted your capacity on this model.",
+            "details": [{"@type": "type.googleapis.com/google.rpc.RetryInfo",
+                         "retryDelay": "3600s"}]}}),
+    ));
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, body) = json_response(
+        app.clone(),
+        post(
+            "/v1/chat/completions",
+            &json!({"model": "gemini-4-neon-low",
+                    "messages": [{"role": "user", "content": "x"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    let (_, accounts) = json_response(
+        app,
+        axum::http::Request::builder()
+            .uri("/admin/accounts")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let first = upstream.calls.lock().expect("calls")[0]
+        .account
+        .token
+        .email
+        .clone();
+    let record = accounts["providers"]["antigravity"]["accounts"]
+        .as_array()
+        .expect("accounts")
+        .iter()
+        .find(|record| record["email"] == first.as_str())
+        .cloned()
+        .expect("the refused account");
+    let until = record["cooldownUntil"].as_f64().expect("cooldown");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs_f64();
+    assert!(until - now > 3000.0, "cooldown {} s", until - now);
+}
+
+/// R6: a reload that fails for one pool still refreshes the catalog, so a
+/// first antigravity login beside an unreadable anthropic directory gets its
+/// catalog fetch (seen here by the Hub version read, which the refresh makes
+/// only for a pool with an account), not only a place in rotation.
+#[tokio::test]
+async fn a_partly_failed_reload_still_refreshes_the_catalog() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let upstream = Arc::new(AntigravityUpstream::new());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    // The startup refresh found no antigravity account, so it read no version.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(*upstream.version_fetches.lock().expect("fetches"), 0);
+    std::fs::write(tmp.path().join("anthropic"), b"not a directory").expect("block anthropic");
+    save_antigravity_account(tmp.path());
+
+    let (status, body) = json_response(
+        app,
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/admin/reload")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 500, "{body}");
+    let mut refreshed = false;
+    for _ in 0..100 {
+        if *upstream.version_fetches.lock().expect("fetches") > 0 {
+            refreshed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(refreshed, "the catalog was not refreshed after the reload");
+}
+
+/// N10: a pool that fails to reload does not stop the others: the reload still
+/// answers with the error, but a fresh antigravity login after it is in use.
+#[tokio::test]
+async fn a_failing_pool_does_not_stop_the_others_from_reloading() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_antigravity_account(tmp.path());
+    let upstream = Arc::new(AntigravityUpstream::new());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    // The anthropic pool's directory turns unreadable: a file where it expects
+    // one, so listing it fails.
+    std::fs::write(tmp.path().join("anthropic"), b"not a directory").expect("block anthropic");
+    save_token(
+        tmp.path(),
+        &antigravity_token("operator@example.com", "google-relogged-token"),
+    )
+    .expect("save relogged token");
+
+    let (status, body) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/admin/reload")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 500, "{body}");
+
+    let (status, _) = json_response(
+        app,
+        post(
+            "/v1/chat/completions",
+            &json!({"model": "gemini-4-neon-low",
+                    "messages": [{"role": "user", "content": "x"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let calls = upstream.calls.lock().expect("calls");
+    assert_eq!(calls[0].account.token.access_token, "google-relogged-token");
+}
+
+/// R1: a tool whose `$ref` chain nests past the walk's bound is answered with a
+/// 400 that names the tool and is never sent. The test thread's 2 MiB stack is
+/// the size a tokio worker has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_too_deep_tool_schema_is_a_400_not_a_crash() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_antigravity_account(tmp.path());
+    let upstream = Arc::new(AntigravityUpstream::new());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    let mut definitions = serde_json::Map::new();
+    for def in 0..100 {
+        let mut node = if def < 99 {
+            json!({"$ref": format!("#/$defs/D{}", def + 1)})
+        } else {
+            json!({"type": "string"})
+        };
+        for _ in 0..20 {
+            node = json!({"type": "object", "properties": {"next": node}});
+        }
+        definitions.insert(format!("D{def}"), node);
+    }
+    let parameters = json!({"$defs": definitions, "type": "object",
+                            "properties": {"root": {"$ref": "#/$defs/D0"}}});
+
+    let (status, body) = json_response(
+        app,
+        post(
+            "/v1/chat/completions",
+            &json!({"model": "gemini-4-neon-low",
+                    "messages": [{"role": "user", "content": "x"}],
+                    "tools": [{"type": "function",
+                               "function": {"name": "deep_tool", "parameters": parameters}}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("deep_tool"), "{body}");
+    assert!(
+        upstream.calls.lock().expect("calls").is_empty(),
+        "the request was sent"
+    );
+}
+
+/// F3: a fresh antigravity login is picked up without a restart.
+#[tokio::test]
+async fn admin_reload_picks_up_a_relogged_antigravity_token_without_a_restart() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_antigravity_account(tmp.path());
+    let upstream = Arc::new(AntigravityUpstream::new());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    save_token(
+        tmp.path(),
+        &antigravity_token("operator@example.com", "google-relogged-token"),
+    )
+    .expect("save relogged token");
+
+    let (status, reloaded) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/admin/reload")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        reloaded["reloaded"]["antigravity"]["updated"],
+        json!(["operator@example.com"])
+    );
+
+    let (status, _) = json_response(
+        app,
+        post(
+            "/v1/chat/completions",
+            &json!({"model": "gemini-4-neon-low",
+                    "messages": [{"role": "user", "content": "x"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let calls = upstream.calls.lock().expect("calls");
+    assert_eq!(calls[0].account.token.access_token, "google-relogged-token");
+}
+
+// ---- N13: a cut Messages stream is not closed as a finished turn ------------
+
+/// One scripted stream, served on whichever chat-shaped upstream the route
+/// calls: a configured endpoint, grok, or antigravity.
+struct CutStreamUpstream {
+    frames: Vec<String>,
+}
+
+impl CutStreamUpstream {
+    fn new(frames: &[&str]) -> Self {
+        Self {
+            frames: frames.iter().map(|frame| (*frame).to_string()).collect(),
+        }
+    }
+
+    fn reply(&self) -> UpstreamSseFuture {
+        let frames = self.frames.clone();
+        Box::pin(async move {
+            Ok(UpstreamSseResponse {
+                quota: None,
+                retry_hint: None,
+                status: axum::http::StatusCode::OK,
+                body: Box::pin(futures_util::stream::iter(
+                    frames.into_iter().map(|frame| Ok(Bytes::from(frame))),
+                )),
+            })
+        })
+    }
+}
+
+impl UpstreamClient for CutStreamUpstream {
+    fn anthropic_messages(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!()
+    }
+    fn anthropic_messages_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!()
+    }
+    fn anthropic_count_tokens(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!()
+    }
+    fn codex_responses(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!()
+    }
+    fn codex_responses_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!()
+    }
+    fn generic_chat(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!()
+    }
+    fn generic_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        self.reply()
+    }
+    fn grok_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        self.reply()
+    }
+    fn antigravity_generate_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        self.reply()
+    }
+    fn fetch_models(
+        &self,
+        _kind: ProviderKind,
+        _account: AvailableAccount,
+        _config: Arc<Config>,
+    ) -> ModelsFuture {
+        Box::pin(async { Ok(FetchedModels::new(vec![])) })
+    }
+}
+
+/// A chat-shaped chunk that starts a reply and never finishes it.
+const CHAT_HALF: &str = "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half\"}}]}\n\n";
+const CHAT_DONE: &str = "data: [DONE]\n\n";
+
+/// The three pools a Messages client can stream from through the chat
+/// matrix, each with one account, and the model id that routes to it.
+fn cut_stream_app(path: &str, frames: &[&str]) -> (tempfile::TempDir, axum::Router, &'static str) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut cfg = config(tmp.path().to_path_buf());
+    let model = match path {
+        "generic" => {
+            save_token(
+                tmp.path(),
+                &TokenData {
+                    access_token: "gsk".to_string(),
+                    refresh_token: String::new(),
+                    email: "key-12345678".to_string(),
+                    expires_at: String::new(),
+                    account_uuid: "acct".to_string(),
+                    provider: ProviderId::generic("groq"),
+                    id_token: None,
+                    last_refresh_at: None,
+                    plan_type: None,
+                    project_id: None,
+                },
+            )
+            .expect("save groq key");
+            cfg.providers.insert(
+                "groq".to_string(),
+                pengepul::config::ConfiguredProvider {
+                    base_url: "https://api.groq.com/openai/v1".to_string(),
+                    models: std::collections::BTreeMap::new(),
+                },
+            );
+            "groq/llama-3.3-70b"
+        }
+        "grok" => {
+            save_grok_account(tmp.path());
+            "grok-4.6"
+        }
+        _ => {
+            save_antigravity_account(tmp.path());
+            "gemini-4-neon-low"
+        }
+    };
+    let app = create_app_with_upstream(cfg, Arc::new(CutStreamUpstream::new(frames)));
+    (tmp, app, model)
+}
+
+async fn messages_stream(app: axum::Router, model: &str) -> String {
+    let (status, _, body) = raw_response(
+        app,
+        post(
+            "/v1/messages",
+            &json!({"model": model, "max_tokens": 64, "stream": true,
+                    "messages": [{"role": "user", "content": "x"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    body
+}
+
+/// N13: a stream the upstream cut before it finished the reply ends with an
+/// error event, not a `message_stop` that tells the client the turn is whole —
+/// on a configured endpoint, on grok, and on antigravity.
+#[tokio::test]
+async fn a_cut_messages_stream_ends_in_an_error_not_a_finished_turn() {
+    let gemini_half = format!(
+        "data: {}\n\n",
+        json!({"response": {"candidates": [{"content": {"parts": [{"text": "half"}]}}]}})
+    );
+    for (path, frame) in [
+        ("generic", CHAT_HALF.to_string()),
+        ("grok", CHAT_HALF.to_string()),
+        ("antigravity", gemini_half),
+    ] {
+        let (_tmp, app, model) = cut_stream_app(path, &[frame.as_str()]);
+        let body = messages_stream(app, model).await;
+        assert!(body.contains("\"text\":\"half\""), "{path}: {body}");
+        assert!(!body.contains("message_stop"), "{path}: {body}");
+        assert!(!body.contains("end_turn"), "{path}: {body}");
+        assert!(body.contains("event: error"), "{path}: {body}");
+    }
+}
+
+/// R5: a gateway that sends its `finish_reason` and then closes the
+/// connection without `[DONE]` finished the reply; its Messages stream closes
+/// with `message_stop` and the stop reason, not an error.
+#[tokio::test]
+async fn a_messages_stream_with_a_finish_reason_and_no_done_still_closes() {
+    const CHAT_FINISH: &str = "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+    for path in ["generic", "grok"] {
+        let (_tmp, app, model) = cut_stream_app(path, &[CHAT_HALF, CHAT_FINISH]);
+        let body = messages_stream(app, model).await;
+        assert!(body.contains("event: message_stop"), "{path}: {body}");
+        assert!(body.contains("end_turn"), "{path}: {body}");
+        assert!(!body.contains("event: error"), "{path}: {body}");
+    }
+}
+
+/// N13: a gateway that ends on `[DONE]` alone, with no `finish_reason`,
+/// finished the reply; its Messages stream still closes.
+#[tokio::test]
+async fn a_messages_stream_ended_by_done_alone_still_closes() {
+    for path in ["generic", "grok"] {
+        let (_tmp, app, model) = cut_stream_app(path, &[CHAT_HALF, CHAT_DONE]);
+        let body = messages_stream(app, model).await;
+        assert!(body.contains("event: message_stop"), "{path}: {body}");
+        assert!(!body.contains("event: error"), "{path}: {body}");
+    }
+}
+
+// ---- R3: a bare id goes to the company that makes the model ----------------
+
+fn built_in_token(provider: ProviderId, email: &str) -> TokenData {
+    TokenData {
+        access_token: format!("{email}-access"),
+        refresh_token: format!("{email}-refresh"),
+        email: email.to_string(),
+        expires_at: "2030-01-01T00:00:00Z".to_string(),
+        account_uuid: format!("acct-{email}"),
+        project_id: (provider.kind == ProviderKind::Antigravity).then(|| "p".to_string()),
+        provider,
+        id_token: None,
+        last_refresh_at: None,
+        plan_type: None,
+    }
+}
+
+/// An app with an account in each of `pools`, whose catalog fetches return
+/// `listed`, once its first catalog refresh has advertised `ready`.
+async fn origin_app(
+    pools: &[ProviderId],
+    listed: Vec<(ProviderKind, Vec<&'static str>)>,
+    ready: &str,
+) -> (tempfile::TempDir, axum::Router, Arc<FakeUpstream>) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for provider in pools {
+        save_token(tmp.path(), &built_in_token(provider.clone(), &provider.id))
+            .expect("save token");
+    }
+    let upstream = Arc::new(FakeUpstream {
+        listed,
+        ..FakeUpstream::default()
+    });
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    let ids = advertised_once(&app, ready).await;
+    assert!(ids.iter().any(|id| id == ready), "{ids:?}");
+    (tmp, app, upstream)
+}
+
+/// R3 and R5: with an anthropic account, a bare Claude id that antigravity
+/// lists reaches anthropic — whether anthropic's list names it or came back
+/// empty (a failed fetch leaves no list at all, which the catalog's own test
+/// covers).
+/// The routing reads the pool's account at request time, so this is the
+/// wiring test too.
+#[tokio::test]
+async fn a_bare_claude_id_reaches_anthropic_with_or_without_its_list() {
+    for anthropic_list in [vec!["claude-sonnet-4-6"], vec![]] {
+        let (_tmp, app, upstream) = origin_app(
+            &[ProviderId::anthropic(), ProviderId::antigravity()],
+            vec![
+                (ProviderKind::Anthropic, anthropic_list.clone()),
+                (ProviderKind::Antigravity, vec!["claude-sonnet-4-6"]),
+            ],
+            "antigravity/claude-sonnet-4-6",
+        )
+        .await;
+        let (status, body) = post_model(&app, "/v1/messages", "claude-sonnet-4-6").await;
+        assert_eq!(status, 200, "{anthropic_list:?}: {body}");
+        let calls = upstream.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].account.provider, ProviderId::anthropic());
+    }
+}
+
+/// R3: with no anthropic account, a bare Claude id that only antigravity
+/// serves is a 404 naming the prefixed id, and nothing is sent.
+#[tokio::test]
+async fn a_bare_claude_id_without_an_anthropic_account_names_the_prefixed_id() {
+    let (_tmp, app, upstream) = origin_app(
+        &[ProviderId::antigravity()],
+        vec![(ProviderKind::Antigravity, vec!["claude-sonnet-4-6"])],
+        "antigravity/claude-sonnet-4-6",
+    )
+    .await;
+    let (status, body) = post_model(&app, "/v1/messages", "claude-sonnet-4-6").await;
+    assert_eq!(status, 404, "{body}");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("antigravity/claude-sonnet-4-6"), "{body}");
+    assert!(upstream.calls().is_empty());
+}
+
+/// R3: a bare `gpt-oss-*` id is `OpenAI`'s, so it never reaches antigravity: with a
+/// codex account that does not list it, and with no codex account, the 404
+/// names `antigravity/gpt-oss-120b-medium`; the prefixed id is served.
+#[tokio::test]
+async fn a_bare_gpt_oss_id_is_refused_with_its_prefixed_id() {
+    for pools in [
+        vec![ProviderId::codex(), ProviderId::antigravity()],
+        vec![ProviderId::antigravity()],
+    ] {
+        let (_tmp, app, upstream) = origin_app(
+            &pools,
+            vec![
+                (ProviderKind::Codex, vec!["gpt-5.5"]),
+                (ProviderKind::Antigravity, vec!["gpt-oss-120b-medium"]),
+            ],
+            "antigravity/gpt-oss-120b-medium",
+        )
+        .await;
+        let (status, body) = post_model(&app, "/v1/chat/completions", "gpt-oss-120b-medium").await;
+        assert_eq!(status, 404, "{pools:?}: {body}");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("codex"), "{body}");
+        assert!(
+            message.contains("antigravity/gpt-oss-120b-medium"),
+            "{body}"
+        );
+        assert!(upstream.calls().is_empty());
+
+        let (status, body) = post_model(
+            &app,
+            "/v1/chat/completions",
+            "antigravity/gpt-oss-120b-medium",
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let calls = upstream.calls();
+        assert_eq!(calls[0].account.provider, ProviderId::antigravity());
+        assert_eq!(calls[0].body["model"], "gpt-oss-120b-medium");
+    }
+}
+
+/// R3: a bare Gemini id reaches antigravity, listed there or not.
+#[tokio::test]
+async fn a_bare_gemini_id_reaches_antigravity() {
+    let (_tmp, app, upstream) = origin_app(
+        &[ProviderId::antigravity()],
+        vec![(ProviderKind::Antigravity, vec!["gemini-4-neon-medium"])],
+        "antigravity/gemini-4-neon-medium",
+    )
+    .await;
+    for id in ["gemini-4-neon-medium", "gemini-3-flash"] {
+        let (status, body) = post_model(&app, "/v1/chat/completions", id).await;
+        assert_eq!(status, 200, "{id}: {body}");
+    }
+    let calls = upstream.calls();
+    assert_eq!(calls.len(), 2);
+    assert!(
+        calls
+            .iter()
+            .all(|call| call.account.provider == ProviderId::antigravity())
+    );
+}
+
+/// R3: a prefixed id reaches that provider exactly, even where a bare id of
+/// the same model would go to its maker.
+#[tokio::test]
+async fn a_prefixed_id_reaches_its_prefix() {
+    let (_tmp, app, upstream) = origin_app(
+        &[ProviderId::anthropic(), ProviderId::antigravity()],
+        vec![
+            (ProviderKind::Anthropic, vec!["claude-sonnet-4-6"]),
+            (ProviderKind::Antigravity, vec!["claude-sonnet-4-6"]),
+        ],
+        "antigravity/claude-sonnet-4-6",
+    )
+    .await;
+    let (status, body) = post_model(
+        &app,
+        "/v1/chat/completions",
+        "antigravity/claude-sonnet-4-6",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = post_model(&app, "/v1/messages", "anthropic/claude-sonnet-4-6").await;
+    assert_eq!(status, 200, "{body}");
+    let calls = upstream.calls();
+    assert_eq!(calls[0].account.provider, ProviderId::antigravity());
+    assert_eq!(calls[1].account.provider, ProviderId::anthropic());
+}
+
+/// R3: an id no maker rule claims keeps the live catalog's routing.
+#[tokio::test]
+async fn an_id_of_no_known_maker_follows_the_catalog() {
+    let (_tmp, app, upstream) = origin_app(
+        &[ProviderId::antigravity()],
+        vec![(ProviderKind::Antigravity, vec!["llama-x"])],
+        "antigravity/llama-x",
+    )
+    .await;
+    let (status, body) = post_model(&app, "/v1/chat/completions", "llama-x").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        upstream.calls()[0].account.provider,
+        ProviderId::antigravity()
+    );
+}
+
+/// S1: anthropic lists `claude-haiku-4-5` only by its dated id. A configured
+/// endpoint that lists the bare alias does not take it: the bare alias reaches
+/// anthropic, on Messages and on Chat, as it did before the origin rule.
+#[tokio::test]
+async fn a_dateless_alias_the_maker_lists_by_date_reaches_the_maker() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(
+        tmp.path(),
+        &built_in_token(ProviderId::anthropic(), "anthropic"),
+    )
+    .expect("save anthropic");
+    save_token(tmp.path(), &groq_key_token()).expect("save groq key");
+    let mut cfg = config(tmp.path().to_path_buf());
+    cfg.providers.insert(
+        "groq".to_string(),
+        pengepul::config::ConfiguredProvider {
+            base_url: "https://api.groq.com/openai/v1".to_string(),
+            models: std::collections::BTreeMap::new(),
+        },
+    );
+    let upstream = Arc::new(FakeUpstream {
+        listed: vec![
+            (ProviderKind::Anthropic, vec!["claude-haiku-4-5-20251001"]),
+            (ProviderKind::Generic, vec!["claude-haiku-4-5"]),
+        ],
+        ..FakeUpstream::default()
+    });
+    let app = create_app_with_upstream(cfg, upstream.clone());
+    advertised_once(&app, "groq/claude-haiku-4-5").await;
+    advertised_once(&app, "anthropic/claude-haiku-4-5-20251001").await;
+
+    let (status, body) = post_model(&app, "/v1/messages", "claude-haiku-4-5").await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = post_model(&app, "/v1/chat/completions", "claude-haiku-4-5").await;
+    assert_eq!(status, 200, "{body}");
+    let calls = upstream.calls();
+    assert_eq!(calls.len(), 2);
+    assert!(
+        calls
+            .iter()
+            .all(|call| call.account.provider == ProviderId::anthropic())
+    );
+}
+
+/// N4: a maker pool whose accounts are all Disabled is told apart from an
+/// empty one, and the 404 says how to put one back.
+#[tokio::test]
+async fn a_bare_id_whose_maker_accounts_are_all_disabled_says_so() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let token = built_in_token(ProviderId::anthropic(), "anthropic");
+    save_token(tmp.path(), &token).expect("save anthropic");
+    assert!(
+        pengepul::tokens::set_credential_disabled(
+            tmp.path(),
+            &ProviderId::anthropic(),
+            &token.email,
+            true
+        )
+        .expect("disable")
+    );
+    let upstream = Arc::new(FakeUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    let (status, body) = post_model(&app, "/v1/messages", "claude-opus-5").await;
+    assert_eq!(status, 404, "{body}");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("every anthropic account is disabled"),
+        "{body}"
+    );
+    assert!(message.contains("pengepul accounts enable"), "{body}");
+    assert!(upstream.calls().is_empty());
+}
+
+// ---- C2: an upstream 404 is a refusal, not an account failure --------------
+
+/// Every send answers 404, as an upstream does for a model it does not have.
+struct NotFoundUpstream;
+
+impl NotFoundUpstream {
+    fn json() -> UpstreamFuture {
+        Box::pin(async {
+            Ok(UpstreamJsonResponse {
+                quota: None,
+                retry_hint: None,
+                status: axum::http::StatusCode::NOT_FOUND,
+                body: json!({"error": {"code": 404, "message": "Requested entity was not found."}}),
+            })
+        })
+    }
+
+    fn sse() -> UpstreamSseFuture {
+        Box::pin(async {
+            Ok(UpstreamSseResponse {
+                quota: None,
+                retry_hint: None,
+                status: axum::http::StatusCode::NOT_FOUND,
+                body: Box::pin(futures_util::stream::iter([Ok(Bytes::from_static(
+                    br#"{"error":{"code":404,"message":"Requested entity was not found."}}"#,
+                ))])),
+            })
+        })
+    }
+}
+
+impl UpstreamClient for NotFoundUpstream {
+    fn anthropic_messages(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        Self::json()
+    }
+    fn anthropic_messages_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        Self::sse()
+    }
+    fn anthropic_count_tokens(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        Self::json()
+    }
+    fn codex_responses(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        Self::json()
+    }
+    fn codex_responses_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        Self::sse()
+    }
+    fn generic_chat(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        Self::json()
+    }
+    fn generic_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        Self::sse()
+    }
+    fn grok_chat(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        Self::json()
+    }
+    fn grok_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        Self::sse()
+    }
+    fn antigravity_generate(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        Self::json()
+    }
+    fn antigravity_generate_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        Self::sse()
+    }
+    fn fetch_models(
+        &self,
+        _kind: ProviderKind,
+        _account: AvailableAccount,
+        _config: Arc<Config>,
+    ) -> ModelsFuture {
+        Box::pin(async { Ok(FetchedModels::new(vec![])) })
+    }
+}
+
+/// Two accounts in `provider`'s pool (a Cooldown needs a sibling to apply),
+/// and the app over [`NotFoundUpstream`].
+fn not_found_app(provider: &ProviderId) -> (tempfile::TempDir, axum::Router) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut cfg = config(tmp.path().to_path_buf());
+    if provider.kind == ProviderKind::Generic {
+        cfg.providers.insert(
+            provider.id.to_string(),
+            pengepul::config::ConfiguredProvider {
+                base_url: "https://api.groq.com/openai/v1".to_string(),
+                models: std::collections::BTreeMap::new(),
+            },
+        );
+    }
+    for name in ["one", "two"] {
+        save_token(
+            tmp.path(),
+            &built_in_token(provider.clone(), &format!("{name}@{}", provider.id)),
+        )
+        .expect("save token");
+    }
+    let app = create_app_with_upstream(cfg, Arc::new(NotFoundUpstream));
+    (tmp, app)
+}
+
+/// C2: on every provider's path, a 404 from the upstream reaches the client as
+/// a 404 and leaves both accounts healthy: no Cooldown, no failure streak, no
+/// `lastError`. It still counts as a failed request.
+#[tokio::test]
+async fn an_upstream_404_cools_no_account_on_any_provider() {
+    for (provider, uri, model, stream) in [
+        (
+            ProviderId::antigravity(),
+            "/v1/chat/completions",
+            "gemini-0-nonexistent",
+            false,
+        ),
+        (
+            ProviderId::antigravity(),
+            "/v1/chat/completions",
+            "gemini-0-nonexistent",
+            true,
+        ),
+        (
+            ProviderId::anthropic(),
+            "/v1/messages",
+            "claude-nonexistent-1",
+            false,
+        ),
+        (
+            ProviderId::anthropic(),
+            "/v1/messages",
+            "claude-nonexistent-1",
+            true,
+        ),
+        (
+            ProviderId::codex(),
+            "/v1/responses",
+            "gpt-nonexistent",
+            false,
+        ),
+        (
+            ProviderId::codex(),
+            "/v1/responses",
+            "gpt-nonexistent",
+            true,
+        ),
+        (
+            ProviderId::grok(),
+            "/v1/chat/completions",
+            "grok-nonexistent",
+            false,
+        ),
+        (
+            ProviderId::grok(),
+            "/v1/chat/completions",
+            "grok-nonexistent",
+            true,
+        ),
+        (
+            ProviderId::generic("groq"),
+            "/v1/chat/completions",
+            "groq/nonexistent",
+            false,
+        ),
+        (
+            ProviderId::generic("groq"),
+            "/v1/chat/completions",
+            "groq/nonexistent",
+            true,
+        ),
+    ] {
+        let label = format!("{provider} {uri} stream={stream}");
+        let (_tmp, app) = not_found_app(&provider);
+        let body = if uri == "/v1/responses" {
+            json!({"model": model, "input": "hi", "stream": stream})
+        } else {
+            json!({"model": model, "max_tokens": 16, "stream": stream,
+                   "messages": [{"role": "user", "content": "hi"}]})
+        };
+        let (status, _, reply) = raw_response(app.clone(), post(uri, &body)).await;
+        assert_eq!(status, 404, "{label}: {reply}");
+
+        let (_, accounts) = json_response(
+            app,
+            axum::http::Request::builder()
+                .uri("/admin/accounts")
+                .header("authorization", "Bearer sk-test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        let pool = &accounts["providers"][provider.id.as_ref()];
+        let accounts = pool["accounts"].as_array().expect("accounts");
+        assert_eq!(accounts.len(), 2, "{label}: {pool}");
+        let failed: i64 = accounts
+            .iter()
+            .map(|account| account["totalFailures"].as_i64().unwrap_or_default())
+            .sum();
+        assert_eq!(failed, 1, "{label}: one failed request: {pool}");
+        for account in accounts {
+            assert_eq!(account["available"], true, "{label}: {account}");
+            assert_eq!(account["failureCount"], 0, "{label}: {account}");
+            assert!(account["lastError"].is_null(), "{label}: {account}");
+        }
+    }
 }

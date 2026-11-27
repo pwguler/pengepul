@@ -27,6 +27,7 @@ From source: `cargo install --git https://github.com/pwguler/pengepul.git --lock
 pengepul login --provider anthropic # authorize an Anthropic account
 pengepul login --provider codex # authorize a ChatGPT/Codex account
 pengepul login --provider grok # authorize a grok.com account
+pengepul login --provider antigravity # authorize a Google AI Pro/Ultra account
 pengepul serve # binds 127.0.0.1:8317
 pengepul serve --host 0.0.0.0 --port 8317 # reachable across your network
 ```
@@ -39,7 +40,28 @@ while that account can serve. A pool set to round-robin (`rotation: { anthropic:
 in `config.yaml`) reads no `priority:` and hands each new conversation to the next account in
 turn instead. A grok
 account serves `grok-4.6` and `grok-4.5`, each with a 500k context window, named bare or
-as `grok/grok-4.6`. Credentials live in `~/.pengepul` (`0600`); a running relay picks up a
+as `grok/grok-4.6`. An antigravity account serves the Google Antigravity catalog as the
+upstream lists it — `gemini-4-neon-low`, `-medium`, `-high` and `-xhigh`, the other
+Gemini 4 and Gemini 3 ids, and Claude and GPT-OSS models. Model ids reach the vendor as
+written, so the effort tier is part of the name: there is no bare `gemini-4-neon`.
+
+A model id without a provider prefix goes to the company that makes the model:
+`claude-*` to anthropic, `gpt-*`, `o<digit>*` and `codex-*` to codex, `gemini-*` to
+antigravity, `grok-*` to grok. It never falls through to another provider. When that
+pool has no account, the relay answers 404 with what to do: use a prefixed id another
+provider serves it under, or log in (`claude-opus-5 is not served by anthropic: no
+anthropic account; run pengepul login --provider anthropic`). When the maker's fetched
+list lacks the id while another provider lists it, the 404 names those prefixed ids, for
+example `gpt-oss-120b-medium is not served by codex; use antigravity/gpt-oss-120b-medium`.
+The maker's list counts a dated release and its dateless alias as one model, so
+`claude-haiku-4-5` stays with anthropic when anthropic lists `claude-haiku-4-5-20251001`;
+an id that no other provider lists always goes to the maker, which answers for it. Only
+ids your `allow:` lists admit are offered. So the Claude and GPT-OSS models of an
+antigravity account are named with their prefix, `antigravity/claude-sonnet-5-5-low` or
+`antigravity/gpt-oss-120b-medium`. A prefixed id goes to that provider exactly, and an id
+of no known maker goes wherever the live catalogs list it. An upstream 404 (a model the
+upstream does not have) is passed to the client and never cools the account.
+Credentials live in `~/.pengepul` (`0600`); a running relay picks up a
 fresh login on restart or `pengepul accounts --reload`. Read the key clients use with
 `pengepul config api-key`. That key alone guards your subscriptions, so keep it secret and
 prefer a trusted network or an SSH tunnel.
@@ -57,8 +79,10 @@ systemctl --user restart pengepul   # or: pengepul service restart
 
 A provider id becomes a directory under the auth dir: letters, digits, `.`, `-`, `_`;
 never `.` or `..`, which a filesystem reads as somewhere else, and never a built-in's
-name (`anthropic`, `claude`, `codex`, `grok`). Providers load at startup, so a new one
-needs a restart. Registration only adds: an id already present with a different
+name (`anthropic`, `claude`, `codex`, `grok`, `antigravity`). Providers load at startup, so a new one
+needs a restart. Upgrading: `antigravity` became a built-in in this release, so a config
+that already registers a `providers: antigravity:` entry with a `base-url` no longer
+loads; rename that entry (and its directory under the auth dir) before upgrading. Registration only adds: an id already present with a different
 `base-url` errors, naming the URL it kept, so a mistyped flag cannot move live traffic.
 Repeating is safe; changing or removing one means editing the file.
 
@@ -152,11 +176,13 @@ port first:
 ssh -L 54545:localhost:54545 user@host # anthropic
 ssh -L 1455:localhost:1455 user@host # codex
 ssh -L 14550:127.0.0.1:14550 user@host # grok
+ssh -L 51121:localhost:51121 user@host # antigravity
 ```
 
-For grok the tunnel is optional: when the browser cannot reach its callback, auth.x.ai
-shows a code instead, and pasting that code, or the full callback URL, at the login prompt
-finishes the same login.
+For grok and antigravity the tunnel is optional. When the browser cannot reach the
+callback, auth.x.ai shows a code; Google shows nothing, and the browser ends on a page
+that does not load, with the full callback URL in its address bar. Pasting that code, or
+that URL, at the login prompt finishes the same login.
 
 ## Clients
 
@@ -234,7 +260,7 @@ curl -sS http://127.0.0.1:8317/v1/chat/completions \
 
 ```sh
 pengepul serve # start the relay (the default with no subcommand)
-pengepul login --provider anthropic # authorize an account in a browser (--provider codex or grok for the others)
+pengepul login --provider anthropic # authorize an account in a browser (--provider codex, grok or antigravity for the others)
 pengepul login --provider groq --key $KEY # save a static key for a configured provider
 pengepul login --provider groq --base-url $URL --key $KEY # register a new OpenAI-compatible provider and save its key
 pengepul status # health of the running relay: build, uptime, what each pool can serve

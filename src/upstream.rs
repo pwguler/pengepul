@@ -33,6 +33,26 @@ pub const GROK_TOKEN_AUTH_VALUE: &str = "xai-grok-cli";
 /// is only the starting point.
 pub const GROK_CLIENT_VERSION: &str = "0.1.202";
 
+/// Google's Cloud Code Assist host, the backend Antigravity drives, on its
+/// `daily-` channel for generation and the control plane alike. Production
+/// answered every generate from a Google AI Pro account with `429
+/// RESOURCE_EXHAUSTED` while its quota read full; daily served generate, stream
+/// and tools for the same account, and is the host `CLIProxyAPI` sends consumer
+/// credentials to (docs/research/antigravity-provider.md). `daily-` is Google's
+/// pre-release channel, so this constant is the one place to switch.
+pub const ANTIGRAVITY_BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
+pub const ANTIGRAVITY_GENERATE_PATH: &str = "/v1internal:generateContent";
+pub const ANTIGRAVITY_STREAM_PATH: &str = "/v1internal:streamGenerateContent?alt=sse";
+pub const ANTIGRAVITY_MODELS_PATH: &str = "/v1internal:fetchAvailableModels";
+pub const ANTIGRAVITY_LOAD_CODE_ASSIST_PATH: &str = "/v1internal:loadCodeAssist";
+pub const ANTIGRAVITY_ONBOARD_USER_PATH: &str = "/v1internal:onboardUser";
+/// The Antigravity Hub release the `User-Agent` names. The Hub's own updater
+/// manifest is the live source (`fetch_antigravity_manifest_version`, read on
+/// each catalog refresh and at login); this is the floor used before that
+/// fetch lands and when it fails.
+pub const ANTIGRAVITY_CLIENT_VERSION: &str = "2.35.2";
+pub const ANTIGRAVITY_HUB_MANIFEST_URL: &str = "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml";
+
 const FINGERPRINT_SALT: &str = "59cf53e54c78";
 
 // Anthropic's billing classifier reads this exact sentence (injected by openclaw's
@@ -1143,8 +1163,16 @@ pub fn learn_grok_client_version(response_body: &str) -> Option<String> {
 /// `"... Please update to version 0.1.202 or later ..."`. A version is a
 /// dotted number; anything else in that slot is not one.
 fn parse_grok_minimum_version(response_body: &str) -> Option<String> {
-    const MARKER: &str = "to version ";
-    let rest = response_body.split_once(MARKER)?.1;
+    parse_minimum_version(response_body)
+}
+
+/// The minimum in a 426 upgrade nudge, `"... update to version 0.1.202 or later
+/// ..."`. Only that lead-in is read: a body that merely mentions a version (the
+/// client's own, say) must not buy a retry. A version is a dotted number;
+/// anything else in that slot is not one.
+#[must_use]
+pub fn parse_minimum_version(response_body: &str) -> Option<String> {
+    let rest = response_body.split_once("to version ")?.1;
     let token: &str = rest.split([' ', '`', '"']).next()?;
     let token = token.trim_end_matches(['.', ',', ';']);
     let dotted = token.contains('.');
@@ -1152,6 +1180,240 @@ fn parse_grok_minimum_version(response_body: &str) -> Option<String> {
         .split('.')
         .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()));
     (dotted && numeric).then(|| token.to_string())
+}
+
+/// Headers for Cloud Code Assist: the Google access token as bearer, JSON, and
+/// the Antigravity Hub identity in the `User-Agent`.
+#[must_use]
+pub fn antigravity_headers(account: &AvailableAccount) -> BTreeMap<String, String> {
+    antigravity_headers_for(account, &antigravity_version())
+}
+
+/// [`antigravity_headers`] presenting a given Hub `version`.
+#[must_use]
+pub fn antigravity_headers_for(
+    account: &AvailableAccount,
+    version: &str,
+) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("Content-Type".to_string(), "application/json".to_string()),
+        (
+            "Authorization".to_string(),
+            format!("Bearer {}", account.token.access_token),
+        ),
+        (
+            "User-Agent".to_string(),
+            antigravity_user_agent_for(version),
+        ),
+    ])
+}
+
+/// The Antigravity runtime identity: `antigravity/hub/<version> (aidev_client;
+/// os_type=darwin; arch=arm64)`. The platform is the one the public
+/// implementations present; the version drifts and is read from the Hub
+/// manifest.
+#[must_use]
+pub fn antigravity_user_agent() -> String {
+    antigravity_user_agent_for(&antigravity_version())
+}
+
+fn antigravity_user_agent_for(version: &str) -> String {
+    format!("antigravity/hub/{version} (aidev_client; os_type=darwin; arch=arm64)")
+}
+
+/// The Hub version to present: the highest this process has been taught, by a
+/// 426 or by the manifest, else the pinned floor.
+#[must_use]
+pub fn antigravity_version() -> String {
+    ANTIGRAVITY_VERSION.current()
+}
+
+/// The process-wide floor every antigravity request presents.
+pub static ANTIGRAVITY_VERSION: VersionFloor = VersionFloor::new(ANTIGRAVITY_CLIENT_VERSION);
+
+/// A client version that only moves up. A 426 names the floor the upstream
+/// enforces and the manifest names the newest release; neither may lower what
+/// the other taught, or the next request is refused again.
+pub struct VersionFloor {
+    pinned: &'static str,
+    learned: Mutex<Option<String>>,
+}
+
+impl VersionFloor {
+    #[must_use]
+    pub const fn new(pinned: &'static str) -> Self {
+        Self {
+            pinned,
+            learned: Mutex::new(None),
+        }
+    }
+
+    #[must_use]
+    pub fn current(&self) -> String {
+        self.learned
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .unwrap_or_else(|| self.pinned.to_string())
+    }
+
+    /// Raise the floor to `version` when it is higher. Returns whether it rose.
+    pub fn adopt(&self, version: &str) -> bool {
+        let Ok(mut guard) = self.learned.lock() else {
+            return false;
+        };
+        let current = guard.clone().unwrap_or_else(|| self.pinned.to_string());
+        if version_rank(version) <= version_rank(&current) {
+            return false;
+        }
+        *guard = Some(version.to_string());
+        true
+    }
+
+    /// What a request refused with this 426 body should be retried with, when
+    /// anything: the version now presented, once it meets the body's minimum
+    /// and differs from the one that request `sent`. Several requests refused at
+    /// once all retry, whichever of them raised the floor.
+    #[must_use]
+    pub fn after_426(&self, response_body: &str, sent: &str) -> Option<String> {
+        let minimum = parse_minimum_version(response_body)?;
+        self.adopt(&minimum);
+        let now = self.current();
+        (now != sent && version_rank(&now) >= version_rank(&minimum)).then_some(now)
+    }
+}
+
+/// A dotted version as numbers, so `2.10.0` ranks above `2.9.0`.
+fn version_rank(version: &str) -> Vec<u64> {
+    version
+        .split('.')
+        .map(|part| part.parse().unwrap_or(0))
+        .collect()
+}
+
+/// The `version:` line of the Antigravity Hub updater manifest. The document is
+/// YAML; this reads the one key it needs rather than adding a parser.
+#[must_use]
+pub fn antigravity_manifest_version(manifest: &str) -> Option<String> {
+    let version = manifest
+        .lines()
+        .find_map(|line| line.strip_prefix("version:"))?
+        .trim();
+    let dotted = version.contains('.');
+    let numeric = version
+        .split('.')
+        .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()));
+    (dotted && numeric).then(|| version.to_string())
+}
+
+/// Wrap a Chat Completions body in the Antigravity envelope: the Gemini request
+/// one level down, and the identity, project and request type beside it.
+///
+/// # Errors
+///
+/// Names a tool whose parameters schema nests past the walk's bound; the
+/// request is refused rather than sent with that schema cut short.
+pub fn antigravity_envelope(
+    chat_body: &Value,
+    model: &str,
+    project: Option<&str>,
+) -> Result<Value, String> {
+    let request = crate::translate::antigravity_request_checked(chat_body)?;
+    let mut envelope = serde_json::Map::new();
+    if let Some(project) = project {
+        envelope.insert("project".to_string(), json!(project));
+    }
+    envelope.insert("model".to_string(), json!(model));
+    envelope.insert("userAgent".to_string(), json!("antigravity"));
+    envelope.insert("requestType".to_string(), json!("agent"));
+    envelope.insert(
+        "requestId".to_string(),
+        json!(format!("agent/{}", Uuid::new_v4())),
+    );
+    envelope.insert("request".to_string(), request);
+    Ok(Value::Object(envelope))
+}
+
+/// The Gemini object inside the Antigravity envelope. A reply that arrives
+/// without the wrapper is returned as it came, so a bare `generateContent`
+/// shape is not mistaken for an empty one.
+#[must_use]
+pub fn antigravity_unwrap(value: Value) -> Value {
+    match value {
+        Value::Object(mut object) => object.remove("response").unwrap_or(Value::Object(object)),
+        other => other,
+    }
+}
+
+/// The wait a `RESOURCE_EXHAUSTED` body names in `details[].retryDelay`. This
+/// is the provider's retry hint; Cloud Code sends no `Retry-After` header.
+#[must_use]
+pub fn antigravity_retry_delay(body: &Value) -> Option<Duration> {
+    let details = body.get("error")?.get("details")?.as_array()?;
+    details
+        .iter()
+        .find_map(|detail| detail.get("retryDelay").and_then(Value::as_str))
+        .and_then(parse_proto_duration)
+}
+
+/// A protobuf `Duration` in its JSON form, which is always decimal seconds with
+/// an `s` suffix (`"3.957525076s"`). Anything else, and a value too large for a
+/// `Duration`, is not a wait.
+fn parse_proto_duration(raw: &str) -> Option<Duration> {
+    let seconds = raw.trim().strip_suffix('s')?;
+    let digits = seconds.bytes().filter(u8::is_ascii_digit).count();
+    let points = seconds.bytes().filter(|&byte| byte == b'.').count();
+    if digits == 0 || points > 1 || digits + points != seconds.len() {
+        return None;
+    }
+    Duration::try_from_secs_f64(seconds.parse().ok()?).ok()
+}
+
+/// How long a Hub manifest read may take. No catalog refresh and no login URL
+/// waits on it; a login waits at most this long, after the browser step and
+/// before its control-plane calls.
+pub const ANTIGRAVITY_MANIFEST_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Read the Hub version on `runtime`'s own task, giving up after `limit`, and
+/// raise `floor` with what it names. Returns at once: the caller learns the
+/// outcome from the handle only if it chooses to wait.
+pub fn spawn_version_refresh<F>(
+    runtime: &tokio::runtime::Handle,
+    floor: &'static VersionFloor,
+    fetch: F,
+    limit: Duration,
+) -> tokio::task::JoinHandle<bool>
+where
+    F: std::future::Future<Output = anyhow::Result<String>> + Send + 'static,
+{
+    runtime.spawn(async move {
+        match tokio::time::timeout(limit, fetch).await {
+            Ok(Ok(version)) => floor.adopt(&version),
+            Ok(Err(_)) | Err(_) => false,
+        }
+    })
+}
+
+/// The version the Antigravity Hub updater manifest names.
+///
+/// # Errors
+///
+/// Returns an error when the manifest cannot be fetched or names no version.
+pub async fn fetch_antigravity_manifest_version(
+    client: &reqwest::Client,
+) -> anyhow::Result<String> {
+    let response = client
+        .get(ANTIGRAVITY_HUB_MANIFEST_URL)
+        .header("User-Agent", "electron-builder")
+        .timeout(ANTIGRAVITY_MANIFEST_TIMEOUT)
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!("antigravity hub manifest returned {status}");
+    }
+    antigravity_manifest_version(&response.text().await?)
+        .ok_or_else(|| anyhow::anyhow!("antigravity hub manifest names no version"))
 }
 
 /// The configured endpoint's base URL, trimmed of a trailing slash so the
@@ -1240,5 +1502,195 @@ mod classifier_tests {
 
         assert!(detect_classifier_tripping_in_messages(&with_sentence));
         assert!(!detect_classifier_tripping_in_messages(&without_sentence));
+    }
+}
+
+#[cfg(test)]
+mod antigravity_tests {
+    use super::{
+        ANTIGRAVITY_CLIENT_VERSION, VersionFloor, antigravity_envelope,
+        antigravity_manifest_version, antigravity_retry_delay, antigravity_unwrap,
+        antigravity_user_agent,
+    };
+    use serde_json::json;
+    use std::time::Duration;
+
+    #[test]
+    fn the_envelope_carries_project_model_identity_and_the_gemini_request() {
+        let envelope = antigravity_envelope(
+            &json!({
+                "model": "gemini-4-neon-high",
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+            "gemini-4-neon-high",
+            Some("cloud-code-project"),
+        )
+        .expect("a shallow schema");
+        assert_eq!(envelope["project"], "cloud-code-project");
+        assert_eq!(envelope["model"], "gemini-4-neon-high");
+        assert_eq!(envelope["userAgent"], "antigravity");
+        assert_eq!(envelope["requestType"], "agent");
+        assert!(
+            envelope["requestId"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("agent/"))
+        );
+        // The chat body is not sent as-is: the Gemini request is one level down.
+        assert!(envelope.get("messages").is_none());
+        assert_eq!(envelope["request"]["contents"][0]["role"], "user");
+        assert_eq!(envelope["request"]["contents"][0]["parts"][0]["text"], "hi");
+    }
+
+    #[test]
+    fn unwrapping_takes_the_response_object_and_leaves_a_bare_body_alone() {
+        let wrapped = json!({"response": {"candidates": []}, "traceId": "t"});
+        assert_eq!(antigravity_unwrap(wrapped), json!({"candidates": []}));
+        let bare = json!({"candidates": []});
+        assert_eq!(antigravity_unwrap(bare.clone()), bare);
+    }
+
+    #[test]
+    fn the_retry_delay_is_read_from_the_error_details() {
+        let body = json!({"error": {"code": 429, "status": "RESOURCE_EXHAUSTED",
+            "message": "You have exhausted your capacity on this model.",
+            "details": [{"@type": "type.googleapis.com/google.rpc.RetryInfo",
+                         "retryDelay": "3.957525076s"}]}});
+        assert_eq!(
+            antigravity_retry_delay(&body),
+            Some(Duration::from_secs_f64(3.957_525_076))
+        );
+    }
+
+    #[test]
+    fn a_retry_delay_that_is_not_a_duration_is_ignored() {
+        let body = json!({"error": {"details": [{"retryDelay": "soon"}]}});
+        assert_eq!(antigravity_retry_delay(&body), None);
+        assert_eq!(antigravity_retry_delay(&json!({"error": {}})), None);
+        // Protobuf Duration JSON is always decimal seconds; nothing else parses.
+        for raw in ["1m30s", "250ms", "-3s", "infs", "1e3s", "3"] {
+            let body = json!({"error": {"details": [{"retryDelay": raw}]}});
+            assert_eq!(antigravity_retry_delay(&body), None, "{raw}");
+        }
+    }
+
+    /// L2: a value no `Duration` can hold is refused, not a panic.
+    #[test]
+    fn an_absurd_retry_delay_is_refused_without_panicking() {
+        let raw = format!("{}s", "9".repeat(400));
+        let body = json!({"error": {"details": [{"retryDelay": raw}]}});
+        assert_eq!(antigravity_retry_delay(&body), None);
+    }
+
+    #[test]
+    fn the_manifest_version_is_the_version_line() {
+        let manifest = "version: 2.35.2\nfiles:\n  - url: https://example/Antigravity.zip\n";
+        assert_eq!(
+            antigravity_manifest_version(manifest),
+            Some("2.35.2".to_string())
+        );
+        assert_eq!(antigravity_manifest_version("files: []"), None);
+        assert_eq!(antigravity_manifest_version("version: soon"), None);
+    }
+
+    #[test]
+    fn the_pinned_version_is_presented_in_the_user_agent() {
+        assert!(
+            antigravity_user_agent()
+                .starts_with(&format!("antigravity/hub/{}", super::antigravity_version())),
+            "{}",
+            antigravity_user_agent()
+        );
+        assert!(antigravity_user_agent().contains("(aidev_client; os_type=darwin; arch=arm64)"));
+        assert_eq!(ANTIGRAVITY_CLIENT_VERSION, "2.35.2");
+    }
+
+    /// N15: a manifest that never answers is given up on after the limit; the
+    /// spawn itself returns at once, and the floor stays.
+    #[test]
+    fn a_slow_manifest_is_given_up_on_without_blocking_the_caller() {
+        static FLOOR: VersionFloor = VersionFloor::new("2.35.2");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let started = std::time::Instant::now();
+        let handle = super::spawn_version_refresh(
+            runtime.handle(),
+            &FLOOR,
+            std::future::pending(),
+            Duration::from_millis(50),
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(20),
+            "the spawn blocked"
+        );
+        let adopted = runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(2), handle).await })
+            .expect("the limit was not applied")
+            .expect("join");
+        assert!(!adopted);
+        assert_eq!(FLOOR.current(), "2.35.2");
+    }
+
+    #[test]
+    fn a_manifest_that_answers_raises_the_floor() {
+        static FLOOR: VersionFloor = VersionFloor::new("2.35.2");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let handle = super::spawn_version_refresh(
+            runtime.handle(),
+            &FLOOR,
+            async { Ok("2.40.0".to_string()) },
+            Duration::from_secs(1),
+        );
+        assert!(runtime.block_on(handle).expect("join"));
+        assert_eq!(FLOOR.current(), "2.40.0");
+    }
+
+    #[test]
+    fn a_426_raises_the_floor_and_buys_one_retry() {
+        let floor = VersionFloor::new("2.35.2");
+        assert_eq!(floor.current(), "2.35.2");
+        let body = "Please update to version 2.41.0 or later.";
+        assert_eq!(floor.after_426(body, "2.35.2"), Some("2.41.0".to_string()));
+        assert_eq!(floor.current(), "2.41.0");
+        // A request that already sent the floor has nothing new to retry with.
+        assert_eq!(floor.after_426(body, "2.41.0"), None);
+    }
+
+    /// L4: a second request refused at the same time still retries, with the
+    /// floor the first one raised.
+    #[test]
+    fn concurrent_426s_all_retry() {
+        let floor = VersionFloor::new("2.35.2");
+        let body = "Please update to version 2.41.0 or later.";
+        assert_eq!(floor.after_426(body, "2.35.2"), Some("2.41.0".to_string()));
+        assert_eq!(floor.after_426(body, "2.35.2"), Some("2.41.0".to_string()));
+    }
+
+    /// L4: the manifest cannot lower a floor a 426 taught, and versions rank
+    /// numerically.
+    #[test]
+    fn the_floor_never_goes_down() {
+        let floor = VersionFloor::new("2.35.2");
+        assert!(floor.adopt("2.41.0"));
+        assert!(!floor.adopt("2.36.0"), "the manifest lowered the floor");
+        assert_eq!(floor.current(), "2.41.0");
+        assert!(floor.adopt("2.100.0"));
+        assert_eq!(floor.current(), "2.100.0");
+    }
+
+    /// L3: a body that names a version without asking for an upgrade buys no
+    /// retry.
+    #[test]
+    fn only_an_upgrade_request_names_a_minimum() {
+        let floor = VersionFloor::new("2.35.2");
+        assert_eq!(
+            floor.after_426("client version 9.9.9 is not supported", "2.35.2"),
+            None
+        );
     }
 }

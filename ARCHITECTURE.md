@@ -3,7 +3,7 @@
 ## What this is
 
 pengepul is a local relay. It pools subscription **Accounts** per **Provider** —
-anthropic, codex, grok, and OpenAI-compatible endpoints configured in `config.yaml` —
+anthropic, codex, grok, antigravity, and OpenAI-compatible endpoints configured in `config.yaml` —
 behind one REST surface, so a harness runs on a subscription instead of a
 per-token key. It authenticates each caller by a **Local API key**, **Cloaks**
 anthropic- and codex-bound requests so the vendor **Classifier** reads them as
@@ -44,8 +44,8 @@ in files.
   registration, `config.yaml.lock` sit there too. The only other
   long-lived file under the auth dir, `cloaking-versions.json`, is the
   Upstream module's own cache — `cloaking_versions.rs`.)
-- **OAuth** (`oauth.rs`) — mints and Refreshes the anthropic, codex and grok
-  credential, each through an authorization-code flow with PKCE (S256), and is the
+- **OAuth** (`oauth.rs`) — mints and Refreshes the anthropic, codex, grok and
+  antigravity credential, each through an authorization-code flow with PKCE (S256), and is the
   only place a rejected refresh token becomes **Reauth**. A grok code is exchanged
   from whichever arrives first, which the runtime waits on: the loopback callback
   on `127.0.0.1:14550`, or the code auth.x.ai shows when that callback cannot be
@@ -72,7 +72,15 @@ in files.
   two headers the grok Upstream
   (grok build's chat proxy) requires (`grok_chat_headers`), and no Cloaking; a
   426 naming a newer client version is retried once with it, and that version is
-  kept for the process lifetime (`learn_grok_client_version`). A chat call to a
+  kept for the process lifetime (`learn_grok_client_version`). An antigravity
+  call carries the Google access token as bearer and the Antigravity Hub
+  `User-Agent` (`antigravity_headers`) and only sends bytes: the route wraps the
+  Chat body in the Antigravity envelope (`antigravity_envelope`) and unwraps
+  and translates the Gemini reply (`antigravity_unwrap`, `antigravity_json`).
+  The version comes from the Hub manifest on each catalog refresh and at login
+  (`fetch_antigravity_manifest_version`), read on a task of its own with a 3 s
+  limit (`spawn_version_refresh`) so neither the catalog nor the login URL waits
+  on it, over a floor that never goes down (`VersionFloor`). It is never Cloaked. A chat call to a
   configured endpoint carries the bearer key; one to an `opencode.ai` host also names
   its conversation in `x-opencode-session`, a hash of Rotation's key
   (`generic_chat_headers`), because OpenCode Go refuses a chat without one. That host
@@ -86,7 +94,19 @@ in files.
   under the upstream's `/models` body, under what the operator states in a
   configured provider's `models:` in `config.yaml` (ADR-0029). grok publishes no
   list to fetch: its two models, `grok-4.6` and `grok-4.5`, are a static one
-  (`grok_static_models`). It also holds the operator's `allow:` lists: a Provider
+  (`grok_static_models`). antigravity fetches its catalog from Cloud Code Assist
+  (`parse_antigravity`). Its floor, the four `gemini-4-neon-{low,medium,high,xhigh}`
+  tiers (`antigravity_static_models`), shows until a live list lands — for an
+  account with no project, or after a failed first fetch — and never replaces
+  one. A bare id goes to its maker's built-in by name (`bare_origin`: `claude-*`,
+  `gpt-*`/`o<digit>*`/`codex-*`, `gemini-*`, `grok-*`) and never falls through
+  (`ModelCatalog::resolve`). A maker pool with no serving account is a 404 naming the
+  prefixed ids the allow lists admit elsewhere, or the missing login or `accounts
+  enable`; a maker whose fetched list lacks the id, matched by model (case, date and
+  `[1m]` aside), is a 404 only when another provider lists it. Only a non-empty fetched
+  list speaks for its maker: the floor and grok's static list do not. A bare id of no known
+  maker goes to the earliest built-in that lists it (anthropic, codex, grok,
+  antigravity). It also holds the operator's `allow:` lists: a Provider
   with one advertises only the listed ids its Upstream lists, matched exactly on the
   id `upstream_model` produces, while its fetched list stays whole so a bare id still
   resolves to it and is refused by name.
@@ -102,7 +122,8 @@ in files.
   stated there as well as in `Translation`.
 - **Config** (`config.rs`) — parses `config.yaml`, including the `providers:`
   section, which is the only Provider registry: there is no database table.
-  An entry named for a built-in (`anthropic`, `claude`, `codex`, `grok`)
+  An entry named for a built-in (`anthropic`, `claude`, `codex`, `grok`,
+  `antigravity`)
   stops the relay at load, since the built-in Pool's prefix would shadow it,
   unless it names a built-in canonically and carries only `allow:`, which
   narrows that built-in's models and registers nothing. `/admin/reload` reads
@@ -160,10 +181,11 @@ in files.
   are advertised as it returns them (ADR-0029). So do a stream's Silence limit
   and the Retry hint's parse: a test double hands back a parsed hint, and only a
   test that streams from a real HTTP server can show where a stream is cut.
-- **`ProviderKind`** — a closed enum (Anthropic, Codex, Grok, Generic) that
-  switches the credential lifecycle, the OAuth flow, and whether Cloaking runs,
-  and names the ids a configured Provider may not take; the compiler is the
-  checklist when a fifth kind arrives.
+- **`ProviderKind`** — a closed enum (Anthropic, Codex, Grok, Antigravity,
+  Generic) that switches the credential lifecycle, the OAuth flow, and whether
+  Cloaking runs, and names the ids a configured Provider may not take. The
+  compiler checks every `match` on it, not every list: code that walks the pools
+  reads `AccountManagers::pools()`, which is the one list a new kind joins.
 - **`CliRuntime`** — every side effect a CLI verb performs, so `cli.rs` stays
   pure argument handling.
 - **`Style`** — decided once from the TTY and environment in `main.rs` and
@@ -191,7 +213,7 @@ in files.
   one, because the Classifier reads the body, not the client's dialect
   (ADR-0028, amending ADR-0002, ADR-0004 and ADR-0007). The vendor-identity
   inject (`apply_cloaking`) runs inside the Upstream client. codex is
-  header-only; grok and a configured OpenAI-compatible endpoint are never
+  header-only; grok, antigravity and a configured OpenAI-compatible endpoint are never
   Cloaked; `count_tokens` gets identifying headers but no body Cloaking.
 - **Tool-name rewrites are bijective within a request and restored before the
   reply reaches the client**, on the upstream's Messages-shaped reply, before
@@ -201,7 +223,9 @@ in files.
   log line, so the rules bias toward failing loud over deleting operator content.
 - **One model id resolves to exactly one Provider**, and an id nobody claims is
   refused 400 before any Account is touched, as is an id outside its Provider's
-  `allow:` list (`resolve_model`, the one resolution every route calls). A bare id
+  `allow:` list (`resolve_model`, the one resolution every route calls); a bare id
+  its maker cannot serve is refused 404 with the prefixed ids that can, or the
+  login it lacks. A bare id
   never routes to a configured endpoint — only an explicit `<provider>/` prefix does.
 - **The `<provider>/` prefix is the only rewrite of a model id.** `upstream_model` removes
   it so the request asks the vendor for a model by the name the client gave after the prefix,
@@ -322,8 +346,8 @@ in files.
   including a client that hangs up mid-stream, whose outcome is paid by a
   `Drop` guard because the code after the stream loop never runs. A
   Refusal counts as a failed request but earns no Cooldown: a dialect the
-  Provider cannot serve, or a 400 the client malformed, is not the
-  Account's fault. Counters written by the earlier scheme, which counted
+  Provider cannot serve, a 400 the client malformed, or a 404 for a model or
+  path the upstream does not have (ADR-0034), is not the Account's fault. Counters written by the earlier scheme, which counted
   at dispatch, are repaired once at load and never again: a gap can no
   longer be created, so the repair is a migration with an end.
 - **A number the panels cannot attribute is not invented.** Every success

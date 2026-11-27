@@ -1157,6 +1157,7 @@ fn login(
         id_token: None,
         last_refresh_at: None,
         plan_type: None,
+        project_id: None,
     };
     // The token first: if the config write then fails, what is left is an
     // orphan token in the auth-dir, which is harmless because the

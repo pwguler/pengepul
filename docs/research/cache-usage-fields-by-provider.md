@@ -260,10 +260,18 @@ chunks"*, and the streamed example is
 > `cachedContentTokenCount`: Output only. The number of tokens in the cached content that
 > was used for this request.
 
-Inclusive, explicitly. The relay never speaks this API directly, and Google's
+Inclusive, explicitly.
+
+pengepul does speak this API directly for the antigravity provider
+(`docs/research/antigravity-provider.md`). Its upstream client translates the Gemini
+`usageMetadata` into the Chat names the relay records, so the inclusive rule is applied
+once, there: `promptTokenCount` → `prompt_tokens`, `candidatesTokenCount` →
+`completion_tokens`, `thoughtsTokenCount` → `completion_tokens_details.reasoning_tokens`,
+`cachedContentTokenCount` → `prompt_tokens_details.cached_tokens`, and `totalTokenCount`
+carried through so `output_from` folds the thinking into the output count. A Gemini
+endpoint registered as a generic provider is still unverified: Google's
 OpenAI-compatibility page (`https://ai.google.dev/gemini-api/docs/openai`) documents no
-cache field at all, so what a Gemini endpoint registered as a generic provider returns is
-**unverified**.
+cache field at all.
 
 ## What the relay read when this was researched
 
@@ -305,6 +313,7 @@ above.
 | Groq | `prompt_tokens_details.cached_tokens` | none (no write fee) | nested | read yes; input double counts |
 | OpenRouter | `prompt_tokens_details.cached_tokens` | `prompt_tokens_details.cache_write_tokens` | nested | read yes, write **no**; input double counts |
 | Moonshot/Kimi | `usage.cached_tokens` (**flat**) | none documented | `reasoning_content` in the message, not usage | **no — reads 0** |
+| Gemini (antigravity) | `usageMetadata.cachedContentTokenCount` (inclusive) | none published | `usageMetadata.thoughtsTokenCount` | translated by the antigravity client |
 | Gemini (compat) | unverified | unverified | unverified | unknown |
 
 ## Live counter evidence

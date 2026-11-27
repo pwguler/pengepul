@@ -3,8 +3,95 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use crate::translate::anthropic_stop_reason;
+use crate::translate::{
+    anthropic_stop_reason, gemini_finish_reason, gemini_parts, gemini_turn_ended, gemini_usage,
+};
 use crate::types::UsageData;
+
+/// The state one antigravity stream carries between Gemini chunks: the id and
+/// model every `chat.completion.chunk` names, whether the opening role delta
+/// has gone out, and the next tool-call index.
+pub struct AntigravityChunkState {
+    id: String,
+    model: String,
+    started: bool,
+    tool_index: i64,
+}
+
+impl AntigravityChunkState {
+    #[must_use]
+    pub fn new(model: impl Into<String>) -> Self {
+        Self {
+            id: format!("chatcmpl_{}", uuid::Uuid::new_v4().simple()),
+            model: model.into(),
+            started: false,
+            tool_index: 0,
+        }
+    }
+
+    /// The Chat Completions chunk a Gemini chunk becomes, or `None` when the
+    /// chunk carries nothing a client can use. The id is taken from the first
+    /// chunk that names one, so a streamed reply and a whole one agree.
+    pub fn chunk(&mut self, gemini: &Value) -> Option<Value> {
+        if let Some(id) = gemini.get("responseId").and_then(Value::as_str) {
+            self.id = id.to_string();
+        }
+        let (text, reasoning, tool_calls) = gemini_parts(gemini);
+        let finish = gemini_turn_ended(gemini);
+        let usage = gemini_usage(gemini.get("usageMetadata"));
+        if text.is_empty()
+            && reasoning.is_empty()
+            && tool_calls.is_empty()
+            && !finish
+            && usage.is_none()
+        {
+            return None;
+        }
+
+        let mut delta = serde_json::Map::new();
+        if !self.started {
+            self.started = true;
+            delta.insert("role".to_string(), json!("assistant"));
+        }
+        if !reasoning.is_empty() {
+            delta.insert("reasoning_content".to_string(), json!(reasoning));
+        }
+        if !text.is_empty() {
+            delta.insert("content".to_string(), json!(text));
+        }
+        if !tool_calls.is_empty() {
+            let mut calls = Vec::new();
+            for call in &tool_calls {
+                calls.push(json!({
+                    "index": self.tool_index,
+                    "id": call.get("id").cloned().unwrap_or(Value::Null),
+                    "type": "function",
+                    "function": call.get("function").cloned().unwrap_or(Value::Null)
+                }));
+                self.tool_index += 1;
+            }
+            delta.insert("tool_calls".to_string(), Value::Array(calls));
+        }
+
+        let mut chunk = json!({
+            "id": self.id,
+            "object": "chat.completion.chunk",
+            "created": chrono::Utc::now().timestamp(),
+            "model": self.model,
+            "choices": [{
+                "index": 0,
+                "delta": Value::Object(delta),
+                // Gemini may send the call and the finish in separate chunks;
+                // the turn ended on a tool call if any chunk carried one.
+                "finish_reason": finish.then(|| gemini_finish_reason(gemini, self.tool_index > 0))
+            }]
+        });
+        if let Some(usage) = usage {
+            chunk["usage"] = usage;
+        }
+        Some(chunk)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ChatStreamState {
@@ -1256,20 +1343,57 @@ pub fn chat_sse_to_anthropic(data: &Value, state: &mut AnthropicStreamState) -> 
     chunks
 }
 
-/// Close the message, whatever the stream did or did not send.
-///
-/// Called once when the stream ends. A stream that stops before any
-/// `finish_reason` — a truncation, a dropped connection, a gateway that
-/// ends on `[DONE]` alone — still has to hand the client the tool calls it
-/// announced and a `message_stop`, or the turn simply never closes and the
-/// content is lost.
+/// End a Messages stream whose upstream stopped before it finished the reply:
+/// no `finish_reason` and no `[DONE]`. A `message_stop` here would tell the
+/// client the turn is whole, so the stream ends with the `error` event the
+/// dialect defines instead, and calls the upstream had not finished are not
+/// handed over half-built.
 #[must_use]
-pub fn finish_chat_stream(state: &mut AnthropicStreamState) -> Vec<String> {
-    if !state.started || state.from_chat.closed {
+pub fn cut_chat_stream(state: &mut AnthropicStreamState) -> Vec<String> {
+    // A stream that never started still ends with the reason, or the client
+    // is left an empty body.
+    if state.from_chat.closed {
         return Vec::new();
     }
     state.from_chat.closed = true;
-    let mut chunks = flush_chat_tool_calls(state);
+    vec![sse(
+        &json!({"type": "error", "error": {
+            "type": "api_error",
+            "message": "the upstream stream ended before the reply finished"
+        }}),
+        Some("error"),
+    )]
+}
+
+impl AnthropicStreamState {
+    /// Whether the chat stream named a `finish_reason`: the content is whole.
+    #[must_use]
+    pub const fn chat_finished(&self) -> bool {
+        self.from_chat.pending_stop_reason.is_some()
+    }
+}
+
+/// Close the message of a reply the upstream finished.
+///
+/// Called once when the stream ends with a `finish_reason` or `[DONE]`. A
+/// gateway that ends on `[DONE]` alone, with no `finish_reason`, still has to
+/// hand the client the tool calls it announced and a `message_stop`, or the
+/// turn never closes and the content is lost. A stream cut before either is
+/// [`cut_chat_stream`]'s.
+#[must_use]
+pub fn finish_chat_stream(state: &mut AnthropicStreamState) -> Vec<String> {
+    if state.from_chat.closed {
+        return Vec::new();
+    }
+    // A finished stream that carried no chunk (`[DONE]` alone) is an empty
+    // reply: it still opens, as its first chunk would have, so it can close.
+    let mut chunks = if state.started {
+        Vec::new()
+    } else {
+        chat_sse_to_anthropic(&json!({"choices": []}), state)
+    };
+    state.from_chat.closed = true;
+    chunks.extend(flush_chat_tool_calls(state));
     chunks.extend(stop_active_block(state));
     let stop_reason = state
         .from_chat
@@ -1893,5 +2017,109 @@ trait MapExt {
 impl MapExt for serde_json::Map<String, Value> {
     fn is_empty(&self) -> bool {
         serde_json::Map::is_empty(self)
+    }
+}
+
+#[cfg(test)]
+mod antigravity_chunk_tests {
+    use super::AntigravityChunkState;
+    use serde_json::json;
+
+    #[test]
+    fn a_gemini_chunk_becomes_a_chat_completion_chunk() {
+        let mut state = AntigravityChunkState::new("gemini-4-neon-high");
+        let chunk = state
+            .chunk(&json!({
+                "responseId": "resp-1",
+                "candidates": [{"content": {"role": "model", "parts": [
+                    {"text": "thinking", "thought": true},
+                    {"text": "hello"}
+                ]}}],
+                "usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 2,
+                                  "thoughtsTokenCount": 3, "totalTokenCount": 12}
+            }))
+            .expect("a chunk");
+
+        assert_eq!(chunk["id"], "resp-1");
+        assert_eq!(chunk["object"], "chat.completion.chunk");
+        assert_eq!(chunk["model"], "gemini-4-neon-high");
+        let delta = &chunk["choices"][0]["delta"];
+        // The role opens the stream once, on the first chunk.
+        assert_eq!(delta["role"], "assistant");
+        assert_eq!(delta["reasoning_content"], "thinking");
+        assert_eq!(delta["content"], "hello");
+        assert_eq!(chunk["usage"]["prompt_tokens"], 7);
+        assert_eq!(
+            chunk["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            3
+        );
+    }
+
+    #[test]
+    fn a_finish_chunk_carries_the_stop_reason_and_no_role_delta() {
+        let mut state = AntigravityChunkState::new("gemini-4-neon");
+        let _ = state.chunk(&json!({"candidates": [{"content": {"parts": [{"text": "x"}]}}]}));
+        let chunk = state
+            .chunk(&json!({"candidates": [{"content": {"parts": []}, "finishReason": "STOP"}]}))
+            .expect("finish chunk");
+        assert_eq!(chunk["choices"][0]["finish_reason"], "stop");
+        assert!(
+            chunk["choices"][0]["delta"].get("role").is_none(),
+            "the role goes out once"
+        );
+    }
+
+    #[test]
+    fn a_function_call_chunk_numbers_its_tool_calls() {
+        let mut state = AntigravityChunkState::new("gemini-4-neon");
+        let chunk = state
+            .chunk(&json!({"candidates": [{"content": {"parts": [
+                {"functionCall": {"name": "a", "args": {}}},
+                {"functionCall": {"name": "b", "args": {}}}
+            ]}}]}))
+            .expect("chunk");
+        assert_eq!(chunk["choices"][0]["delta"]["tool_calls"][0]["index"], 0);
+        assert_eq!(chunk["choices"][0]["delta"]["tool_calls"][1]["index"], 1);
+        assert_eq!(
+            chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+            "a"
+        );
+    }
+
+    /// F1: a streamed call hands the client an id that carries the signature,
+    /// so the next turn can replay it.
+    #[test]
+    fn a_streamed_call_carries_its_thought_signature_in_the_id() {
+        let mut state = AntigravityChunkState::new("gemini-4-neon-low");
+        let chunk = state
+            .chunk(&json!({"candidates": [{"content": {"parts": [{
+                "thoughtSignature": "sig-bytes",
+                "functionCall": {"name": "w", "args": {}, "id": "call_1"}
+            }]}}]}))
+            .expect("chunk");
+        let id = chunk["choices"][0]["delta"]["tool_calls"][0]["id"]
+            .as_str()
+            .expect("id");
+        assert!(id.starts_with("call_1__ags__"), "{id}");
+    }
+
+    /// L6: a blocked prompt in a stream ends it as a content filter.
+    #[test]
+    fn a_blocked_prompt_ends_the_stream_as_a_content_filter() {
+        let mut state = AntigravityChunkState::new("m");
+        let chunk = state
+            .chunk(&json!({"promptFeedback": {"blockReason": "SAFETY"}}))
+            .expect("a finish chunk");
+        assert_eq!(chunk["choices"][0]["finish_reason"], "content_filter");
+    }
+
+    #[test]
+    fn a_chunk_with_nothing_to_say_is_dropped() {
+        let mut state = AntigravityChunkState::new("gemini-4-neon");
+        assert!(
+            state
+                .chunk(&json!({"candidates": [{"content": {"parts": []}}]}))
+                .is_none()
+        );
     }
 }

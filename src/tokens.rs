@@ -21,6 +21,7 @@ struct StoredToken {
     id_token: Option<String>,
     last_refresh: Option<String>,
     plan_type: Option<String>,
+    project_id: Option<String>,
 }
 
 /// Save an OAuth token under the provider-specific auth directory filename.
@@ -291,6 +292,7 @@ fn token_to_storage(token: &TokenData) -> StoredToken {
             ProviderKind::Anthropic => "claude".to_string(),
             ProviderKind::Codex => "codex".to_string(),
             ProviderKind::Grok => "grok".to_string(),
+            ProviderKind::Antigravity => "antigravity".to_string(),
             ProviderKind::Generic => "generic".to_string(),
         }),
         expired: token.expires_at.clone(),
@@ -298,6 +300,7 @@ fn token_to_storage(token: &TokenData) -> StoredToken {
         id_token: token.id_token.clone(),
         last_refresh: Some(token.last_refresh_at.clone().unwrap_or_else(now_iso)),
         plan_type: token.plan_type.clone(),
+        project_id: token.project_id.clone(),
     }
 }
 
@@ -305,6 +308,7 @@ fn storage_to_token(stored: StoredToken, dir_id: &str) -> TokenData {
     let provider = match stored.token_type.as_deref() {
         Some("codex") => ProviderId::codex(),
         Some("grok") => ProviderId::grok(),
+        Some("antigravity") => ProviderId::antigravity(),
         // The id lives in the directory name, not the file: a configured
         // provider's token_type is "generic" and its `providers:` entry name
         // is the subdirectory under auth-dir.
@@ -325,6 +329,7 @@ fn storage_to_token(stored: StoredToken, dir_id: &str) -> TokenData {
         id_token: stored.id_token,
         last_refresh_at: stored.last_refresh,
         plan_type,
+        project_id: stored.project_id,
     }
 }
 
@@ -824,6 +829,7 @@ mod tests {
             id_token: None,
             last_refresh_at: None,
             plan_type: None,
+            project_id: None,
         }
     }
 
@@ -843,6 +849,37 @@ mod tests {
             std::path::Path::new(&components[1])
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        );
+    }
+
+    #[test]
+    fn project_id_round_trips_through_storage_and_older_files_still_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut antigravity = token(ProviderId::antigravity(), "operator@example.com");
+        antigravity.project_id = Some("cloud-code-project".to_string());
+        save_token(dir.path(), &antigravity).expect("save");
+        let loaded = load_all_tokens(dir.path(), Some(&ProviderId::antigravity())).expect("load");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].project_id.as_deref(), Some("cloud-code-project"));
+
+        // A credential written before the field existed carries no key at all;
+        // it must load rather than be skipped as unreadable.
+        let older = dir
+            .path()
+            .join("antigravity")
+            .join("older@example.com.json");
+        std::fs::write(
+            &older,
+            r#"{"access_token":"a","refresh_token":"r","email":"older@example.com",
+                "expired":"2099-01-01T00:00:00Z","type":"antigravity"}"#,
+        )
+        .expect("write");
+        let loaded = load_all_tokens(dir.path(), Some(&ProviderId::antigravity())).expect("load");
+        assert_eq!(loaded.len(), 2, "an older file must still load");
+        assert!(
+            loaded
+                .iter()
+                .any(|t| t.email == "older@example.com" && t.project_id.is_none())
         );
     }
 

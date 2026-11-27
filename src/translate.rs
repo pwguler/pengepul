@@ -1675,6 +1675,1109 @@ fn copy_value_field(source: &Value, target: &mut Value, key: &str) {
     }
 }
 
+// -- Antigravity: Chat Completions <-> Gemini ----------------------------
+
+/// The Gemini `GenerateContentRequest` a Chat Completions body becomes — the
+/// inner `request` of the Antigravity envelope. Chat Completions is the
+/// relay's pivot, so a Messages or Responses client reaches this through the
+/// existing translators rather than through a second matrix.
+#[must_use]
+pub fn antigravity_request(chat: &Value) -> Value {
+    build_antigravity_request(chat).0
+}
+
+/// [`antigravity_request`], refusing a tool schema the relay will not inline
+/// in full: one that nests deeper than the walk's bound.
+///
+/// # Errors
+///
+/// Names the tool whose parameters nest too deep.
+pub fn antigravity_request_checked(chat: &Value) -> Result<Value, String> {
+    let (request, too_deep) = build_antigravity_request(chat);
+    match too_deep.first() {
+        None => Ok(request),
+        Some(tool) => Err(format!(
+            "tool `{tool}`: its parameters schema nests more than {GEMINI_SCHEMA_DEPTH} schema \
+             levels once its $refs are inlined (each $ref, anyOf branch and property counts), \
+             which the relay does not send to the antigravity upstream"
+        )),
+    }
+}
+
+/// The Gemini request and the names of the tools whose schema hit the depth
+/// bound (they were sent cut short at it).
+fn build_antigravity_request(chat: &Value) -> (Value, Vec<String>) {
+    let mut too_deep = Vec::new();
+    let mut system = Vec::new();
+    let mut contents: Vec<Value> = Vec::new();
+    let mut tool_names: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+
+    for message in value_array(chat.get("messages")) {
+        match message.get("role").and_then(Value::as_str) {
+            Some("system" | "developer") => {
+                let text = text_from_content(message.get("content").unwrap_or(&Value::Null));
+                if !text.is_empty() {
+                    system.push(text);
+                }
+            }
+            Some("assistant") => {
+                let parts = gemini_model_parts(message, &mut tool_names);
+                push_gemini_content(&mut contents, "model", parts);
+            }
+            Some("tool") => {
+                let part = gemini_function_response(message, &tool_names);
+                push_gemini_content(&mut contents, "user", vec![part]);
+            }
+            _ => {
+                let parts =
+                    gemini_parts_from_content(message.get("content").unwrap_or(&Value::Null));
+                push_gemini_content(&mut contents, "user", parts);
+            }
+        }
+    }
+
+    let mut out = Map::new();
+    out.insert("contents".to_string(), Value::Array(contents));
+    if !system.is_empty() {
+        // Must be an object with parts; a bare string is a 400 upstream.
+        out.insert(
+            "systemInstruction".to_string(),
+            json!({"parts": [{"text": system.join("\n\n")}]}),
+        );
+    }
+    let generation = gemini_generation_config(chat);
+    if !generation.is_empty() {
+        out.insert("generationConfig".to_string(), Value::Object(generation));
+    }
+    let tools = value_array(chat.get("tools"))
+        .into_iter()
+        .filter_map(|tool| gemini_function_declaration(tool, &mut too_deep))
+        .collect::<Vec<_>>();
+    if !tools.is_empty() {
+        out.insert(
+            "tools".to_string(),
+            json!([{"functionDeclarations": tools}]),
+        );
+        if let Some(config) = gemini_tool_config(chat.get("tool_choice"), &tools) {
+            out.insert("toolConfig".to_string(), config);
+        }
+    }
+    (Value::Object(out), too_deep)
+}
+
+/// One assistant message as the parts of a Gemini model turn: returned
+/// reasoning as a thought, the text, and each call with the vendor's id and its
+/// signature. Each call's name is remembered under its id for the results.
+fn gemini_model_parts(
+    message: &Value,
+    tool_names: &mut std::collections::BTreeMap<String, String>,
+) -> Vec<Value> {
+    let mut parts = Vec::new();
+    // Reasoning the client sends back rides in front of the answer, flagged as
+    // a thought so the vendor does not read it as text.
+    let reasoning = message
+        .get("reasoning_content")
+        .or_else(|| message.get("reasoning"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !reasoning.is_empty() {
+        parts.push(json!({"text": reasoning, "thought": true}));
+    }
+    let text = text_from_content(message.get("content").unwrap_or(&Value::Null));
+    if !text.is_empty() {
+        parts.push(json!({"text": text}));
+    }
+    for (position, call) in value_array(message.get("tool_calls"))
+        .into_iter()
+        .enumerate()
+    {
+        let function = call.get("function").unwrap_or(&Value::Null);
+        let name = function
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let (id, signature) = call
+            .get("id")
+            .and_then(Value::as_str)
+            .map(decode_tool_call_id)
+            .unwrap_or_default();
+        tool_names.insert(id.clone(), name.to_string());
+        let mut function_call = json!({
+            "name": name,
+            "args": gemini_tool_arguments(function.get("arguments")),
+        });
+        if !id.is_empty() {
+            function_call["id"] = json!(id);
+        }
+        let mut part = json!({"functionCall": function_call});
+        // Gemini refuses a model turn whose first call carries no signature. A
+        // history with none to replay gets the validator-skip sentinel Google
+        // documents for exactly that case, which Cloud Code accepts for Gemini
+        // and Claude alike.
+        match signature {
+            Some(signature) => part["thoughtSignature"] = json!(signature),
+            None if position == 0 => {
+                part["thoughtSignature"] = json!(SKIP_THOUGHT_SIGNATURE);
+            }
+            None => {}
+        }
+        parts.push(part);
+    }
+    parts
+}
+
+/// One tool result as a Gemini `functionResponse`, named and identified by the
+/// call it answers.
+fn gemini_function_response(
+    message: &Value,
+    tool_names: &std::collections::BTreeMap<String, String>,
+) -> Value {
+    let id = message
+        .get("tool_call_id")
+        .and_then(Value::as_str)
+        .map(|id| decode_tool_call_id(id).0)
+        .unwrap_or_default();
+    let name = tool_names
+        .get(&id)
+        .cloned()
+        .or_else(|| {
+            message
+                .get("name")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_default();
+    let content = text_from_content(message.get("content").unwrap_or(&Value::Null));
+    let mut response = json!({"name": name, "response": {"content": content}});
+    // Claude models behind Cloud Code refuse a result without the id of the
+    // call it answers.
+    if !id.is_empty() {
+        response["id"] = json!(id);
+    }
+    json!({"functionResponse": response})
+}
+
+/// Append parts to the conversation, merging into the previous turn when the
+/// role repeats: Gemini reads one `contents` entry per turn, and a Messages
+/// client splits a tool result into its own message.
+fn push_gemini_content(contents: &mut Vec<Value>, role: &str, parts: Vec<Value>) {
+    if parts.is_empty() {
+        return;
+    }
+    if let Some(existing) = contents
+        .last_mut()
+        .filter(|last| last.get("role").and_then(Value::as_str) == Some(role))
+        .and_then(|last| last.get_mut("parts"))
+        .and_then(Value::as_array_mut)
+    {
+        existing.extend(parts);
+        return;
+    }
+    contents.push(json!({"role": role, "parts": parts}));
+}
+
+/// Chat message content as Gemini parts: text, and an image URL as either
+/// `inlineData` (a data URL) or `fileData` (a hosted one).
+fn gemini_parts_from_content(content: &Value) -> Vec<Value> {
+    match content {
+        Value::String(text) => {
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![json!({"text": text})]
+            }
+        }
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| match item.get("type").and_then(Value::as_str) {
+                Some("text") => item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(|text| json!({"text": text})),
+                Some("image_url") => {
+                    let url = item
+                        .get("image_url")
+                        .and_then(|image| image.get("url"))
+                        .or_else(|| item.get("image_url"))
+                        .and_then(Value::as_str)?;
+                    Some(gemini_image_part(url))
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn gemini_image_part(url: &str) -> Value {
+    use base64::Engine as _;
+    // `data:<mime>[;base64],<payload>` travels inline; a payload that is not
+    // base64 is percent-decoded and encoded, since `inlineData` is base64 only.
+    if let Some((meta, data)) = url
+        .strip_prefix("data:")
+        .and_then(|rest| rest.split_once(','))
+    {
+        return match meta.strip_suffix(";base64") {
+            Some(mime) => json!({"inlineData": {"mimeType": mime, "data": data}}),
+            None => json!({"inlineData": {
+                "mimeType": meta,
+                "data": base64::engine::general_purpose::STANDARD.encode(percent_decode(data))
+            }}),
+        };
+    }
+    // A hosted image is handed over as a URI; `fileData` needs its MIME type,
+    // which the extension names for the formats the upstream reads.
+    json!({"fileData": {"fileUri": url, "mimeType": image_mime_from_url(url)}})
+}
+
+fn image_mime_from_url(url: &str) -> &'static str {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let extension = path
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    match extension.as_str() {
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "heic" => "image/heic",
+        "heif" => "image/heif",
+        // JPEG is the common case and the upstream's own default for photos.
+        _ => "image/jpeg",
+    }
+}
+
+/// `%XX` escapes decoded to bytes; anything malformed stays as written.
+fn percent_decode(text: &str) -> Vec<u8> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let escaped = (bytes[index] == b'%')
+            .then(|| text.get(index + 1..index + 3))
+            .flatten()
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        if let Some(byte) = escaped {
+            out.push(byte);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    out
+}
+
+fn gemini_tool_arguments(arguments: Option<&Value>) -> Value {
+    match arguments {
+        Some(Value::String(raw)) => serde_json::from_str(raw).unwrap_or_else(|_| json!({})),
+        Some(value) if value.is_object() => value.clone(),
+        _ => json!({}),
+    }
+}
+
+fn gemini_generation_config(chat: &Value) -> Map<String, Value> {
+    let mut config = Map::new();
+    let budget = chat
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .and_then(gemini_thinking_budget);
+    let max_tokens = chat
+        .get("max_completion_tokens")
+        .or_else(|| chat.get("max_tokens"))
+        .and_then(Value::as_i64);
+    if let Some(budget) = budget {
+        config.insert(
+            "thinkingConfig".to_string(),
+            json!({"thinkingBudget": budget, "includeThoughts": true}),
+        );
+    }
+    // The upstream refuses `maxOutputTokens <= thinkingBudget`, so a client cap
+    // at or below the budget is raised past it; a larger cap goes out as set,
+    // and no cap is invented where the client set none.
+    if let Some(max_tokens) = max_tokens {
+        let limit = match budget {
+            // Room for the answer past the thinking budget.
+            Some(budget) if max_tokens <= budget => budget + 1024,
+            _ => max_tokens,
+        };
+        config.insert("maxOutputTokens".to_string(), json!(limit));
+    }
+    for (from, to) in [
+        ("temperature", "temperature"),
+        ("top_p", "topP"),
+        ("top_k", "topK"),
+    ] {
+        if let Some(value) = chat.get(from).filter(|value| value.is_number()) {
+            config.insert(to.to_string(), value.clone());
+        }
+    }
+    if let Some(stop) = chat.get("stop") {
+        let sequences = match stop {
+            Value::String(one) => vec![Value::String(one.clone())],
+            Value::Array(items) => items.clone(),
+            _ => Vec::new(),
+        };
+        if !sequences.is_empty() {
+            config.insert("stopSequences".to_string(), Value::Array(sequences));
+        }
+    }
+    config
+}
+
+/// The thinking budget an effort names. `none` names none, so no
+/// `thinkingConfig` is sent and the model's own default applies; whether the
+/// Gemini 4 tiers accept `thinkingBudget: 0` is unverified.
+fn gemini_thinking_budget(effort: &str) -> Option<i64> {
+    match effort {
+        "none" => None,
+        "minimal" => Some(1_024),
+        "low" => Some(4_096),
+        "high" => Some(24_576),
+        "xhigh" => Some(32_768),
+        _ => Some(8_192),
+    }
+}
+
+fn gemini_function_declaration(tool: &Value, too_deep: &mut Vec<String>) -> Option<Value> {
+    let function = tool.get("function").unwrap_or(tool);
+    let name = function.get("name").and_then(Value::as_str)?;
+    let mut out = Map::new();
+    out.insert("name".to_string(), json!(name));
+    if let Some(description) = function.get("description").and_then(Value::as_str) {
+        out.insert("description".to_string(), json!(description));
+    }
+    if let Some(parameters) = function.get("parameters").filter(|value| value.is_object()) {
+        let (schema, cut) = gemini_schema(parameters);
+        if cut {
+            too_deep.push(name.to_string());
+        }
+        out.insert("parameters".to_string(), schema);
+    }
+    Some(Value::Object(out))
+}
+
+/// The fields of the Gemini `Schema` proto, the only ones Cloud Code accepts in
+/// a function declaration: any other key is `400 Cannot find field`.
+const GEMINI_SCHEMA_FIELDS: [&str; 21] = [
+    "type",
+    "format",
+    "title",
+    "description",
+    "nullable",
+    "enum",
+    "maxItems",
+    "minItems",
+    "properties",
+    "required",
+    "minProperties",
+    "maxProperties",
+    "minLength",
+    "maxLength",
+    "pattern",
+    "example",
+    "anyOf",
+    "propertyOrdering",
+    "items",
+    "minimum",
+    "maximum",
+];
+
+/// How many `$ref`s one declaration may inline. A cycle ends at its first
+/// repeat; this caps a schema that fans out wide without one, so no tool list
+/// can make every turn's request explode.
+const GEMINI_REF_EXPANSIONS: usize = 256;
+
+/// How deep the cleaned schema may nest. The walk recurses once per level, on
+/// a worker's stack, so without a bound a long chain of distinct `$ref`s
+/// overflows it and aborts the relay; real tool schemas nest far less.
+pub const GEMINI_SCHEMA_DEPTH: usize = 64;
+
+/// What one schema walk carries: the root `$ref`s resolve against, the refs
+/// being expanded on the current path, how many have been inlined, how deep it
+/// is, and whether it stopped at the depth bound.
+struct SchemaWalk<'a> {
+    root: &'a Value,
+    active: Vec<String>,
+    expansions: usize,
+    depth: usize,
+    too_deep: bool,
+}
+
+/// A JSON Schema as the Gemini `Schema` proto accepts it. Local `$ref`s are
+/// inlined from `$defs`/`definitions`, a cycle ending as an open object; a
+/// `type` array becomes one type plus `nullable`; an `anyOf`/`oneOf` branch of
+/// `null` becomes `nullable`; a string enum stays, a non-string one keeps its
+/// type and moves into the description; an array gets `items`; exclusive
+/// bounds become inclusive ones; and every key the proto lacks is dropped.
+/// Returns the cleaned schema and whether the walk stopped at its depth bound.
+fn gemini_schema(schema: &Value) -> (Value, bool) {
+    let mut walk = SchemaWalk {
+        root: schema,
+        active: Vec::new(),
+        expansions: 0,
+        depth: 0,
+        too_deep: false,
+    };
+    let cleaned = gemini_schema_node(schema, &mut walk);
+    (cleaned, walk.too_deep)
+}
+
+/// One schema node, at most [`GEMINI_SCHEMA_DEPTH`] levels down; past that the
+/// walk stops with an open object and records that it did.
+fn gemini_schema_node(node: &Value, walk: &mut SchemaWalk<'_>) -> Value {
+    if walk.depth >= GEMINI_SCHEMA_DEPTH {
+        walk.too_deep = true;
+        return json!({"type": "object"});
+    }
+    walk.depth += 1;
+    let cleaned = gemini_schema_level(node, walk);
+    walk.depth -= 1;
+    cleaned
+}
+
+fn gemini_schema_level(node: &Value, walk: &mut SchemaWalk<'_>) -> Value {
+    let Some(map) = node.as_object() else {
+        return json!({});
+    };
+    // A local reference stands for its target; sibling keys (a description, a
+    // default) add to it.
+    if let Some(reference) = map.get("$ref").and_then(Value::as_str) {
+        let expandable = !walk.active.iter().any(|active| active == reference)
+            && walk.expansions < GEMINI_REF_EXPANSIONS;
+        let target = expandable
+            .then(|| resolve_local_ref(walk.root, reference))
+            .flatten()
+            .and_then(Value::as_object);
+        // Unresolvable, a cycle, or past the cap: an open object, never a
+        // dangling ref.
+        let mut merged = target
+            .cloned()
+            .unwrap_or_else(|| Map::from_iter([("type".to_string(), json!("object"))]));
+        for (key, value) in map {
+            if key != "$ref" {
+                merged.insert(key.clone(), value.clone());
+            }
+        }
+        if target.is_none() {
+            return gemini_schema_node(&Value::Object(merged), walk);
+        }
+        walk.expansions += 1;
+        walk.active.push(reference.to_string());
+        let inlined = gemini_schema_node(&Value::Object(merged), walk);
+        walk.active.pop();
+        return inlined;
+    }
+
+    // `Optional[X]`: one real branch beside `null`. It stands for that branch
+    // with the node's own keys on top, as a `$ref` with siblings does, so the
+    // field's description and the branch's allowed values meet in one node.
+    if let Some(lone) = lone_branch(map) {
+        return gemini_schema_node(&Value::Object(lone), walk);
+    }
+
+    let mut out = Map::new();
+    let mut nullable = map.get("nullable").and_then(Value::as_bool) == Some(true);
+    let mut types = schema_types(map, &mut nullable);
+    if types.len() > 1 {
+        return schema_type_union(map, &types, nullable, walk);
+    }
+    fold_schema_branches(map, walk, &mut out, &mut nullable);
+    schema_enum(map, &mut out, &mut nullable, &mut types);
+    // Several declared types were split into branches above; an enum may still
+    // have settled the type here.
+    if let Some(kind) = types.first() {
+        out.insert("type".to_string(), json!(kind));
+    }
+    // An exclusive bound becomes the inclusive one; for the integers coding
+    // tools bound, that is off by one in the permissive direction only.
+    for (exclusive, inclusive) in [
+        ("exclusiveMinimum", "minimum"),
+        ("exclusiveMaximum", "maximum"),
+    ] {
+        if let Some(bound) = map.get(exclusive).filter(|bound| bound.is_number()) {
+            out.entry(inclusive.to_string())
+                .or_insert_with(|| bound.clone());
+        }
+    }
+    copy_schema_fields(map, walk, &mut out);
+    // Gemini refuses an array without `items` (`items: missing field`); a
+    // schema that says nothing about its members gets strings, as CLIProxyAPI's
+    // `addMissingArrayItems` does.
+    if out.get("type").and_then(Value::as_str) == Some("array")
+        && !out.get("items").is_some_and(Value::is_object)
+    {
+        out.insert("items".to_string(), json!({"type": "string"}));
+    }
+    if nullable {
+        out.insert("nullable".to_string(), json!(true));
+    }
+    Value::Object(out)
+}
+
+/// A node with several real types (`["string", "array"]`) as an `anyOf` with one
+/// branch per type. Each branch carries the node's keywords that apply to its
+/// kind — `items` on the array branch, `properties` on the object branch, string
+/// bounds on the string branch — and is cleaned like any node, so an array
+/// branch gets `items` too. The node keeps only its description, title and
+/// nullability.
+fn schema_type_union(
+    map: &Map<String, Value>,
+    types: &[String],
+    nullable: bool,
+    walk: &mut SchemaWalk<'_>,
+) -> Value {
+    let enum_kind = map
+        .get("enum")
+        .and_then(Value::as_array)
+        .and_then(|values| values.iter().find(|value| !value.is_null()))
+        .or_else(|| map.get("const"))
+        .map(json_kind);
+    let branches = types
+        .iter()
+        .map(|kind| {
+            let mut branch = map
+                .iter()
+                .filter(|(key, _)| schema_keyword_applies(key, kind, enum_kind))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<Map<String, Value>>();
+            branch.insert("type".to_string(), json!(kind));
+            gemini_schema_node(&Value::Object(branch), walk)
+        })
+        .collect();
+    let mut out = Map::new();
+    out.insert("anyOf".to_string(), Value::Array(branches));
+    for key in ["description", "title"] {
+        if let Some(text) = map.get(key).filter(|value| value.is_string()) {
+            out.insert(key.to_string(), text.clone());
+        }
+    }
+    if nullable {
+        out.insert("nullable".to_string(), json!(true));
+    }
+    Value::Object(out)
+}
+
+/// The JSON Schema kind a value is.
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Bool(_) => "boolean",
+        Value::Number(number) if number.is_i64() || number.is_u64() => "integer",
+        Value::Number(_) => "number",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+        Value::String(_) | Value::Null => "string",
+    }
+}
+
+/// Whether a keyword of a union node belongs on its `kind` branch. Keywords
+/// that bind one kind go only there; an enum goes to the branch of its members'
+/// kind; the node's own description, title and nullability stay on the node.
+fn schema_keyword_applies(key: &str, kind: &str, enum_kind: Option<&str>) -> bool {
+    match key {
+        "type" | "anyOf" | "oneOf" | "allOf" | "description" | "title" | "nullable" => false,
+        "items" | "prefixItems" | "minItems" | "maxItems" => kind == "array",
+        "properties"
+        | "required"
+        | "minProperties"
+        | "maxProperties"
+        | "additionalProperties"
+        | "propertyOrdering" => kind == "object",
+        "minLength" | "maxLength" | "pattern" => kind == "string",
+        "minimum" | "maximum" | "exclusiveMinimum" | "exclusiveMaximum" => {
+            matches!(kind, "number" | "integer")
+        }
+        "format" => matches!(kind, "string" | "number" | "integer"),
+        "enum" | "const" => {
+            enum_kind == Some(kind) || (kind == "number" && enum_kind == Some("integer"))
+        }
+        _ => true,
+    }
+}
+
+/// The node's real types; a `null` among them (`["boolean", "null"]`) marks it
+/// nullable instead.
+fn schema_types(map: &Map<String, Value>, nullable: &mut bool) -> Vec<String> {
+    let mut types: Vec<String> = match map.get("type") {
+        Some(Value::String(one)) => vec![one.clone()],
+        Some(Value::Array(many)) => many
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToString::to_string)
+            .collect(),
+        _ => Vec::new(),
+    };
+    if types.iter().any(|kind| kind == "null") {
+        *nullable = true;
+        types.retain(|kind| kind != "null");
+    }
+    types
+}
+
+/// `anyOf`/`oneOf` keep their non-null branches, a lone branch folded into the
+/// node (pydantic's `Optional[X]`); `allOf` branches merge into it.
+fn fold_schema_branches(
+    map: &Map<String, Value>,
+    walk: &mut SchemaWalk<'_>,
+    out: &mut Map<String, Value>,
+    nullable: &mut bool,
+) {
+    let mut branches = Vec::new();
+    for key in ["anyOf", "oneOf"] {
+        for branch in value_array(map.get(key)) {
+            if branch.get("type").and_then(Value::as_str) == Some("null") {
+                *nullable = true;
+            } else {
+                branches.push(gemini_schema_node(branch, walk));
+            }
+        }
+    }
+    // A lone real branch was folded before this node was cleaned.
+    if !branches.is_empty() {
+        out.insert("anyOf".to_string(), Value::Array(branches));
+    }
+    for branch in value_array(map.get("allOf")) {
+        if let Value::Object(part) = gemini_schema_node(branch, walk) {
+            for (key, value) in part {
+                // The field's own words describe the field; the model's are
+                // its fallback, as with a `$ref` and its siblings.
+                if !is_own_words(map, &key) {
+                    merge_schema_key(out, key, value);
+                }
+            }
+        }
+    }
+}
+
+/// Whether `key` is a description or title the node states itself.
+fn is_own_words(map: &Map<String, Value>, key: &str) -> bool {
+    matches!(key, "description" | "title") && map.get(key).is_some_and(Value::is_string)
+}
+
+/// For a node whose `anyOf`/`oneOf` holds exactly one branch besides `null`:
+/// that branch with the node's other keys laid over it, `nullable` when a
+/// `null` branch was there. `None` for any other node.
+fn lone_branch(map: &Map<String, Value>) -> Option<Map<String, Value>> {
+    let mut real = Vec::new();
+    let mut null = false;
+    for key in ["anyOf", "oneOf"] {
+        for branch in value_array(map.get(key)) {
+            if branch.get("type").and_then(Value::as_str) == Some("null") {
+                null = true;
+            } else {
+                real.push(branch);
+            }
+        }
+    }
+    let [only] = real.as_slice() else {
+        return None;
+    };
+    let mut merged = only.as_object()?.clone();
+    for (key, value) in map {
+        if key != "anyOf" && key != "oneOf" {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    if null {
+        merged.insert("nullable".to_string(), json!(true));
+    }
+    Some(merged)
+}
+
+/// `const` and `enum`. The proto's enum is strings only: a string enum stays
+/// one, of type `string`. A non-string enum keeps the declared type — the type
+/// decides the JSON the model writes, and `"2"` for an integer field fails at
+/// the tool — and its members move into the description, as `CLIProxyAPI` does
+/// for antigravity tools. An untyped one takes the type its members share.
+fn schema_enum(
+    map: &Map<String, Value>,
+    out: &mut Map<String, Value>,
+    nullable: &mut bool,
+    types: &mut Vec<String>,
+) {
+    let mut values: Vec<Value> = value_array(map.get("enum")).into_iter().cloned().collect();
+    if let Some(constant) = map.get("const") {
+        values.push(constant.clone());
+    }
+    if values.iter().any(Value::is_null) {
+        *nullable = true;
+    }
+    values.retain(|value| !value.is_null());
+    if values.is_empty() {
+        return;
+    }
+    if values.iter().all(Value::is_string) {
+        out.insert("enum".to_string(), Value::Array(values));
+        *types = vec!["string".to_string()];
+        return;
+    }
+    if types.is_empty() {
+        let shared = if values.iter().all(Value::is_boolean) {
+            "boolean"
+        } else if values.iter().all(|value| value.is_i64() || value.is_u64()) {
+            "integer"
+        } else if values.iter().all(Value::is_number) {
+            "number"
+        } else {
+            "string"
+        };
+        *types = vec![shared.to_string()];
+    }
+    let allowed = values
+        .iter()
+        .map(|value| match value {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let description = match map.get("description").and_then(Value::as_str) {
+        Some(text) if !text.is_empty() => format!("{text} Allowed: {allowed}"),
+        _ => format!("Allowed: {allowed}"),
+    };
+    out.insert("description".to_string(), json!(description));
+}
+
+/// The proto fields the node carries as they are, its subschemas cleaned, and
+/// every other key dropped.
+fn copy_schema_fields(
+    map: &Map<String, Value>,
+    walk: &mut SchemaWalk<'_>,
+    out: &mut Map<String, Value>,
+) {
+    for (key, value) in map {
+        if out.contains_key(key) || !GEMINI_SCHEMA_FIELDS.contains(&key.as_str()) {
+            continue;
+        }
+        match key.as_str() {
+            "type" | "enum" | "anyOf" | "nullable" => {}
+            "properties" => {
+                let properties = value
+                    .as_object()
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .map(|(name, sub)| (name.clone(), gemini_schema_node(sub, walk)))
+                            .collect::<Map<String, Value>>()
+                    })
+                    .unwrap_or_default();
+                out.insert(key.clone(), Value::Object(properties));
+            }
+            "items" => {
+                // A tuple (`items: [..]`) keeps its first shape.
+                let item = match value {
+                    Value::Array(tuple) => tuple.first().cloned().unwrap_or_else(|| json!({})),
+                    other => other.clone(),
+                };
+                out.insert(key.clone(), gemini_schema_node(&item, walk));
+            }
+            // The proto names a handful of formats; `uri`, `email` and the
+            // rest are dropped rather than refused.
+            "format" => {
+                if matches!(
+                    value.as_str(),
+                    Some("enum" | "date-time" | "int32" | "int64" | "float" | "double")
+                ) {
+                    out.insert(key.clone(), value.clone());
+                }
+            }
+            "required" | "propertyOrdering" => {
+                if value
+                    .as_array()
+                    .is_some_and(|names| names.iter().all(Value::is_string))
+                {
+                    out.insert(key.clone(), value.clone());
+                }
+            }
+            "title" | "description" | "pattern" => {
+                if value.is_string() {
+                    out.insert(key.clone(), value.clone());
+                }
+            }
+            _ => {
+                out.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+/// `#/$defs/Name` or `#/definitions/Name`, read from the schema's root.
+fn resolve_local_ref<'a>(root: &'a Value, reference: &str) -> Option<&'a Value> {
+    let path = reference.strip_prefix("#/")?;
+    path.split('/').try_fold(root, |node, segment| {
+        node.get(segment.replace("~1", "/").replace("~0", "~"))
+    })
+}
+
+/// One key of an `allOf` branch folded into its parent: properties and
+/// `required` union, anything else is kept where the parent has none.
+fn merge_schema_key(out: &mut Map<String, Value>, key: String, value: Value) {
+    match (out.get_mut(&key), value) {
+        (Some(Value::Object(existing)), Value::Object(more)) if key == "properties" => {
+            existing.extend(more);
+        }
+        (Some(Value::Array(existing)), Value::Array(more)) if key == "required" => {
+            for name in more {
+                if !existing.contains(&name) {
+                    existing.push(name);
+                }
+            }
+        }
+        (Some(_), _) => {}
+        (None, value) => {
+            out.insert(key, value);
+        }
+    }
+}
+
+fn gemini_tool_config(choice: Option<&Value>, declarations: &[Value]) -> Option<Value> {
+    let mode = match choice {
+        None => return None,
+        Some(Value::String(mode)) => mode.clone(),
+        Some(object) => {
+            let function = object.get("function").unwrap_or(object);
+            let name = function.get("name").and_then(Value::as_str)?;
+            return Some(json!({"functionCallingConfig": {
+                "mode": "ANY",
+                "allowedFunctionNames": [name]
+            }}));
+        }
+    };
+    let mode = match mode.as_str() {
+        "auto" => "AUTO",
+        "none" => "NONE",
+        "required" | "any" => "ANY",
+        _ => return None,
+    };
+    // `ANY` without a name is the upstream's "must call something"; a client
+    // that named nothing is served by the declared names.
+    let names = declarations
+        .iter()
+        .filter_map(|declaration| declaration.get("name").cloned())
+        .collect::<Vec<_>>();
+    let config = if mode == "ANY" && !names.is_empty() {
+        json!({"mode": mode, "allowedFunctionNames": names})
+    } else {
+        json!({"mode": mode})
+    };
+    Some(json!({"functionCallingConfig": config}))
+}
+
+/// A Gemini `GenerateContentResponse` as an `OpenAI` Chat Completions reply.
+#[must_use]
+pub fn antigravity_response(gemini: &Value, model: &str) -> Value {
+    let (text, reasoning, tool_calls) = gemini_parts(gemini);
+    let mut message = Map::new();
+    message.insert("role".to_string(), json!("assistant"));
+    message.insert("content".to_string(), json!(text));
+    if !reasoning.is_empty() {
+        message.insert("reasoning_content".to_string(), json!(reasoning));
+    }
+    let has_tool_calls = !tool_calls.is_empty();
+    if has_tool_calls {
+        message.insert("tool_calls".to_string(), Value::Array(tool_calls));
+    }
+    let mut out = json!({
+        "id": gemini_id(gemini),
+        "object": "chat.completion",
+        "created": chrono::Utc::now().timestamp(),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": Value::Object(message),
+            "finish_reason": gemini_finish_reason(gemini, has_tool_calls)
+        }]
+    });
+    if let Some(usage) = gemini_usage(gemini.get("usageMetadata")) {
+        out["usage"] = usage;
+    }
+    out
+}
+
+/// One candidate's parts split three ways: answer text, thinking text, and
+/// function calls in the Chat shape. Shared by the whole reply and the stream.
+#[must_use]
+pub fn gemini_parts(gemini: &Value) -> (String, String, Vec<Value>) {
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut tool_calls = Vec::new();
+    for part in value_array(
+        gemini
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|candidates| candidates.first())
+            .and_then(|candidate| candidate.get("content"))
+            .and_then(|content| content.get("parts")),
+    ) {
+        if part.get("thought").and_then(Value::as_bool) == Some(true) {
+            if let Some(thought) = part.get("text").and_then(Value::as_str) {
+                reasoning.push_str(thought);
+            }
+            continue;
+        }
+        if let Some(chunk) = part.get("text").and_then(Value::as_str) {
+            text.push_str(chunk);
+        }
+        if let Some(call) = part.get("functionCall") {
+            let signature = part.get("thoughtSignature").and_then(Value::as_str);
+            tool_calls.push(gemini_tool_call(call, signature));
+        }
+    }
+    (text, reasoning, tool_calls)
+}
+
+/// What Google documents for a model turn whose calls have no signature to
+/// replay: the validator is skipped for that turn.
+const SKIP_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
+
+/// Separates the vendor's call id from the signature carried beside it. Ids
+/// Cloud Code mints (`call_<digits>`, `toolu_vrtx_<alnum>`) never contain it.
+const SIGNATURE_MARKER: &str = "__ags__";
+
+/// The tool-call id handed to the client: the vendor's id, and the call's
+/// thought signature when it has one, so the next turn can send the signature
+/// back without the relay holding any state. A harness echoes the id verbatim
+/// on the call and on its result; the signature is base64url so the id stays
+/// inside `[A-Za-z0-9_-]`, which every dialect's tool ids accept.
+fn encode_tool_call_id(id: &str, signature: Option<&str>) -> String {
+    use base64::Engine as _;
+    match signature.filter(|signature| !signature.is_empty()) {
+        Some(signature) => format!(
+            "{id}{SIGNATURE_MARKER}{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature)
+        ),
+        None => id.to_string(),
+    }
+}
+
+/// The inverse of [`encode_tool_call_id`]: the vendor's id and the signature,
+/// if the id carried one that decodes. Any other id is returned whole.
+fn decode_tool_call_id(id: &str) -> (String, Option<String>) {
+    use base64::Engine as _;
+    let Some((vendor, encoded)) = id.split_once(SIGNATURE_MARKER) else {
+        return (id.to_string(), None);
+    };
+    let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok());
+    match signature {
+        Some(signature) => (vendor.to_string(), Some(signature)),
+        None => (id.to_string(), None),
+    }
+}
+
+fn gemini_tool_call(call: &Value, signature: Option<&str>) -> Value {
+    let name = call.get("name").and_then(Value::as_str).unwrap_or_default();
+    let args = call.get("args").cloned().unwrap_or_else(|| json!({}));
+    let id = call.get("id").and_then(Value::as_str).map_or_else(
+        || format!("call_{}", uuid::Uuid::new_v4().simple()),
+        ToString::to_string,
+    );
+    let id = encode_tool_call_id(&id, signature);
+    json!({
+        "id": id,
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string())
+        }
+    })
+}
+
+/// `usageMetadata` under the Chat names. Gemini reports thinking apart from
+/// `candidatesTokenCount`; the Chat dialect counts it inside
+/// `completion_tokens`, with `reasoning_tokens` as its breakdown, so a client
+/// never sees reasoning larger than the output it belongs to.
+#[must_use]
+pub fn gemini_usage(usage: Option<&Value>) -> Option<Value> {
+    let usage = usage?;
+    if !usage.is_object() {
+        return None;
+    }
+    let prompt = int_field(usage, "promptTokenCount");
+    let completion = int_field(usage, "candidatesTokenCount");
+    let reasoning = int_field(usage, "thoughtsTokenCount");
+    let cached = int_field(usage, "cachedContentTokenCount");
+    let total = usage
+        .get("totalTokenCount")
+        .and_then(Value::as_i64)
+        .unwrap_or(prompt + completion + reasoning);
+    let mut out = json!({
+        "prompt_tokens": prompt,
+        "completion_tokens": completion + reasoning,
+        "total_tokens": total
+    });
+    if reasoning > 0 {
+        out["completion_tokens_details"] = json!({"reasoning_tokens": reasoning});
+    }
+    if cached > 0 {
+        out["prompt_tokens_details"] = json!({"cached_tokens": cached});
+    }
+    Some(out)
+}
+
+#[must_use]
+pub fn gemini_finish_reason(gemini: &Value, has_tool_calls: bool) -> &'static str {
+    if gemini_prompt_blocked(gemini) {
+        return "content_filter";
+    }
+    let reason = gemini
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|candidates| candidates.first())
+        .and_then(|candidate| candidate.get("finishReason"))
+        .and_then(Value::as_str);
+    match reason {
+        Some("MAX_TOKENS") => "length",
+        Some("SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII") => {
+            "content_filter"
+        }
+        // A call the model could not form is not a cutoff: reporting `length`
+        // told a Messages client `max_tokens`, which invites a retry with more.
+        Some("MALFORMED_FUNCTION_CALL") => "stop",
+        _ if has_tool_calls => "tool_calls",
+        _ => "stop",
+    }
+}
+
+/// Whether a Gemini reply or chunk ends the turn: a candidate's non-empty
+/// `finishReason`, or a prompt the upstream blocked, which carries no candidate
+/// to hold one. The stream converter and the relay's accounting both ask this,
+/// so a turn they disagree on cannot exist.
+#[must_use]
+pub fn gemini_turn_ended(gemini: &Value) -> bool {
+    gemini
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|candidates| candidates.first())
+        .and_then(|candidate| candidate.get("finishReason"))
+        .and_then(Value::as_str)
+        .is_some_and(|reason| !reason.is_empty())
+        || gemini_prompt_blocked(gemini)
+}
+
+/// A prompt the upstream refused outright: `promptFeedback.blockReason` and
+/// no candidate at all.
+#[must_use]
+pub fn gemini_prompt_blocked(gemini: &Value) -> bool {
+    gemini
+        .get("promptFeedback")
+        .and_then(|feedback| feedback.get("blockReason"))
+        .is_some_and(|reason| !reason.is_null())
+}
+
+fn gemini_id(gemini: &Value) -> String {
+    gemini
+        .get("responseId")
+        .and_then(Value::as_str)
+        .map_or_else(
+            || format!("chatcmpl_{}", uuid::Uuid::new_v4().simple()),
+            ToString::to_string,
+        )
+}
+
 fn value_array(value: Option<&Value>) -> Vec<&Value> {
     value
         .and_then(Value::as_array)
@@ -1802,5 +2905,793 @@ mod grok_responses_tests {
             "grok-4.6",
         );
         assert_eq!(reply["status"], "incomplete");
+    }
+}
+
+#[cfg(test)]
+mod antigravity_translation_tests {
+    use super::{antigravity_request, antigravity_response};
+    use serde_json::json;
+
+    /// The tool turn the upstream answered on turn one, as Gemini sends it:
+    /// the call carries its id and, for Gemini models, a thought signature.
+    fn turn_one() -> serde_json::Value {
+        antigravity_response(
+            &json!({"candidates": [{"content": {"role": "model", "parts": [{
+                "thoughtSignature": "c2lnbmF0dXJlLWJ5dGVz+/=",
+                "functionCall": {"name": "get_weather", "args": {"city": "Paris"},
+                                 "id": "call_7168"}
+            }]}, "finishReason": "STOP"}]}),
+            "gemini-4-neon-low",
+        )
+    }
+
+    /// F1: the second turn of a tool loop sends the call and its result back
+    /// with the vendor's id, and the call with the signature the vendor minted.
+    #[test]
+    fn a_tool_call_round_trips_its_id_and_thought_signature() {
+        let reply = turn_one();
+        let call = &reply["choices"][0]["message"]["tool_calls"][0];
+        let id = call["id"].as_str().expect("id").to_string();
+        // The client's id stays inside the alphabet every dialect accepts.
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "{id}"
+        );
+        let request = antigravity_request(&json!({"messages": [
+            {"role": "user", "content": "weather in Paris?"},
+            {"role": "assistant", "content": null, "tool_calls": [call.clone()]},
+            {"role": "tool", "tool_call_id": id, "content": "22C"}
+        ]}));
+        let model = &request["contents"][1]["parts"][0];
+        assert_eq!(model["functionCall"]["id"], "call_7168");
+        assert_eq!(model["functionCall"]["name"], "get_weather");
+        assert_eq!(model["thoughtSignature"], "c2lnbmF0dXJlLWJ5dGVz+/=");
+        let result = &request["contents"][2]["parts"][0]["functionResponse"];
+        assert_eq!(result["id"], "call_7168");
+        assert_eq!(result["name"], "get_weather");
+    }
+
+    /// F1: a call with no signature to replay (another provider's history, or
+    /// a Claude model, which mints none) carries the documented sentinel on the
+    /// first call of its turn, and only there.
+    #[test]
+    fn a_call_without_a_signature_carries_the_sentinel_on_the_first_call_only() {
+        let request = antigravity_request(&json!({"messages": [
+            {"role": "user", "content": "two cities"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "toolu_vrtx_1", "type": "function",
+                 "function": {"name": "w", "arguments": "{\"city\":\"Paris\"}"}},
+                {"id": "toolu_vrtx_2", "type": "function",
+                 "function": {"name": "w", "arguments": "{\"city\":\"Rome\"}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "toolu_vrtx_1", "content": "22C"},
+            {"role": "tool", "tool_call_id": "toolu_vrtx_2", "content": "25C"}
+        ]}));
+        let parts = &request["contents"][1]["parts"];
+        assert_eq!(parts[0]["functionCall"]["id"], "toolu_vrtx_1");
+        assert_eq!(
+            parts[0]["thoughtSignature"],
+            "skip_thought_signature_validator"
+        );
+        assert!(parts[1].get("thoughtSignature").is_none(), "{parts}");
+        let results = &request["contents"][2]["parts"];
+        assert_eq!(results[0]["functionResponse"]["id"], "toolu_vrtx_1");
+        assert_eq!(results[1]["functionResponse"]["id"], "toolu_vrtx_2");
+    }
+
+    /// F1: an id with nothing to carry is handed to the client unchanged.
+    #[test]
+    fn a_call_without_a_signature_keeps_the_vendor_id() {
+        let reply = antigravity_response(
+            &json!({"candidates": [{"content": {"parts": [{
+                "functionCall": {"name": "w", "args": {}, "id": "toolu_vrtx_01B"}
+            }]}, "finishReason": "OTHER"}]}),
+            "claude-sonnet-5-5-low",
+        );
+        assert_eq!(
+            reply["choices"][0]["message"]["tool_calls"][0]["id"],
+            "toolu_vrtx_01B"
+        );
+    }
+
+    #[test]
+    fn antigravity_request_maps_messages_system_tools_and_thinking() {
+        let request = antigravity_request(&json!({
+            "model": "gemini-4-neon-high",
+            "reasoning_effort": "high",
+            "max_tokens": 1000,
+            "temperature": 0.4,
+            "messages": [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "look"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}
+                ]},
+                {"role": "assistant", "content": "checking", "tool_calls": [
+                    {"id": "call_1", "type": "function",
+                     "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "22C"}
+            ],
+            "tools": [{"type": "function", "function": {
+                "name": "get_weather",
+                "description": "weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
+                               "required": ["city"], "additionalProperties": false}
+            }}],
+            "tool_choice": "auto"
+        }));
+
+        assert_eq!(request["systemInstruction"]["parts"][0]["text"], "be brief");
+        let contents = request["contents"].as_array().expect("contents");
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[0]["parts"][0]["text"], "look");
+        assert_eq!(
+            contents[0]["parts"][1]["inlineData"]["mimeType"],
+            "image/png"
+        );
+        assert_eq!(contents[0]["parts"][1]["inlineData"]["data"], "AAA");
+        assert_eq!(contents[1]["role"], "model");
+        assert_eq!(
+            contents[1]["parts"][1]["functionCall"]["name"],
+            "get_weather"
+        );
+        assert_eq!(
+            contents[1]["parts"][1]["functionCall"]["args"]["city"],
+            "Paris"
+        );
+        // A tool result is a user turn, and the name is resolved from the call id.
+        assert_eq!(contents[2]["role"], "user");
+        assert_eq!(
+            contents[2]["parts"][0]["functionResponse"]["name"],
+            "get_weather"
+        );
+        assert_eq!(
+            contents[2]["parts"][0]["functionResponse"]["response"]["content"],
+            "22C"
+        );
+        assert_eq!(
+            request["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            24_576
+        );
+        assert_eq!(
+            request["generationConfig"]["thinkingConfig"]["includeThoughts"],
+            true
+        );
+        // The upstream refuses maxOutputTokens <= thinkingBudget.
+        assert!(
+            request["generationConfig"]["maxOutputTokens"]
+                .as_i64()
+                .expect("max")
+                > 24_576
+        );
+        assert_eq!(request["generationConfig"]["temperature"], 0.4);
+        assert_eq!(
+            request["tools"][0]["functionDeclarations"][0]["name"],
+            "get_weather"
+        );
+        assert_eq!(
+            request["toolConfig"]["functionCallingConfig"]["mode"],
+            "AUTO"
+        );
+    }
+
+    /// F9: an effort alone sends no cap; a client cap at or below the budget
+    /// is raised past it; `max_completion_tokens` wins. N8: `none` sends no
+    /// `thinkingConfig`, which leaves the model's own default, not "off".
+    #[test]
+    fn the_output_cap_is_the_clients_and_none_sends_no_thinking_config() {
+        let effort_only = antigravity_request(&json!({
+            "reasoning_effort": "low", "messages": [{"role": "user", "content": "x"}]
+        }));
+        assert!(
+            effort_only["generationConfig"]
+                .get("maxOutputTokens")
+                .is_none(),
+            "{effort_only}"
+        );
+        let small = antigravity_request(&json!({
+            "reasoning_effort": "low", "max_tokens": 100,
+            "messages": [{"role": "user", "content": "x"}]
+        }));
+        assert_eq!(small["generationConfig"]["maxOutputTokens"], 4096 + 1024);
+        // N7: a cap already above the budget goes out as the client set it.
+        let above = antigravity_request(&json!({
+            "reasoning_effort": "low", "max_tokens": 4500,
+            "messages": [{"role": "user", "content": "x"}]
+        }));
+        assert_eq!(above["generationConfig"]["maxOutputTokens"], 4500);
+        let completion = antigravity_request(&json!({
+            "max_completion_tokens": 300, "max_tokens": 50,
+            "messages": [{"role": "user", "content": "x"}]
+        }));
+        assert_eq!(completion["generationConfig"]["maxOutputTokens"], 300);
+        let none = antigravity_request(&json!({
+            "reasoning_effort": "none", "messages": [{"role": "user", "content": "x"}]
+        }));
+        assert!(none.get("generationConfig").is_none(), "{none}");
+    }
+
+    /// The fields of the Gemini `Schema` proto; anything else is a 400.
+    const SCHEMA_FIELDS: [&str; 21] = [
+        "type",
+        "format",
+        "title",
+        "description",
+        "nullable",
+        "enum",
+        "maxItems",
+        "minItems",
+        "properties",
+        "required",
+        "minProperties",
+        "maxProperties",
+        "minLength",
+        "maxLength",
+        "pattern",
+        "example",
+        "anyOf",
+        "propertyOrdering",
+        "items",
+        "minimum",
+        "maximum",
+    ];
+
+    /// Every schema node, recursively, holds only proto fields, and every
+    /// `type` is a single string.
+    fn assert_proto_schema(schema: &serde_json::Value, path: &str) {
+        let object = schema
+            .as_object()
+            .unwrap_or_else(|| panic!("{path}: not an object"));
+        // Gemini refuses an array schema without `items` (`items: missing field`).
+        if object.get("type").and_then(serde_json::Value::as_str) == Some("array") {
+            assert!(
+                object
+                    .get("items")
+                    .is_some_and(serde_json::Value::is_object),
+                "{path} is an array without items"
+            );
+        }
+        for (key, value) in object {
+            assert!(
+                SCHEMA_FIELDS.contains(&key.as_str()),
+                "{path}.{key} is not a Schema field"
+            );
+            match key.as_str() {
+                "type" => assert!(value.is_string(), "{path}.type is {value}"),
+                "enum" => assert!(
+                    value
+                        .as_array()
+                        .expect("enum")
+                        .iter()
+                        .all(serde_json::Value::is_string),
+                    "{path}.enum is {value}"
+                ),
+                "properties" => {
+                    for (name, sub) in value.as_object().expect("properties") {
+                        assert_proto_schema(sub, &format!("{path}.{name}"));
+                    }
+                }
+                "items" => assert_proto_schema(value, &format!("{path}[]")),
+                "anyOf" => {
+                    for (i, sub) in value.as_array().expect("anyOf").iter().enumerate() {
+                        assert_proto_schema(sub, &format!("{path}|{i}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn declared_parameters(parameters: &serde_json::Value) -> serde_json::Value {
+        let request = antigravity_request(&json!({
+            "messages": [{"role": "user", "content": "x"}],
+            "tools": [{"type": "function", "function": {"name": "t", "parameters": parameters}}]
+        }));
+        request["tools"][0]["functionDeclarations"][0]["parameters"].clone()
+    }
+
+    /// F2: Claude Code's tool schemas — draft 2020-12, nullable type arrays,
+    /// exclusive bounds, closed objects — reach the upstream as proto schemas.
+    #[test]
+    fn claude_code_shaped_tool_schemas_become_proto_schemas() {
+        let parameters = declared_parameters(&json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "file_path": {"type": "string", "description": "absolute path"},
+                "replace_all": {"type": ["boolean", "null"], "default": false},
+                "limit": {"type": "integer", "exclusiveMinimum": 0, "maximum": 2000},
+                "timeout": {"type": "number", "exclusiveMaximum": 600_000},
+                "url": {"type": "string", "format": "uri", "minLength": 1},
+                "tags": {"type": "array", "description": "labels"},
+                "paths": {"type": ["string", "array"], "items": {"type": "string"},
+                          "description": "one path or several", "minLength": 1},
+                "target": {"type": ["string", "object"],
+                           "properties": {"x": {"type": "number"}}, "required": ["x"]},
+                "loose": {"type": ["string", "array"]},
+                "todos": {"type": "array", "items": {
+                    "type": "object",
+                    "properties": {"status": {"type": "string",
+                                              "enum": ["pending", "in_progress", "completed"]}},
+                    "required": ["status"],
+                    "additionalProperties": false
+                }}
+            },
+            "required": ["file_path"]
+        }));
+        assert_proto_schema(&parameters, "parameters");
+        let properties = &parameters["properties"];
+        assert_eq!(properties["replace_all"]["type"], "boolean");
+        assert_eq!(properties["replace_all"]["nullable"], true);
+        assert_eq!(properties["limit"]["minimum"], 0);
+        assert_eq!(properties["limit"]["maximum"], 2000);
+        assert_eq!(properties["timeout"]["maximum"], 600_000);
+        assert_eq!(properties["url"]["minLength"], 1);
+        assert_eq!(properties["tags"]["items"]["type"], "string");
+        // R2: a union keeps each kind's keywords on its own branch, so the
+        // array branch has `items` and the object branch its `properties`.
+        let branch = |name: &str, kind: &str| {
+            properties[name]["anyOf"]
+                .as_array()
+                .expect("anyOf")
+                .iter()
+                .find(|branch| branch["type"] == kind)
+                .cloned()
+                .unwrap_or_else(|| panic!("{name} has no {kind} branch"))
+        };
+        assert_eq!(branch("paths", "array")["items"]["type"], "string");
+        assert_eq!(branch("paths", "string")["minLength"], 1);
+        assert!(branch("paths", "array").get("minLength").is_none());
+        assert!(
+            properties["paths"].get("items").is_none(),
+            "{}",
+            properties["paths"]
+        );
+        assert_eq!(properties["paths"]["description"], "one path or several");
+        assert_eq!(
+            branch("target", "object")["properties"]["x"]["type"],
+            "number"
+        );
+        assert_eq!(branch("target", "object")["required"], json!(["x"]));
+        assert!(properties["target"].get("properties").is_none());
+        // An array branch that names no members still gets `items` (N1).
+        assert_eq!(branch("loose", "array")["items"]["type"], "string");
+        assert_eq!(parameters["required"], json!(["file_path"]));
+        assert_eq!(properties["todos"]["items"]["required"], json!(["status"]));
+    }
+
+    /// F2: a pydantic-built MCP schema — `$defs` and `$ref`, `anyOf` with a
+    /// `null` branch, titles, defaults, integer enums — keeps its shape.
+    #[test]
+    fn pydantic_shaped_tool_schemas_inline_refs_and_fold_nullable_unions() {
+        let parameters = declared_parameters(&json!({
+            "$defs": {
+                "Point": {"title": "Point", "type": "object",
+                          "properties": {"x": {"type": "number"}, "y": {"type": "number"}},
+                          "required": ["x", "y"]},
+                "Level": {"enum": [1, 2, 3], "title": "Level", "type": "integer"}
+            },
+            "title": "DrawArgs",
+            "type": "object",
+            "properties": {
+                "at": {"$ref": "#/$defs/Point"},
+                "level": {"$ref": "#/$defs/Level", "default": 1},
+                "label": {"anyOf": [{"type": "string"}, {"type": "null"}],
+                          "default": null, "title": "Label"},
+                "mode": {"oneOf": [{"const": "fill"}, {"const": "stroke"}]},
+                "points": {"type": "array", "items": {"$ref": "#/$defs/Point"}}
+            },
+            "required": ["at"]
+        }));
+        assert_proto_schema(&parameters, "parameters");
+        let properties = &parameters["properties"];
+        assert_eq!(properties["at"]["type"], "object");
+        assert_eq!(properties["at"]["required"], json!(["x", "y"]));
+        // N5: a non-string enum keeps its declared type, and its members move
+        // into the description, since the proto's enum is strings only.
+        assert_eq!(properties["level"]["type"], "integer");
+        assert!(
+            properties["level"].get("enum").is_none(),
+            "{}",
+            properties["level"]
+        );
+        assert_eq!(properties["level"]["description"], "Allowed: 1, 2, 3");
+        assert_eq!(properties["label"]["type"], "string");
+        assert_eq!(properties["label"]["nullable"], true);
+        assert_eq!(
+            properties["points"]["items"]["properties"]["x"]["type"],
+            "number"
+        );
+        let modes = properties["mode"]["anyOf"].as_array().expect("anyOf");
+        assert_eq!(modes[0]["enum"], json!(["fill"]));
+    }
+
+    /// N5: a boolean `const` and an untyped number enum keep a non-string type;
+    /// a description the schema already has keeps its text.
+    #[test]
+    fn non_string_enums_keep_their_type_and_move_into_the_description() {
+        let parameters = declared_parameters(&json!({
+            "type": "object",
+            "properties": {
+                "force": {"type": "boolean", "const": true},
+                "ratio": {"enum": [0.5, 1.5], "description": "Scale."},
+                "count": {"enum": [1, 2]},
+                "mode": {"type": "string", "enum": ["fast", "slow"]}
+            }
+        }));
+        assert_proto_schema(&parameters, "parameters");
+        let properties = &parameters["properties"];
+        assert_eq!(properties["force"]["type"], "boolean");
+        assert_eq!(properties["force"]["description"], "Allowed: true");
+        assert_eq!(properties["ratio"]["type"], "number");
+        assert_eq!(
+            properties["ratio"]["description"],
+            "Scale. Allowed: 0.5, 1.5"
+        );
+        assert_eq!(properties["count"]["type"], "integer");
+        assert_eq!(properties["mode"]["enum"], json!(["fast", "slow"]));
+        assert_eq!(properties["mode"]["type"], "string");
+    }
+
+    /// A chain of `defs` distinct definitions, each nesting `levels` objects
+    /// deep before it refers to the next.
+    fn ref_chain(defs: usize, levels: usize) -> serde_json::Value {
+        let mut definitions = serde_json::Map::new();
+        for def in 0..defs {
+            let mut node = if def + 1 < defs {
+                json!({"$ref": format!("#/$defs/D{}", def + 1)})
+            } else {
+                json!({"type": "string"})
+            };
+            for _ in 0..levels {
+                node = json!({"type": "object", "properties": {"next": node}});
+            }
+            definitions.insert(format!("D{def}"), node);
+        }
+        json!({"$defs": definitions, "type": "object",
+               "properties": {"root": {"$ref": "#/$defs/D0"}}})
+    }
+
+    /// R1: a long chain of distinct refs no longer recurses without bound. On a
+    /// tokio worker's 2 MiB stack it returns instead of aborting the process,
+    /// and the request it came in says it is too deep.
+    #[test]
+    fn a_long_ref_chain_is_bounded_and_refused_not_a_stack_overflow() {
+        let parameters = ref_chain(100, 20);
+        let outcome = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let chat = json!({
+                    "messages": [{"role": "user", "content": "x"}],
+                    "tools": [{"type": "function",
+                               "function": {"name": "deep_tool", "parameters": parameters}}]
+                });
+                super::antigravity_request_checked(&chat).map(|_| ())
+            })
+            .expect("spawn")
+            .join()
+            .expect("the schema walk overflowed its stack");
+        let error = outcome.expect_err("a schema past the depth bound");
+        assert!(error.contains("deep_tool"), "{error}");
+        assert!(error.contains("64"), "{error}");
+    }
+
+    /// R1: ordinary nesting is far below the bound and passes the check.
+    #[test]
+    fn a_shallow_ref_chain_passes_the_depth_check() {
+        let chat = json!({
+            "messages": [{"role": "user", "content": "x"}],
+            "tools": [{"type": "function",
+                       "function": {"name": "t", "parameters": ref_chain(3, 4)}}]
+        });
+        assert!(super::antigravity_request_checked(&chat).is_ok());
+    }
+
+    /// S4: an `Optional` integer enum with its own description keeps both the
+    /// field's words and the allowed values, which the proto can carry only in
+    /// the description — as a plain `$ref` with the same sibling does.
+    #[test]
+    fn an_optional_integer_enum_keeps_its_allowed_values_and_description() {
+        let parameters = declared_parameters(&json!({
+            "$defs": {"Level": {"type": "integer", "enum": [1, 2, 3], "title": "Level"}},
+            "type": "object",
+            "properties": {
+                "level": {"anyOf": [{"$ref": "#/$defs/Level"}, {"type": "null"}],
+                          "description": "Pick a level."},
+                "plain": {"$ref": "#/$defs/Level", "description": "Pick a level."}
+            }
+        }));
+        for name in ["level", "plain"] {
+            let field = &parameters["properties"][name];
+            assert_eq!(field["type"], "integer", "{name}: {field}");
+            assert_eq!(
+                field["description"], "Pick a level. Allowed: 1, 2, 3",
+                "{name}: {field}"
+            );
+        }
+        assert_eq!(parameters["properties"]["level"]["nullable"], true);
+    }
+
+    /// C3: the `allOf` wrapper pydantic v1 and schemars put around a referenced
+    /// model keeps the field's own description and title, as the `anyOf` fold
+    /// does.
+    #[test]
+    fn an_all_of_wrapped_model_keeps_the_fields_own_description() {
+        let parameters = declared_parameters(&json!({
+            "definitions": {"Address": {"type": "object", "title": "Address",
+                                        "description": "A postal address.",
+                                        "properties": {"city": {"type": "string"}}}},
+            "type": "object",
+            "properties": {
+                "ship_to": {"title": "Ship To", "description": "Where the parcel goes.",
+                            "allOf": [{"$ref": "#/definitions/Address"}]}
+            }
+        }));
+        let field = &parameters["properties"]["ship_to"];
+        assert_eq!(field["description"], "Where the parcel goes.", "{field}");
+        assert_eq!(field["title"], "Ship To", "{field}");
+        assert_eq!(field["properties"]["city"]["type"], "string", "{field}");
+    }
+
+    /// R7: folding `Optional[Model]` keeps the field's own description and
+    /// title, as a plain `$ref` with siblings does.
+    #[test]
+    fn an_optional_model_keeps_the_fields_own_description() {
+        let parameters = declared_parameters(&json!({
+            "$defs": {"Address": {"type": "object", "title": "Address",
+                                  "description": "A postal address.",
+                                  "properties": {"city": {"type": "string"}}}},
+            "type": "object",
+            "properties": {
+                "ship_to": {"anyOf": [{"$ref": "#/$defs/Address"}, {"type": "null"}],
+                            "title": "Ship To", "description": "Where the parcel goes."},
+                "bill_to": {"$ref": "#/$defs/Address", "description": "Who pays."}
+            }
+        }));
+        let properties = &parameters["properties"];
+        assert_eq!(
+            properties["ship_to"]["description"],
+            "Where the parcel goes."
+        );
+        assert_eq!(properties["ship_to"]["title"], "Ship To");
+        assert_eq!(properties["ship_to"]["nullable"], true);
+        assert_eq!(
+            properties["ship_to"]["properties"]["city"]["type"],
+            "string"
+        );
+        assert_eq!(properties["bill_to"]["description"], "Who pays.");
+    }
+
+    /// N3: depth is not a limit. Three nested optional models, the ordinary
+    /// pydantic shape, keep their innermost properties.
+    #[test]
+    fn nested_optional_models_keep_their_innermost_properties() {
+        let optional =
+            |name: &str| json!({"anyOf": [{"$ref": format!("#/$defs/{name}")}, {"type": "null"}]});
+        let parameters = declared_parameters(&json!({
+            "$defs": {
+                "Geo": {"type": "object", "properties": {"lat": {"type": "number"}}},
+                "Address": {"type": "object", "properties": {"geo": optional("Geo")}},
+                "Customer": {"type": "object", "properties": {"address": optional("Address")}},
+                "Order": {"type": "object", "properties": {
+                    "customer": optional("Customer"),
+                    "parts": {"anyOf": [{"type": "array", "items": {"$ref": "#/$defs/Part"}},
+                                        {"type": "null"}]}
+                }},
+                "Part": {"type": "object", "properties": {"sku": {"type": "string"}}}
+            },
+            "type": "object",
+            "properties": {"orders": {"anyOf": [
+                {"type": "array", "items": {"$ref": "#/$defs/Order"}}, {"type": "null"}]}}
+        }));
+        assert_proto_schema(&parameters, "parameters");
+        let order = &parameters["properties"]["orders"]["items"]["properties"];
+        assert_eq!(
+            order["customer"]["properties"]["address"]["properties"]["geo"]["properties"]["lat"]["type"],
+            "number",
+            "{order}"
+        );
+        assert_eq!(
+            order["parts"]["items"]["properties"]["sku"]["type"],
+            "string"
+        );
+    }
+
+    /// N3: a definition that refers to itself from many properties stays small:
+    /// a ref already being expanded is a cycle and ends as an open object.
+    #[test]
+    fn a_wide_self_reference_stays_small() {
+        let properties = (0..12)
+            .map(|i| (format!("child{i}"), json!({"$ref": "#/$defs/Node"})))
+            .collect::<serde_json::Map<_, _>>();
+        let parameters = declared_parameters(&json!({
+            "$defs": {"Node": {"type": "object", "properties": properties}},
+            "type": "object",
+            "properties": {"root": {"$ref": "#/$defs/Node"}}
+        }));
+        assert_proto_schema(&parameters, "parameters");
+        let size = parameters.to_string().len();
+        assert!(size < 4_096, "a 12-wide self-reference became {size} bytes");
+        assert_eq!(
+            parameters["properties"]["root"]["properties"]["child0"]["type"],
+            "object"
+        );
+    }
+
+    /// N3: a schema that fans out without a cycle is bounded by the expansion
+    /// cap, not by its size.
+    #[test]
+    fn a_wide_acyclic_fan_out_is_bounded() {
+        let level = |next: &str| {
+            let properties = (0..8)
+                .map(|i| (format!("p{i}"), json!({"$ref": format!("#/$defs/{next}")})))
+                .collect::<serde_json::Map<_, _>>();
+            json!({"type": "object", "properties": properties})
+        };
+        let parameters = declared_parameters(&json!({
+            "$defs": {"A": level("B"), "B": level("C"), "C": level("D"), "D": level("E"),
+                      "E": {"type": "object", "properties": {"leaf": {"type": "string"}}}},
+            "type": "object",
+            "properties": {"root": {"$ref": "#/$defs/A"}}
+        }));
+        assert_proto_schema(&parameters, "parameters");
+        let size = parameters.to_string().len();
+        assert!(size < 200_000, "the fan-out became {size} bytes");
+    }
+
+    /// F2: a schema that refers to itself ends as an open object at its first
+    /// repeat instead of recursing forever.
+    #[test]
+    fn a_recursive_ref_ends_at_its_first_repeat() {
+        let parameters = declared_parameters(&json!({
+            "$defs": {"Node": {"type": "object", "properties": {
+                "children": {"type": "array", "items": {"$ref": "#/$defs/Node"}}}}},
+            "type": "object",
+            "properties": {"root": {"$ref": "#/$defs/Node"}}
+        }));
+        assert_proto_schema(&parameters, "parameters");
+    }
+
+    /// F2: Codex CLI's tools are plain objects with string arrays; they pass
+    /// through whole.
+    #[test]
+    fn codex_cli_shaped_tool_schemas_pass_through() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "command": {"type": "array", "items": {"type": "string"},
+                            "description": "The command to execute"},
+                "workdir": {"type": "string"},
+                "timeout_ms": {"type": "number"}
+            },
+            "required": ["command"],
+            "additionalProperties": false
+        });
+        let parameters = declared_parameters(&schema);
+        assert_proto_schema(&parameters, "parameters");
+        assert_eq!(
+            parameters["properties"]["command"]["items"]["type"],
+            "string"
+        );
+        assert_eq!(parameters["required"], json!(["command"]));
+    }
+
+    /// L6: a malformed call is not a length cutoff, and a blocked prompt (no
+    /// candidates, only `promptFeedback`) is a content filter, not a quiet stop.
+    #[test]
+    fn malformed_calls_and_blocked_prompts_get_their_own_finish_reason() {
+        let malformed = antigravity_response(
+            &json!({"candidates": [{"content": {"parts": []},
+                                    "finishReason": "MALFORMED_FUNCTION_CALL"}]}),
+            "m",
+        );
+        assert_eq!(malformed["choices"][0]["finish_reason"], "stop");
+        let blocked =
+            antigravity_response(&json!({"promptFeedback": {"blockReason": "SAFETY"}}), "m");
+        assert_eq!(blocked["choices"][0]["finish_reason"], "content_filter");
+    }
+
+    /// L8: a hosted image names its MIME type, and a data URL that is not
+    /// base64 is encoded before it goes out as `inlineData`.
+    #[test]
+    fn image_parts_carry_a_mime_type_and_base64_data() {
+        let request = antigravity_request(&json!({"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "https://example.com/a/cat.PNG?x=1"}},
+            {"type": "image_url", "image_url": {"url": "data:image/svg+xml,%3Csvg%2F%3E"}}
+        ]}]}));
+        let parts = &request["contents"][0]["parts"];
+        assert_eq!(
+            parts[0]["fileData"]["fileUri"],
+            "https://example.com/a/cat.PNG?x=1"
+        );
+        assert_eq!(parts[0]["fileData"]["mimeType"], "image/png");
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/svg+xml");
+        // `<svg/>` in base64.
+        assert_eq!(parts[1]["inlineData"]["data"], "PHN2Zy8+");
+    }
+
+    #[test]
+    fn antigravity_request_drops_the_schema_keywords_the_upstream_rejects() {
+        let request = antigravity_request(&json!({
+            "messages": [{"role": "user", "content": "x"}],
+            "tools": [{"type": "function", "function": {
+                "name": "pick",
+                "parameters": {
+                    "type": "object",
+                    "$schema": "http://json-schema.org/draft-07/schema#",
+                    "properties": {
+                        "kind": {"const": "email"},
+                        "other": {"type": "string", "default": "x", "examples": ["y"]}
+                    }
+                }
+            }}]
+        }));
+        let parameters = &request["tools"][0]["functionDeclarations"][0]["parameters"];
+        assert!(parameters.get("$schema").is_none(), "{parameters}");
+        assert_eq!(parameters["properties"]["kind"]["enum"], json!(["email"]));
+        assert!(parameters["properties"]["other"].get("default").is_none());
+        assert!(parameters["properties"]["other"].get("examples").is_none());
+    }
+
+    #[test]
+    fn antigravity_response_maps_thinking_text_usage_and_tool_calls() {
+        let response = antigravity_response(
+            &json!({
+                "candidates": [{
+                    "content": {"role": "model", "parts": [
+                        {"text": "weighing", "thought": true},
+                        {"text": "the answer"},
+                        {"functionCall": {"name": "stop", "args": {"now": true}, "id": "call_9"}}
+                    ]},
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 100,
+                    "candidatesTokenCount": 20,
+                    "thoughtsTokenCount": 30,
+                    "totalTokenCount": 150,
+                    "cachedContentTokenCount": 40
+                }
+            }),
+            "gemini-4-neon-high",
+        );
+
+        assert_eq!(response["object"], "chat.completion");
+        assert_eq!(response["model"], "gemini-4-neon-high");
+        let message = &response["choices"][0]["message"];
+        assert_eq!(message["role"], "assistant");
+        assert_eq!(message["reasoning_content"], "weighing");
+        assert_eq!(message["content"], "the answer");
+        assert_eq!(message["tool_calls"][0]["id"], "call_9");
+        assert_eq!(message["tool_calls"][0]["function"]["name"], "stop");
+        assert_eq!(
+            message["tool_calls"][0]["function"]["arguments"],
+            "{\"now\":true}"
+        );
+        // A function call is a tool_calls finish whatever the vendor said.
+        assert_eq!(response["choices"][0]["finish_reason"], "tool_calls");
+        let usage = &response["usage"];
+        assert_eq!(usage["prompt_tokens"], 100);
+        // Gemini reports thinking apart from candidates; the Chat count holds
+        // both, and the total is the upstream's own.
+        assert_eq!(usage["completion_tokens"], 50);
+        assert_eq!(usage["total_tokens"], 150);
+        assert_eq!(usage["completion_tokens_details"]["reasoning_tokens"], 30);
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 40);
+    }
+
+    #[test]
+    fn antigravity_response_reports_length_when_the_vendor_cut_the_turn() {
+        let response = antigravity_response(
+            &json!({"candidates": [{"content": {"parts": [{"text": "half"}]},
+                                    "finishReason": "MAX_TOKENS"}]}),
+            "gemini-4-neon",
+        );
+        assert_eq!(response["choices"][0]["finish_reason"], "length");
+        assert!(response.get("usage").is_none(), "nothing was published");
     }
 }

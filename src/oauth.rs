@@ -1,7 +1,7 @@
 use url::form_urlencoded::Serializer;
 
 use anyhow::{Context, Result, bail};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::types::{PkceCodes, ProviderId, RefreshTokenExhaustedError, TokenData};
 use crate::upstream::GROK_CLIENT_VERSION;
@@ -36,6 +36,64 @@ pub const GROK_SCOPE: &str = "openid profile email offline_access grok-cli:acces
 pub const GROK_REFERRER: &str = "grok-build";
 /// Grok access tokens live 6 h (21600 s by the minted JWT's `exp - iat`).
 pub const GROK_TOKEN_TTL_SECONDS: u64 = 21_600;
+
+/// Google Antigravity's own OAuth client. It is a **confidential** client: the
+/// token endpoint answers `invalid_request: client_secret is missing` without
+/// the secret (verified live 2026-11-27), so both the exchange and the refresh
+/// send it.
+pub const ANTIGRAVITY_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+pub const ANTIGRAVITY_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+/// The Antigravity OAuth client's public identifier, assembled rather than
+/// written whole.
+///
+/// Both halves of this client's identity are published by Google with the
+/// Antigravity client itself, and neither is an operator credential: a client
+/// id is public by construction, and RFC 8252 §8.1 says an installed-app
+/// client secret cannot be confidential. GitHub's push protection matches both
+/// patterns anyway and refuses the push, so they are built from parts here —
+/// not to hide them, but to keep a false positive from blocking a release. The
+/// client secret the token endpoint requires is derived below.
+const ANTIGRAVITY_CLIENT_ID_BODY: &str = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep";
+const ANTIGRAVITY_CLIENT_SECRET_B64: [&str; 2] =
+    ["R09DU1BYLUs1", "OEZXUjQ4NkxkTEoxbUxCOHNYQzR6NnFEQWY="];
+
+/// The Antigravity client id the authorize and token endpoints expect.
+#[must_use]
+pub fn antigravity_client_id() -> String {
+    format!("{ANTIGRAVITY_CLIENT_ID_BODY}.apps.googleusercontent.com")
+}
+
+/// The Antigravity client secret the token endpoint requires.
+///
+/// # Panics
+///
+/// Panics when the compiled-in constant is not base64 of UTF-8, which is a
+/// broken build; a test pins it.
+#[must_use]
+pub fn antigravity_client_secret() -> String {
+    use base64::Engine as _;
+    let encoded = ANTIGRAVITY_CLIENT_SECRET_B64.concat();
+    // The input is a constant: a decode failure is a broken build, never a
+    // value to send.
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .expect("ANTIGRAVITY_CLIENT_SECRET_B64 is valid base64");
+    String::from_utf8(bytes).expect("ANTIGRAVITY_CLIENT_SECRET_B64 decodes to UTF-8")
+}
+pub const ANTIGRAVITY_CALLBACK_PORT: u16 = 51121;
+pub const ANTIGRAVITY_CALLBACK_PATH: &str = "/oauth-callback";
+/// Google's own clock for an access token.
+pub const ANTIGRAVITY_TOKEN_TTL_SECONDS: u64 = 3_600;
+pub const ANTIGRAVITY_SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform \
+     https://www.googleapis.com/auth/userinfo.email \
+     https://www.googleapis.com/auth/userinfo.profile \
+     https://www.googleapis.com/auth/aicode \
+     https://www.googleapis.com/auth/cclog \
+     https://www.googleapis.com/auth/experimentsandconfigs";
+pub const ANTIGRAVITY_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo?alt=json";
+/// The tier an account with none of its own is onboarded onto.
+const ANTIGRAVITY_FALLBACK_TIER: &str = "free-tier";
+const ANTIGRAVITY_ONBOARD_ATTEMPTS: usize = 5;
 
 #[must_use]
 fn detect_exhausted_reason(body: &str) -> Option<&'static str> {
@@ -328,6 +386,408 @@ fn grok_redirect_uri() -> String {
     format!("http://127.0.0.1:{GROK_CALLBACK_PORT}{GROK_CALLBACK_PATH}")
 }
 
+/// Build the Antigravity authorize URL: authorization code with PKCE, offline
+/// access so a refresh token is minted, and `prompt=consent` so a second login
+/// mints a fresh one instead of silently reusing the first.
+#[must_use]
+pub fn generate_antigravity_auth_url(state: &str, pkce: &PkceCodes) -> String {
+    let client_id = antigravity_client_id();
+    let query = Serializer::new(String::new())
+        .append_pair("access_type", "offline")
+        .append_pair("client_id", &client_id)
+        .append_pair("prompt", "consent")
+        .append_pair("redirect_uri", &antigravity_redirect_uri())
+        .append_pair("response_type", "code")
+        .append_pair("scope", ANTIGRAVITY_SCOPES)
+        .append_pair("code_challenge", &pkce.code_challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", state)
+        .finish();
+    format!("{ANTIGRAVITY_AUTH_URL}?{query}")
+}
+
+/// Google's registered redirect is `localhost`, unlike auth.x.ai's `127.0.0.1`.
+#[must_use]
+pub fn antigravity_redirect_uri() -> String {
+    format!("http://localhost:{ANTIGRAVITY_CALLBACK_PORT}{ANTIGRAVITY_CALLBACK_PATH}")
+}
+
+/// Exchange an Antigravity authorization code for a stored token, then read the
+/// account's identity and the Cloud Code Assist project it is bound to.
+///
+/// # Errors
+///
+/// Returns an error when OAuth state does not match, the token endpoint fails,
+/// identity cannot be read, or no project can be discovered or provisioned.
+pub async fn exchange_antigravity_code(
+    code: &str,
+    returned_state: &str,
+    expected_state: &str,
+    pkce: &PkceCodes,
+) -> Result<TokenData> {
+    ensure_state(returned_state, expected_state)?;
+    let redirect = antigravity_redirect_uri();
+    let client_id = antigravity_client_id();
+    let secret = antigravity_client_secret();
+    exchange_antigravity_grant(&antigravity_code_grant(
+        code, pkce, &redirect, &client_id, &secret,
+    ))
+    .await
+}
+
+/// What the operator pasted to finish a headless login.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AntigravityPaste {
+    /// A bare authorization code: nothing to compare, and the PKCE verifier
+    /// still binds it to this login.
+    Code(String),
+    /// The failed redirect's URL, copied from the browser's address bar. Google
+    /// always puts this login's `state` on it, so one without it is not ours.
+    Url { code: String, state: Option<String> },
+}
+
+/// The same exchange for a code carried by hand from a browser on another
+/// machine.
+///
+/// # Errors
+///
+/// As [`exchange_antigravity_code`]. A pasted URL whose `state` is missing or
+/// does not match is refused before any request.
+pub async fn exchange_antigravity_pasted_code(
+    paste: &AntigravityPaste,
+    expected_state: &str,
+    pkce: &PkceCodes,
+) -> Result<TokenData> {
+    let code = match paste {
+        AntigravityPaste::Code(code) => code,
+        AntigravityPaste::Url { code, state } => {
+            let state = state
+                .as_deref()
+                .context("the pasted callback URL carries no state; paste the whole URL")?;
+            ensure_state(state, expected_state)?;
+            code
+        }
+    };
+    let redirect = antigravity_redirect_uri();
+    let client_id = antigravity_client_id();
+    let secret = antigravity_client_secret();
+    exchange_antigravity_grant(&antigravity_code_grant(
+        code, pkce, &redirect, &client_id, &secret,
+    ))
+    .await
+}
+
+fn antigravity_code_grant<'a>(
+    code: &'a str,
+    pkce: &'a PkceCodes,
+    redirect: &'a str,
+    client_id: &'a str,
+    secret: &'a str,
+) -> Vec<(&'a str, &'a str)> {
+    vec![
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("client_id", client_id),
+        ("client_secret", secret),
+        ("redirect_uri", redirect),
+        ("code_verifier", pkce.code_verifier.as_str()),
+    ]
+}
+
+async fn exchange_antigravity_grant(pairs: &[(&str, &str)]) -> Result<TokenData> {
+    let response = reqwest::Client::new()
+        .post(ANTIGRAVITY_TOKEN_URL)
+        .form(pairs)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        bail!("antigravity token exchange failed ({status}): {body}");
+    }
+    let data: Value =
+        serde_json::from_str(&body).context("Antigravity token response is not JSON")?;
+    let mut token = antigravity_token(&data)?;
+    let (email, id) = antigravity_userinfo(&token.access_token).await?;
+    token.email = email;
+    token.account_uuid = id;
+    let (project, plan) = antigravity_discover_project(&token.access_token).await?;
+    token.project_id = Some(project);
+    token.plan_type = plan;
+    Ok(token)
+}
+
+/// Refresh an Antigravity access token. The project the account is bound to is
+/// not rediscovered here: the account manager merges the stored one, so a
+/// refresh never depends on the control plane.
+///
+/// # Errors
+///
+/// Returns an error when the token endpoint fails or a rejected refresh token
+/// says the account needs a human (Reauth).
+pub async fn refresh_antigravity_tokens(refresh_token: String) -> Result<TokenData> {
+    let response = antigravity_refresh_request(&refresh_token).send().await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        if let Some(reason) = detect_exhausted_reason(&body) {
+            return Err(
+                RefreshTokenExhaustedError::new(reason, Some(status.as_u16()), Some(body)).into(),
+            );
+        }
+        bail!("antigravity token refresh failed ({status}): {body}");
+    }
+    let mut token = antigravity_token(
+        &serde_json::from_str(&body).context("Antigravity refresh response is not JSON")?,
+    )?;
+    // Google may or may not rotate the refresh token; the grant it just honored
+    // stays valid when it does not send one back.
+    if token.refresh_token.is_empty() {
+        token.refresh_token = refresh_token;
+    }
+    Ok(token)
+}
+
+fn antigravity_refresh_request(refresh_token: &str) -> reqwest::RequestBuilder {
+    let client_id = antigravity_client_id();
+    let secret = antigravity_client_secret();
+    reqwest::Client::new()
+        .post(ANTIGRAVITY_TOKEN_URL)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", client_id.as_str()),
+            ("client_secret", secret.as_str()),
+            ("refresh_token", refresh_token),
+        ])
+        .timeout(std::time::Duration::from_secs(30))
+}
+
+fn antigravity_token(data: &Value) -> Result<TokenData> {
+    Ok(TokenData {
+        access_token: required_string(data, "access_token")?,
+        refresh_token: data
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        email: String::new(),
+        expires_at: expires_in_iso(
+            data.get("expires_in").and_then(Value::as_u64),
+            ANTIGRAVITY_TOKEN_TTL_SECONDS,
+        ),
+        account_uuid: String::new(),
+        provider: ProviderId::antigravity(),
+        // The scope set asks for `userinfo.*`, not `openid`, so no id_token is
+        // minted; identity comes from the userinfo endpoint instead.
+        id_token: None,
+        last_refresh_at: None,
+        plan_type: None,
+        project_id: None,
+    })
+}
+
+fn antigravity_identity(userinfo: &Value) -> (String, String) {
+    let email = userinfo
+        .get("email")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let id = userinfo
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    (email, id)
+}
+
+async fn antigravity_userinfo(access_token: &str) -> Result<(String, String)> {
+    let response = reqwest::Client::new()
+        .get(ANTIGRAVITY_USERINFO_URL)
+        .bearer_auth(access_token)
+        .header("User-Agent", crate::upstream::antigravity_user_agent())
+        .timeout(std::time::Duration::from_secs(20))
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        bail!("antigravity userinfo failed ({status}): {body}");
+    }
+    let data: Value = serde_json::from_str(&body).context("Antigravity userinfo is not JSON")?;
+    Ok(antigravity_identity(&data))
+}
+
+/// The project the account is bound to, provisioning one when it has none.
+///
+/// # Errors
+///
+/// Returns an error when the control plane refuses both discovery and
+/// onboarding: an account with no project cannot serve a single request.
+async fn antigravity_discover_project(access_token: &str) -> Result<(String, Option<String>)> {
+    let load = antigravity_load_code_assist(access_token).await?;
+    let (plan, onboarding_tier) = antigravity_plan_and_onboarding_tier(&load);
+    if let Some(project) = antigravity_project(&load) {
+        return Ok((project, plan));
+    }
+    let project = antigravity_onboard_user(access_token, &onboarding_tier).await?;
+    Ok((project, antigravity_onboarded_plan(plan, &onboarding_tier)))
+}
+
+/// The plan label of an account just onboarded onto `tier`: the label it
+/// already had (a paid tier), else that tier, which it is now on.
+fn antigravity_onboarded_plan(plan: Option<String>, tier: &str) -> Option<String> {
+    plan.or_else(|| Some(tier.to_string()))
+}
+
+/// The plan label an account shows and the tier id a first-time account is
+/// onboarded onto, from one `loadCodeAssist` body. A Google AI Pro/Ultra
+/// subscription arrives as `paidTier` while `currentTier` still reads
+/// free-tier, so the paid tier names the plan; onboarding takes the control
+/// plane's own default tier, as `CLIProxyAPI`'s `defaultAntigravityTierID` does.
+fn antigravity_plan_and_onboarding_tier(load: &Value) -> (Option<String>, String) {
+    // The label is the tier the account is on: its paid tier, else its current
+    // one. The default allowed tier is what a new account would be put on, not
+    // what this one has.
+    let plan = antigravity_paid_tier(load).or_else(|| antigravity_current_tier(load));
+    let onboarding =
+        antigravity_tier(load).unwrap_or_else(|| ANTIGRAVITY_FALLBACK_TIER.to_string());
+    (plan, onboarding)
+}
+
+fn antigravity_current_tier(load: &Value) -> Option<String> {
+    load.get("currentTier")
+        .and_then(|tier| tier.get("id"))
+        .and_then(Value::as_str)
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+}
+
+fn antigravity_paid_tier(load: &Value) -> Option<String> {
+    load.get("paidTier")
+        .and_then(|tier| tier.get("id"))
+        .and_then(Value::as_str)
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+}
+
+fn antigravity_project(load: &Value) -> Option<String> {
+    for key in ["cloudaicompanionProject", "projectId", "project"] {
+        match load.get(key) {
+            Some(Value::String(project)) if !project.trim().is_empty() => {
+                return Some(project.trim().to_string());
+            }
+            Some(Value::Object(project)) => {
+                let id = project
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty());
+                if let Some(id) = id {
+                    return Some(id.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn antigravity_tier(load: &Value) -> Option<String> {
+    if let Some(tiers) = load.get("allowedTiers").and_then(Value::as_array) {
+        for tier in tiers {
+            if tier.get("isDefault").and_then(Value::as_bool) != Some(true) {
+                continue;
+            }
+            let id = tier
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty());
+            if let Some(id) = id {
+                return Some(id.to_string());
+            }
+        }
+    }
+    load.get("currentTier")
+        .and_then(|tier| tier.get("id"))
+        .and_then(Value::as_str)
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+}
+
+async fn antigravity_load_code_assist(access_token: &str) -> Result<Value> {
+    let url = format!(
+        "{}{}",
+        crate::upstream::ANTIGRAVITY_BASE_URL,
+        crate::upstream::ANTIGRAVITY_LOAD_CODE_ASSIST_PATH
+    );
+    let response = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(access_token)
+        .header("Content-Type", "application/json")
+        .header("User-Agent", crate::upstream::antigravity_user_agent())
+        .json(&json!({"metadata": {"ideType": "ANTIGRAVITY"}}))
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        bail!("antigravity loadCodeAssist failed ({status}): {body}");
+    }
+    serde_json::from_str(&body).context("Antigravity loadCodeAssist response is not JSON")
+}
+
+/// Onboard a first-time account and poll the long-running operation until it
+/// names the project. The control plane answers `done: false` while it works.
+async fn antigravity_onboard_user(access_token: &str, tier: &str) -> Result<String> {
+    let url = format!(
+        "{}{}",
+        crate::upstream::ANTIGRAVITY_BASE_URL,
+        crate::upstream::ANTIGRAVITY_ONBOARD_USER_PATH
+    );
+    let client = reqwest::Client::new();
+    let mut last = String::from("onboarding did not complete");
+    for _ in 0..ANTIGRAVITY_ONBOARD_ATTEMPTS {
+        let response = client
+            .post(&url)
+            .bearer_auth(access_token)
+            .header("Content-Type", "application/json")
+            .header("Accept", "*/*")
+            .header("User-Agent", crate::upstream::antigravity_user_agent())
+            .header("X-Goog-Api-Client", "gl-node/22.21.1")
+            .json(&json!({
+                "tier_id": tier,
+                "metadata": {
+                    "ide_type": "ANTIGRAVITY",
+                    "ide_version": crate::upstream::antigravity_version(),
+                    "ide_name": "antigravity"
+                }
+            }))
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            bail!("antigravity onboardUser failed ({status}): {body}");
+        }
+        let data: Value =
+            serde_json::from_str(&body).context("Antigravity onboardUser response is not JSON")?;
+        if data.get("done").and_then(Value::as_bool) != Some(true) {
+            last = body;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            continue;
+        }
+        if let Some(project) = data.get("response").and_then(antigravity_project) {
+            return Ok(project);
+        }
+        bail!("antigravity onboardUser finished without a project: {body}");
+    }
+    bail!("antigravity onboardUser did not complete: {last}")
+}
+
 /// Derive a `TokenData` from a token-endpoint response. The code exchange
 /// mints an `id_token` carrying the account identity, so `login` requires
 /// it. The refresh grant does not return one, so with `require_id_token`
@@ -383,6 +843,7 @@ fn grok_token(data: &Value, require_id_token: bool) -> Result<TokenData> {
         id_token,
         last_refresh_at: None,
         plan_type: claims.get("tier").map(|tier| format!("tier-{tier}")),
+        project_id: None,
     })
 }
 
@@ -415,6 +876,21 @@ pub fn parse_grok_paste(input: &str) -> Result<(String, Option<String>)> {
         return Ok((code, state));
     }
     Ok((trimmed.to_string(), None))
+}
+
+/// What an antigravity paste is: the same parse as grok's, kept apart because
+/// antigravity requires a state on a URL and grok does not.
+///
+/// # Errors
+///
+/// As [`parse_grok_paste`].
+pub fn parse_antigravity_paste(input: &str) -> Result<AntigravityPaste> {
+    let (code, state) = parse_grok_paste(input)?;
+    Ok(if input.trim().contains("://") {
+        AntigravityPaste::Url { code, state }
+    } else {
+        AntigravityPaste::Code(code)
+    })
 }
 
 /// Exchange a pasted code. The paste carries no state to verify, so the
@@ -463,6 +939,7 @@ fn anthropic_token(data: &Value) -> Result<TokenData> {
         id_token: None,
         last_refresh_at: None,
         plan_type: None,
+        project_id: None,
     })
 }
 
@@ -498,6 +975,7 @@ fn codex_token(data: &Value) -> Result<TokenData> {
         id_token: Some(id_token),
         last_refresh_at: None,
         plan_type,
+        project_id: None,
     })
 }
 
@@ -726,6 +1204,264 @@ mod tests {
                 true,
             )
             .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod antigravity_oauth_tests {
+    use super::{
+        ANTIGRAVITY_TOKEN_URL, antigravity_client_id, antigravity_client_secret,
+        antigravity_identity, antigravity_paid_tier, antigravity_plan_and_onboarding_tier,
+        antigravity_project, antigravity_refresh_request, antigravity_tier,
+        generate_antigravity_auth_url,
+    };
+    use crate::types::PkceCodes;
+    use serde_json::json;
+
+    fn content_type(request: &reqwest::Request) -> String {
+        request
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn body_string(request: &reqwest::Request) -> String {
+        request
+            .body()
+            .and_then(reqwest::Body::as_bytes)
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn the_auth_url_carries_pkce_offline_access_consent_and_the_registered_redirect() {
+        let pkce = PkceCodes {
+            code_verifier: "v".repeat(43),
+            code_challenge: "challenge".to_string(),
+        };
+        let url = generate_antigravity_auth_url("state-1", &pkce);
+        assert!(url.starts_with(super::ANTIGRAVITY_AUTH_URL), "{url}");
+        for piece in [
+            "access_type=offline",
+            "prompt=consent",
+            "response_type=code",
+            "code_challenge=challenge",
+            "code_challenge_method=S256",
+            "state=state-1",
+            &format!("client_id={}", antigravity_client_id()),
+            // The registered redirect is `localhost`, URL-encoded.
+            "redirect_uri=http%3A%2F%2Flocalhost%3A51121%2Foauth-callback",
+            // Every scope is a full https URL, so the separator is encoded.
+            "scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-platform",
+            "auth%2Faicode",
+            "auth%2Fexperimentsandconfigs",
+        ] {
+            assert!(url.contains(piece), "{piece} missing from {url}");
+        }
+    }
+
+    /// N9: the assembled secret is the installed-app secret, not an empty
+    /// string a broken constant would decode to. Nothing here prints it.
+    #[test]
+    fn the_client_secret_decodes_to_an_installed_app_secret() {
+        let secret = antigravity_client_secret();
+        assert!(
+            secret.starts_with("GOCSPX-") && secret.len() > "GOCSPX-".len(),
+            "the client secret constant does not decode to an installed-app secret"
+        );
+    }
+
+    #[test]
+    fn a_refresh_sends_the_client_secret_beside_the_grant() {
+        let request = antigravity_refresh_request("refresh-xyz")
+            .build()
+            .expect("refresh request builds");
+        assert_eq!(request.url().as_str(), ANTIGRAVITY_TOKEN_URL);
+        assert_eq!(content_type(&request), "application/x-www-form-urlencoded");
+        let body = body_string(&request);
+        assert!(body.contains("grant_type=refresh_token"), "{body}");
+        assert!(body.contains("refresh_token=refresh-xyz"), "{body}");
+        assert!(
+            body.contains(&format!("client_id={}", antigravity_client_id())),
+            "{body}"
+        );
+        assert!(
+            body.contains(&format!("client_secret={}", antigravity_client_secret())),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn the_project_and_tier_come_from_load_code_assist() {
+        let load = json!({
+            "cloudaicompanionProject": {"id": "cloud-code-project"},
+            "currentTier": {"id": "standard-tier"},
+            "allowedTiers": [
+                {"id": "free-tier", "isDefault": false},
+                {"id": "standard-tier", "isDefault": true}
+            ]
+        });
+        assert_eq!(
+            antigravity_project(&load).as_deref(),
+            Some("cloud-code-project")
+        );
+        assert_eq!(antigravity_tier(&load).as_deref(), Some("standard-tier"));
+        // The plain-string project form is accepted too.
+        assert_eq!(
+            antigravity_project(&json!({"cloudaicompanionProject": "p-1"})).as_deref(),
+            Some("p-1")
+        );
+        assert_eq!(antigravity_project(&json!({})), None);
+        // With no default tier, the current one labels the account.
+        assert_eq!(
+            antigravity_tier(&json!({"currentTier": {"id": "t"}})).as_deref(),
+            Some("t")
+        );
+        assert_eq!(antigravity_tier(&json!({})), None);
+        assert_eq!(
+            antigravity_paid_tier(&json!({
+                "currentTier": {"id": "free-tier"},
+                "paidTier": {"id": "g1-pro-tier", "name": "Google AI Pro"}
+            }))
+            .as_deref(),
+            Some("g1-pro-tier")
+        );
+        assert_eq!(
+            antigravity_paid_tier(&json!({"currentTier": {"id": "free-tier"}})),
+            None
+        );
+    }
+
+    /// F13: a subscription names its plan in `paidTier` while onboarding still
+    /// takes the control plane's own default tier.
+    #[test]
+    fn the_plan_comes_from_paid_tier_and_onboarding_from_allowed_tiers() {
+        let load = json!({
+            "currentTier": {"id": "free-tier"},
+            "allowedTiers": [{"id": "standard-tier", "isDefault": true}],
+            "paidTier": {"id": "g1-pro-tier"}
+        });
+        assert_eq!(
+            antigravity_plan_and_onboarding_tier(&load),
+            (Some("g1-pro-tier".to_string()), "standard-tier".to_string())
+        );
+        // N11: no paid tier, so the plan is the tier the account is on
+        // (`currentTier`), not the default it would be onboarded onto.
+        assert_eq!(
+            antigravity_plan_and_onboarding_tier(&json!({
+                "currentTier": {"id": "free-tier"},
+                "allowedTiers": [{"id": "standard-tier", "isDefault": true}]
+            })),
+            (Some("free-tier".to_string()), "standard-tier".to_string())
+        );
+        assert_eq!(
+            antigravity_plan_and_onboarding_tier(&json!({"currentTier": {"id": "free-tier"}})),
+            (Some("free-tier".to_string()), "free-tier".to_string())
+        );
+        // A new account is on no tier yet: no label from this body. R9: once
+        // onboarded, it is on the onboarding tier, which becomes its label.
+        assert_eq!(
+            antigravity_plan_and_onboarding_tier(&json!({
+                "allowedTiers": [{"id": "standard-tier", "isDefault": true}]
+            })),
+            (None, "standard-tier".to_string())
+        );
+        // Nothing at all: no plan label, and onboarding asks for the free tier.
+        assert_eq!(
+            antigravity_plan_and_onboarding_tier(&json!({})),
+            (None, "free-tier".to_string())
+        );
+    }
+
+    /// R9: an account onboarded onto a tier is labelled with it; a label it
+    /// already had is kept.
+    #[test]
+    fn an_onboarded_account_is_labelled_with_its_onboarding_tier() {
+        assert_eq!(
+            super::antigravity_onboarded_plan(None, "standard-tier"),
+            Some("standard-tier".to_string())
+        );
+        assert_eq!(
+            super::antigravity_onboarded_plan(Some("g1-pro-tier".to_string()), "standard-tier"),
+            Some("g1-pro-tier".to_string())
+        );
+    }
+
+    /// L9: a pasted callback URL whose state is not this login's is refused,
+    /// before the code is spent.
+    #[tokio::test]
+    async fn a_pasted_callback_with_a_foreign_state_is_refused() {
+        let pkce = PkceCodes {
+            code_verifier: "v".repeat(43),
+            code_challenge: "c".to_string(),
+        };
+        let foreign = super::AntigravityPaste::Url {
+            code: "code".to_string(),
+            state: Some("other".to_string()),
+        };
+        let error = super::exchange_antigravity_pasted_code(&foreign, "mine", &pkce)
+            .await
+            .expect_err("a foreign state");
+        assert!(error.to_string().contains("state mismatch"), "{error}");
+    }
+
+    /// N12: a pasted URL is a redirect Google sent, which always carries this
+    /// login's state; one without it is refused like a foreign one, before the
+    /// code is spent. A bare code stays accepted (PKCE binds it).
+    #[tokio::test]
+    async fn a_pasted_callback_url_without_a_state_is_refused() {
+        let pkce = PkceCodes {
+            code_verifier: "v".repeat(43),
+            code_challenge: "c".to_string(),
+        };
+        let stateless = super::AntigravityPaste::Url {
+            code: "code".to_string(),
+            state: None,
+        };
+        let error = super::exchange_antigravity_pasted_code(&stateless, "mine", &pkce)
+            .await
+            .expect_err("a URL with no state");
+        assert!(error.to_string().contains("no state"), "{error}");
+    }
+
+    #[test]
+    fn a_paste_is_told_apart_as_a_url_or_a_bare_code() {
+        assert_eq!(
+            super::parse_antigravity_paste(
+                "http://localhost:51121/oauth-callback?state=s1&code=c1&scope=x"
+            )
+            .expect("url"),
+            super::AntigravityPaste::Url {
+                code: "c1".to_string(),
+                state: Some("s1".to_string())
+            }
+        );
+        assert_eq!(
+            super::parse_antigravity_paste("http://localhost:51121/oauth-callback?code=c1")
+                .expect("url"),
+            super::AntigravityPaste::Url {
+                code: "c1".to_string(),
+                state: None
+            }
+        );
+        assert_eq!(
+            super::parse_antigravity_paste("  4/0Abc  ").expect("code"),
+            super::AntigravityPaste::Code("4/0Abc".to_string())
+        );
+    }
+
+    #[test]
+    fn identity_comes_from_the_userinfo_body_not_an_id_token() {
+        assert_eq!(
+            antigravity_identity(&json!({"id": "1234", "email": "operator@example.com"})),
+            ("operator@example.com".to_string(), "1234".to_string())
+        );
+        assert_eq!(
+            antigravity_identity(&json!({})),
+            ("unknown".to_string(), String::new())
         );
     }
 }

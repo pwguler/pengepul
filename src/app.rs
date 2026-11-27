@@ -28,32 +28,37 @@ use crate::cloaking_versions::{CliVersions, codex_release, effective, npm_latest
 use crate::config::{BodyLimit, Config, RotationMode};
 use crate::masquerade::{masquerade_request, restore_tool_use_names};
 use crate::models::{
-    FetchedModels, ModelCatalog, grok_static_models, parse_anthropic, parse_codex, parse_openai,
-    upstream_model,
+    FetchedModels, MakerPool, ModelCatalog, antigravity_static_models, grok_static_models,
+    parse_anthropic, parse_antigravity, parse_codex, parse_openai, upstream_model,
 };
-use crate::oauth::{refresh_anthropic_tokens, refresh_codex_tokens, refresh_grok_tokens};
+use crate::oauth::{
+    refresh_anthropic_tokens, refresh_antigravity_tokens, refresh_codex_tokens, refresh_grok_tokens,
+};
 use crate::quota::{self, QuotaSnapshot};
 use crate::streaming::{
-    AnthropicStreamState, ChatStreamState, ResponsesStreamState, anthropic_sse_to_chat,
-    anthropic_sse_to_responses, chat_sse_to_anthropic, chat_sse_to_responses,
-    drain_complete_sse_events, finish_chat_stream, finish_sse_events, responses_sse_to_anthropic,
-    responses_sse_to_chat, responses_sse_to_payload, sse,
+    AnthropicStreamState, AntigravityChunkState, ChatStreamState, ResponsesStreamState,
+    anthropic_sse_to_chat, anthropic_sse_to_responses, chat_sse_to_anthropic,
+    chat_sse_to_responses, cut_chat_stream, drain_complete_sse_events, finish_chat_stream,
+    finish_sse_events, responses_sse_to_anthropic, responses_sse_to_chat, responses_sse_to_payload,
+    sse,
 };
 use crate::threads::{Stored, StreamingReply, ThreadLedger, Turn};
 use crate::tokens::{Peak, load_peak, save_peak};
 use crate::translate::{
     anthropic_to_chat_request, anthropic_to_openai, anthropic_to_responses,
     anthropic_to_responses_request, chat_to_anthropic_message, chat_to_responses_message,
-    chat_to_responses_request, openai_to_anthropic, responses_to_anthropic,
+    chat_to_responses_request, gemini_usage, openai_to_anthropic, responses_to_anthropic,
     responses_to_anthropic_message, responses_to_chat_completion, responses_to_chat_request,
 };
 use crate::types::{AvailableAccount, ProviderId, ProviderKind, UsageData};
 use crate::upstream::{
-    ANTHROPIC_BASE_URL, CODEX_BASE_URL, CODEX_DEFAULT_CLI_VERSION, CODEX_MODELS_PATH,
-    CODEX_RESPONSES_PATH, GROK_CHAT_BASE_URL, Threading, anthropic_headers,
-    anthropic_messages_wire, anthropic_usage_headers, codex_headers, generic_base_url,
-    generic_chat_headers, generic_headers, grok_chat_headers, learn_grok_client_version,
-    normalize_codex_responses_body, resolve_beta,
+    ANTHROPIC_BASE_URL, ANTIGRAVITY_BASE_URL, ANTIGRAVITY_GENERATE_PATH, ANTIGRAVITY_MODELS_PATH,
+    ANTIGRAVITY_STREAM_PATH, ANTIGRAVITY_VERSION, CODEX_BASE_URL, CODEX_DEFAULT_CLI_VERSION,
+    CODEX_MODELS_PATH, CODEX_RESPONSES_PATH, GROK_CHAT_BASE_URL, Threading, VersionFloor,
+    anthropic_headers, anthropic_messages_wire, anthropic_usage_headers, antigravity_envelope,
+    antigravity_headers, antigravity_headers_for, antigravity_retry_delay, antigravity_unwrap,
+    codex_headers, generic_base_url, generic_chat_headers, generic_headers, grok_chat_headers,
+    learn_grok_client_version, normalize_codex_responses_body, resolve_beta,
 };
 use crate::utils::now_iso;
 use crate::utils::sha256_hex;
@@ -68,6 +73,7 @@ pub type UpstreamSseFuture =
     Pin<Box<dyn Future<Output = anyhow::Result<UpstreamSseResponse>> + Send>>;
 pub type ModelsFuture = Pin<Box<dyn Future<Output = anyhow::Result<FetchedModels>> + Send>>;
 pub type CliVersionsFuture = Pin<Box<dyn Future<Output = anyhow::Result<CliVersions>> + Send>>;
+pub type VersionFuture = Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>>;
 
 #[derive(Debug, Clone)]
 pub struct UpstreamRequest {
@@ -133,6 +139,27 @@ pub trait UpstreamClient: Send + Sync {
         let _ = request;
         Box::pin(async { anyhow::bail!("no grok upstream") })
     }
+
+    /// Antigravity's Cloud Code Assist generate call, over a pooled Google
+    /// subscription. The body crossing this boundary is the Antigravity
+    /// envelope and the reply is the upstream's own (`{"response": <Gemini>}`
+    /// or an error): the route wraps and translates, so the wire shapes are
+    /// tested with the route and the client only sends bytes.
+    fn antigravity_generate(&self, request: UpstreamRequest) -> UpstreamFuture {
+        let _ = request;
+        Box::pin(async { anyhow::bail!("no antigravity upstream") })
+    }
+
+    fn antigravity_generate_stream(&self, request: UpstreamRequest) -> UpstreamSseFuture {
+        let _ = request;
+        Box::pin(async { anyhow::bail!("no antigravity upstream") })
+    }
+
+    /// The Antigravity Hub release its updater manifest names. Default: no
+    /// source, so a client that never serves antigravity makes no call.
+    fn fetch_antigravity_version(&self) -> VersionFuture {
+        Box::pin(async { anyhow::bail!("no antigravity version source") })
+    }
     fn fetch_models(
         &self,
         kind: ProviderKind,
@@ -168,6 +195,7 @@ struct AccountManagers {
     anthropic: tokio::sync::Mutex<AccountManager>,
     codex: tokio::sync::Mutex<AccountManager>,
     grok: tokio::sync::Mutex<AccountManager>,
+    antigravity: tokio::sync::Mutex<AccountManager>,
     generic: BTreeMap<String, tokio::sync::Mutex<AccountManager>>,
 }
 
@@ -178,6 +206,7 @@ impl AccountManagers {
             (ProviderId::anthropic(), &self.anthropic),
             (ProviderId::codex(), &self.codex),
             (ProviderId::grok(), &self.grok),
+            (ProviderId::antigravity(), &self.antigravity),
         ];
         pools.extend(
             self.generic
@@ -515,6 +544,44 @@ impl UpstreamClient for HttpUpstreamClient {
         })
     }
 
+    fn antigravity_generate(&self, request: UpstreamRequest) -> UpstreamFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            // The whole-reply path is only taken for a client that did not
+            // stream, so its deadline is the whole-request one.
+            let timeout_ms = request.config.timeouts.messages_ms;
+            send_antigravity_json(
+                client,
+                ANTIGRAVITY_BASE_URL,
+                &ANTIGRAVITY_VERSION,
+                &request.account,
+                request.body,
+                timeout_ms,
+            )
+            .await
+        })
+    }
+
+    fn antigravity_generate_stream(&self, request: UpstreamRequest) -> UpstreamSseFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            send_antigravity_stream(
+                client,
+                ANTIGRAVITY_BASE_URL,
+                &ANTIGRAVITY_VERSION,
+                &request.account,
+                request.body,
+                request.config.timeouts.stream_messages_ms,
+            )
+            .await
+        })
+    }
+
+    fn fetch_antigravity_version(&self) -> VersionFuture {
+        let client = self.client.clone();
+        Box::pin(async move { crate::upstream::fetch_antigravity_manifest_version(&client).await })
+    }
+
     fn fetch_models(
         &self,
         kind: ProviderKind,
@@ -547,13 +614,7 @@ impl UpstreamClient for HttpUpstreamClient {
                         ("anthropic-version".to_string(), "2023-06-01".to_string()),
                         ("anthropic-beta".to_string(), "oauth-2025-04-20".to_string()),
                     ]);
-                    let body = send_get(
-                        client,
-                        format!("{ANTHROPIC_BASE_URL}/v1/models"),
-                        headers,
-                        timeout,
-                    )
-                    .await?;
+                    let body = send_get(client, anthropic_models_url(), headers, timeout).await?;
                     Ok(parse_anthropic(&body, &account.provider))
                 }
                 ProviderKind::Codex => {
@@ -571,9 +632,46 @@ impl UpstreamClient for HttpUpstreamClient {
                 // Grok's catalog is static — two models, known up front — so
                 // the fetch is local and cannot fail.
                 ProviderKind::Grok => Ok(grok_static_models()),
+                // Antigravity's catalog is live: `fetchAvailableModels` keys a
+                // map by model id. A failed fetch is an error, and the refresh
+                // decides what stays advertised.
+                ProviderKind::Antigravity => {
+                    fetch_antigravity_models(client, ANTIGRAVITY_BASE_URL, &account, timeout).await
+                }
             }
         })
     }
+}
+
+/// The antigravity catalog from `fetchAvailableModels` at `base`. An account
+/// with no project cannot ask and gets the static floor. A failed fetch is an
+/// error: the refresh keeps the last list, or shows the floor when none has
+/// landed yet.
+async fn fetch_antigravity_models(
+    client: reqwest::Client,
+    base: &str,
+    account: &AvailableAccount,
+    timeout_ms: u64,
+) -> anyhow::Result<FetchedModels> {
+    let Some(project) = account.token.project_id.clone() else {
+        return Ok(antigravity_static_models());
+    };
+    let response = send_json(
+        client,
+        format!("{base}{ANTIGRAVITY_MODELS_PATH}"),
+        antigravity_headers(account),
+        json!({"project": project}),
+        timeout_ms,
+    )
+    .await?;
+    if !response.status.is_success() {
+        anyhow::bail!("fetchAvailableModels returned {}", response.status);
+    }
+    let parsed = parse_antigravity(&response.body, &account.provider);
+    if parsed.ids.is_empty() {
+        anyhow::bail!("fetchAvailableModels listed no chat model");
+    }
+    Ok(parsed)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -710,9 +808,24 @@ fn build_account_managers(config: &Config) -> AccountManagers {
     let _ = anthropic.load();
     let _ = codex.load();
     let _ = grok.load();
+    // Google access tokens live an hour; the lead refreshes five minutes
+    // before expiry, which is the room Google's own clients keep.
+    let mut antigravity = AccountManager::new(
+        config.auth_dir.clone(),
+        ProviderId::antigravity(),
+        config.priority_for("antigravity"),
+        config.rotation_for("antigravity"),
+        |refresh_token| Box::pin(refresh_antigravity_tokens(refresh_token)),
+        RefreshPolicy {
+            kind: RefreshPolicyKind::ExpiresLead,
+            seconds: 5 * 60,
+        },
+    );
+    let _ = antigravity.load();
     warn_unknown_priority_accounts("anthropic", &anthropic);
     warn_unknown_priority_accounts("codex", &codex);
     warn_unknown_priority_accounts("grok", &grok);
+    warn_unknown_priority_accounts("antigravity", &antigravity);
     // One manager per configured provider; static keys never refresh, so the
     // callback exists only to satisfy the type and must never be called.
     let mut generic = BTreeMap::new();
@@ -736,6 +849,7 @@ fn build_account_managers(config: &Config) -> AccountManagers {
         anthropic = anthropic.account_count(),
         codex = codex.account_count(),
         grok = grok.account_count(),
+        antigravity = antigravity.account_count(),
         generic = generic.len(),
         "loaded provider accounts"
     );
@@ -743,6 +857,7 @@ fn build_account_managers(config: &Config) -> AccountManagers {
         anthropic: tokio::sync::Mutex::new(anthropic),
         codex: tokio::sync::Mutex::new(codex),
         grok: tokio::sync::Mutex::new(grok),
+        antigravity: tokio::sync::Mutex::new(antigravity),
         generic,
     }
 }
@@ -828,7 +943,7 @@ fn quota_source(provider: &ProviderId, config: &Config) -> Option<QuotaSource> {
                 None
             }
         }
-        ProviderKind::Codex | ProviderKind::Grok => None,
+        ProviderKind::Codex | ProviderKind::Grok | ProviderKind::Antigravity => None,
     }
 }
 
@@ -1098,10 +1213,35 @@ async fn refresh_model_catalog(state: &AppState) {
         // Grok's list is static, but it enters the catalog through the same
         // fetch so /v1/models and routing see it like any provider's.
         ProviderKind::Grok,
+        // Antigravity's list is fetched from Cloud Code Assist; until one
+        // lands, the pool advertises the static floor.
+        ProviderKind::Antigravity,
     ] {
         let Some(account) = catalog_account(state, kind).await else {
             continue;
         };
+        // The Hub release the antigravity `User-Agent` names drifts. It is read
+        // beside the catalog, so it is asked for only while the pool has an
+        // account and again on every refresh after a boot without network, on
+        // a task of its own: the catalog never waits on it.
+        if kind == ProviderKind::Antigravity {
+            // Dropping the handle detaches the task; nothing waits on it.
+            drop(crate::upstream::spawn_version_refresh(
+                &tokio::runtime::Handle::current(),
+                &ANTIGRAVITY_VERSION,
+                state.upstream.fetch_antigravity_version(),
+                crate::upstream::ANTIGRAVITY_MANIFEST_TIMEOUT,
+            ));
+            // An account with no project cannot ask for a catalog; it shows
+            // the floor, which is not a list the upstream gave.
+            if account.token.project_id.is_none() {
+                let mut catalog = state.catalog.write().expect("catalog lock poisoned");
+                if !catalog.lists(kind) {
+                    catalog.set_floor(kind, antigravity_static_models());
+                }
+                continue;
+            }
+        }
         match state
             .upstream
             .fetch_models(kind, account, cloaked_config(state))
@@ -1118,6 +1258,14 @@ async fn refresh_model_catalog(state: &AppState) {
                     ?error,
                     "model list fetch failed"
                 );
+                // Before any live list has landed, antigravity advertises its
+                // floor (AC-2); a live list, once there, is never replaced (F7).
+                if kind == ProviderKind::Antigravity {
+                    let mut catalog = state.catalog.write().expect("catalog lock poisoned");
+                    if !catalog.lists(kind) {
+                        catalog.set_floor(kind, antigravity_static_models());
+                    }
+                }
             }
         }
     }
@@ -1176,6 +1324,12 @@ async fn catalog_account(state: &AppState, kind: ProviderKind) -> Option<Availab
         }
         ProviderKind::Grok => {
             let mut manager = state.account_managers.grok.lock().await;
+            let email = manager.next_account()?.token.email;
+            let _ = manager.refresh_if_due(&email).await;
+            manager.account(&email)
+        }
+        ProviderKind::Antigravity => {
+            let mut manager = state.account_managers.antigravity.lock().await;
             let email = manager.next_account()?.token.email;
             let _ = manager.refresh_if_due(&email).await;
             manager.account(&email)
@@ -1605,38 +1759,35 @@ async fn admin_reload(State(state): State<AppState>, headers: HeaderMap) -> Resp
             .set_allow(reread.allow);
     }
 
-    // Every pool is reloaded here, built-ins included. A hand-written list of
-    // providers is what let grok's fresh login be silently ignored: the token
-    // file was replaced, reload reported nothing, and the relay kept serving
-    // the stale credential until a restart.
-    let anthropic = state.account_managers.anthropic.lock().await.reload();
-    let codex = state.account_managers.codex.lock().await.reload();
-    let grok = state.account_managers.grok.lock().await.reload();
+    // Every pool is reloaded here, built-ins included, from the one list of
+    // pools. A hand-written list is what let first grok's and then
+    // antigravity's fresh login be silently ignored: the token file was
+    // replaced, reload reported nothing, and the relay kept serving the stale
+    // credential until a restart.
+    // Every pool reloads before any error is reported, so one unreadable
+    // directory cannot keep a fresh login in another pool out of rotation.
     let mut reloaded = serde_json::Map::new();
-    for (provider, result) in [
-        (ProviderId::anthropic(), anthropic),
-        (ProviderId::codex(), codex),
-        (ProviderId::grok(), grok),
-    ] {
-        match result {
+    let mut first_failure = None;
+    for (provider, manager) in state.account_managers.pools() {
+        match manager.lock().await.reload() {
             Ok(value) => {
                 reloaded.insert(provider.to_string(), value);
             }
-            Err(error) => return accounts_reload_failed(&provider, &error),
-        }
-    }
-    for (id, manager) in &state.account_managers.generic {
-        match manager.lock().await.reload() {
-            Ok(result) => {
-                reloaded.insert(id.clone(), result);
+            // The first failure is logged where it is answered; the rest here.
+            Err(error) if first_failure.is_some() => {
+                tracing::warn!(%provider, error = %error_chain(&error), "account pool reload failed");
             }
-            Err(error) => return accounts_reload_failed(id, &error),
+            Err(error) => first_failure = Some((provider, error)),
         }
     }
 
-    // Reloading accounts can add a provider that now has credentials to fetch models with.
+    // Reloading accounts can add a provider that now has credentials to fetch
+    // models with; that holds for the pools that reloaded even when one failed.
     let refresh_state = state.clone();
     tokio::spawn(async move { refresh_model_catalog(&refresh_state).await });
+    if let Some((provider, error)) = first_failure {
+        return accounts_reload_failed(&provider, &error);
+    }
 
     Json(json!({"reloaded": reloaded, "generated_at": now_iso()})).into_response()
 }
@@ -1752,7 +1903,7 @@ async fn count_tokens(State(state): State<AppState>, headers: HeaderMap, body: B
     let Some(model_id) = required_model(&body) else {
         return AppError::simple(StatusCode::BAD_REQUEST, "model is required").into_response();
     };
-    let (provider, model) = match resolve_model(&state, model_id) {
+    let (provider, model) = match resolve_model(&state, model_id).await {
         Ok(resolved) => resolved,
         Err(error) => return error.into_response(),
     };
@@ -1825,17 +1976,35 @@ fn parse_request(state: &AppState, headers: &HeaderMap, body: &[u8]) -> Result<V
 }
 
 /// The Provider a client's model id resolves to and the id that Provider is asked for, or the
-/// 400 that refuses it: an id nobody claims, or one outside its Provider's allow list.
-fn resolve_model(state: &AppState, model_id: &str) -> Result<(ProviderId, String), AppError> {
+/// 4xx that refuses it: an id nobody claims (400), a bare id its maker cannot serve (404, naming
+/// the prefixed ids that can), or one outside its Provider's allow list (400).
+async fn resolve_model(state: &AppState, model_id: &str) -> Result<(ProviderId, String), AppError> {
+    // Whether the pool of the model's maker can serve now, read before the
+    // catalog lock: the account managers are behind async locks.
+    let origin = crate::models::bare_origin(model_id, &state.config.providers);
+    let pool = match origin {
+        Some(kind) => maker_pool(state, kind).await,
+        None => MakerPool::Empty,
+    };
     let catalog = state.catalog.read().expect("catalog lock poisoned");
-    let provider = catalog
-        .resolve_id(model_id, &state.config.providers)
-        .ok_or_else(|| {
-            AppError::simple(
+    let provider = match catalog.resolve(model_id, &state.config.providers, pool) {
+        Ok(Some(provider)) => provider,
+        Ok(None) => {
+            return Err(AppError::simple(
                 StatusCode::BAD_REQUEST,
                 format!("unknown model: {model_id}"),
-            )
-        })?;
+            ));
+        }
+        // Only a bare id with a maker is refused, so `origin` names who.
+        Err(message) => {
+            return Err(AppError {
+                status: StatusCode::NOT_FOUND,
+                message,
+                error_type: Some("model_not_served"),
+                provider: origin.map(ProviderId::for_kind),
+            });
+        }
+    };
     let model = upstream_model(model_id, &provider);
     if !catalog.allows(&provider, model) {
         return Err(model_not_allowed(model_id, model, provider));
@@ -1891,7 +2060,7 @@ struct ResolvedRequest {
 }
 
 /// Resolve a client body to a routed request, or the error to return.
-fn resolve_route_request(
+async fn resolve_route_request(
     state: &AppState,
     headers: &HeaderMap,
     body: &Value,
@@ -1903,7 +2072,7 @@ fn resolve_route_request(
             "model is required",
         ));
     };
-    let (provider, model) = resolve_model(state, model_id)?;
+    let (provider, model) = resolve_model(state, model_id).await?;
     check_fallback_models(state, &provider, body)?;
     Ok(ResolvedRequest {
         model,
@@ -1919,7 +2088,7 @@ async fn route_provider_request(
     body: &Value,
     route: RequestRoute,
 ) -> Response {
-    let request = match resolve_route_request(state, headers, body, route) {
+    let request = match resolve_route_request(state, headers, body, route).await {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
@@ -1971,6 +2140,12 @@ async fn route_provider_request(
                 // dialect, so nothing is refused here. A future route must
                 // decide: Translation::between forces the choice.
                 route_grok_request(state, headers, body, route, &request, &account).await
+            }
+            ProviderKind::Antigravity => {
+                // Antigravity speaks Gemini; the route translates the client's
+                // dialect onto Chat and Chat onto the Gemini envelope, so every
+                // inbound dialect is served the same way grok serves it.
+                route_antigravity_request(state, headers, body, route, &request, &account).await
             }
             ProviderKind::Anthropic => {
                 route_anthropic_request(state, headers, body, route, &request, &account).await
@@ -2041,6 +2216,27 @@ async fn route_refusal(
     .into_response()
 }
 
+/// What a built-in maker's pool can do now, for bare-id routing. The serving
+/// count leaves Disabled accounts out, so a pool with none serving is either
+/// all Disabled or empty.
+async fn maker_pool(state: &AppState, kind: ProviderKind) -> MakerPool {
+    let manager = match kind {
+        ProviderKind::Anthropic => &state.account_managers.anthropic,
+        ProviderKind::Codex => &state.account_managers.codex,
+        ProviderKind::Grok => &state.account_managers.grok,
+        ProviderKind::Antigravity => &state.account_managers.antigravity,
+        ProviderKind::Generic => return MakerPool::Empty,
+    };
+    let manager = manager.lock().await;
+    if manager.account_count() > 0 {
+        MakerPool::Serving
+    } else if manager.disabled_count() > 0 {
+        MakerPool::AllDisabled
+    } else {
+        MakerPool::Empty
+    }
+}
+
 async fn provider_account_count(state: &AppState, provider: ProviderId) -> usize {
     match provider.kind {
         ProviderKind::Anthropic => state
@@ -2051,6 +2247,12 @@ async fn provider_account_count(state: &AppState, provider: ProviderId) -> usize
             .account_count(),
         ProviderKind::Codex => state.account_managers.codex.lock().await.account_count(),
         ProviderKind::Grok => state.account_managers.grok.lock().await.account_count(),
+        ProviderKind::Antigravity => state
+            .account_managers
+            .antigravity
+            .lock()
+            .await
+            .account_count(),
         ProviderKind::Generic => {
             let Some(manager) = state.account_managers.generic.get(provider.id.as_ref()) else {
                 return 0;
@@ -2281,6 +2483,92 @@ async fn route_grok_request(
         .await
     {
         Ok(response) => {
+            record_json_result(state, account.provider.clone(), account, &response, model).await;
+            json_upstream_response(response, &account.provider, route, model, &BTreeMap::new())
+        }
+        Err(error) => {
+            upstream_failure_response(state, account.provider.clone(), account, &error).await
+        }
+    }
+}
+
+async fn route_antigravity_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &Value,
+    route: RequestRoute,
+    request: &ResolvedRequest,
+    account: &AvailableAccount,
+) -> Response {
+    let model = request.model.as_str();
+    let chat = upstream_request_body(ProviderKind::Antigravity, route, body, model);
+    let upstream_body =
+        match antigravity_envelope(&chat, model, account.token.project_id.as_deref()) {
+            Ok(envelope) => envelope,
+            Err(reason) => {
+                // The relay's own refusal of the body: the account is not at fault.
+                record_provider_refusal(state, &account.provider, account).await;
+                return AppError::provider(
+                    StatusCode::BAD_REQUEST,
+                    reason,
+                    "invalid_request_error",
+                    account.provider.clone(),
+                )
+                .into_response();
+            }
+        };
+    if request.client_wants_stream {
+        return match state
+            .upstream
+            .antigravity_generate_stream(UpstreamRequest {
+                body: upstream_body,
+                request_headers: headers_to_map(headers),
+                account: account.clone(),
+                config: cloaked_config(state),
+                conversation: request.conversation.clone(),
+                threading: Threading::Plain,
+            })
+            .await
+        {
+            Ok(response) => {
+                let accounting = stream_accounting(
+                    state,
+                    account.provider.clone(),
+                    account,
+                    response.status,
+                    response.retry_hint,
+                    response.quota.clone(),
+                    model,
+                )
+                .await;
+                sse_upstream_response(
+                    response,
+                    account.provider.clone(),
+                    route,
+                    model,
+                    accounting,
+                    Arc::new(BTreeMap::new()),
+                )
+            }
+            Err(error) => {
+                upstream_failure_response(state, account.provider.clone(), account, &error).await
+            }
+        };
+    }
+    match state
+        .upstream
+        .antigravity_generate(UpstreamRequest {
+            body: upstream_body,
+            request_headers: headers_to_map(headers),
+            account: account.clone(),
+            config: cloaked_config(state),
+            conversation: request.conversation.clone(),
+            threading: Threading::Plain,
+        })
+        .await
+    {
+        Ok(response) => {
+            let response = antigravity_json(response, model);
             record_json_result(state, account.provider.clone(), account, &response, model).await;
             json_upstream_response(response, &account.provider, route, model, &BTreeMap::new())
         }
@@ -3151,6 +3439,7 @@ async fn next_provider_account(
         ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
         ProviderKind::Codex => state.account_managers.codex.lock().await,
         ProviderKind::Grok => state.account_managers.grok.lock().await,
+        ProviderKind::Antigravity => state.account_managers.antigravity.lock().await,
         ProviderKind::Generic => {
             let Some(manager) = state.account_managers.generic.get(provider.id.as_ref()) else {
                 return Err(AppError::provider(
@@ -3269,6 +3558,7 @@ async fn record_provider_success(
         ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
         ProviderKind::Codex => state.account_managers.codex.lock().await,
         ProviderKind::Grok => state.account_managers.grok.lock().await,
+        ProviderKind::Antigravity => state.account_managers.antigravity.lock().await,
         ProviderKind::Generic => {
             let Some(manager) = state.account_managers.generic.get(provider.id.as_ref()) else {
                 return;
@@ -3314,6 +3604,7 @@ async fn record_provider_refusal(
         ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
         ProviderKind::Codex => state.account_managers.codex.lock().await,
         ProviderKind::Grok => state.account_managers.grok.lock().await,
+        ProviderKind::Antigravity => state.account_managers.antigravity.lock().await,
         ProviderKind::Generic => {
             let Some(manager) = state.account_managers.generic.get(provider.id.as_ref()) else {
                 return;
@@ -3340,6 +3631,7 @@ async fn record_provider_quota(
         ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
         ProviderKind::Codex => state.account_managers.codex.lock().await,
         ProviderKind::Grok => state.account_managers.grok.lock().await,
+        ProviderKind::Antigravity => state.account_managers.antigravity.lock().await,
         ProviderKind::Generic => {
             let Some(manager) = state.account_managers.generic.get(provider.id.as_ref()) else {
                 return;
@@ -3377,6 +3669,7 @@ async fn record_billing_cooldown(
         ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
         ProviderKind::Codex => state.account_managers.codex.lock().await,
         ProviderKind::Grok => state.account_managers.grok.lock().await,
+        ProviderKind::Antigravity => state.account_managers.antigravity.lock().await,
         ProviderKind::Generic => {
             let Some(manager) = state.account_managers.generic.get(provider.id.as_ref()) else {
                 return;
@@ -3414,12 +3707,13 @@ async fn record_provider_failure(
     detail: Option<&str>,
     retry_hint: Option<Duration>,
 ) {
-    // 400/402 by themselves say nothing about account health — a malformed request is
-    // the client's fault, and a drained balance is recorded by the failover path with
-    // the billing kind instead. Recording both would count the failure twice, widening
-    // one request's cooldown. The request still happened, though: count it as a refusal
-    // so it reaches an outcome without touching the account's health.
-    if status == StatusCode::BAD_REQUEST || status == StatusCode::PAYMENT_REQUIRED {
+    // 400/402/404 by themselves say nothing about account health — a malformed request
+    // is the client's fault, a 404 is the upstream refusing a model or path it does not
+    // have (ADR-0034), and a drained balance is recorded by the failover path with the
+    // billing kind instead. Recording both would count the failure twice, widening one
+    // request's cooldown. The request still happened, though: count it as a refusal so
+    // it reaches an outcome without touching the account's health.
+    if matches!(status.as_u16(), 400 | 402 | 404) {
         // The request reached an outcome here. If the body turns out to be
         // billing-scoped, the failover path adds the cooldown without
         // recording a second outcome (`record_billing_cooldown`).
@@ -3450,6 +3744,7 @@ async fn record_provider_failure_kind(
         ProviderKind::Anthropic => state.account_managers.anthropic.lock().await,
         ProviderKind::Codex => state.account_managers.codex.lock().await,
         ProviderKind::Grok => state.account_managers.grok.lock().await,
+        ProviderKind::Antigravity => state.account_managers.antigravity.lock().await,
         ProviderKind::Generic => {
             let Some(manager) = state.account_managers.generic.get(provider.id.as_ref()) else {
                 return;
@@ -3681,8 +3976,12 @@ struct SseStreamStates {
     chat: ChatStreamState,
     responses: ResponsesStreamState,
     anthropic: AnthropicStreamState,
+    antigravity: AntigravityChunkState,
     usage: crate::types::UsageData,
     completed: bool,
+    /// The message of an in-band error frame the upstream sent, which ends the
+    /// stream as a failure.
+    stream_error: Option<String>,
     refusal_next_index: u64,
     refusal_open_index: Option<u64>,
 }
@@ -3693,8 +3992,10 @@ impl SseStreamStates {
             chat: ChatStreamState::new(model),
             responses: ResponsesStreamState::new(model),
             anthropic: AnthropicStreamState::new(model),
+            antigravity: AntigravityChunkState::new(model),
             usage: crate::types::UsageData::default(),
             completed: false,
+            stream_error: None,
             refusal_next_index: 0,
             refusal_open_index: None,
         }
@@ -3721,6 +4022,11 @@ fn translated_sse_event(
         &mut states.usage,
         &mut states.completed,
     );
+    if provider.kind == ProviderKind::Antigravity
+        && let Some(message) = antigravity_stream_error_message(raw)
+    {
+        states.stream_error = Some(message);
+    }
     forward_refusal_event(
         provider,
         route,
@@ -3737,6 +4043,7 @@ fn translated_sse_event(
             &mut states.chat,
             &mut states.responses,
             &mut states.anthropic,
+            &mut states.antigravity,
             event,
             raw,
             tool_reverse,
@@ -3809,19 +4116,43 @@ fn transformed_sse_stream(
                 yield Bytes::from(chunk);
             }
         }
-        // The Messages message a generic endpoint's stream became is closed
-        // here and nowhere else: a stream that stopped before any
-        // finish_reason still owes the client the tool calls it announced
-        // and a message_stop, and usage often arrives after finish_reason.
-        if Translation::between(provider.kind, route).closes_its_own_stream() {
-            for chunk in finish_chat_stream(&mut states.anthropic) {
+        // The Messages message a chat-shaped stream became is closed here and
+        // nowhere else, because usage often arrives after finish_reason. A
+        // stream that already sent an error event gets nothing more.
+        if Translation::between(provider.kind, route).closes_its_own_stream()
+            && states.stream_error.is_none()
+        {
+            // A reply the upstream finished — a `finish_reason`, or `[DONE]`
+            // alone — closes as a turn; one it cut ends in an error event, as a
+            // cut Chat stream ends without `[DONE]`.
+            let tail = if states.completed || states.anthropic.chat_finished() {
+                finish_chat_stream(&mut states.anthropic)
+            } else {
+                cut_chat_stream(&mut states.anthropic)
+            };
+            for chunk in tail {
                 yield Bytes::from(chunk);
             }
         }
-        if states.completed {
-            record_stream_success(accounting.as_ref(), &states.usage).await;
-        } else {
-            record_stream_failure(accounting.as_ref(), "stream terminated before completion").await;
+        // Gemini streams end at `finishReason` with no `[DONE]`; a Chat client
+        // waits for the terminator, so it is written here, and only when the
+        // upstream finished the reply: a cut stream must not read as complete.
+        if provider.kind == ProviderKind::Antigravity
+            && route == RequestRoute::Chat
+            && states.completed
+            && states.stream_error.is_none()
+        {
+            yield Bytes::from("data: [DONE]\n\n");
+        }
+        match &states.stream_error {
+            Some(message) => record_stream_failure(accounting.as_ref(), message).await,
+            None if states.completed => {
+                record_stream_success(accounting.as_ref(), &states.usage).await;
+            }
+            None => {
+                record_stream_failure(accounting.as_ref(), "stream terminated before completion")
+                    .await;
+            }
         }
     })
 }
@@ -3876,6 +4207,25 @@ fn update_stream_usage(
         // and servers that opt into usage carry it on a late chunk (often
         // the last before [DONE]) in the same shape as the streamed body.
         ProviderKind::Grok | ProviderKind::Generic => update_generic_stream_usage(&data, usage),
+        ProviderKind::Antigravity => update_antigravity_stream_usage(&data, usage, completed),
+    }
+}
+
+fn update_antigravity_stream_usage(data: &Value, usage: &mut UsageData, completed: &mut bool) {
+    // Every SSE line is the envelope: `{"response": {<gemini chunk>}}`.
+    let gemini = data.get("response").unwrap_or(data);
+    if let Some(next) = gemini_usage(gemini.get("usageMetadata")) {
+        usage.input_tokens = int_field_or(&next, "prompt_tokens", usage.input_tokens);
+        usage.output_tokens = output_from(&next).unwrap_or(usage.output_tokens);
+        usage.cache_read_input_tokens =
+            cache_read_from(&next).unwrap_or(usage.cache_read_input_tokens);
+        usage.reasoning_output_tokens =
+            reasoning_from(&next).unwrap_or(usage.reasoning_output_tokens);
+    }
+    // Gemini closes a stream with a `finishReason` and no `[DONE]`, so this is
+    // the one place a streamed reply is known to be complete.
+    if crate::translate::gemini_turn_ended(gemini) {
+        *completed = true;
     }
 }
 
@@ -4038,6 +4388,7 @@ fn transform_sse_event(
     chat_state: &mut ChatStreamState,
     responses_state: &mut ResponsesStreamState,
     anthropic_state: &mut AnthropicStreamState,
+    antigravity_state: &mut AntigravityChunkState,
     event: &str,
     raw: &str,
     tool_reverse: &BTreeMap<String, String>,
@@ -4051,7 +4402,7 @@ fn transform_sse_event(
             // A Responses client's stream already closed with
             // response.completed (the finish_reason chunk); the chat
             // terminator itself is not part of its dialect.
-            (ProviderKind::Grok, RequestRoute::Responses) => Vec::new(),
+            (ProviderKind::Grok | ProviderKind::Antigravity, RequestRoute::Responses) => Vec::new(),
             // Chat Completions clients — generic upstreams included — end
             // their stream with [DONE]; dropping it hangs parsers that wait
             // for the terminator.
@@ -4113,10 +4464,77 @@ fn transform_sse_event(
             |_| Vec::new(),
             |data| chat_sse_to_anthropic(&data, anthropic_state),
         ),
+        // Antigravity streams Gemini chunks. Each one becomes a Chat chunk
+        // first, then the client's dialect, so the same converters serve it as
+        // serve grok and a configured endpoint.
+        (ProviderKind::Antigravity, _) => parsed.map_or_else(
+            |_| Vec::new(),
+            |data| {
+                if let Some(error) = data.get("error").filter(|error| !error.is_null()) {
+                    return antigravity_error_event(error, route);
+                }
+                let gemini = data.get("response").cloned().unwrap_or(data);
+                antigravity_state
+                    .chunk(&gemini)
+                    .map_or_else(Vec::new, |mut chunk| match route {
+                        RequestRoute::Chat => {
+                            // Gemini repeats its cumulative usage on every chunk;
+                            // a Chat client is told once, on the final one. The
+                            // relay's own count reads the raw frames.
+                            if chunk["choices"][0]["finish_reason"].is_null()
+                                && let Some(object) = chunk.as_object_mut()
+                            {
+                                object.remove("usage");
+                            }
+                            vec![sse(&chunk, None)]
+                        }
+                        RequestRoute::Messages => chat_sse_to_anthropic(&chunk, anthropic_state),
+                        RequestRoute::Responses => {
+                            chat_sse_to_responses(&chunk, responses_state, model)
+                        }
+                    })
+            },
+        ),
         (ProviderKind::Generic, _) => parsed.map_or_else(
             |_| Vec::new(),
             |data| vec![sse(&data, passthrough_event(event))],
         ),
+    }
+}
+
+/// The message of an in-band error frame, `data: {"error": {...}}`.
+fn antigravity_stream_error_message(raw: &str) -> Option<String> {
+    let data = serde_json::from_str::<Value>(raw).ok()?;
+    let error = data.get("error").filter(|error| !error.is_null())?;
+    Some(
+        error
+            .get("message")
+            .and_then(Value::as_str)
+            .map_or_else(|| error.to_string(), ToString::to_string),
+    )
+}
+
+/// An in-band upstream error in the client's dialect: a data frame carrying
+/// `error` for Chat, and the `error` event Messages and Responses define.
+fn antigravity_error_event(error: &Value, route: RequestRoute) -> Vec<String> {
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .map_or_else(|| error.to_string(), ToString::to_string);
+    let code = error.get("status").cloned().unwrap_or(Value::Null);
+    match route {
+        RequestRoute::Chat => vec![sse(
+            &json!({"error": {"message": message, "type": "upstream_error", "code": code}}),
+            None,
+        )],
+        RequestRoute::Messages => vec![sse(
+            &json!({"type": "error", "error": {"type": "api_error", "message": message}}),
+            Some("error"),
+        )],
+        RequestRoute::Responses => vec![sse(
+            &json!({"type": "error", "code": code, "message": message, "param": Value::Null}),
+            Some("error"),
+        )],
     }
 }
 
@@ -4173,18 +4591,23 @@ impl Translation {
             (ProviderKind::Codex, RequestRoute::Chat) => Self::ChatToResponses,
             (ProviderKind::Codex, RequestRoute::Messages) => Self::AnthropicToResponses,
             // Grok rides the generic chat translation for Messages and adds
-            // a Responses converter of its own.
-            (ProviderKind::Grok | ProviderKind::Generic, RequestRoute::Messages) => {
-                Self::AnthropicToChat
+            // a Responses converter of its own. Antigravity's route takes the
+            // client's dialect to Chat before the Gemini envelope, so it rides
+            // the same pair.
+            (
+                ProviderKind::Grok | ProviderKind::Antigravity | ProviderKind::Generic,
+                RequestRoute::Messages,
+            ) => Self::AnthropicToChat,
+            (ProviderKind::Grok | ProviderKind::Antigravity, RequestRoute::Responses) => {
+                Self::ResponsesToChat
             }
-            (ProviderKind::Grok, RequestRoute::Responses) => Self::ResponsesToChat,
             // The pairs where the client already speaks the upstream's
             // dialect, plus (Generic, Responses), which routing answers 501
             // before an account is chosen. The arms are here so the match is
             // total, not because each is reachable.
             (ProviderKind::Anthropic, RequestRoute::Messages)
             | (ProviderKind::Codex, RequestRoute::Responses)
-            | (ProviderKind::Grok, RequestRoute::Chat)
+            | (ProviderKind::Grok | ProviderKind::Antigravity, RequestRoute::Chat)
             | (ProviderKind::Generic, RequestRoute::Chat | RequestRoute::Responses) => Self::Native,
         }
     }
@@ -4281,12 +4704,24 @@ async fn send_json(
     body: Value,
     timeout_ms: u64,
 ) -> anyhow::Result<UpstreamJsonResponse> {
+    send_json_ref(client, url, headers, &body, timeout_ms).await
+}
+
+/// [`send_json`] for a body the caller keeps, so a retry sends the same one
+/// without a copy.
+async fn send_json_ref(
+    client: reqwest::Client,
+    url: String,
+    headers: BTreeMap<String, String>,
+    body: &Value,
+    timeout_ms: u64,
+) -> anyhow::Result<UpstreamJsonResponse> {
     let model = body
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or("claude-sonnet-4-6")
         .to_string();
-    let response = build_upstream_request(&client, &url, headers, &body)
+    let response = build_upstream_request(&client, &url, headers, body)
         .timeout(Duration::from_millis(timeout_ms))
         .send()
         .await?;
@@ -4310,6 +4745,13 @@ async fn send_json(
         retry_hint,
         quota,
     })
+}
+
+/// Anthropic's model list, in one page. The API's default page is 20 models,
+/// and a model past it would read as one anthropic does not serve; 1000 is the
+/// largest page the List Models API takes.
+fn anthropic_models_url() -> String {
+    format!("{ANTHROPIC_BASE_URL}/v1/models?limit=1000")
 }
 
 async fn send_get(
@@ -4343,10 +4785,22 @@ async fn send_stream(
     body: Value,
     silence_ms: u64,
 ) -> anyhow::Result<UpstreamSseResponse> {
+    send_stream_ref(client, url, headers, &body, silence_ms).await
+}
+
+/// [`send_stream`] for a body the caller keeps, so a retry sends the same one
+/// without a copy.
+async fn send_stream_ref(
+    client: reqwest::Client,
+    url: String,
+    headers: BTreeMap<String, String>,
+    body: &Value,
+    silence_ms: u64,
+) -> anyhow::Result<UpstreamSseResponse> {
     let silence = Duration::from_millis(silence_ms);
     let response = tokio::time::timeout(
         silence,
-        build_upstream_request(&client, &url, headers, &body).send(),
+        build_upstream_request(&client, &url, headers, body).send(),
     )
     .await
     .map_err(|_| silence_error(silence))??;
@@ -4494,6 +4948,125 @@ async fn send_grok_stream(
             Ok::<Bytes, anyhow::Error>(Bytes::from(bytes))
         })),
     })
+}
+
+/// Send one antigravity generate call to `base` and return the upstream's own
+/// reply. A 426 naming a minimum Hub version raises `floor` and is retried once
+/// with it; the route translates whatever comes back.
+async fn send_antigravity_json(
+    client: reqwest::Client,
+    base: &str,
+    floor: &VersionFloor,
+    account: &AvailableAccount,
+    envelope: Value,
+    timeout_ms: u64,
+) -> anyhow::Result<UpstreamJsonResponse> {
+    let url = format!("{base}{ANTIGRAVITY_GENERATE_PATH}");
+    let sent = floor.current();
+    let first = send_json_ref(
+        client.clone(),
+        url.clone(),
+        antigravity_headers_for(account, &sent),
+        &envelope,
+        timeout_ms,
+    )
+    .await?;
+    if first.status.as_u16() == 426
+        && let Some(version) = floor.after_426(&first.body.to_string(), &sent)
+    {
+        return send_json_ref(
+            client,
+            url,
+            antigravity_headers_for(account, &version),
+            &envelope,
+            timeout_ms,
+        )
+        .await;
+    }
+    Ok(first)
+}
+
+/// An antigravity reply in the shape the rest of the relay reads: the envelope
+/// unwrapped into Chat on success, and the provider's own `retryDelay` taken as
+/// the retry hint when no header named one.
+fn antigravity_json(mut response: UpstreamJsonResponse, model: &str) -> UpstreamJsonResponse {
+    if response.status.is_success() {
+        let gemini = antigravity_unwrap(response.body);
+        response.body = crate::translate::antigravity_response(&gemini, model);
+    } else if response.retry_hint.is_none() {
+        // Cloud Code names its wait in the body, not in a header.
+        response.retry_hint = antigravity_retry_delay(&response.body);
+    }
+    response
+}
+
+/// The stream twin of [`send_antigravity_json`]. A streamed Gemini chunk stays
+/// in its own dialect here: `transform_sse_event` rewrites each one to Chat and
+/// then to the client's dialect, so the frame splitting stays in one place.
+async fn send_antigravity_stream(
+    client: reqwest::Client,
+    base: &str,
+    floor: &VersionFloor,
+    account: &AvailableAccount,
+    envelope: Value,
+    silence_ms: u64,
+) -> anyhow::Result<UpstreamSseResponse> {
+    let url = format!("{base}{ANTIGRAVITY_STREAM_PATH}");
+    let sent = floor.current();
+    let first = send_stream_ref(
+        client.clone(),
+        url.clone(),
+        antigravity_headers_for(account, &sent),
+        &envelope,
+        silence_ms,
+    )
+    .await?;
+    if first.status.is_success() {
+        return Ok(first);
+    }
+    let (first, text) = antigravity_stream_error(first).await?;
+    if first.status.as_u16() == 426
+        && let Some(version) = floor.after_426(&text, &sent)
+    {
+        let retried = send_stream_ref(
+            client,
+            url,
+            antigravity_headers_for(account, &version),
+            &envelope,
+            silence_ms,
+        )
+        .await?;
+        if retried.status.is_success() {
+            return Ok(retried);
+        }
+        return Ok(antigravity_stream_error(retried).await?.0);
+    }
+    Ok(first)
+}
+
+/// A failed stream's body read whole: it is a short JSON document, not an
+/// event stream, and it carries the 426 floor and the `retryDelay` hint.
+async fn antigravity_stream_error(
+    response: UpstreamSseResponse,
+) -> anyhow::Result<(UpstreamSseResponse, String)> {
+    let bytes = response.body.try_collect::<Vec<Bytes>>().await?.concat();
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    let retry_hint = response.retry_hint.or_else(|| {
+        serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|body| antigravity_retry_delay(&body))
+    });
+    Ok((
+        UpstreamSseResponse {
+            status: response.status,
+            retry_hint,
+            quota: response.quota,
+            body: Box::pin(futures_util::stream::once(async move {
+                Ok::<Bytes, anyhow::Error>(Bytes::from(bytes))
+            })),
+        },
+        text,
+    ))
 }
 
 fn decode_upstream_body(headers: &HeaderMap, bytes: &[u8], model: &str) -> Value {
@@ -4940,6 +5513,7 @@ mod tests {
             id_token: None,
             last_refresh_at: None,
             plan_type: None,
+            project_id: None,
         }
     }
 
@@ -5406,6 +5980,7 @@ mod tests {
                 ("anthropic".to_string(), Priority),
                 ("codex".to_string(), RoundRobin),
                 ("grok".to_string(), Priority),
+                ("antigravity".to_string(), Priority),
                 ("groq".to_string(), RoundRobin),
                 ("mistral".to_string(), Priority),
             ])
@@ -5909,6 +6484,7 @@ mod tests {
                 id_token: None,
                 last_refresh_at: None,
                 plan_type: None,
+                project_id: None,
             },
             device_id: "device".to_string(),
             account_uuid: String::new(),
@@ -6264,6 +6840,7 @@ mod tests {
                 anthropic: tokio::sync::Mutex::new(manager(tmp, ProviderId::anthropic())),
                 codex: tokio::sync::Mutex::new(manager(tmp, ProviderId::codex())),
                 grok: tokio::sync::Mutex::new(manager(tmp, ProviderId::grok())),
+                antigravity: tokio::sync::Mutex::new(manager(tmp, ProviderId::antigravity())),
                 generic: std::collections::BTreeMap::new(),
             }),
             rate_limit_buckets: Arc::new(Mutex::new(std::collections::BTreeMap::<
@@ -6299,6 +6876,7 @@ mod tests {
                 id_token: None,
                 last_refresh_at: None,
                 plan_type: None,
+                project_id: None,
             },
         )
         .expect("save codex token");
@@ -6945,6 +7523,534 @@ mod tests {
         assert_eq!(
             conversation_key(&HeaderMap::new(), &long, RequestRoute::Messages),
             conversation_key(&HeaderMap::new(), &grown, RequestRoute::Messages)
+        );
+    }
+
+    // ---- antigravity: the client boundary ------------------------------------
+
+    fn antigravity_account(project: Option<&str>) -> AvailableAccount {
+        AvailableAccount {
+            token: TokenData {
+                access_token: "google-access".to_string(),
+                refresh_token: "google-refresh".to_string(),
+                email: "operator@example.com".to_string(),
+                expires_at: "2030-01-01T00:00:00Z".to_string(),
+                account_uuid: String::new(),
+                provider: ProviderId::antigravity(),
+                id_token: None,
+                last_refresh_at: None,
+                plan_type: None,
+                project_id: project.map(ToString::to_string),
+            },
+            device_id: "device".to_string(),
+            account_uuid: String::new(),
+            provider: ProviderId::antigravity(),
+            chatgpt_account_id: None,
+        }
+    }
+
+    /// One request the local Cloud Code saw.
+    #[derive(Debug, Clone)]
+    struct SeenRequest {
+        agent: String,
+        body: Vec<u8>,
+    }
+
+    /// A local Cloud Code: each request gets the next scripted
+    /// `(status, body)`; the last one repeats. Returns the address and every
+    /// request it saw, `User-Agent` and body.
+    async fn serve_cloud_code(
+        script: Vec<(u16, &'static str)>,
+    ) -> (std::net::SocketAddr, Arc<Mutex<Vec<SeenRequest>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("bound address");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let script = Arc::new(script);
+        tokio::spawn(async move {
+            let app =
+                axum::Router::new().fallback(move |headers: HeaderMap, body: axum::body::Bytes| {
+                    let log = Arc::clone(&log);
+                    let script = Arc::clone(&script);
+                    async move {
+                        let agent = headers
+                            .get("user-agent")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        let index = {
+                            let mut log = log.lock().expect("log");
+                            log.push(SeenRequest {
+                                agent,
+                                body: body.to_vec(),
+                            });
+                            log.len() - 1
+                        };
+                        let (status, body) = script[index.min(script.len() - 1)];
+                        (
+                            StatusCode::from_u16(status).expect("status"),
+                            [("content-type", "application/json")],
+                            body,
+                        )
+                    }
+                });
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, seen)
+    }
+
+    const GEMINI_OK: &str = r#"{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"pong"}]},"finishReason":"STOP"}]}}"#;
+    const UPGRADE_426: &str =
+        r#"{"error":{"code":426,"message":"Please update to version 99.0.0 or later."}}"#;
+    const EXHAUSTED_429: &str = r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"42s"}]}}"#;
+
+    /// AC-6 / F13: a 426 naming a newer Hub version is retried once, with it.
+    #[tokio::test]
+    async fn an_antigravity_426_is_retried_once_with_the_named_version() {
+        let (addr, seen) = serve_cloud_code(vec![(426, UPGRADE_426), (200, GEMINI_OK)]).await;
+        let floor = crate::upstream::VersionFloor::new("2.35.2");
+        let response = super::send_antigravity_json(
+            reqwest::Client::new(),
+            &format!("http://{addr}"),
+            &floor,
+            &antigravity_account(Some("p")),
+            json!({"model": "gemini-4-neon-low"}),
+            5_000,
+        )
+        .await
+        .expect("the local upstream answers");
+        assert_eq!(response.status, StatusCode::OK);
+        let seen = seen.lock().expect("seen");
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(
+            seen[1].agent.starts_with("antigravity/hub/99.0.0"),
+            "{seen:?}"
+        );
+        // N14: the retry sends the very envelope the first try did.
+        assert!(!seen[0].body.is_empty());
+        assert_eq!(seen[1].body, seen[0].body);
+    }
+
+    /// L4 / F13: a stream whose 426 retry is refused still hands back the
+    /// `retryDelay` its body names.
+    #[tokio::test]
+    async fn a_refused_antigravity_stream_retry_keeps_its_retry_delay() {
+        let (addr, seen) = serve_cloud_code(vec![(426, UPGRADE_426), (429, EXHAUSTED_429)]).await;
+        let floor = crate::upstream::VersionFloor::new("2.35.2");
+        let response = super::send_antigravity_stream(
+            reqwest::Client::new(),
+            &format!("http://{addr}"),
+            &floor,
+            &antigravity_account(Some("p")),
+            json!({"model": "gemini-4-neon-low"}),
+            5_000,
+        )
+        .await
+        .expect("the local upstream answers");
+        assert_eq!(response.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.retry_hint,
+            Some(std::time::Duration::from_secs(42))
+        );
+        assert_eq!(seen.lock().expect("seen").len(), 2);
+    }
+
+    /// F13: a failed stream with no 426 reads its `retryDelay` too.
+    #[tokio::test]
+    async fn a_refused_antigravity_stream_reads_its_retry_delay() {
+        let (addr, _) = serve_cloud_code(vec![(429, EXHAUSTED_429)]).await;
+        let floor = crate::upstream::VersionFloor::new("2.35.2");
+        let response = super::send_antigravity_stream(
+            reqwest::Client::new(),
+            &format!("http://{addr}"),
+            &floor,
+            &antigravity_account(Some("p")),
+            json!({"model": "gemini-4-neon-low"}),
+            5_000,
+        )
+        .await
+        .expect("the local upstream answers");
+        assert_eq!(
+            response.retry_hint,
+            Some(std::time::Duration::from_secs(42))
+        );
+    }
+
+    /// F13: the reply the route reads is unwrapped and translated; a 429's
+    /// body names the hint unless a header already did.
+    #[test]
+    fn antigravity_json_unwraps_and_reads_the_retry_delay() {
+        let ok = super::antigravity_json(
+            UpstreamJsonResponse {
+                status: StatusCode::OK,
+                body: serde_json::from_str(GEMINI_OK).expect("json"),
+                retry_hint: None,
+                quota: None,
+            },
+            "gemini-4-neon-low",
+        );
+        assert_eq!(ok.body["object"], "chat.completion");
+        assert_eq!(ok.body["choices"][0]["message"]["content"], "pong");
+
+        let exhausted = |retry_hint| UpstreamJsonResponse {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            body: serde_json::from_str(EXHAUSTED_429).expect("json"),
+            retry_hint,
+            quota: None,
+        };
+        assert_eq!(
+            super::antigravity_json(exhausted(None), "m").retry_hint,
+            Some(std::time::Duration::from_secs(42))
+        );
+        // A header the vendor sent wins over the body.
+        assert_eq!(
+            super::antigravity_json(exhausted(Some(std::time::Duration::from_secs(7))), "m")
+                .retry_hint,
+            Some(std::time::Duration::from_secs(7))
+        );
+    }
+
+    /// F7: a failed catalog fetch is an error, so the last list stays; only an
+    /// account without a project falls back to the floor.
+    #[tokio::test]
+    async fn a_failed_antigravity_catalog_fetch_is_an_error() {
+        let (addr, _) = serve_cloud_code(vec![(503, r#"{"error":{"code":503}}"#)]).await;
+        let base = format!("http://{addr}");
+        let failed = super::fetch_antigravity_models(
+            reqwest::Client::new(),
+            &base,
+            &antigravity_account(Some("p")),
+            5_000,
+        )
+        .await;
+        assert!(failed.is_err(), "{failed:?}");
+
+        let floor = super::fetch_antigravity_models(
+            reqwest::Client::new(),
+            &base,
+            &antigravity_account(None),
+            5_000,
+        )
+        .await
+        .expect("the floor");
+        assert!(floor.ids.contains(&"gemini-4-neon-medium".to_string()));
+
+        let (addr, _) =
+            serve_cloud_code(vec![(200, r#"{"models":{"gemini-4-neon-medium":{}}}"#)]).await;
+        let live = super::fetch_antigravity_models(
+            reqwest::Client::new(),
+            &format!("http://{addr}"),
+            &antigravity_account(Some("p")),
+            5_000,
+        )
+        .await
+        .expect("the live list");
+        assert_eq!(live.ids, vec!["gemini-4-neon-medium".to_string()]);
+    }
+
+    /// An upstream double that counts Hub version fetches.
+    #[derive(Default)]
+    struct VersionCountingUpstream {
+        version_fetches: std::sync::atomic::AtomicUsize,
+    }
+
+    impl UpstreamClient for VersionCountingUpstream {
+        fn generic_chat(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn generic_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!()
+        }
+        fn anthropic_messages(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn anthropic_messages_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!()
+        }
+        fn anthropic_count_tokens(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn codex_responses(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn codex_responses_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!()
+        }
+        fn fetch_models(
+            &self,
+            _kind: ProviderKind,
+            _account: AvailableAccount,
+            _config: Arc<Config>,
+        ) -> super::ModelsFuture {
+            Box::pin(async { Ok(FetchedModels::new(vec![])) })
+        }
+        fn fetch_antigravity_version(&self) -> super::VersionFuture {
+            self.version_fetches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { bail!("offline") })
+        }
+    }
+
+    /// F10: the Hub manifest is asked for only while the antigravity pool has
+    /// an account, and on every refresh, not once per process.
+    #[tokio::test]
+    async fn the_hub_version_is_fetched_only_for_an_antigravity_pool() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let upstream = Arc::new(VersionCountingUpstream::default());
+        let state = test_state(tmp.path(), upstream.clone());
+        super::refresh_model_catalog(&state).await;
+        assert_eq!(
+            upstream
+                .version_fetches
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an install with no antigravity account made a call"
+        );
+
+        save_token(tmp.path(), &antigravity_account(Some("p")).token).expect("save");
+        let state = test_state(tmp.path(), upstream.clone());
+        super::refresh_model_catalog(&state).await;
+        super::refresh_model_catalog(&state).await;
+        assert_eq!(
+            upstream
+                .version_fetches
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
+    /// A double whose antigravity catalog fetch answers from a script: `true`
+    /// lists one live id, `false` fails.
+    struct ScriptedCatalogUpstream {
+        answers: Mutex<std::collections::VecDeque<bool>>,
+    }
+
+    impl UpstreamClient for ScriptedCatalogUpstream {
+        fn generic_chat(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn generic_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!()
+        }
+        fn anthropic_messages(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn anthropic_messages_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!()
+        }
+        fn anthropic_count_tokens(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn codex_responses(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn codex_responses_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!()
+        }
+        fn fetch_models(
+            &self,
+            _kind: ProviderKind,
+            _account: AvailableAccount,
+            _config: Arc<Config>,
+        ) -> super::ModelsFuture {
+            let live = self
+                .answers
+                .lock()
+                .expect("answers")
+                .pop_front()
+                .unwrap_or(false);
+            Box::pin(async move {
+                if live {
+                    Ok(FetchedModels::new(vec![
+                        "gemini-4-argon-medium".to_string(),
+                    ]))
+                } else {
+                    bail!("fetchAvailableModels returned 503")
+                }
+            })
+        }
+    }
+
+    fn advertised_antigravity(state: &AppState) -> Vec<String> {
+        state
+            .catalog
+            .read()
+            .expect("catalog")
+            .advertised()
+            .into_iter()
+            .filter(|model| model.provider.kind == ProviderKind::Antigravity)
+            .map(|model| model.id)
+            .collect()
+    }
+
+    /// N6 / AC-2: a real account (it always has a project) whose first fetch
+    /// fails advertises the floor; a live list, once it lands, is never
+    /// replaced by it (F7).
+    #[tokio::test]
+    async fn a_failed_first_antigravity_fetch_advertises_the_floor() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        save_token(tmp.path(), &antigravity_account(Some("p")).token).expect("save");
+        let upstream = Arc::new(ScriptedCatalogUpstream {
+            answers: Mutex::new([false, true, false].into_iter().collect()),
+        });
+        let state = test_state(tmp.path(), upstream);
+
+        super::refresh_model_catalog(&state).await;
+        assert!(
+            advertised_antigravity(&state)
+                .contains(&"antigravity/gemini-4-neon-medium".to_string()),
+            "{:?}",
+            advertised_antigravity(&state)
+        );
+        super::refresh_model_catalog(&state).await;
+        assert_eq!(
+            advertised_antigravity(&state),
+            vec!["antigravity/gemini-4-argon-medium".to_string()]
+        );
+        super::refresh_model_catalog(&state).await;
+        assert_eq!(
+            advertised_antigravity(&state),
+            vec!["antigravity/gemini-4-argon-medium".to_string()],
+            "a failed fetch replaced the live list"
+        );
+    }
+
+    /// A double whose Hub manifest never answers, and whose catalog does.
+    struct SlowManifestUpstream;
+
+    impl UpstreamClient for SlowManifestUpstream {
+        fn generic_chat(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn generic_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!()
+        }
+        fn anthropic_messages(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn anthropic_messages_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!()
+        }
+        fn anthropic_count_tokens(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn codex_responses(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn codex_responses_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!()
+        }
+        fn fetch_models(
+            &self,
+            _kind: ProviderKind,
+            _account: AvailableAccount,
+            _config: Arc<Config>,
+        ) -> super::ModelsFuture {
+            Box::pin(async {
+                Ok(FetchedModels::new(vec![
+                    "gemini-4-argon-medium".to_string(),
+                ]))
+            })
+        }
+        fn fetch_antigravity_version(&self) -> super::VersionFuture {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// N15: a Hub manifest that never answers does not hold up the catalog: the
+    /// refresh returns and the live list is in place while the fetch is still
+    /// out.
+    #[tokio::test]
+    async fn a_slow_hub_manifest_does_not_delay_the_catalog() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        save_token(tmp.path(), &antigravity_account(Some("p")).token).expect("save");
+        let state = test_state(tmp.path(), Arc::new(SlowManifestUpstream));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            super::refresh_model_catalog(&state),
+        )
+        .await
+        .expect("the catalog refresh waited on the manifest");
+        assert_eq!(
+            advertised_antigravity(&state),
+            vec!["antigravity/gemini-4-argon-medium".to_string()]
+        );
+    }
+
+    /// S1: anthropic's list is asked for in one page of up to 1000 models, not
+    /// the API's default 20.
+    #[test]
+    fn anthropic_s_model_list_is_asked_for_in_one_large_page() {
+        let url = url::Url::parse(&super::anthropic_models_url()).expect("url");
+        assert_eq!(url.path(), "/v1/models");
+        assert_eq!(
+            url.query_pairs()
+                .find(|(key, _)| key == "limit")
+                .map(|(_, v)| v.into_owned()),
+            Some("1000".to_string())
+        );
+    }
+
+    /// A double that answers a catalog fetch as the real client does for an
+    /// account with no project: with the floor.
+    struct NoProjectUpstream;
+
+    impl UpstreamClient for NoProjectUpstream {
+        fn generic_chat(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn generic_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!()
+        }
+        fn anthropic_messages(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn anthropic_messages_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!()
+        }
+        fn anthropic_count_tokens(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn codex_responses(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn codex_responses_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!()
+        }
+        fn fetch_models(
+            &self,
+            _kind: ProviderKind,
+            _account: AvailableAccount,
+            _config: Arc<Config>,
+        ) -> super::ModelsFuture {
+            Box::pin(async { Ok(super::antigravity_static_models()) })
+        }
+    }
+
+    /// N2: an account with no project gets the floor, and the floor is not a
+    /// list the upstream gave, so it cannot say antigravity lacks an id that a
+    /// configured endpoint lists.
+    #[tokio::test]
+    async fn a_no_project_account_s_floor_is_not_a_live_list() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        save_token(tmp.path(), &antigravity_account(None).token).expect("save");
+        let state = test_state(tmp.path(), Arc::new(NoProjectUpstream));
+        super::refresh_model_catalog(&state).await;
+        let mut catalog = state.catalog.write().expect("catalog");
+        assert!(catalog.lists(ProviderKind::Antigravity));
+        catalog.set_generic(
+            "opencode",
+            FetchedModels::new(vec!["gemini-3-flash".to_string()]),
+        );
+        assert_eq!(
+            catalog.resolve(
+                "gemini-3-flash",
+                &std::collections::BTreeMap::new(),
+                super::MakerPool::Serving
+            ),
+            Ok(Some(ProviderId::antigravity()))
         );
     }
 }

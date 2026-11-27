@@ -52,6 +52,7 @@ async fn since_last_refresh_refreshes_legacy_token_without_last_refresh() {
                     id_token: None,
                     last_refresh_at: None,
                     plan_type: None,
+                    project_id: None,
                 })
             })
         },
@@ -593,6 +594,7 @@ fn static_token(email: &str) -> TokenData {
         id_token: None,
         last_refresh_at: None,
         plan_type: None,
+        project_id: None,
     }
 }
 
@@ -1797,6 +1799,7 @@ async fn a_pinned_account_on_cooldown_falls_through_to_rotation() {
                 id_token: None,
                 last_refresh_at: None,
                 plan_type: None,
+                project_id: None,
             },
         )
         .expect("save token");
@@ -1865,6 +1868,7 @@ async fn a_conversation_that_failed_over_stays_on_the_account_that_rescued_it() 
                 id_token: None,
                 last_refresh_at: None,
                 plan_type: None,
+                project_id: None,
             },
         )
         .expect("save token");
@@ -2267,6 +2271,7 @@ fn refreshing_codex_manager(auth_dir: &Path) -> AccountManager {
                     id_token: None,
                     last_refresh_at: None,
                     plan_type: None,
+                    project_id: None,
                 })
             })
         },
@@ -3510,4 +3515,71 @@ async fn concurrent_new_conversations_each_take_a_turn_of_their_own() {
             ("c@example.com".to_string(), 3),
         ])
     );
+}
+
+/// AC-7 / F13: an antigravity Refresh does not rediscover the project, so the
+/// one stored at login is kept — in memory and on disk.
+#[tokio::test]
+async fn an_antigravity_refresh_keeps_the_stored_project() {
+    let tmp = tempdir().expect("tempdir");
+    save_token(
+        tmp.path(),
+        &TokenData {
+            access_token: "old-access".to_string(),
+            refresh_token: "old-refresh".to_string(),
+            email: "operator@example.com".to_string(),
+            expires_at: "2000-01-01T00:00:00Z".to_string(),
+            account_uuid: "google-id".to_string(),
+            provider: ProviderId::antigravity(),
+            id_token: None,
+            last_refresh_at: None,
+            plan_type: Some("g1-pro-tier".to_string()),
+            project_id: Some("cloud-code-project".to_string()),
+        },
+    )
+    .expect("save");
+    let mut manager = AccountManager::new(
+        tmp.path().to_path_buf(),
+        ProviderId::antigravity(),
+        std::collections::BTreeMap::new(),
+        RotationMode::Priority,
+        |_refresh_token| {
+            Box::pin(async {
+                // What `refresh_antigravity_tokens` returns: no identity, no project.
+                Ok(TokenData {
+                    access_token: "new-access".to_string(),
+                    refresh_token: "old-refresh".to_string(),
+                    email: String::new(),
+                    expires_at: "2030-01-01T00:00:00Z".to_string(),
+                    account_uuid: String::new(),
+                    provider: ProviderId::antigravity(),
+                    id_token: None,
+                    last_refresh_at: None,
+                    plan_type: None,
+                    project_id: None,
+                })
+            })
+        },
+        RefreshPolicy {
+            kind: RefreshPolicyKind::ExpiresLead,
+            seconds: 300,
+        },
+    );
+    manager.load().expect("load");
+    assert!(
+        manager
+            .refresh_account("operator@example.com")
+            .await
+            .expect("refresh")
+    );
+    let account = manager.account("operator@example.com").expect("account");
+    assert_eq!(account.token.access_token, "new-access");
+    assert_eq!(
+        account.token.project_id.as_deref(),
+        Some("cloud-code-project")
+    );
+    assert_eq!(account.token.plan_type.as_deref(), Some("g1-pro-tier"));
+    let on_disk = pengepul::tokens::load_all_tokens(tmp.path(), Some(&ProviderId::antigravity()))
+        .expect("load");
+    assert_eq!(on_disk[0].project_id.as_deref(), Some("cloud-code-project"));
 }

@@ -11,10 +11,12 @@ use crate::app::create_app;
 use crate::cli::{AccountToggle, CliRuntime, LaunchPlan, ModelChoice, ServiceInstallRequest};
 use crate::config::{Config, DebugMode};
 use crate::oauth::{
-    ANTHROPIC_REDIRECT_URI, CODEX_CALLBACK_PATH, CODEX_CALLBACK_PORT, GROK_CALLBACK_PATH,
-    GROK_CALLBACK_PORT, exchange_anthropic_code, exchange_codex_code, exchange_grok_code,
-    exchange_grok_pasted_code, generate_anthropic_auth_url, generate_codex_auth_url,
-    generate_grok_auth_url, parse_grok_paste,
+    ANTHROPIC_REDIRECT_URI, ANTIGRAVITY_CALLBACK_PATH, ANTIGRAVITY_CALLBACK_PORT,
+    CODEX_CALLBACK_PATH, CODEX_CALLBACK_PORT, GROK_CALLBACK_PATH, GROK_CALLBACK_PORT,
+    exchange_anthropic_code, exchange_antigravity_code, exchange_antigravity_pasted_code,
+    exchange_codex_code, exchange_grok_code, exchange_grok_pasted_code,
+    generate_anthropic_auth_url, generate_antigravity_auth_url, generate_codex_auth_url,
+    generate_grok_auth_url, parse_antigravity_paste, parse_grok_paste,
 };
 use crate::render::Style;
 use crate::service::{ServiceOptions, run_command};
@@ -247,6 +249,21 @@ impl CliRuntime for RealRuntime {
         provider: ProviderId,
         _key: Option<&str>,
     ) -> Result<String> {
+        // Login's control-plane calls present the Hub version too. The read
+        // starts now, off this thread, so the URL prints at once; it is waited
+        // on, for at most its short limit, only before those calls, which come
+        // after the operator has finished in the browser.
+        let version_refresh = (provider.kind == ProviderKind::Antigravity).then(|| {
+            crate::upstream::spawn_version_refresh(
+                self.runtime.handle(),
+                &crate::upstream::ANTIGRAVITY_VERSION,
+                async {
+                    crate::upstream::fetch_antigravity_manifest_version(&reqwest::Client::new())
+                        .await
+                },
+                crate::upstream::ANTIGRAVITY_MANIFEST_TIMEOUT,
+            )
+        });
         let state = random_urlsafe(32);
         let pkce = generate_pkce_codes();
         let nonce = random_urlsafe(32);
@@ -254,23 +271,35 @@ impl CliRuntime for RealRuntime {
         println!("\nOpen this URL to authorize {provider}:\n\n{auth_url}\n");
         open_browser(&auth_url);
         let (port, path) = callback_endpoint(&provider)?;
-        let callback = if provider.kind == ProviderKind::Grok {
-            // auth.x.ai hands the code to the user by hand when the redirect
-            // cannot reach this host (headless box, browser on another
-            // machine). Take either path, whichever arrives first. The
-            // paste prompt is only honest when stdin can actually deliver
-            // one — a non-tty stdin is the headless case, where the
-            // browser-side link has to do the work.
+        let callback = if matches!(
+            provider.kind,
+            ProviderKind::Grok | ProviderKind::Antigravity
+        ) {
+            // When the redirect cannot reach this host (headless box, browser
+            // on another machine) the operator carries it by hand. auth.x.ai
+            // shows a code; Google shows nothing, and the browser's address
+            // bar holds the failed redirect URL. Take the loopback callback or
+            // the paste, whichever arrives first. The paste prompt is only
+            // honest when stdin can deliver one — a non-tty stdin is the
+            // headless case, where the browser-side link has to do the work.
             if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-                println!(
+                let hint = if provider.kind == ProviderKind::Antigravity {
+                    "If the browser cannot reach this host, it ends on a page that does not load.\n\
+                     Copy that page's full URL from the address bar, paste it here and press Enter.\n"
+                } else {
                     "If the browser cannot reach this host, auth.x.ai shows a code instead.\n\
                      Paste that code — or the full callback URL — here and press Enter.\n"
-                );
+                };
+                println!("{hint}");
             }
             wait_for_callback_or_paste(port, path, Duration::from_mins(5))?
         } else {
             wait_for_callback(port, path, Duration::from_mins(5))?
         };
+        if let Some(refresh) = version_refresh {
+            // Bounded by the refresh's own limit; a failure keeps the floor.
+            let _ = self.runtime.block_on(refresh);
+        }
         let token = self.runtime.block_on(async {
             match provider.kind {
                 ProviderKind::Anthropic => {
@@ -284,6 +313,15 @@ impl CliRuntime for RealRuntime {
                         exchange_grok_pasted_code(&callback.code, &pkce).await
                     } else {
                         exchange_grok_code(&callback.code, &callback.state, &state, &pkce).await
+                    }
+                }
+                ProviderKind::Antigravity => {
+                    if let Some(raw) = &callback.paste {
+                        let paste = parse_antigravity_paste(raw)?;
+                        exchange_antigravity_pasted_code(&paste, &state, &pkce).await
+                    } else {
+                        exchange_antigravity_code(&callback.code, &callback.state, &state, &pkce)
+                            .await
                     }
                 }
                 ProviderKind::Generic => {
@@ -470,10 +508,13 @@ fn home_dir() -> Result<PathBuf> {
 struct CallbackResult {
     code: String,
     state: String,
-    /// True when the credential arrived as a pasted code rather than through
-    /// the loopback callback: auth.x.ai's manual-carry fallback. A pasted
-    /// code carries no state to verify (the PKCE verifier still binds it).
+    /// True when the credential arrived by paste rather than through the
+    /// loopback callback. Grok exchanges a paste without comparing its `state`;
+    /// the PKCE verifier still binds the code.
     pasted: bool,
+    /// What was pasted, as typed, for a provider that tells a pasted URL from
+    /// a bare code (antigravity refuses a URL without its state).
+    paste: Option<String>,
 }
 
 fn auth_url(provider: &ProviderId, state: &str, pkce: &PkceCodes, nonce: &str) -> String {
@@ -481,6 +522,7 @@ fn auth_url(provider: &ProviderId, state: &str, pkce: &PkceCodes, nonce: &str) -
         ProviderKind::Anthropic => generate_anthropic_auth_url(state, pkce),
         ProviderKind::Codex => generate_codex_auth_url(state, pkce),
         ProviderKind::Grok => generate_grok_auth_url(state, pkce, nonce),
+        ProviderKind::Antigravity => generate_antigravity_auth_url(state, pkce),
         ProviderKind::Generic => {
             unreachable!("static-key providers never build an OAuth authorize URL")
         }
@@ -496,6 +538,7 @@ fn callback_endpoint(provider: &ProviderId) -> Result<(u16, &'static str)> {
         }
         ProviderKind::Codex => Ok((CODEX_CALLBACK_PORT, CODEX_CALLBACK_PATH)),
         ProviderKind::Grok => Ok((GROK_CALLBACK_PORT, GROK_CALLBACK_PATH)),
+        ProviderKind::Antigravity => Ok((ANTIGRAVITY_CALLBACK_PORT, ANTIGRAVITY_CALLBACK_PATH)),
         ProviderKind::Generic => {
             unreachable!("static-key providers never serve an OAuth callback")
         }
@@ -569,6 +612,7 @@ fn wait_for_callback_or_paste(
                 code,
                 state: state.unwrap_or_default(),
                 pasted: true,
+                paste: Some(paste),
             });
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -637,6 +681,7 @@ fn handle_callback_stream(
         code,
         state,
         pasted: false,
+        paste: None,
     })
 }
 
