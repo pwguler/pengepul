@@ -1065,7 +1065,7 @@ dependencies = [
 
 [[package]]
 name = "pengepul"
-version = "0.115.0"
+version = "0.116.0"
 dependencies = [
  "anyhow",
  "async-stream",
