@@ -504,9 +504,10 @@ fn home_dir() -> Result<PathBuf> {
 struct CallbackResult {
     code: String,
     state: String,
-    /// True when the credential arrived as a pasted code rather than through
-    /// the loopback callback: auth.x.ai's manual-carry fallback. A pasted
-    /// code carries no state to verify (the PKCE verifier still binds it).
+    /// True when the credential arrived by paste rather than through the
+    /// loopback callback. A pasted callback URL carries its `state`, which is
+    /// checked; a bare pasted code has none, and the PKCE verifier still binds
+    /// it.
     pasted: bool,
 }
 

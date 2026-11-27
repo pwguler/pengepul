@@ -74,10 +74,12 @@ in files.
   426 naming a newer client version is retried once with it, and that version is
   kept for the process lifetime (`learn_grok_client_version`). An antigravity
   call carries the Google access token as bearer and the Antigravity Hub
-  `User-Agent` (`antigravity_headers`), wraps the Chat body in the Antigravity
-  envelope (`antigravity_envelope`), unwraps the Gemini reply
-  (`antigravity_unwrap`), and takes the version from the Hub manifest, falling
-  back to a pinned floor (`refresh_antigravity_version`). It is never Cloaked. A chat call to a
+  `User-Agent` (`antigravity_headers`) and only sends bytes: the route wraps the
+  Chat body in the Antigravity envelope (`antigravity_envelope`) and unwraps
+  and translates the Gemini reply (`antigravity_unwrap`, `antigravity_json`).
+  The version comes from the Hub manifest on each catalog refresh and at login
+  (`fetch_antigravity_manifest_version`), over a floor that never goes down
+  (`VersionFloor`). It is never Cloaked. A chat call to a
   configured endpoint carries the bearer key; one to an `opencode.ai` host also names
   its conversation in `x-opencode-session`, a hash of Rotation's key
   (`generic_chat_headers`), because OpenCode Go refuses a chat without one. That host
@@ -92,9 +94,12 @@ in files.
   configured provider's `models:` in `config.yaml` (ADR-0029). grok publishes no
   list to fetch: its two models, `grok-4.6` and `grok-4.5`, are a static one
   (`grok_static_models`). antigravity fetches its catalog from Cloud Code Assist
-  (`parse_antigravity`), with the brief's floor — `gemini-4-neon` and its four
-  effort tiers (`antigravity_static_models`) — standing in when the fetch has no
-  project or fails. It also holds the operator's `allow:` lists: a Provider
+  (`parse_antigravity`). Its floor, the four `gemini-4-neon-{low,medium,high,xhigh}`
+  tiers (`antigravity_static_models`), shows until a live list lands — for an
+  account with no project, or after a failed first fetch — and never replaces
+  one. A bare id more than one built-in lists goes to the earliest
+  (anthropic, codex, grok, antigravity), and one the name heuristic gives to a
+  built-in stays there while that pool has an account. It also holds the operator's `allow:` lists: a Provider
   with one advertises only the listed ids its Upstream lists, matched exactly on the
   id `upstream_model` produces, while its fetched list stays whole so a bare id still
   resolves to it and is refused by name.

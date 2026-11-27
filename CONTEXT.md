@@ -159,7 +159,7 @@ _Avoid_: billing classifier, detector, filter
 - A conversation whose **Thread** the vendor declined, and whose turn it then took **Plain**, is sent **Plain** on that **Account** from then on; three such conversations in a row rest the **Account**, which is then not asked for a **Thread** for an hour.
 - A **Harness** reaches the relay through its own configuration, never through a route made for it (ADR-0007). `pengepul launch` writes that configuration into one process instead of onto disk, so it covers only the **Harnesses** that can be redirected per-process.
 - Any **Inbound dialect** may be served by anthropic, codex, grok or antigravity, and **Translation** is what closes the gap; grok speaks only Chat Completions upstream, and the other two dialects are translated onto it. A configured OpenAI-compatible endpoint speaks only Chat Completions upstream too, so Messages is translated onto it and Responses answers 501. count_tokens is anthropic-only and answers 501 elsewhere.
-- The antigravity **Upstream** speaks Gemini `generateContent` inside an Antigravity envelope, which is a shape the **Translation** matrix does not carry: its upstream client wraps the Chat request and unwraps the Gemini reply, so the matrix still sees Chat Completions and every **Inbound dialect** is served as it is for grok.
+- The antigravity **Upstream** speaks Gemini `generateContent` inside an Antigravity envelope, which is a shape the **Translation** matrix does not carry: its route wraps the Chat request in the envelope and unwraps the Gemini reply, so the matrix still sees Chat Completions and every **Inbound dialect** is served as it is for grok.
 
 ## Example dialogue
 

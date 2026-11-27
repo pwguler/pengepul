@@ -595,6 +595,10 @@ pub struct ModelCatalog {
     /// The operator's `allow:` lists. The lists above stay whole, so a bare id still resolves
     /// to the Provider that lists it and is refused by name rather than as unknown.
     allow: AllowLists,
+    /// The built-ins whose pool holds an account, as the last catalog refresh saw
+    /// them. A bare id the name heuristic gives to one of them stays there even
+    /// when its list is missing, so a later built-in's list cannot take it.
+    pooled: std::collections::HashSet<ProviderKind>,
 }
 
 impl ModelCatalog {
@@ -609,6 +613,23 @@ impl ModelCatalog {
             let entries = self.direct.entry(id).or_default();
             entries.push(DirectModel { kind, metadata });
             entries.sort_by_key(|entry| bare_id_precedence(entry.kind));
+        }
+    }
+
+    /// Whether any fetch has put a list for `kind` in the catalog.
+    #[must_use]
+    pub fn lists(&self, kind: ProviderKind) -> bool {
+        self.direct
+            .values()
+            .any(|entries| entries.iter().any(|entry| entry.kind == kind))
+    }
+
+    /// Record whether a built-in's pool holds an account.
+    pub fn set_pooled(&mut self, kind: ProviderKind, pooled: bool) {
+        if pooled {
+            self.pooled.insert(kind);
+        } else {
+            self.pooled.remove(&kind);
         }
     }
 
@@ -685,11 +706,26 @@ impl ModelCatalog {
                 _ => {}
             }
         }
-        self.direct
+        let listed = self
+            .direct
             .get(model)
             .and_then(|entries| entries.first())
-            .map(|entry| ProviderId::for_kind(entry.kind))
-            .or_else(|| heuristic_provider(model).map(ProviderId::for_kind))
+            .map(|entry| entry.kind);
+        let shaped = heuristic_provider(model);
+        // The id's name says which built-in it belongs to. While that built-in
+        // ranks first and has an account, a later built-in's list cannot take
+        // the id from it, even when its own list failed to load.
+        let kind = match (listed, shaped) {
+            (Some(listed), Some(shaped))
+                if bare_id_precedence(shaped) < bare_id_precedence(listed)
+                    && self.pooled.contains(&shaped) =>
+            {
+                Some(shaped)
+            }
+            (Some(listed), _) => Some(listed),
+            (None, shaped) => shaped,
+        };
+        kind.map(ProviderId::for_kind)
     }
 
     /// The advertised catalog for `/v1/models`: every id carries its `<provider>/<model>`
@@ -793,9 +829,9 @@ pub fn grok_static_models() -> FetchedModels {
     FetchedModels::with_metadata(ids, metadata)
 }
 
-/// The antigravity catalog before a live fetch: the floor the provider
-/// advertises the moment an account exists. A successful
-/// `fetchAvailableModels` replaces it with the upstream's own list.
+/// The antigravity floor: what the pool advertises until a live list lands,
+/// for an account with no project or after a failed first fetch. A successful
+/// `fetchAvailableModels` replaces it, and nothing replaces a live list with it.
 #[must_use]
 pub fn antigravity_static_models() -> FetchedModels {
     // The bare `gemini-4-neon` is not an upstream id (`404 Requested entity was
@@ -2077,4 +2113,33 @@ fn the_antigravity_catalog_advertises_only_served_chat_models() {
         &ProviderId::antigravity(),
     );
     assert_eq!(fetched.ids, vec!["gemini-4-neon-medium".to_string()]);
+}
+
+/// N4: while the anthropic pool has an account, a bare `claude-*` id stays
+/// with anthropic even when only antigravity's list is present (anthropic's
+/// fetch failed, or has not landed). With no anthropic account it goes to the
+/// pool that lists it.
+#[test]
+fn a_bare_id_stays_with_an_earlier_built_in_that_has_an_account() {
+    let providers = BTreeMap::new();
+    let mut catalog = ModelCatalog::default();
+    catalog.set_direct(
+        ProviderKind::Antigravity,
+        FetchedModels::new(vec!["claude-sonnet-4-6".to_string()]),
+    );
+    catalog.set_pooled(ProviderKind::Anthropic, true);
+    assert_eq!(
+        catalog.resolve_id("claude-sonnet-4-6", &providers),
+        Some(ProviderId::anthropic())
+    );
+    // The antigravity copy is still reachable by its prefix.
+    assert_eq!(
+        catalog.resolve_id("antigravity/claude-sonnet-4-6", &providers),
+        Some(ProviderId::antigravity())
+    );
+    catalog.set_pooled(ProviderKind::Anthropic, false);
+    assert_eq!(
+        catalog.resolve_id("claude-sonnet-4-6", &providers),
+        Some(ProviderId::antigravity())
+    );
 }

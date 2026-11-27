@@ -1969,10 +1969,14 @@ fn gemini_generation_config(chat: &Value) -> Map<String, Value> {
         );
     }
     // The upstream refuses `maxOutputTokens <= thinkingBudget`, so a client cap
-    // below the budget is raised past it; no cap is invented where the client
-    // set none.
+    // at or below the budget is raised past it; a larger cap goes out as set,
+    // and no cap is invented where the client set none.
     if let Some(max_tokens) = max_tokens {
-        let limit = budget.map_or(max_tokens, |budget| max_tokens.max(budget + 1024));
+        let limit = match budget {
+            // Room for the answer past the thinking budget.
+            Some(budget) if max_tokens <= budget => budget + 1024,
+            _ => max_tokens,
+        };
         config.insert("maxOutputTokens".to_string(), json!(limit));
     }
     for (from, to) in [
@@ -1997,7 +2001,9 @@ fn gemini_generation_config(chat: &Value) -> Map<String, Value> {
     config
 }
 
-/// The thinking budget an effort names; `none` asks for no thinking at all.
+/// The thinking budget an effort names. `none` names none, so no
+/// `thinkingConfig` is sent and the model's own default applies; whether the
+/// Gemini 4 tiers accept `thinkingBudget: 0` is unverified.
 fn gemini_thinking_budget(effort: &str) -> Option<i64> {
     match effort {
         "none" => None,
@@ -2049,49 +2055,72 @@ const GEMINI_SCHEMA_FIELDS: [&str; 21] = [
     "maximum",
 ];
 
-/// How deep `$ref`s are inlined; a recursive definition ends here as an open
-/// object rather than expanding forever.
-const GEMINI_REF_DEPTH: usize = 8;
+/// How many `$ref`s one declaration may inline. A cycle ends at its first
+/// repeat; this caps a schema that fans out wide without one, so no tool list
+/// can make every turn's request explode.
+const GEMINI_REF_EXPANSIONS: usize = 256;
 
-/// A JSON Schema as the Gemini `Schema` proto accepts it. Local `$ref`s are
-/// inlined from `$defs`/`definitions`; a `type` array becomes one type plus
-/// `nullable`; an `anyOf`/`oneOf` branch of `null` becomes `nullable`; `const`
-/// and non-string enums become string enums; exclusive bounds become inclusive
-/// ones; and every key the proto lacks is dropped.
-fn gemini_schema(schema: &Value) -> Value {
-    gemini_schema_node(schema, schema, 0)
+/// What one schema walk carries: the root `$ref`s resolve against, the refs
+/// being expanded on the current path, and how many have been inlined.
+struct SchemaWalk<'a> {
+    root: &'a Value,
+    active: Vec<String>,
+    expansions: usize,
 }
 
-fn gemini_schema_node(node: &Value, root: &Value, depth: usize) -> Value {
+/// A JSON Schema as the Gemini `Schema` proto accepts it. Local `$ref`s are
+/// inlined from `$defs`/`definitions`, a cycle ending as an open object; a
+/// `type` array becomes one type plus `nullable`; an `anyOf`/`oneOf` branch of
+/// `null` becomes `nullable`; a string enum stays, a non-string one keeps its
+/// type and moves into the description; an array gets `items`; exclusive
+/// bounds become inclusive ones; and every key the proto lacks is dropped.
+fn gemini_schema(schema: &Value) -> Value {
+    let mut walk = SchemaWalk {
+        root: schema,
+        active: Vec::new(),
+        expansions: 0,
+    };
+    gemini_schema_node(schema, &mut walk)
+}
+
+fn gemini_schema_node(node: &Value, walk: &mut SchemaWalk<'_>) -> Value {
     let Some(map) = node.as_object() else {
         return json!({});
     };
     // A local reference stands for its target; sibling keys (a description, a
     // default) add to it.
     if let Some(reference) = map.get("$ref").and_then(Value::as_str) {
-        let target = (depth < GEMINI_REF_DEPTH)
-            .then(|| resolve_local_ref(root, reference))
-            .flatten();
+        let expandable = !walk.active.iter().any(|active| active == reference)
+            && walk.expansions < GEMINI_REF_EXPANSIONS;
+        let target = expandable
+            .then(|| resolve_local_ref(walk.root, reference))
+            .flatten()
+            .and_then(Value::as_object);
+        // Unresolvable, a cycle, or past the cap: an open object, never a
+        // dangling ref.
         let mut merged = target
-            .and_then(Value::as_object)
             .cloned()
-            // Unresolvable or too deep: an open object, never a dangling ref.
             .unwrap_or_else(|| Map::from_iter([("type".to_string(), json!("object"))]));
         for (key, value) in map {
             if key != "$ref" {
                 merged.insert(key.clone(), value.clone());
             }
         }
-        return gemini_schema_node(&Value::Object(merged), root, depth + 1);
+        if target.is_none() {
+            return gemini_schema_node(&Value::Object(merged), walk);
+        }
+        walk.expansions += 1;
+        walk.active.push(reference.to_string());
+        let inlined = gemini_schema_node(&Value::Object(merged), walk);
+        walk.active.pop();
+        return inlined;
     }
 
     let mut out = Map::new();
     let mut nullable = map.get("nullable").and_then(Value::as_bool) == Some(true);
     let mut types = schema_types(map, &mut nullable);
-    fold_schema_branches(map, root, depth, &mut out, &mut nullable);
-    if schema_string_enum(map, &mut out, &mut nullable) {
-        types = vec!["string".to_string()];
-    }
+    fold_schema_branches(map, walk, &mut out, &mut nullable);
+    schema_enum(map, &mut out, &mut nullable, &mut types);
     match types.as_slice() {
         [] => {}
         [one] => {
@@ -2114,7 +2143,15 @@ fn gemini_schema_node(node: &Value, root: &Value, depth: usize) -> Value {
                 .or_insert_with(|| bound.clone());
         }
     }
-    copy_schema_fields(map, root, depth, &mut out);
+    copy_schema_fields(map, walk, &mut out);
+    // Gemini refuses an array without `items` (`items: missing field`); a
+    // schema that says nothing about its members gets strings, as CLIProxyAPI's
+    // `addMissingArrayItems` does.
+    if out.get("type").and_then(Value::as_str) == Some("array")
+        && !out.get("items").is_some_and(Value::is_object)
+    {
+        out.insert("items".to_string(), json!({"type": "string"}));
+    }
     if nullable {
         out.insert("nullable".to_string(), json!(true));
     }
@@ -2144,8 +2181,7 @@ fn schema_types(map: &Map<String, Value>, nullable: &mut bool) -> Vec<String> {
 /// node (pydantic's `Optional[X]`); `allOf` branches merge into it.
 fn fold_schema_branches(
     map: &Map<String, Value>,
-    root: &Value,
-    depth: usize,
+    walk: &mut SchemaWalk<'_>,
     out: &mut Map<String, Value>,
     nullable: &mut bool,
 ) {
@@ -2155,7 +2191,7 @@ fn fold_schema_branches(
             if branch.get("type").and_then(Value::as_str) == Some("null") {
                 *nullable = true;
             } else {
-                branches.push(gemini_schema_node(branch, root, depth + 1));
+                branches.push(gemini_schema_node(branch, walk));
             }
         }
     }
@@ -2169,7 +2205,7 @@ fn fold_schema_branches(
         out.insert("anyOf".to_string(), Value::Array(branches));
     }
     for branch in value_array(map.get("allOf")) {
-        if let Value::Object(part) = gemini_schema_node(branch, root, depth + 1) {
+        if let Value::Object(part) = gemini_schema_node(branch, walk) {
             for (key, value) in part {
                 merge_schema_key(out, key, value);
             }
@@ -2177,41 +2213,65 @@ fn fold_schema_branches(
     }
 }
 
-/// `const` and `enum` as the proto's string-only enum. Returns whether the
-/// node now holds one, which makes its type `string`.
-fn schema_string_enum(
+/// `const` and `enum`. The proto's enum is strings only: a string enum stays
+/// one, of type `string`. A non-string enum keeps the declared type — the type
+/// decides the JSON the model writes, and `"2"` for an integer field fails at
+/// the tool — and its members move into the description, as `CLIProxyAPI` does
+/// for antigravity tools. An untyped one takes the type its members share.
+fn schema_enum(
     map: &Map<String, Value>,
     out: &mut Map<String, Value>,
     nullable: &mut bool,
-) -> bool {
+    types: &mut Vec<String>,
+) {
     let mut values: Vec<Value> = value_array(map.get("enum")).into_iter().cloned().collect();
     if let Some(constant) = map.get("const") {
         values.push(constant.clone());
     }
-    if values.is_empty() {
-        return false;
-    }
     if values.iter().any(Value::is_null) {
         *nullable = true;
     }
-    let strings = values
+    values.retain(|value| !value.is_null());
+    if values.is_empty() {
+        return;
+    }
+    if values.iter().all(Value::is_string) {
+        out.insert("enum".to_string(), Value::Array(values));
+        *types = vec!["string".to_string()];
+        return;
+    }
+    if types.is_empty() {
+        let shared = if values.iter().all(Value::is_boolean) {
+            "boolean"
+        } else if values.iter().all(|value| value.is_i64() || value.is_u64()) {
+            "integer"
+        } else if values.iter().all(Value::is_number) {
+            "number"
+        } else {
+            "string"
+        };
+        *types = vec![shared.to_string()];
+    }
+    let allowed = values
         .iter()
-        .filter(|value| !value.is_null())
         .map(|value| match value {
-            Value::String(text) => Value::String(text.clone()),
-            other => Value::String(other.to_string()),
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
         })
-        .collect();
-    out.insert("enum".to_string(), Value::Array(strings));
-    true
+        .collect::<Vec<_>>()
+        .join(", ");
+    let description = match map.get("description").and_then(Value::as_str) {
+        Some(text) if !text.is_empty() => format!("{text} Allowed: {allowed}"),
+        _ => format!("Allowed: {allowed}"),
+    };
+    out.insert("description".to_string(), json!(description));
 }
 
 /// The proto fields the node carries as they are, its subschemas cleaned, and
 /// every other key dropped.
 fn copy_schema_fields(
     map: &Map<String, Value>,
-    root: &Value,
-    depth: usize,
+    walk: &mut SchemaWalk<'_>,
     out: &mut Map<String, Value>,
 ) {
     for (key, value) in map {
@@ -2226,9 +2286,7 @@ fn copy_schema_fields(
                     .map(|entries| {
                         entries
                             .iter()
-                            .map(|(name, sub)| {
-                                (name.clone(), gemini_schema_node(sub, root, depth + 1))
-                            })
+                            .map(|(name, sub)| (name.clone(), gemini_schema_node(sub, walk)))
                             .collect::<Map<String, Value>>()
                     })
                     .unwrap_or_default();
@@ -2240,7 +2298,7 @@ fn copy_schema_fields(
                     Value::Array(tuple) => tuple.first().cloned().unwrap_or_else(|| json!({})),
                     other => other.clone(),
                 };
-                out.insert(key.clone(), gemini_schema_node(&item, root, depth + 1));
+                out.insert(key.clone(), gemini_schema_node(&item, walk));
             }
             // The proto names a handful of formats; `uri`, `email` and the
             // rest are dropped rather than refused.
@@ -2510,6 +2568,22 @@ pub fn gemini_finish_reason(gemini: &Value, has_tool_calls: bool) -> &'static st
         _ if has_tool_calls => "tool_calls",
         _ => "stop",
     }
+}
+
+/// Whether a Gemini reply or chunk ends the turn: a candidate's non-empty
+/// `finishReason`, or a prompt the upstream blocked, which carries no candidate
+/// to hold one. The stream converter and the relay's accounting both ask this,
+/// so a turn they disagree on cannot exist.
+#[must_use]
+pub fn gemini_turn_ended(gemini: &Value) -> bool {
+    gemini
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|candidates| candidates.first())
+        .and_then(|candidate| candidate.get("finishReason"))
+        .and_then(Value::as_str)
+        .is_some_and(|reason| !reason.is_empty())
+        || gemini_prompt_blocked(gemini)
 }
 
 /// A prompt the upstream refused outright: `promptFeedback.blockReason` and
@@ -2832,10 +2906,11 @@ mod antigravity_translation_tests {
         );
     }
 
-    /// F9: an effort alone sends no cap; a client cap below the budget is
-    /// raised past it; `max_completion_tokens` wins; `none` sends no thinking.
+    /// F9: an effort alone sends no cap; a client cap at or below the budget
+    /// is raised past it; `max_completion_tokens` wins. N8: `none` sends no
+    /// `thinkingConfig`, which leaves the model's own default, not "off".
     #[test]
-    fn the_output_cap_is_the_clients_and_none_turns_thinking_off() {
+    fn the_output_cap_is_the_clients_and_none_sends_no_thinking_config() {
         let effort_only = antigravity_request(&json!({
             "reasoning_effort": "low", "messages": [{"role": "user", "content": "x"}]
         }));
@@ -2850,6 +2925,12 @@ mod antigravity_translation_tests {
             "messages": [{"role": "user", "content": "x"}]
         }));
         assert_eq!(small["generationConfig"]["maxOutputTokens"], 4096 + 1024);
+        // N7: a cap already above the budget goes out as the client set it.
+        let above = antigravity_request(&json!({
+            "reasoning_effort": "low", "max_tokens": 4500,
+            "messages": [{"role": "user", "content": "x"}]
+        }));
+        assert_eq!(above["generationConfig"]["maxOutputTokens"], 4500);
         let completion = antigravity_request(&json!({
             "max_completion_tokens": 300, "max_tokens": 50,
             "messages": [{"role": "user", "content": "x"}]
@@ -2892,6 +2973,15 @@ mod antigravity_translation_tests {
         let object = schema
             .as_object()
             .unwrap_or_else(|| panic!("{path}: not an object"));
+        // Gemini refuses an array schema without `items` (`items: missing field`).
+        if object.get("type").and_then(serde_json::Value::as_str) == Some("array") {
+            assert!(
+                object
+                    .get("items")
+                    .is_some_and(serde_json::Value::is_object),
+                "{path} is an array without items"
+            );
+        }
         for (key, value) in object {
             assert!(
                 SCHEMA_FIELDS.contains(&key.as_str()),
@@ -2945,6 +3035,7 @@ mod antigravity_translation_tests {
                 "limit": {"type": "integer", "exclusiveMinimum": 0, "maximum": 2000},
                 "timeout": {"type": "number", "exclusiveMaximum": 600_000},
                 "url": {"type": "string", "format": "uri", "minLength": 1},
+                "tags": {"type": "array", "description": "labels"},
                 "todos": {"type": "array", "items": {
                     "type": "object",
                     "properties": {"status": {"type": "string",
@@ -2963,6 +3054,7 @@ mod antigravity_translation_tests {
         assert_eq!(properties["limit"]["maximum"], 2000);
         assert_eq!(properties["timeout"]["maximum"], 600_000);
         assert_eq!(properties["url"]["minLength"], 1);
+        assert_eq!(properties["tags"]["items"]["type"], "string");
         assert_eq!(parameters["required"], json!(["file_path"]));
         assert_eq!(properties["todos"]["items"]["required"], json!(["status"]));
     }
@@ -2994,8 +3086,15 @@ mod antigravity_translation_tests {
         let properties = &parameters["properties"];
         assert_eq!(properties["at"]["type"], "object");
         assert_eq!(properties["at"]["required"], json!(["x", "y"]));
-        assert_eq!(properties["level"]["enum"], json!(["1", "2", "3"]));
-        assert_eq!(properties["level"]["type"], "string");
+        // N5: a non-string enum keeps its declared type, and its members move
+        // into the description, since the proto's enum is strings only.
+        assert_eq!(properties["level"]["type"], "integer");
+        assert!(
+            properties["level"].get("enum").is_none(),
+            "{}",
+            properties["level"]
+        );
+        assert_eq!(properties["level"]["description"], "Allowed: 1, 2, 3");
         assert_eq!(properties["label"]["type"], "string");
         assert_eq!(properties["label"]["nullable"], true);
         assert_eq!(
@@ -3006,10 +3105,114 @@ mod antigravity_translation_tests {
         assert_eq!(modes[0]["enum"], json!(["fill"]));
     }
 
-    /// F2: a schema that refers to itself ends at a depth guard instead of
-    /// recursing forever.
+    /// N5: a boolean `const` and an untyped number enum keep a non-string type;
+    /// a description the schema already has keeps its text.
     #[test]
-    fn a_recursive_ref_stops_at_the_depth_guard() {
+    fn non_string_enums_keep_their_type_and_move_into_the_description() {
+        let parameters = declared_parameters(&json!({
+            "type": "object",
+            "properties": {
+                "force": {"type": "boolean", "const": true},
+                "ratio": {"enum": [0.5, 1.5], "description": "Scale."},
+                "count": {"enum": [1, 2]},
+                "mode": {"type": "string", "enum": ["fast", "slow"]}
+            }
+        }));
+        assert_proto_schema(&parameters, "parameters");
+        let properties = &parameters["properties"];
+        assert_eq!(properties["force"]["type"], "boolean");
+        assert_eq!(properties["force"]["description"], "Allowed: true");
+        assert_eq!(properties["ratio"]["type"], "number");
+        assert_eq!(
+            properties["ratio"]["description"],
+            "Scale. Allowed: 0.5, 1.5"
+        );
+        assert_eq!(properties["count"]["type"], "integer");
+        assert_eq!(properties["mode"]["enum"], json!(["fast", "slow"]));
+        assert_eq!(properties["mode"]["type"], "string");
+    }
+
+    /// N3: depth is not a limit. Three nested optional models, the ordinary
+    /// pydantic shape, keep their innermost properties.
+    #[test]
+    fn nested_optional_models_keep_their_innermost_properties() {
+        let optional =
+            |name: &str| json!({"anyOf": [{"$ref": format!("#/$defs/{name}")}, {"type": "null"}]});
+        let parameters = declared_parameters(&json!({
+            "$defs": {
+                "Geo": {"type": "object", "properties": {"lat": {"type": "number"}}},
+                "Address": {"type": "object", "properties": {"geo": optional("Geo")}},
+                "Customer": {"type": "object", "properties": {"address": optional("Address")}},
+                "Order": {"type": "object", "properties": {
+                    "customer": optional("Customer"),
+                    "parts": {"anyOf": [{"type": "array", "items": {"$ref": "#/$defs/Part"}},
+                                        {"type": "null"}]}
+                }},
+                "Part": {"type": "object", "properties": {"sku": {"type": "string"}}}
+            },
+            "type": "object",
+            "properties": {"orders": {"anyOf": [
+                {"type": "array", "items": {"$ref": "#/$defs/Order"}}, {"type": "null"}]}}
+        }));
+        assert_proto_schema(&parameters, "parameters");
+        let order = &parameters["properties"]["orders"]["items"]["properties"];
+        assert_eq!(
+            order["customer"]["properties"]["address"]["properties"]["geo"]["properties"]["lat"]["type"],
+            "number",
+            "{order}"
+        );
+        assert_eq!(
+            order["parts"]["items"]["properties"]["sku"]["type"],
+            "string"
+        );
+    }
+
+    /// N3: a definition that refers to itself from many properties stays small:
+    /// a ref already being expanded is a cycle and ends as an open object.
+    #[test]
+    fn a_wide_self_reference_stays_small() {
+        let properties = (0..12)
+            .map(|i| (format!("child{i}"), json!({"$ref": "#/$defs/Node"})))
+            .collect::<serde_json::Map<_, _>>();
+        let parameters = declared_parameters(&json!({
+            "$defs": {"Node": {"type": "object", "properties": properties}},
+            "type": "object",
+            "properties": {"root": {"$ref": "#/$defs/Node"}}
+        }));
+        assert_proto_schema(&parameters, "parameters");
+        let size = parameters.to_string().len();
+        assert!(size < 4_096, "a 12-wide self-reference became {size} bytes");
+        assert_eq!(
+            parameters["properties"]["root"]["properties"]["child0"]["type"],
+            "object"
+        );
+    }
+
+    /// N3: a schema that fans out without a cycle is bounded by the expansion
+    /// cap, not by its size.
+    #[test]
+    fn a_wide_acyclic_fan_out_is_bounded() {
+        let level = |next: &str| {
+            let properties = (0..8)
+                .map(|i| (format!("p{i}"), json!({"$ref": format!("#/$defs/{next}")})))
+                .collect::<serde_json::Map<_, _>>();
+            json!({"type": "object", "properties": properties})
+        };
+        let parameters = declared_parameters(&json!({
+            "$defs": {"A": level("B"), "B": level("C"), "C": level("D"), "D": level("E"),
+                      "E": {"type": "object", "properties": {"leaf": {"type": "string"}}}},
+            "type": "object",
+            "properties": {"root": {"$ref": "#/$defs/A"}}
+        }));
+        assert_proto_schema(&parameters, "parameters");
+        let size = parameters.to_string().len();
+        assert!(size < 200_000, "the fan-out became {size} bytes");
+    }
+
+    /// F2: a schema that refers to itself ends as an open object at its first
+    /// repeat instead of recursing forever.
+    #[test]
+    fn a_recursive_ref_ends_at_its_first_repeat() {
         let parameters = declared_parameters(&json!({
             "$defs": {"Node": {"type": "object", "properties": {
                 "children": {"type": "array", "items": {"$ref": "#/$defs/Node"}}}}},

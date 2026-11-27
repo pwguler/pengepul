@@ -64,15 +64,21 @@ pub fn antigravity_client_id() -> String {
 }
 
 /// The Antigravity client secret the token endpoint requires.
+///
+/// # Panics
+///
+/// Panics when the compiled-in constant is not base64 of UTF-8, which is a
+/// broken build; a test pins it.
 #[must_use]
 pub fn antigravity_client_secret() -> String {
     use base64::Engine as _;
     let encoded = ANTIGRAVITY_CLIENT_SECRET_B64.concat();
-    base64::engine::general_purpose::STANDARD
+    // The input is a constant: a decode failure is a broken build, never a
+    // value to send.
+    let bytes = base64::engine::general_purpose::STANDARD
         .decode(encoded)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .unwrap_or_default()
+        .expect("ANTIGRAVITY_CLIENT_SECRET_B64 is valid base64");
+    String::from_utf8(bytes).expect("ANTIGRAVITY_CLIENT_SECRET_B64 decodes to UTF-8")
 }
 pub const ANTIGRAVITY_CALLBACK_PORT: u16 = 51121;
 pub const ANTIGRAVITY_CALLBACK_PATH: &str = "/oauth-callback";
@@ -1207,6 +1213,17 @@ mod antigravity_oauth_tests {
         ] {
             assert!(url.contains(piece), "{piece} missing from {url}");
         }
+    }
+
+    /// N9: the assembled secret is the installed-app secret, not an empty
+    /// string a broken constant would decode to. Nothing here prints it.
+    #[test]
+    fn the_client_secret_decodes_to_an_installed_app_secret() {
+        let secret = antigravity_client_secret();
+        assert!(
+            secret.starts_with("GOCSPX-") && secret.len() > "GOCSPX-".len(),
+            "the client secret constant does not decode to an installed-app secret"
+        );
     }
 
     #[test]

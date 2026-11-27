@@ -381,8 +381,8 @@ greater than `thinkingBudget`. **from source**,
   envelope wrap/unwrap helpers and the `retryDelay` hint.
 - `src/translate.rs` — Chat Completions ↔ Gemini: request, whole response, and the
   streamed chunk, so Messages and Responses ride the existing chat converters.
-- `src/models.rs` — the fetched catalog, with the static floor when the fetch
-  fails.
+- `src/models.rs` — the fetched catalog, and the static floor shown until a
+  live list lands.
 - `src/app.rs` — routing, the stream arms, and the profile accounting.
 
 ## Gotchas

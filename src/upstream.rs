@@ -47,8 +47,9 @@ pub const ANTIGRAVITY_MODELS_PATH: &str = "/v1internal:fetchAvailableModels";
 pub const ANTIGRAVITY_LOAD_CODE_ASSIST_PATH: &str = "/v1internal:loadCodeAssist";
 pub const ANTIGRAVITY_ONBOARD_USER_PATH: &str = "/v1internal:onboardUser";
 /// The Antigravity Hub release the `User-Agent` names. The Hub's own updater
-/// manifest is the live source (`refresh_antigravity_version`); this is the
-/// floor used before that fetch lands and when it fails.
+/// manifest is the live source (`fetch_antigravity_manifest_version`, read on
+/// each catalog refresh and at login); this is the floor used before that
+/// fetch lands and when it fails.
 pub const ANTIGRAVITY_CLIENT_VERSION: &str = "2.35.2";
 pub const ANTIGRAVITY_HUB_MANIFEST_URL: &str = "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml";
 

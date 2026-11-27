@@ -9255,6 +9255,53 @@ async fn antigravity_chat_stream_reports_usage_once() {
     assert!(last.contains("\"usage\""), "{last}");
 }
 
+/// The one account's record from `/admin/accounts`.
+async fn antigravity_record(app: axum::Router) -> Value {
+    let (_, accounts) = json_response(
+        app,
+        axum::http::Request::builder()
+            .uri("/admin/accounts")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    accounts["providers"]["antigravity"]["accounts"][0].clone()
+}
+
+/// N2: a prompt the upstream blocks ends the turn as finished, streamed as
+/// well as whole: the Chat client gets `[DONE]`, and the account is booked a
+/// success rather than charged a server failure.
+#[tokio::test]
+async fn a_blocked_antigravity_stream_is_a_finished_turn() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_antigravity_account(tmp.path());
+    let upstream = Arc::new(AntigravityUpstream::new().stream(&[json!({"response": {
+        "promptFeedback": {"blockReason": "PROHIBITED_CONTENT"}
+    }})]));
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, _, body) = raw_response(
+        app.clone(),
+        post(
+            "/v1/chat/completions",
+            &json!({"model": "gemini-4-neon-low", "stream": true,
+                    "messages": [{"role": "user", "content": "x"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        body.contains("\"finish_reason\":\"content_filter\""),
+        "{body}"
+    );
+    assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+
+    let record = antigravity_record(app).await;
+    assert_eq!(record["totalSuccesses"], 1, "{record}");
+    assert_eq!(record["failureCount"], 0, "{record}");
+}
+
 /// F8: a stream the upstream cut before any finishReason is not dressed up as
 /// complete.
 #[tokio::test]
@@ -9548,6 +9595,49 @@ async fn an_antigravity_429_retry_delay_sets_the_cooldown() {
         .expect("clock")
         .as_secs_f64();
     assert!(until - now > 3000.0, "cooldown {} s", until - now);
+}
+
+/// N10: a pool that fails to reload does not stop the others: the reload still
+/// answers with the error, but a fresh antigravity login after it is in use.
+#[tokio::test]
+async fn a_failing_pool_does_not_stop_the_others_from_reloading() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_antigravity_account(tmp.path());
+    let upstream = Arc::new(AntigravityUpstream::new());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    // The anthropic pool's directory turns unreadable: a file where it expects
+    // one, so listing it fails.
+    std::fs::write(tmp.path().join("anthropic"), b"not a directory").expect("block anthropic");
+    save_token(
+        tmp.path(),
+        &antigravity_token("operator@example.com", "google-relogged-token"),
+    )
+    .expect("save relogged token");
+
+    let (status, body) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/admin/reload")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 500, "{body}");
+
+    let (status, _) = json_response(
+        app,
+        post(
+            "/v1/chat/completions",
+            &json!({"model": "gemini-4-neon-low",
+                    "messages": [{"role": "user", "content": "x"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let calls = upstream.calls.lock().expect("calls");
+    assert_eq!(calls[0].account.token.access_token, "google-relogged-token");
 }
 
 /// F3: a fresh antigravity login is picked up without a restart.

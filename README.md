@@ -45,8 +45,8 @@ upstream lists it — `gemini-4-neon-low`, `-medium`, `-high` and `-xhigh`, the 
 Gemini 4 and Gemini 3 ids, and Claude and GPT-OSS models — named bare or as
 `antigravity/gemini-4-neon-medium`. Model ids reach the vendor as written, so the effort
 tier is part of the name: there is no bare `gemini-4-neon`. An id another built-in also
-lists stays with that built-in when named bare; the antigravity copy is
-`antigravity/<id>`.
+lists stays with that built-in when named bare, and so does a `claude-*` id while the
+anthropic pool has an account; the antigravity copy is `antigravity/<id>`.
 Credentials live in `~/.pengepul` (`0600`); a running relay picks up a
 fresh login on restart or `pengepul accounts --reload`. Read the key clients use with
 `pengepul config api-key`. That key alone guards your subscriptions, so keep it secret and

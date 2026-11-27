@@ -637,10 +637,9 @@ impl UpstreamClient for HttpUpstreamClient {
                 // Grok's catalog is static — two models, known up front — so
                 // the fetch is local and cannot fail.
                 ProviderKind::Grok => Ok(grok_static_models()),
-                // Antigravity's catalog is live when an account can reach it:
-                // `fetchAvailableModels` keys a map by model id. A failed fetch
-                // (no project yet, a 401 mid-refresh) falls back to the static
-                // floor rather than leaving the pool with nothing to advertise.
+                // Antigravity's catalog is live: `fetchAvailableModels` keys a
+                // map by model id. A failed fetch is an error, and the refresh
+                // decides what stays advertised.
                 ProviderKind::Antigravity => {
                     fetch_antigravity_models(client, ANTIGRAVITY_BASE_URL, &account, timeout).await
                 }
@@ -649,9 +648,10 @@ impl UpstreamClient for HttpUpstreamClient {
     }
 }
 
-/// The antigravity catalog from `fetchAvailableModels` at `base`. The static
-/// floor stands in only for an account with no project, which cannot ask; a
-/// failed fetch is an error, so the refresh keeps the last list it had.
+/// The antigravity catalog from `fetchAvailableModels` at `base`. An account
+/// with no project cannot ask and gets the static floor. A failed fetch is an
+/// error: the refresh keeps the last list, or shows the floor when none has
+/// landed yet.
 async fn fetch_antigravity_models(
     client: reqwest::Client,
     base: &str,
@@ -1218,10 +1218,18 @@ async fn refresh_model_catalog(state: &AppState) {
         // Grok's list is static, but it enters the catalog through the same
         // fetch so /v1/models and routing see it like any provider's.
         ProviderKind::Grok,
-        // Antigravity's list is fetched from Cloud Code Assist; an account
-        // with no project yet advertises the static floor.
+        // Antigravity's list is fetched from Cloud Code Assist; until one
+        // lands, the pool advertises the static floor.
         ProviderKind::Antigravity,
     ] {
+        // Whether the pool holds an account at all, cooling down or not: a bare
+        // id its name gives this built-in stays with it while it does.
+        let pooled = provider_account_count(state, ProviderId::for_kind(kind)).await > 0;
+        state
+            .catalog
+            .write()
+            .expect("catalog lock poisoned")
+            .set_pooled(kind, pooled);
         let Some(account) = catalog_account(state, kind).await else {
             continue;
         };
@@ -1254,6 +1262,14 @@ async fn refresh_model_catalog(state: &AppState) {
                     ?error,
                     "model list fetch failed"
                 );
+                // Before any live list has landed, antigravity advertises its
+                // floor (AC-2); a live list, once there, is never replaced (F7).
+                if kind == ProviderKind::Antigravity {
+                    let mut catalog = state.catalog.write().expect("catalog lock poisoned");
+                    if !catalog.lists(kind) {
+                        catalog.set_direct(kind, antigravity_static_models());
+                    }
+                }
             }
         }
     }
@@ -1752,14 +1768,22 @@ async fn admin_reload(State(state): State<AppState>, headers: HeaderMap) -> Resp
     // antigravity's fresh login be silently ignored: the token file was
     // replaced, reload reported nothing, and the relay kept serving the stale
     // credential until a restart.
+    // Every pool reloads before any error is reported, so one unreadable
+    // directory cannot keep a fresh login in another pool out of rotation.
     let mut reloaded = serde_json::Map::new();
+    let mut first_failure = None;
     for (provider, manager) in state.account_managers.pools() {
         match manager.lock().await.reload() {
             Ok(value) => {
                 reloaded.insert(provider.to_string(), value);
             }
-            Err(error) => return accounts_reload_failed(&provider, &error),
+            Err(error) => {
+                first_failure.get_or_insert((provider, error));
+            }
         }
+    }
+    if let Some((provider, error)) = first_failure {
+        return accounts_reload_failed(&provider, &error);
     }
 
     // Reloading accounts can add a provider that now has credentials to fetch models with.
@@ -2101,9 +2125,9 @@ async fn route_provider_request(
                 route_grok_request(state, headers, body, route, &request, &account).await
             }
             ProviderKind::Antigravity => {
-                // Antigravity speaks Gemini, which the upstream calls translate
-                // onto Chat Completions at their boundary, so every inbound
-                // dialect is served the same way grok serves it.
+                // Antigravity speaks Gemini; the route translates the client's
+                // dialect onto Chat and Chat onto the Gemini envelope, so every
+                // inbound dialect is served the same way grok serves it.
                 route_antigravity_request(state, headers, body, route, &request, &account).await
             }
             ProviderKind::Anthropic => {
@@ -4141,14 +4165,7 @@ fn update_antigravity_stream_usage(data: &Value, usage: &mut UsageData, complete
     }
     // Gemini closes a stream with a `finishReason` and no `[DONE]`, so this is
     // the one place a streamed reply is known to be complete.
-    let finished = gemini
-        .get("candidates")
-        .and_then(Value::as_array)
-        .and_then(|candidates| candidates.first())
-        .and_then(|candidate| candidate.get("finishReason"))
-        .and_then(Value::as_str)
-        .is_some_and(|reason| !reason.is_empty());
-    if finished {
+    if crate::translate::gemini_turn_ended(gemini) {
         *completed = true;
     }
 }
@@ -4515,8 +4532,9 @@ impl Translation {
             (ProviderKind::Codex, RequestRoute::Chat) => Self::ChatToResponses,
             (ProviderKind::Codex, RequestRoute::Messages) => Self::AnthropicToResponses,
             // Grok rides the generic chat translation for Messages and adds
-            // a Responses converter of its own. Antigravity's upstream calls
-            // hand the relay a Chat body too, so it rides the same pair.
+            // a Responses converter of its own. Antigravity's route takes the
+            // client's dialect to Chat before the Gemini envelope, so it rides
+            // the same pair.
             (
                 ProviderKind::Grok | ProviderKind::Antigravity | ProviderKind::Generic,
                 RequestRoute::Messages,
@@ -7693,6 +7711,102 @@ mod tests {
                 .version_fetches
                 .load(std::sync::atomic::Ordering::SeqCst),
             2
+        );
+    }
+
+    /// A double whose antigravity catalog fetch answers from a script: `true`
+    /// lists one live id, `false` fails.
+    struct ScriptedCatalogUpstream {
+        answers: Mutex<std::collections::VecDeque<bool>>,
+    }
+
+    impl UpstreamClient for ScriptedCatalogUpstream {
+        fn generic_chat(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn generic_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!()
+        }
+        fn anthropic_messages(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn anthropic_messages_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!()
+        }
+        fn anthropic_count_tokens(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn codex_responses(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn codex_responses_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!()
+        }
+        fn fetch_models(
+            &self,
+            _kind: ProviderKind,
+            _account: AvailableAccount,
+            _config: Arc<Config>,
+        ) -> super::ModelsFuture {
+            let live = self
+                .answers
+                .lock()
+                .expect("answers")
+                .pop_front()
+                .unwrap_or(false);
+            Box::pin(async move {
+                if live {
+                    Ok(FetchedModels::new(vec![
+                        "gemini-4-argon-medium".to_string(),
+                    ]))
+                } else {
+                    bail!("fetchAvailableModels returned 503")
+                }
+            })
+        }
+    }
+
+    fn advertised_antigravity(state: &AppState) -> Vec<String> {
+        state
+            .catalog
+            .read()
+            .expect("catalog")
+            .advertised()
+            .into_iter()
+            .filter(|model| model.provider.kind == ProviderKind::Antigravity)
+            .map(|model| model.id)
+            .collect()
+    }
+
+    /// N6 / AC-2: a real account (it always has a project) whose first fetch
+    /// fails advertises the floor; a live list, once it lands, is never
+    /// replaced by it (F7).
+    #[tokio::test]
+    async fn a_failed_first_antigravity_fetch_advertises_the_floor() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        save_token(tmp.path(), &antigravity_account(Some("p")).token).expect("save");
+        let upstream = Arc::new(ScriptedCatalogUpstream {
+            answers: Mutex::new([false, true, false].into_iter().collect()),
+        });
+        let state = test_state(tmp.path(), upstream);
+
+        super::refresh_model_catalog(&state).await;
+        assert!(
+            advertised_antigravity(&state)
+                .contains(&"antigravity/gemini-4-neon-medium".to_string()),
+            "{:?}",
+            advertised_antigravity(&state)
+        );
+        super::refresh_model_catalog(&state).await;
+        assert_eq!(
+            advertised_antigravity(&state),
+            vec!["antigravity/gemini-4-argon-medium".to_string()]
+        );
+        super::refresh_model_catalog(&state).await;
+        assert_eq!(
+            advertised_antigravity(&state),
+            vec!["antigravity/gemini-4-argon-medium".to_string()],
+            "a failed fetch replaced the live list"
         );
     }
 }

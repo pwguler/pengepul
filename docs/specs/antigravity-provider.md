@@ -48,7 +48,10 @@ sources live in `docs/research/antigravity-provider.md`.
   fetch keeps the last list. Requests may address an id bare or prefixed; the id
   reaches the vendor as the client wrote it (ADR-0025). A bare id that another
   built-in also serves stays with that built-in, and the antigravity copy is
-  reachable only with its prefix.
+  reachable only with its prefix. A bare id the name heuristic gives to an
+  earlier built-in (`claude-*` to anthropic) stays with it while its pool has an
+  account, even when its list is missing; an antigravity-only `claude-*` id
+  then needs its `antigravity/` prefix.
 - AC-3: A Chat Completions request naming an antigravity model is answered in
   standard OpenAI shape, streaming and non-streaming, with reasoning delivered as
   `reasoning_content` and usage reported from `usageMetadata`, thinking counted
@@ -72,7 +75,9 @@ sources live in `docs/research/antigravity-provider.md`.
   or `…/v1internal:streamGenerateContent?alt=sse`. Tool declarations, tool
   results, system instructions and images are carried in their Gemini shapes;
   tool schemas are reduced to what the Gemini Schema proto accepts (nullable type
-  arrays, exclusive bounds, local `$ref`s inlined, non-string enums stringified).
+  arrays, exclusive bounds, local `$ref`s inlined to any depth with a cycle
+  ending as an open object, an array given `items`, and a non-string enum
+  keeping its type with its members moved into the description).
 - AC-6: A 426 whose body names a minimum version ("version X or later") is retried
   once with that version, which stays adopted for the process lifetime and is
   never lowered; the client sees the retried result. The `User-Agent` version is

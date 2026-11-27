@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 
 use crate::translate::{
-    anthropic_stop_reason, gemini_finish_reason, gemini_parts, gemini_prompt_blocked, gemini_usage,
+    anthropic_stop_reason, gemini_finish_reason, gemini_parts, gemini_turn_ended, gemini_usage,
 };
 use crate::types::UsageData;
 
@@ -37,21 +37,12 @@ impl AntigravityChunkState {
             self.id = id.to_string();
         }
         let (text, reasoning, tool_calls) = gemini_parts(gemini);
-        let finish = gemini
-            .get("candidates")
-            .and_then(Value::as_array)
-            .and_then(|candidates| candidates.first())
-            .and_then(|candidate| candidate.get("finishReason"))
-            .and_then(Value::as_str)
-            .filter(|reason| !reason.is_empty())
-            // A blocked prompt has no candidate to carry a reason; it still ends
-            // the stream.
-            .or_else(|| gemini_prompt_blocked(gemini).then_some("BLOCKED"));
+        let finish = gemini_turn_ended(gemini);
         let usage = gemini_usage(gemini.get("usageMetadata"));
         if text.is_empty()
             && reasoning.is_empty()
             && tool_calls.is_empty()
-            && finish.is_none()
+            && !finish
             && usage.is_none()
         {
             return None;
@@ -92,7 +83,7 @@ impl AntigravityChunkState {
                 "delta": Value::Object(delta),
                 // Gemini may send the call and the finish in separate chunks;
                 // the turn ended on a tool call if any chunk carried one.
-                "finish_reason": finish.map(|_| gemini_finish_reason(gemini, self.tool_index > 0))
+                "finish_reason": finish.then(|| gemini_finish_reason(gemini, self.tool_index > 0))
             }]
         });
         if let Some(usage) = usage {
