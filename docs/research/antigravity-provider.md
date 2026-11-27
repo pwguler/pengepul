@@ -135,8 +135,8 @@ production host:
 
 | Environment | Host | Status |
 |---|---|---|
-| production | `https://cloudcode-pa.googleapis.com` | verified-live (401, not 404) |
-| daily | `https://daily-cloudcode-pa.googleapis.com` | from source, CLIProxyAPI's default for generate |
+| production | `https://cloudcode-pa.googleapis.com` | verified-live: control plane (loadCodeAssist, fetchAvailableModels) answers 200, but generate answers 429 RESOURCE_EXHAUSTED for a Google AI Pro account with full quota (2026-11-27) |
+| daily | `https://daily-cloudcode-pa.googleapis.com` | verified-live 2026-11-27: generate, stream and tools answer 200 for the same account; pengepul's base |
 | daily sandbox | `https://daily-cloudcode-pa.sandbox.googleapis.com` | from source, `ANTIGRAVITY_API_SPEC.md` |
 
 | Action | Path |

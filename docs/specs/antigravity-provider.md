@@ -57,7 +57,7 @@ pool on every inbound dialect. Protocol facts and sources live in
   `Content-Type: application/json` and a `User-Agent` of
   `antigravity/hub/<version> (aidev_client; …)`, and its body is the Antigravity
   envelope — `project`, `model`, `userAgent`, `requestType` and the Gemini
-  `request` — to `https://cloudcode-pa.googleapis.com/v1internal:generateContent`
+  `request` — to `https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent`
   or `…/v1internal:streamGenerateContent?alt=sse`. Tool declarations, tool
   results, system instructions and images are carried in their Gemini shapes.
 - AC-6: A 426 whose body names a minimum version ("version X or later") is retried

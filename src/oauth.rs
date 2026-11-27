@@ -595,15 +595,27 @@ async fn antigravity_userinfo(access_token: &str) -> Result<(String, String)> {
 async fn antigravity_discover_project(access_token: &str) -> Result<(String, Option<String>)> {
     let load = antigravity_load_code_assist(access_token).await?;
     let tier = antigravity_tier(&load);
+    // The plan an account is on: a Google AI Pro/Ultra subscription arrives as
+    // `paidTier` while `currentTier` still reads free-tier, so the paid tier
+    // names the plan. Onboarding still takes the control plane's own tier id.
+    let plan = antigravity_paid_tier(&load).or_else(|| tier.clone());
     if let Some(project) = antigravity_project(&load) {
-        return Ok((project, tier));
+        return Ok((project, plan));
     }
     let tier_id = tier
         .as_deref()
         .unwrap_or(ANTIGRAVITY_FALLBACK_TIER)
         .to_string();
     let project = antigravity_onboard_user(access_token, &tier_id).await?;
-    Ok((project, tier))
+    Ok((project, plan))
+}
+
+fn antigravity_paid_tier(load: &Value) -> Option<String> {
+    load.get("paidTier")
+        .and_then(|tier| tier.get("id"))
+        .and_then(Value::as_str)
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
 }
 
 fn antigravity_project(load: &Value) -> Option<String> {
@@ -1132,8 +1144,8 @@ mod tests {
 mod antigravity_oauth_tests {
     use super::{
         ANTIGRAVITY_TOKEN_URL, antigravity_client_id, antigravity_client_secret,
-        antigravity_identity, antigravity_project, antigravity_refresh_request, antigravity_tier,
-        generate_antigravity_auth_url,
+        antigravity_identity, antigravity_paid_tier, antigravity_project,
+        antigravity_refresh_request, antigravity_tier, generate_antigravity_auth_url,
     };
     use crate::types::PkceCodes;
     use serde_json::json;
@@ -1229,6 +1241,18 @@ mod antigravity_oauth_tests {
             Some("t")
         );
         assert_eq!(antigravity_tier(&json!({})), None);
+        assert_eq!(
+            antigravity_paid_tier(&json!({
+                "currentTier": {"id": "free-tier"},
+                "paidTier": {"id": "g1-pro-tier", "name": "Google AI Pro"}
+            }))
+            .as_deref(),
+            Some("g1-pro-tier")
+        );
+        assert_eq!(
+            antigravity_paid_tier(&json!({"currentTier": {"id": "free-tier"}})),
+            None
+        );
     }
 
     #[test]

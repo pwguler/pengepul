@@ -36,7 +36,7 @@ pub const GROK_CLIENT_VERSION: &str = "0.1.202";
 /// Google's Cloud Code Assist host, the backend Antigravity drives. All five
 /// paths answer `401 UNAUTHENTICATED` naming their method, which is how they
 /// were confirmed live (docs/research/antigravity-provider.md).
-pub const ANTIGRAVITY_BASE_URL: &str = "https://cloudcode-pa.googleapis.com";
+pub const ANTIGRAVITY_BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
 pub const ANTIGRAVITY_GENERATE_PATH: &str = "/v1internal:generateContent";
 pub const ANTIGRAVITY_STREAM_PATH: &str = "/v1internal:streamGenerateContent?alt=sse";
 pub const ANTIGRAVITY_MODELS_PATH: &str = "/v1internal:fetchAvailableModels";
