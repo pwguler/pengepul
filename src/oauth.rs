@@ -430,12 +430,22 @@ pub async fn exchange_antigravity_code(
 }
 
 /// The same exchange for a code carried by hand from a browser on another
-/// machine: there is no state to compare, and the PKCE verifier still binds it.
+/// machine. A pasted callback URL carries its `state`, which must match; a
+/// bare code has none to compare, and the PKCE verifier still binds it.
 ///
 /// # Errors
 ///
-/// As [`exchange_antigravity_code`].
-pub async fn exchange_antigravity_pasted_code(code: &str, pkce: &PkceCodes) -> Result<TokenData> {
+/// As [`exchange_antigravity_code`], and a pasted `state` that does not match
+/// is refused before any request.
+pub async fn exchange_antigravity_pasted_code(
+    code: &str,
+    returned_state: Option<&str>,
+    expected_state: &str,
+    pkce: &PkceCodes,
+) -> Result<TokenData> {
+    if let Some(returned) = returned_state {
+        ensure_state(returned, expected_state)?;
+    }
     let redirect = antigravity_redirect_uri();
     let client_id = antigravity_client_id();
     let secret = antigravity_client_secret();
@@ -480,9 +490,9 @@ async fn exchange_antigravity_grant(pairs: &[(&str, &str)]) -> Result<TokenData>
     let (email, id) = antigravity_userinfo(&token.access_token).await?;
     token.email = email;
     token.account_uuid = id;
-    let (project, tier) = antigravity_discover_project(&token.access_token).await?;
+    let (project, plan) = antigravity_discover_project(&token.access_token).await?;
     token.project_id = Some(project);
-    token.plan_type = tier;
+    token.plan_type = plan;
     Ok(token)
 }
 
@@ -594,20 +604,24 @@ async fn antigravity_userinfo(access_token: &str) -> Result<(String, String)> {
 /// onboarding: an account with no project cannot serve a single request.
 async fn antigravity_discover_project(access_token: &str) -> Result<(String, Option<String>)> {
     let load = antigravity_load_code_assist(access_token).await?;
-    let tier = antigravity_tier(&load);
-    // The plan an account is on: a Google AI Pro/Ultra subscription arrives as
-    // `paidTier` while `currentTier` still reads free-tier, so the paid tier
-    // names the plan. Onboarding still takes the control plane's own tier id.
-    let plan = antigravity_paid_tier(&load).or_else(|| tier.clone());
+    let (plan, onboarding_tier) = antigravity_plan_and_onboarding_tier(&load);
     if let Some(project) = antigravity_project(&load) {
         return Ok((project, plan));
     }
-    let tier_id = tier
-        .as_deref()
-        .unwrap_or(ANTIGRAVITY_FALLBACK_TIER)
-        .to_string();
-    let project = antigravity_onboard_user(access_token, &tier_id).await?;
+    let project = antigravity_onboard_user(access_token, &onboarding_tier).await?;
     Ok((project, plan))
+}
+
+/// The plan label an account shows and the tier id a first-time account is
+/// onboarded onto, from one `loadCodeAssist` body. A Google AI Pro/Ultra
+/// subscription arrives as `paidTier` while `currentTier` still reads
+/// free-tier, so the paid tier names the plan; onboarding takes the control
+/// plane's own default tier, as `CLIProxyAPI`'s `defaultAntigravityTierID` does.
+fn antigravity_plan_and_onboarding_tier(load: &Value) -> (Option<String>, String) {
+    let tier = antigravity_tier(load);
+    let plan = antigravity_paid_tier(load).or_else(|| tier.clone());
+    let onboarding = tier.unwrap_or_else(|| ANTIGRAVITY_FALLBACK_TIER.to_string());
+    (plan, onboarding)
 }
 
 fn antigravity_paid_tier(load: &Value) -> Option<String> {
@@ -1144,8 +1158,9 @@ mod tests {
 mod antigravity_oauth_tests {
     use super::{
         ANTIGRAVITY_TOKEN_URL, antigravity_client_id, antigravity_client_secret,
-        antigravity_identity, antigravity_paid_tier, antigravity_project,
-        antigravity_refresh_request, antigravity_tier, generate_antigravity_auth_url,
+        antigravity_identity, antigravity_paid_tier, antigravity_plan_and_onboarding_tier,
+        antigravity_project, antigravity_refresh_request, antigravity_tier,
+        generate_antigravity_auth_url,
     };
     use crate::types::PkceCodes;
     use serde_json::json;
@@ -1253,6 +1268,45 @@ mod antigravity_oauth_tests {
             antigravity_paid_tier(&json!({"currentTier": {"id": "free-tier"}})),
             None
         );
+    }
+
+    /// F13: a subscription names its plan in `paidTier` while onboarding still
+    /// takes the control plane's own default tier.
+    #[test]
+    fn the_plan_comes_from_paid_tier_and_onboarding_from_allowed_tiers() {
+        let load = json!({
+            "currentTier": {"id": "free-tier"},
+            "allowedTiers": [{"id": "standard-tier", "isDefault": true}],
+            "paidTier": {"id": "g1-pro-tier"}
+        });
+        assert_eq!(
+            antigravity_plan_and_onboarding_tier(&load),
+            (Some("g1-pro-tier".to_string()), "standard-tier".to_string())
+        );
+        // No paid tier: the plan is the tier the account is on.
+        assert_eq!(
+            antigravity_plan_and_onboarding_tier(&json!({"currentTier": {"id": "free-tier"}})),
+            (Some("free-tier".to_string()), "free-tier".to_string())
+        );
+        // Nothing at all: no plan label, and onboarding asks for the free tier.
+        assert_eq!(
+            antigravity_plan_and_onboarding_tier(&json!({})),
+            (None, "free-tier".to_string())
+        );
+    }
+
+    /// L9: a pasted callback URL whose state is not this login's is refused,
+    /// before the code is spent.
+    #[tokio::test]
+    async fn a_pasted_callback_with_a_foreign_state_is_refused() {
+        let pkce = PkceCodes {
+            code_verifier: "v".repeat(43),
+            code_challenge: "c".to_string(),
+        };
+        let error = super::exchange_antigravity_pasted_code("code", Some("other"), "mine", &pkce)
+            .await
+            .expect_err("a foreign state");
+        assert!(error.to_string().contains("state mismatch"), "{error}");
     }
 
     #[test]

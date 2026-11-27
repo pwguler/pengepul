@@ -21,10 +21,6 @@ struct StoredToken {
     id_token: Option<String>,
     last_refresh: Option<String>,
     plan_type: Option<String>,
-    /// Defaulted because every credential written before this provider existed
-    /// omits it, and a required field would make `load_all_tokens` skip the
-    /// whole file (tokens.rs warns and continues on a parse error).
-    #[serde(default)]
     project_id: Option<String>,
 }
 

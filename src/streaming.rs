@@ -3,7 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use crate::translate::{anthropic_stop_reason, gemini_finish_reason, gemini_parts, gemini_usage};
+use crate::translate::{
+    anthropic_stop_reason, gemini_finish_reason, gemini_parts, gemini_prompt_blocked, gemini_usage,
+};
 use crate::types::UsageData;
 
 /// The state one antigravity stream carries between Gemini chunks: the id and
@@ -41,7 +43,10 @@ impl AntigravityChunkState {
             .and_then(|candidates| candidates.first())
             .and_then(|candidate| candidate.get("finishReason"))
             .and_then(Value::as_str)
-            .filter(|reason| !reason.is_empty());
+            .filter(|reason| !reason.is_empty())
+            // A blocked prompt has no candidate to carry a reason; it still ends
+            // the stream.
+            .or_else(|| gemini_prompt_blocked(gemini).then_some("BLOCKED"));
         let usage = gemini_usage(gemini.get("usageMetadata"));
         if text.is_empty()
             && reasoning.is_empty()
@@ -85,7 +90,9 @@ impl AntigravityChunkState {
             "choices": [{
                 "index": 0,
                 "delta": Value::Object(delta),
-                "finish_reason": finish.map(|_| gemini_finish_reason(gemini, !tool_calls.is_empty()))
+                // Gemini may send the call and the finish in separate chunks;
+                // the turn ended on a tool call if any chunk carried one.
+                "finish_reason": finish.map(|_| gemini_finish_reason(gemini, self.tool_index > 0))
             }]
         });
         if let Some(usage) = usage {
@@ -2049,6 +2056,33 @@ mod antigravity_chunk_tests {
             chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
             "a"
         );
+    }
+
+    /// F1: a streamed call hands the client an id that carries the signature,
+    /// so the next turn can replay it.
+    #[test]
+    fn a_streamed_call_carries_its_thought_signature_in_the_id() {
+        let mut state = AntigravityChunkState::new("gemini-4-neon-low");
+        let chunk = state
+            .chunk(&json!({"candidates": [{"content": {"parts": [{
+                "thoughtSignature": "sig-bytes",
+                "functionCall": {"name": "w", "args": {}, "id": "call_1"}
+            }]}}]}))
+            .expect("chunk");
+        let id = chunk["choices"][0]["delta"]["tool_calls"][0]["id"]
+            .as_str()
+            .expect("id");
+        assert!(id.starts_with("call_1__ags__"), "{id}");
+    }
+
+    /// L6: a blocked prompt in a stream ends it as a content filter.
+    #[test]
+    fn a_blocked_prompt_ends_the_stream_as_a_content_filter() {
+        let mut state = AntigravityChunkState::new("m");
+        let chunk = state
+            .chunk(&json!({"promptFeedback": {"blockReason": "SAFETY"}}))
+            .expect("a finish chunk");
+        assert_eq!(chunk["choices"][0]["finish_reason"], "content_filter");
     }
 
     #[test]

@@ -585,8 +585,10 @@ struct GenericModel {
 /// succeeded, so it advertises nothing and its ids fall back to the prefix heuristic.
 #[derive(Debug, Clone, Default)]
 pub struct ModelCatalog {
-    /// model id -> the provider serving it. anthropic and codex id namespaces do not overlap.
-    direct: BTreeMap<String, DirectModel>,
+    /// model id -> every built-in that lists it, in routing precedence. A bare id
+    /// routes to the first; each copy is advertised under its own prefix, so a
+    /// later fetch never takes an id from a built-in that listed it too.
+    direct: BTreeMap<String, Vec<DirectModel>>,
     /// configured provider id -> the model ids its `/v1/models` returned. Only
     /// advertised; bare ids never route to generic providers (prefix-only).
     generic: BTreeMap<String, Vec<GenericModel>>,
@@ -598,10 +600,15 @@ pub struct ModelCatalog {
 impl ModelCatalog {
     /// Replace a provider's entries with a freshly fetched list.
     pub fn set_direct(&mut self, kind: ProviderKind, models: FetchedModels) {
-        self.direct.retain(|_, existing| existing.kind != kind);
+        for entries in self.direct.values_mut() {
+            entries.retain(|existing| existing.kind != kind);
+        }
+        self.direct.retain(|_, entries| !entries.is_empty());
         for id in models.ids {
             let metadata = models.metadata.get(&id).cloned();
-            self.direct.insert(id, DirectModel { kind, metadata });
+            let entries = self.direct.entry(id).or_default();
+            entries.push(DirectModel { kind, metadata });
+            entries.sort_by_key(|entry| bare_id_precedence(entry.kind));
         }
     }
 
@@ -646,7 +653,7 @@ impl ModelCatalog {
             kind => self
                 .direct
                 .get(model)
-                .is_some_and(|listed| listed.kind == kind),
+                .is_some_and(|listed| listed.iter().any(|entry| entry.kind == kind)),
         };
         allowed
             .iter()
@@ -680,6 +687,7 @@ impl ModelCatalog {
         }
         self.direct
             .get(model)
+            .and_then(|entries| entries.first())
             .map(|entry| ProviderId::for_kind(entry.kind))
             .or_else(|| heuristic_provider(model).map(ProviderId::for_kind))
     }
@@ -691,10 +699,12 @@ impl ModelCatalog {
         let mut out = self
             .direct
             .iter()
-            .map(|(id, model)| AdvertisedModel {
-                id: format!("{}/{id}", model.kind.canonical_id()),
-                provider: ProviderId::for_kind(model.kind),
-                metadata: model.metadata.clone(),
+            .flat_map(|(id, entries)| {
+                entries.iter().map(move |model| AdvertisedModel {
+                    id: format!("{}/{id}", model.kind.canonical_id()),
+                    provider: ProviderId::for_kind(model.kind),
+                    metadata: model.metadata.clone(),
+                })
             })
             .collect::<Vec<_>>();
         for (provider_id, models) in &self.generic {
@@ -728,6 +738,19 @@ pub fn upstream_model<'a>(model: &'a str, provider: &ProviderId) -> &'a str {
         .strip_prefix(prefix)
         .and_then(|rest| rest.strip_prefix('/'))
         .unwrap_or(model)
+}
+
+/// Which built-in a bare id goes to when several list it: the built-ins in the
+/// order they joined the relay, so a new provider never takes an id an older one
+/// already served.
+const fn bare_id_precedence(kind: ProviderKind) -> u8 {
+    match kind {
+        ProviderKind::Anthropic => 0,
+        ProviderKind::Codex => 1,
+        ProviderKind::Grok => 2,
+        ProviderKind::Antigravity => 3,
+        ProviderKind::Generic => 4,
+    }
 }
 
 /// Route an id no fetched list claims, by name shape. Broad on purpose: a new `gpt-*` or
@@ -775,8 +798,9 @@ pub fn grok_static_models() -> FetchedModels {
 /// `fetchAvailableModels` replaces it with the upstream's own list.
 #[must_use]
 pub fn antigravity_static_models() -> FetchedModels {
+    // The bare `gemini-4-neon` is not an upstream id (`404 Requested entity was
+    // not found`); the effort is part of the name.
     let ids = [
-        "gemini-4-neon",
         "gemini-4-neon-low",
         "gemini-4-neon-medium",
         "gemini-4-neon-high",
@@ -793,6 +817,17 @@ pub fn antigravity_static_models() -> FetchedModels {
     FetchedModels::with_metadata(ids, metadata)
 }
 
+/// Whether an id the Antigravity catalog lists is a chat model this relay serves.
+/// The list also carries the IDE's tab-completion models (`tab_*`), internal
+/// `chat_<n>` ids, a thinking alias `CLIProxyAPI` also skips, and image models,
+/// which need another request type (a non-goal).
+fn is_antigravity_chat_model(id: &str) -> bool {
+    !(id.starts_with("tab_")
+        || id.starts_with("chat_")
+        || id.contains("image")
+        || id == "gemini-2.5-flash-thinking")
+}
+
 /// Models from an Antigravity `fetchAvailableModels` body, which keys a map by
 /// model id: `{"models": {"<id>": {"displayName", "maxTokens",
 /// "maxOutputTokens"}}}`. The window and cap are renamed to the field names the
@@ -804,7 +839,10 @@ pub fn parse_antigravity(body: &Value, provider: &ProviderId) -> FetchedModels {
     };
     let mut ids = Vec::new();
     let mut metadata = BTreeMap::new();
-    for (id, entry) in models {
+    for (id, entry) in models
+        .iter()
+        .filter(|(id, _)| is_antigravity_chat_model(id))
+    {
         ids.push(id.clone());
         let published = json!({
             "context_length": entry.get("maxTokens"),
@@ -1874,9 +1912,8 @@ fn antigravity_models_route_bare_prefixed_and_by_shape() {
     catalog.set_direct(ProviderKind::Antigravity, antigravity_static_models());
     let providers = BTreeMap::new();
 
-    // The brief's floor: the base id and its four effort tiers.
+    // The floor: the four effort tiers the upstream serves.
     for id in [
-        "gemini-4-neon",
         "gemini-4-neon-low",
         "gemini-4-neon-medium",
         "gemini-4-neon-high",
@@ -1908,7 +1945,6 @@ fn antigravity_static_models_floor_advertises_prefixed_with_limits() {
     assert_eq!(
         static_models.ids,
         vec![
-            "gemini-4-neon".to_string(),
             "gemini-4-neon-low".to_string(),
             "gemini-4-neon-medium".to_string(),
             "gemini-4-neon-high".to_string(),
@@ -1929,7 +1965,7 @@ fn antigravity_static_models_floor_advertises_prefixed_with_limits() {
         .filter(|model| model.provider.kind == ProviderKind::Antigravity)
         .map(|model| model.id)
         .collect();
-    assert!(advertised.contains(&"antigravity/gemini-4-neon".to_string()));
+    assert!(advertised.contains(&"antigravity/gemini-4-neon-medium".to_string()));
     assert!(advertised.contains(&"antigravity/gemini-4-neon-xhigh".to_string()));
 }
 
@@ -1968,4 +2004,77 @@ fn parse_antigravity_without_a_models_map_is_empty() {
             .ids
             .is_empty()
     );
+}
+
+/// F6: an id both the anthropic and the antigravity catalogs list stays with
+/// anthropic whichever was fetched last; the antigravity copy is reachable only
+/// by its prefix, and both stay advertised.
+#[test]
+fn an_antigravity_catalog_never_takes_an_id_from_anthropic() {
+    let providers = BTreeMap::new();
+    for anthropic_first in [true, false] {
+        let mut catalog = ModelCatalog::default();
+        let anthropic = FetchedModels::new(vec!["claude-sonnet-4-6".to_string()]);
+        let antigravity = FetchedModels::new(vec![
+            "claude-sonnet-4-6".to_string(),
+            "gemini-4-neon-low".to_string(),
+        ]);
+        if anthropic_first {
+            catalog.set_direct(ProviderKind::Anthropic, anthropic);
+            catalog.set_direct(ProviderKind::Antigravity, antigravity);
+        } else {
+            catalog.set_direct(ProviderKind::Antigravity, antigravity);
+            catalog.set_direct(ProviderKind::Anthropic, anthropic);
+        }
+        assert_eq!(
+            catalog.resolve_id("claude-sonnet-4-6", &providers),
+            Some(ProviderId::anthropic()),
+            "anthropic first: {anthropic_first}"
+        );
+        assert_eq!(
+            catalog.resolve_id("antigravity/claude-sonnet-4-6", &providers),
+            Some(ProviderId::antigravity())
+        );
+        let advertised: Vec<String> = catalog.advertised().into_iter().map(|m| m.id).collect();
+        assert!(
+            advertised.contains(&"anthropic/claude-sonnet-4-6".to_string()),
+            "{advertised:?}"
+        );
+        assert!(
+            advertised.contains(&"antigravity/claude-sonnet-4-6".to_string()),
+            "{advertised:?}"
+        );
+        // A refetch of anthropic alone leaves antigravity's copy listed.
+        catalog.set_direct(
+            ProviderKind::Anthropic,
+            FetchedModels::new(vec!["claude-sonnet-4-6".to_string()]),
+        );
+        assert!(
+            catalog
+                .advertised()
+                .iter()
+                .any(|m| m.id == "antigravity/claude-sonnet-4-6")
+        );
+    }
+}
+
+/// F5/L5: the floor names only ids the upstream serves, and the internal and
+/// non-chat ids of a live list are not advertised.
+#[test]
+fn the_antigravity_catalog_advertises_only_served_chat_models() {
+    assert!(
+        !antigravity_static_models()
+            .ids
+            .contains(&"gemini-4-neon".to_string()),
+        "the bare id answers 404 upstream"
+    );
+    let fetched = parse_antigravity(
+        &json!({"models": {
+            "gemini-4-neon-medium": {}, "tab_flash_lite_preview": {},
+            "tab_jump_flash_lite_preview": {}, "chat_20706": {},
+            "gemini-3.1-flash-image": {}, "gemini-2.5-flash-thinking": {}
+        }}),
+        &ProviderId::antigravity(),
+    );
+    assert_eq!(fetched.ids, vec!["gemini-4-neon-medium".to_string()]);
 }

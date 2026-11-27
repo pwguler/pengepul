@@ -33,9 +33,13 @@ pub const GROK_TOKEN_AUTH_VALUE: &str = "xai-grok-cli";
 /// is only the starting point.
 pub const GROK_CLIENT_VERSION: &str = "0.1.202";
 
-/// Google's Cloud Code Assist host, the backend Antigravity drives. All five
-/// paths answer `401 UNAUTHENTICATED` naming their method, which is how they
-/// were confirmed live (docs/research/antigravity-provider.md).
+/// Google's Cloud Code Assist host, the backend Antigravity drives, on its
+/// `daily-` channel for generation and the control plane alike. Production
+/// answered every generate from a Google AI Pro account with `429
+/// RESOURCE_EXHAUSTED` while its quota read full; daily served generate, stream
+/// and tools for the same account, and is the host `CLIProxyAPI` sends consumer
+/// credentials to (docs/research/antigravity-provider.md). `daily-` is Google's
+/// pre-release channel, so this constant is the one place to switch.
 pub const ANTIGRAVITY_BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
 pub const ANTIGRAVITY_GENERATE_PATH: &str = "/v1internal:generateContent";
 pub const ANTIGRAVITY_STREAM_PATH: &str = "/v1internal:streamGenerateContent?alt=sse";
@@ -1161,16 +1165,13 @@ fn parse_grok_minimum_version(response_body: &str) -> Option<String> {
     parse_minimum_version(response_body)
 }
 
-/// The minimum in a 426 upgrade nudge: grok's `"... version 0.1.202 or later
-/// ..."` and Antigravity's `"Please update to version 2.41.0"` are the same
-/// sentence with different lead-ins. A version is a dotted number; anything else
-/// in that slot is not one.
+/// The minimum in a 426 upgrade nudge, `"... update to version 0.1.202 or later
+/// ..."`. Only that lead-in is read: a body that merely mentions a version (the
+/// client's own, say) must not buy a retry. A version is a dotted number;
+/// anything else in that slot is not one.
 #[must_use]
 pub fn parse_minimum_version(response_body: &str) -> Option<String> {
-    let rest = response_body
-        .split_once("to version ")
-        .or_else(|| response_body.split_once("version "))?
-        .1;
+    let rest = response_body.split_once("to version ")?.1;
     let token: &str = rest.split([' ', '`', '"']).next()?;
     let token = token.trim_end_matches(['.', ',', ';']);
     let dotted = token.contains('.');
@@ -1206,37 +1207,85 @@ pub fn antigravity_user_agent() -> String {
     )
 }
 
-/// The Hub version to present: the one the manifest taught this process, else
-/// the pinned floor.
+/// The Hub version to present: the highest this process has been taught, by a
+/// 426 or by the manifest, else the pinned floor.
 #[must_use]
 pub fn antigravity_version() -> String {
-    ANTIGRAVITY_VERSION
-        .get()
-        .and_then(|state| state.lock().ok().and_then(|guard| guard.clone()))
-        .unwrap_or_else(|| ANTIGRAVITY_CLIENT_VERSION.to_string())
+    ANTIGRAVITY_VERSION.current()
 }
 
-static ANTIGRAVITY_VERSION: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static ANTIGRAVITY_VERSION: VersionFloor = VersionFloor::new(ANTIGRAVITY_CLIENT_VERSION);
 
-/// Adopt a version from a 426 body or the Hub manifest. Returns it when it is
-/// news (so the caller may retry once), `None` when the body names none or the
-/// process already presents it.
-#[must_use]
-pub fn learn_antigravity_version(response_body: &str) -> Option<String> {
-    let version = parse_minimum_version(response_body)?;
-    adopt_antigravity_version(version)
+/// A client version that only moves up. A 426 names the floor the upstream
+/// enforces and the manifest names the newest release; neither may lower what
+/// the other taught, or the next request is refused again.
+pub struct VersionFloor {
+    pinned: &'static str,
+    learned: Mutex<Option<String>>,
 }
 
-fn adopt_antigravity_version(version: String) -> Option<String> {
-    let mut guard = ANTIGRAVITY_VERSION
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .ok()?;
-    if guard.as_deref() == Some(version.as_str()) {
-        return None;
+impl VersionFloor {
+    #[must_use]
+    pub const fn new(pinned: &'static str) -> Self {
+        Self {
+            pinned,
+            learned: Mutex::new(None),
+        }
     }
-    *guard = Some(version.clone());
-    Some(version)
+
+    #[must_use]
+    pub fn current(&self) -> String {
+        self.learned
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .unwrap_or_else(|| self.pinned.to_string())
+    }
+
+    /// Raise the floor to `version` when it is higher. Returns whether it rose.
+    pub fn adopt(&self, version: &str) -> bool {
+        let Ok(mut guard) = self.learned.lock() else {
+            return false;
+        };
+        let current = guard.clone().unwrap_or_else(|| self.pinned.to_string());
+        if version_rank(version) <= version_rank(&current) {
+            return false;
+        }
+        *guard = Some(version.to_string());
+        true
+    }
+
+    /// What a request refused with this 426 body should be retried with, when
+    /// anything: the version now presented, once it meets the body's minimum
+    /// and differs from the one that request `sent`. Several requests refused at
+    /// once all retry, whichever of them raised the floor.
+    #[must_use]
+    pub fn after_426(&self, response_body: &str, sent: &str) -> Option<String> {
+        let minimum = parse_minimum_version(response_body)?;
+        self.adopt(&minimum);
+        let now = self.current();
+        (now != sent && version_rank(&now) >= version_rank(&minimum)).then_some(now)
+    }
+}
+
+/// A dotted version as numbers, so `2.10.0` ranks above `2.9.0`.
+fn version_rank(version: &str) -> Vec<u64> {
+    version
+        .split('.')
+        .map(|part| part.parse().unwrap_or(0))
+        .collect()
+}
+
+/// The version to retry a 426 with, on the process-wide floor; see
+/// [`VersionFloor::after_426`].
+#[must_use]
+pub fn learn_antigravity_version(response_body: &str, sent: &str) -> Option<String> {
+    ANTIGRAVITY_VERSION.after_426(response_body, sent)
+}
+
+/// Raise the process-wide floor to a version the manifest names.
+pub fn adopt_antigravity_version(version: &str) -> bool {
+    ANTIGRAVITY_VERSION.adopt(version)
 }
 
 /// The `version:` line of the Antigravity Hub updater manifest. The document is
@@ -1287,71 +1336,50 @@ pub fn antigravity_unwrap(value: Value) -> Value {
     }
 }
 
-/// The wait a `RESOURCE_EXHAUSTED` body names in `details[].retryDelay`, a Go
-/// duration string (`"3.957525076s"`, `"1m30s"`). This is the provider's retry
-/// hint; Cloud Code sends no `Retry-After` header.
+/// The wait a `RESOURCE_EXHAUSTED` body names in `details[].retryDelay`. This
+/// is the provider's retry hint; Cloud Code sends no `Retry-After` header.
 #[must_use]
 pub fn antigravity_retry_delay(body: &Value) -> Option<Duration> {
     let details = body.get("error")?.get("details")?.as_array()?;
     details
         .iter()
         .find_map(|detail| detail.get("retryDelay").and_then(Value::as_str))
-        .and_then(parse_go_duration)
+        .and_then(parse_proto_duration)
 }
 
-/// A Go duration string: one or more `<number><unit>` groups, where a unit is
-/// `h`, `m`, `s`, `ms`, `us` or `ns`. Fractional values are accepted; anything
-/// else in that slot is not a duration.
-fn parse_go_duration(raw: &str) -> Option<Duration> {
-    let mut total = Duration::ZERO;
-    let mut rest = raw.trim();
-    if rest.is_empty() {
+/// A protobuf `Duration` in its JSON form, which is always decimal seconds with
+/// an `s` suffix (`"3.957525076s"`). Anything else, and a value too large for a
+/// `Duration`, is not a wait.
+fn parse_proto_duration(raw: &str) -> Option<Duration> {
+    let seconds = raw.trim().strip_suffix('s')?;
+    let digits = seconds.bytes().filter(u8::is_ascii_digit).count();
+    let points = seconds.bytes().filter(|&byte| byte == b'.').count();
+    if digits == 0 || points > 1 || digits + points != seconds.len() {
         return None;
     }
-    while !rest.is_empty() {
-        let end = rest
-            .find(|c: char| !c.is_ascii_digit() && c != '.')
-            .unwrap_or(rest.len());
-        let (number, tail) = rest.split_at(end);
-        let value: f64 = number.parse().ok()?;
-        let units = [
-            ("ms", Duration::from_millis(1)),
-            ("us", Duration::from_micros(1)),
-            ("ns", Duration::from_nanos(1)),
-            ("s", Duration::from_secs(1)),
-            ("m", Duration::from_mins(1)),
-            ("h", Duration::from_hours(1)),
-        ];
-        let (span, leftover) = units
-            .iter()
-            .find_map(|(unit, span)| tail.strip_prefix(unit).map(|rest| (*span, rest)))?;
-        total += span.mul_f64(value);
-        rest = leftover;
-    }
-    Some(total)
+    Duration::try_from_secs_f64(seconds.parse().ok()?).ok()
 }
 
-/// Read the Hub manifest once per process and adopt its version. A failed fetch
-/// keeps the pinned floor: the manifest is a nicety, not a dependency.
-pub async fn refresh_antigravity_version(client: &reqwest::Client) {
-    let Ok(response) = client
+/// The version the Antigravity Hub updater manifest names.
+///
+/// # Errors
+///
+/// Returns an error when the manifest cannot be fetched or names no version.
+pub async fn fetch_antigravity_manifest_version(
+    client: &reqwest::Client,
+) -> anyhow::Result<String> {
+    let response = client
         .get(ANTIGRAVITY_HUB_MANIFEST_URL)
         .header("User-Agent", "electron-builder")
         .timeout(Duration::from_secs(10))
         .send()
-        .await
-    else {
-        return;
-    };
-    if !response.status().is_success() {
-        return;
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!("antigravity hub manifest returned {status}");
     }
-    let Ok(text) = response.text().await else {
-        return;
-    };
-    if let Some(version) = antigravity_manifest_version(&text) {
-        adopt_antigravity_version(version);
-    }
+    antigravity_manifest_version(&response.text().await?)
+        .ok_or_else(|| anyhow::anyhow!("antigravity hub manifest names no version"))
 }
 
 /// The configured endpoint's base URL, trimmed of a trailing slash so the
@@ -1446,9 +1474,9 @@ mod classifier_tests {
 #[cfg(test)]
 mod antigravity_tests {
     use super::{
-        ANTIGRAVITY_CLIENT_VERSION, antigravity_envelope, antigravity_manifest_version,
-        antigravity_retry_delay, antigravity_unwrap, antigravity_user_agent,
-        learn_antigravity_version,
+        ANTIGRAVITY_CLIENT_VERSION, VersionFloor, antigravity_envelope,
+        antigravity_manifest_version, antigravity_retry_delay, antigravity_unwrap,
+        antigravity_user_agent,
     };
     use serde_json::json;
     use std::time::Duration;
@@ -1503,17 +1531,19 @@ mod antigravity_tests {
         let body = json!({"error": {"details": [{"retryDelay": "soon"}]}});
         assert_eq!(antigravity_retry_delay(&body), None);
         assert_eq!(antigravity_retry_delay(&json!({"error": {}})), None);
-        // Compound and fractional Go durations both parse.
-        let compound = json!({"error": {"details": [{"retryDelay": "1m30s"}]}});
-        assert_eq!(
-            antigravity_retry_delay(&compound),
-            Some(Duration::from_secs(90))
-        );
-        let milliseconds = json!({"error": {"details": [{"retryDelay": "250ms"}]}});
-        assert_eq!(
-            antigravity_retry_delay(&milliseconds),
-            Some(Duration::from_millis(250))
-        );
+        // Protobuf Duration JSON is always decimal seconds; nothing else parses.
+        for raw in ["1m30s", "250ms", "-3s", "infs", "1e3s", "3"] {
+            let body = json!({"error": {"details": [{"retryDelay": raw}]}});
+            assert_eq!(antigravity_retry_delay(&body), None, "{raw}");
+        }
+    }
+
+    /// L2: a value no `Duration` can hold is refused, not a panic.
+    #[test]
+    fn an_absurd_retry_delay_is_refused_without_panicking() {
+        let raw = format!("{}s", "9".repeat(400));
+        let body = json!({"error": {"details": [{"retryDelay": raw}]}});
+        assert_eq!(antigravity_retry_delay(&body), None);
     }
 
     #[test]
@@ -1527,25 +1557,58 @@ mod antigravity_tests {
         assert_eq!(antigravity_manifest_version("version: soon"), None);
     }
 
-    /// One test owns the process-global learned version: parallel tests would
-    /// race on it.
     #[test]
-    fn the_pinned_version_is_presented_until_a_426_teaches_another() {
+    fn the_pinned_version_is_presented_in_the_user_agent() {
         assert!(
             antigravity_user_agent()
-                .starts_with(&format!("antigravity/hub/{ANTIGRAVITY_CLIENT_VERSION}")),
+                .starts_with(&format!("antigravity/hub/{}", super::antigravity_version())),
             "{}",
             antigravity_user_agent()
         );
         assert!(antigravity_user_agent().contains("(aidev_client; os_type=darwin; arch=arm64)"));
+        assert_eq!(ANTIGRAVITY_CLIENT_VERSION, "2.35.2");
+    }
+
+    #[test]
+    fn a_426_raises_the_floor_and_buys_one_retry() {
+        let floor = VersionFloor::new("2.35.2");
+        assert_eq!(floor.current(), "2.35.2");
+        let body = "Please update to version 2.41.0 or later.";
+        assert_eq!(floor.after_426(body, "2.35.2"), Some("2.41.0".to_string()));
+        assert_eq!(floor.current(), "2.41.0");
+        // A request that already sent the floor has nothing new to retry with.
+        assert_eq!(floor.after_426(body, "2.41.0"), None);
+    }
+
+    /// L4: a second request refused at the same time still retries, with the
+    /// floor the first one raised.
+    #[test]
+    fn concurrent_426s_all_retry() {
+        let floor = VersionFloor::new("2.35.2");
+        let body = "Please update to version 2.41.0 or later.";
+        assert_eq!(floor.after_426(body, "2.35.2"), Some("2.41.0".to_string()));
+        assert_eq!(floor.after_426(body, "2.35.2"), Some("2.41.0".to_string()));
+    }
+
+    /// L4: the manifest cannot lower a floor a 426 taught, and versions rank
+    /// numerically.
+    #[test]
+    fn the_floor_never_goes_down() {
+        let floor = VersionFloor::new("2.35.2");
+        assert!(floor.adopt("2.41.0"));
+        assert!(!floor.adopt("2.36.0"), "the manifest lowered the floor");
+        assert_eq!(floor.current(), "2.41.0");
+        assert!(floor.adopt("2.100.0"));
+        assert_eq!(floor.current(), "2.100.0");
+    }
+
+    /// L3: a body that names a version without asking for an upgrade buys no
+    /// retry.
+    #[test]
+    fn only_an_upgrade_request_names_a_minimum() {
+        let floor = VersionFloor::new("2.35.2");
         assert_eq!(
-            learn_antigravity_version("Please update to version 2.41.0 or later."),
-            Some("2.41.0".to_string())
-        );
-        assert!(antigravity_user_agent().starts_with("antigravity/hub/2.41.0"));
-        // The same floor again teaches nothing, so no second retry is owed.
-        assert_eq!(
-            learn_antigravity_version("Please update to version 2.41.0 or later."),
+            floor.after_426("client version 9.9.9 is not supported", "2.35.2"),
             None
         );
     }

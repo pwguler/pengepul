@@ -98,7 +98,7 @@ the operator picks; it is the Cloud Code Assist project the account is bound to,
 and it is discovered, not configured:
 
 ```
-POST https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist
+POST https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist
 Authorization: Bearer <token>
 {"metadata": {"ideType": "ANTIGRAVITY"}}
 → {"cloudaicompanionProject": "...", "currentTier": {"id": "…"},
@@ -112,7 +112,7 @@ object with `id`; CLIProxyAPI accepts `cloudaicompanionProject`, `projectId` and
 A first-time account has no project and must be onboarded:
 
 ```
-POST https://cloudcode-pa.googleapis.com/v1internal:onboardUser
+POST https://daily-cloudcode-pa.googleapis.com/v1internal:onboardUser
 Authorization: Bearer <token>
 {"tier_id": "<default tier>", "metadata": {"ide_type": "ANTIGRAVITY",
  "ide_version": "<version>", "ide_name": "antigravity"}}
@@ -123,11 +123,15 @@ Authorization: Bearer <token>
 apart. The tier is the `allowedTiers` entry with `isDefault`, else
 `currentTier.id`, else `free-tier`.
 
-`cloudcode-pa` answers `401 UNAUTHENTICATED` for both actions without a token,
-naming the method — which is how the two paths are confirmed to exist on the
-production host:
-**verified-live 2026-11-27** (`CloudCode.LoadCodeAssist` and
-`PredictionService.GenerateContent`).
+Both hosts answer `401 UNAUTHENTICATED` for both actions without a token, naming
+the method — which is how the paths are confirmed to exist on production and on
+daily: **verified-live 2026-11-27** (`CloudCode.LoadCodeAssist` and
+`PredictionService.GenerateContent` on production; `loadCodeAssist`,
+`onboardUser` and `fetchAvailableModels` on daily). CLIProxyAPI sends login's
+`loadCodeAssist` and `onboardUser` to the daily host too
+(`internal/auth/antigravity/auth.go`, `DailyAPIEndpoint`). pengepul uses daily
+for everything; daily `loadCodeAssist`/`onboardUser` with a real token is
+**unverified** until a login with this build.
 
 ## Upstream
 
@@ -147,8 +151,12 @@ production host:
 | onboarding | `/v1internal:onboardUser` |
 | model catalog | `/v1internal:fetchAvailableModels` |
 
-All five answer `401 UNAUTHENTICATED` on the production host without a token, so
-all five exist there. **verified-live 2026-11-27.**
+All five answer `401 UNAUTHENTICATED` on both hosts without a token, so all five
+exist on both. **verified-live 2026-11-27.** pengepul's base is daily: production
+answered every generate with 429 while the account's quota read full, and
+CLIProxyAPI's `resolveAntigravityRequestBaseURL` defaults consumer credentials to
+daily with no cross-tier fallback. `daily-` is Google's pre-release channel, so it
+can change first; one constant (`ANTIGRAVITY_BASE_URL`) switches it.
 
 ### Envelope
 
@@ -238,6 +246,28 @@ Thinking arrives as a part with `"thought": true` beside its `text`, or, for
 Gemini models, a part carrying `thoughtSignature`. **from source**,
 `ANTIGRAVITY_API_SPEC.md` "Thinking Response".
 
+### Tool loops
+
+The second turn of a tool loop sends the call and its result back, and both
+families refuse it unless it carries what turn one minted. **verified-live
+2026-11-27**, daily, with the isolated instance's credential:
+
+- `gemini-4-neon-low` puts a `thoughtSignature` (a few hundred bytes) beside the
+  `functionCall` part, and the call carries `id` (`call_<digits>`). Replayed
+  without the signature: `400 INVALID_ARGUMENT: Function call is missing a
+  thought_signature in functionCall parts`. Replayed with it: 200.
+- `claude-sonnet-5-5-low` mints no signature; its call id is `toolu_vrtx_…`.
+  Replayed without `functionCall.id`: `400 messages.1.content.0.tool_use.id:
+  Field required`. With the id on the call and on `functionResponse`: 200.
+- Google's documented sentinel `skip_thought_signature_validator`, on the first
+  `functionCall` of a model turn, answers 200 on both families, so a history the
+  relay has no signature for (another provider's, or Claude's) still replays.
+
+The relay holds no conversation, so the signature travels with the client: it is
+appended to the tool-call id the client is given (`<vendor id>__ags__<base64url
+signature>`), every dialect echoes that id on the call and its result, and the
+next request splits it back out (docs/specs/antigravity-provider.md, AC-9).
+
 ### Headers
 
 ```http
@@ -297,7 +327,7 @@ relay must parse the duration string rather than the header. The existing
 ### Model catalog
 
 ```
-POST https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels
+POST https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels
 Authorization: Bearer <token>
 {"project": "<project id>"}
 → {"models": {"<model id>": {"displayName": "...", "maxTokens": 1048576,
@@ -367,10 +397,20 @@ greater than `thinkingBudget`. **from source**,
   generation is rejected. `response` must be unwrapped on the way back.
 - **Streams may omit `[DONE]`.** The stream ends when the connection does; a
   client that waits for a terminator needs one synthesized.
-- **No `Retry-After`.** The wait is `details[].retryDelay`, a Go duration string.
-- **Thinking signatures** (`thoughtSignature`) are opaque and model-specific; they
-  are dropped rather than replayed, because pengepul is stateless in this
-  provider.
+- **No `Retry-After`.** The wait is `details[].retryDelay`, a protobuf Duration in
+  JSON form: decimal seconds with an `s` suffix.
+- **Thinking signatures** (`thoughtSignature`) are opaque and model-specific, and
+  a Gemini tool loop is refused without them (see Tool loops). They ride in the
+  tool-call id rather than in relay state.
+- **Quota is per model, the Cooldown per account.** A 429's `retryDelay` names
+  the wait for the model that was exhausted, but pengepul's Cooldown parks the
+  whole account, for every model, up to the Retry-hint cap of a day. Decided:
+  kept account-wide (owner, PR #19 review L11). A pool with a sibling account
+  fails over; a pool of one keeps no Cooldown (ADR-0027).
+- **Tool schemas** are read as the Gemini `Schema` proto: a `type` array,
+  `exclusiveMinimum`, `$ref` or `additionalProperties` is `400 Cannot find field`
+  or `Proto field is not repeating` (verified-live 2026-11-27, request `l3` of
+  the PR #19 review).
 - **Tool-name and schema restrictions** are real `400`s, and `const`/`$ref` show
   up in ordinary client tool definitions.
 - **Client secret** lives in the binary like the other providers' client ids. It
@@ -396,8 +436,12 @@ greater than `thinkingBudget`. **from source**,
   - `POST https://oauth2.googleapis.com/token` without/with the client secret →
     `invalid_request` / `invalid_grant`.
   - `POST https://cloudcode-pa.googleapis.com/v1internal:{generateContent,
-    streamGenerateContent?alt=sse,fetchAvailableModels,loadCodeAssist}` → `401
-    UNAUTHENTICATED` naming the method.
+    streamGenerateContent?alt=sse,fetchAvailableModels,loadCodeAssist}` and
+    `POST https://daily-cloudcode-pa.googleapis.com/v1internal:{loadCodeAssist,
+    onboardUser,fetchAvailableModels}` → `401 UNAUTHENTICATED` naming the method.
+- Live probes with the isolated instance's credential, 2026-11-27: the tool-loop
+  replays above, and the daily catalog (37 ids; no bare `gemini-4-neon`, which
+  answers `404 Requested entity was not found`).
   - `GET https://accounts.google.com/o/oauth2/v2/auth?...` → `302` to sign-in.
   - `GET https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/
     manifest/latest-arm64-mac.yml` → `version: 2.35.2`.

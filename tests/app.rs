@@ -8848,123 +8848,162 @@ async fn messages_route_masks_custom_typed_tools_and_restores_them_in_a_stream()
 
 // ---- antigravity: the pool serves every inbound dialect ----------------------
 
+/// A scripted Cloud Code double. It speaks the upstream's own wire shapes
+/// (`{"response": <Gemini>}` and Gemini SSE frames), so every route test runs
+/// the relay's envelope, unwrap and translation, and it records each envelope
+/// it was sent.
 struct AntigravityUpstream {
     calls: Mutex<Vec<UpstreamRequest>>,
+    replies: Mutex<std::collections::VecDeque<(u16, Value)>>,
+    streams: Mutex<std::collections::VecDeque<Vec<String>>>,
+    version_fetches: Mutex<usize>,
 }
 
 impl AntigravityUpstream {
     fn new() -> Self {
         Self {
             calls: Mutex::new(Vec::new()),
+            replies: Mutex::new(std::collections::VecDeque::new()),
+            streams: Mutex::new(std::collections::VecDeque::new()),
+            version_fetches: Mutex::new(0),
         }
     }
 
-    fn chat_body() -> Value {
-        json!({
-            "id": "chatcmpl_antigravity",
-            "object": "chat.completion",
-            "created": 1_789_015_110u64,
-            "model": "gemini-4-neon",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": "pong",
-                    "reasoning_content": "the user asked for pong"
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 211, "completion_tokens": 1, "total_tokens": 212}
-        })
+    fn reply(self, status: u16, body: Value) -> Self {
+        self.replies
+            .lock()
+            .expect("replies")
+            .push_back((status, body));
+        self
+    }
+
+    fn stream(self, frames: &[Value]) -> Self {
+        let frames = frames
+            .iter()
+            .map(|frame| format!("data: {frame}\n\n"))
+            .collect();
+        self.streams.lock().expect("streams").push_back(frames);
+        self
+    }
+
+    fn envelopes(&self) -> Vec<Value> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .iter()
+            .map(|call| call.body.clone())
+            .collect()
     }
 }
 
+/// `{"response": {...}}` around one candidate.
+fn gemini(parts: Value, finish: Option<&str>, usage: Option<Value>) -> Value {
+    let mut candidate = json!({"content": {"role": "model"}});
+    candidate["content"]["parts"] = parts;
+    if let Some(finish) = finish {
+        candidate["finishReason"] = json!(finish);
+    }
+    let mut response = json!({"responseId": "resp-1", "candidates": [candidate]});
+    if let Some(usage) = usage {
+        response["usageMetadata"] = usage;
+    }
+    json!({"response": response, "traceId": "t"})
+}
+
+fn answer_with_thinking() -> Value {
+    gemini(
+        json!([
+            {"text": "the user asked for pong", "thought": true},
+            {"text": "pong"}
+        ]),
+        Some("STOP"),
+        Some(json!({"promptTokenCount": 211, "candidatesTokenCount": 1,
+                    "thoughtsTokenCount": 9, "totalTokenCount": 221})),
+    )
+}
+
 impl UpstreamClient for AntigravityUpstream {
-    fn anthropic_messages(
-        &self,
-        _request: UpstreamRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+    fn anthropic_messages(&self, _request: UpstreamRequest) -> UpstreamFuture {
         unreachable!("anthropic not used in antigravity tests")
     }
 
-    fn anthropic_messages_stream(
-        &self,
-        _request: UpstreamRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+    fn anthropic_messages_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
         unreachable!("anthropic stream not used in antigravity tests")
     }
 
-    fn anthropic_count_tokens(
-        &self,
-        _request: UpstreamRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+    fn anthropic_count_tokens(&self, _request: UpstreamRequest) -> UpstreamFuture {
         unreachable!("count_tokens not used in antigravity tests")
     }
 
-    fn codex_responses(
-        &self,
-        _request: UpstreamRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+    fn codex_responses(&self, _request: UpstreamRequest) -> UpstreamFuture {
         unreachable!("codex not used in antigravity tests")
     }
 
-    fn codex_responses_stream(
-        &self,
-        _request: UpstreamRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+    fn codex_responses_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
         unreachable!("codex stream not used in antigravity tests")
     }
 
-    fn generic_chat(
-        &self,
-        _request: UpstreamRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+    fn generic_chat(&self, _request: UpstreamRequest) -> UpstreamFuture {
         unreachable!("generic chat not used in antigravity tests")
     }
 
-    fn generic_chat_stream(
-        &self,
-        _request: UpstreamRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+    fn generic_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
         unreachable!("generic stream not used in antigravity tests")
     }
 
-    fn antigravity_generate(
-        &self,
-        request: UpstreamRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<UpstreamJsonResponse>> + Send>> {
+    fn antigravity_generate(&self, request: UpstreamRequest) -> UpstreamFuture {
         self.calls.lock().expect("calls lock").push(request);
-        Box::pin(async {
+        let (status, body) = self
+            .replies
+            .lock()
+            .expect("replies")
+            .pop_front()
+            .unwrap_or_else(|| (200, answer_with_thinking()));
+        Box::pin(async move {
             Ok(UpstreamJsonResponse {
                 quota: None,
                 retry_hint: None,
-                status: axum::http::StatusCode::OK,
-                body: AntigravityUpstream::chat_body(),
+                status: axum::http::StatusCode::from_u16(status).expect("status"),
+                body,
             })
         })
     }
 
-    fn antigravity_generate_stream(
-        &self,
-        request: UpstreamRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<UpstreamSseResponse>> + Send>> {
+    fn antigravity_generate_stream(&self, request: UpstreamRequest) -> UpstreamSseFuture {
         self.calls.lock().expect("calls lock").push(request);
-        Box::pin(async {
+        let frames = self
+            .streams
+            .lock()
+            .expect("streams")
+            .pop_front()
+            .unwrap_or_else(|| {
+                [
+                    gemini(
+                        json!([{"text": "thin", "thought": true}]),
+                        None,
+                        Some(json!({"promptTokenCount": 211, "candidatesTokenCount": 0,
+                                    "totalTokenCount": 211})),
+                    ),
+                    gemini(json!([{"text": "pong"}]), None, None),
+                    gemini(
+                        json!([]),
+                        Some("STOP"),
+                        Some(json!({"promptTokenCount": 211, "candidatesTokenCount": 1,
+                                    "totalTokenCount": 212})),
+                    ),
+                ]
+                .iter()
+                .map(|frame| format!("data: {frame}\n\n"))
+                .collect()
+            });
+        Box::pin(async move {
             Ok(UpstreamSseResponse {
                 quota: None,
                 retry_hint: None,
                 status: axum::http::StatusCode::OK,
-                body: Box::pin(futures_util::stream::iter([
-                    Ok(Bytes::from_static(
-                        b"data: {\"response\":{\"responseId\":\"resp-1\",\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"thin\",\"thought\":true}]}}],\"usageMetadata\":{\"promptTokenCount\":211,\"candidatesTokenCount\":0,\"totalTokenCount\":211}}}\n\n",
-                    )),
-                    Ok(Bytes::from_static(
-                        b"data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"pong\"}]}}]}}\n\n",
-                    )),
-                    Ok(Bytes::from_static(
-                        b"data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":211,\"candidatesTokenCount\":1,\"totalTokenCount\":212}}}\n\n",
-                    )),
-                ])),
+                body: Box::pin(futures_util::stream::iter(
+                    frames.into_iter().map(|frame| Ok(Bytes::from(frame))),
+                )),
             })
         })
     }
@@ -8978,25 +9017,69 @@ impl UpstreamClient for AntigravityUpstream {
         assert_eq!(kind, ProviderKind::Antigravity);
         Box::pin(async { Ok(FetchedModels::new(vec![])) })
     }
+
+    fn fetch_antigravity_version(&self) -> pengepul::app::VersionFuture {
+        *self.version_fetches.lock().expect("fetches") += 1;
+        Box::pin(async { Ok("2.35.2".to_string()) })
+    }
+}
+
+fn antigravity_token(email: &str, access: &str) -> TokenData {
+    TokenData {
+        access_token: access.to_string(),
+        refresh_token: "google-refresh".to_string(),
+        email: email.to_string(),
+        expires_at: "2030-01-01T00:00:00Z".to_string(),
+        account_uuid: "google-account-id".to_string(),
+        provider: ProviderId::antigravity(),
+        id_token: None,
+        last_refresh_at: None,
+        plan_type: Some("g1-pro-tier".to_string()),
+        project_id: Some("cloud-code-project".to_string()),
+    }
 }
 
 fn save_antigravity_account(dir: &std::path::Path) {
     save_token(
         dir,
-        &TokenData {
-            access_token: "google-access-token".to_string(),
-            refresh_token: "google-refresh".to_string(),
-            email: "operator@example.com".to_string(),
-            expires_at: "2030-01-01T00:00:00Z".to_string(),
-            account_uuid: "google-account-id".to_string(),
-            provider: ProviderId::antigravity(),
-            id_token: None,
-            last_refresh_at: None,
-            plan_type: Some("standard-tier".to_string()),
-            project_id: Some("cloud-code-project".to_string()),
-        },
+        &antigravity_token("operator@example.com", "google-access-token"),
     )
     .expect("save antigravity token");
+}
+
+fn post(uri: &str, body: &Value) -> axum::http::Request<Body> {
+    axum::http::Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("authorization", "Bearer sk-test")
+        .header("content-type", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .header("content-length", "1")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+fn weather_tool() -> Value {
+    json!({"type": "function", "function": {
+        "name": "get_weather",
+        "description": "Current weather for a city",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
+                       "required": ["city"]}
+    }})
+}
+
+/// A turn-one reply that calls the tool, with the signature Gemini mints.
+fn tool_call_reply() -> Value {
+    gemini(
+        json!([{
+            "thoughtSignature": "c2lnbmF0dXJl+/=",
+            "functionCall": {"name": "get_weather", "args": {"city": "Paris"},
+                             "id": "call_7168"}
+        }]),
+        Some("STOP"),
+        Some(json!({"promptTokenCount": 101, "candidatesTokenCount": 19,
+                    "thoughtsTokenCount": 70, "totalTokenCount": 190})),
+    )
 }
 
 #[tokio::test]
@@ -9008,48 +9091,46 @@ async fn antigravity_pool_serves_chat_completions_and_passes_reasoning_through()
 
     let (status, body) = json_response(
         app,
-        axum::http::Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("authorization", "Bearer sk-test")
-            .header("content-type", "application/json")
-            .header("content-length", "1")
-            .body(Body::from(
-                json!({
-                    "model": "gemini-4-neon",
-                    "messages": [{"role": "user", "content": "reply exactly: pong"}],
-                    "reasoning_effort": "low"
-                })
-                .to_string(),
-            ))
-            .unwrap(),
+        post(
+            "/v1/chat/completions",
+            &json!({
+                "model": "gemini-4-neon-medium",
+                "messages": [{"role": "user", "content": "reply exactly: pong"}],
+                "reasoning_effort": "low"
+            }),
+        ),
     )
     .await;
 
-    assert_eq!(status, 200);
+    assert_eq!(status, 200, "{body}");
     assert_eq!(body["choices"][0]["message"]["content"], "pong");
     assert_eq!(
         body["choices"][0]["message"]["reasoning_content"],
         "the user asked for pong"
     );
     assert_eq!(body["usage"]["prompt_tokens"], 211);
-
-    let calls = upstream.calls.lock().expect("calls lock");
-    let request = calls.first().expect("one antigravity upstream call");
-    // The body crossing the client boundary is Chat; the envelope is the
-    // client's own business.
-    assert_eq!(request.body["model"], "gemini-4-neon");
-    assert_eq!(request.body["reasoning_effort"], "low");
-    assert_eq!(request.body["messages"][0]["role"], "user");
-    assert_eq!(request.account.token.access_token, "google-access-token");
+    // F11: thinking is part of the output the client is told about.
+    assert_eq!(body["usage"]["completion_tokens"], 10);
     assert_eq!(
-        request.account.token.project_id.as_deref(),
-        Some("cloud-code-project")
+        body["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        9
     );
+
+    let envelopes = upstream.envelopes();
+    let envelope = envelopes.first().expect("one antigravity upstream call");
+    assert_eq!(envelope["model"], "gemini-4-neon-medium");
+    assert_eq!(envelope["project"], "cloud-code-project");
+    assert_eq!(envelope["request"]["contents"][0]["role"], "user");
+    assert_eq!(
+        envelope["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+        4096
+    );
+    let calls = upstream.calls.lock().expect("calls");
+    assert_eq!(calls[0].account.token.access_token, "google-access-token");
 }
 
 #[tokio::test]
-async fn antigravity_messages_route_translates_onto_chat_and_back() {
+async fn antigravity_messages_route_translates_onto_gemini_and_back() {
     let tmp = tempfile::tempdir().expect("tempdir");
     save_antigravity_account(tmp.path());
     let upstream = Arc::new(AntigravityUpstream::new());
@@ -9057,38 +9138,37 @@ async fn antigravity_messages_route_translates_onto_chat_and_back() {
 
     let (status, body) = json_response(
         app,
-        axum::http::Request::builder()
-            .method("POST")
-            .uri("/v1/messages")
-            .header("authorization", "Bearer sk-test")
-            .header("content-type", "application/json")
-            .header("content-length", "1")
-            .body(Body::from(
-                json!({
-                    "model": "antigravity/gemini-4-neon-high",
-                    "max_tokens": 64,
-                    "system": "You are terse.",
-                    "messages": [{"role": "user", "content": "reply exactly: pong"}]
-                })
-                .to_string(),
-            ))
-            .unwrap(),
+        post(
+            "/v1/messages",
+            &json!({
+                "model": "antigravity/gemini-4-neon-high",
+                "max_tokens": 64,
+                "system": "You are terse.",
+                "messages": [{"role": "user", "content": "reply exactly: pong"}]
+            }),
+        ),
     )
     .await;
 
-    assert_eq!(status, 200);
+    assert_eq!(status, 200, "{body}");
     assert_eq!(body["type"], "message");
     assert_eq!(body["content"][0]["type"], "thinking");
     assert_eq!(body["content"][0]["thinking"], "the user asked for pong");
-    assert_eq!(body["content"][1]["type"], "text");
     assert_eq!(body["content"][1]["text"], "pong");
+    // F11: Messages counts thinking inside output_tokens.
+    assert_eq!(body["usage"]["output_tokens"], 10);
 
-    let calls = upstream.calls.lock().expect("calls lock");
-    let request = calls.first().expect("one antigravity upstream call");
+    let envelope = &upstream.envelopes()[0];
     // The prefix goes and the effort tier reaches the vendor as written.
-    assert_eq!(request.body["model"], "gemini-4-neon-high");
-    assert_eq!(request.body["messages"][0]["role"], "system");
-    assert_eq!(request.body["messages"][0]["content"], "You are terse.");
+    assert_eq!(envelope["model"], "gemini-4-neon-high");
+    assert_eq!(
+        envelope["request"]["systemInstruction"]["parts"][0]["text"],
+        "You are terse."
+    );
+    assert_eq!(
+        envelope["request"]["generationConfig"]["maxOutputTokens"],
+        64
+    );
 }
 
 #[tokio::test]
@@ -9100,39 +9180,28 @@ async fn antigravity_responses_route_is_served_not_refused() {
 
     let (status, body) = json_response(
         app,
-        axum::http::Request::builder()
-            .method("POST")
-            .uri("/v1/responses")
-            .header("authorization", "Bearer sk-test")
-            .header("content-type", "application/json")
-            .header("content-length", "1")
-            .body(Body::from(
-                json!({
-                    "model": "gemini-4-neon",
-                    "instructions": "You are terse.",
-                    "max_output_tokens": 64,
-                    "reasoning": {"effort": "low"},
-                    "input": [
-                        {"role": "user", "content": [{"type": "input_text", "text": "reply exactly: pong"}]}
-                    ]
-                })
-                .to_string(),
-            ))
-            .unwrap(),
+        post(
+            "/v1/responses",
+            &json!({
+                "model": "gemini-4-neon-medium",
+                "instructions": "You are terse.",
+                "reasoning": {"effort": "low"},
+                "input": [{"role": "user", "content": [
+                    {"type": "input_text", "text": "reply exactly: pong"}]}]
+            }),
+        ),
     )
     .await;
 
-    assert_eq!(status, 200);
+    assert_eq!(status, 200, "{body}");
     assert_eq!(body["object"], "response");
-    assert_eq!(body["status"], "completed");
     assert_eq!(body["output"][0]["type"], "reasoning");
-    assert_eq!(body["output"][1]["type"], "message");
     assert_eq!(body["output"][1]["content"][0]["text"], "pong");
-
-    let calls = upstream.calls.lock().expect("calls lock");
-    let request = calls.first().expect("one antigravity upstream call");
-    assert_eq!(request.body["model"], "gemini-4-neon");
-    assert_eq!(request.body["reasoning_effort"], "low");
+    // F11: reasoning never exceeds the output it is part of.
+    assert_eq!(body["usage"]["output_tokens"], 10);
+    // F9: an effort with no client cap sends no invented cap.
+    let generation = &upstream.envelopes()[0]["request"]["generationConfig"];
+    assert!(generation.get("maxOutputTokens").is_none(), "{generation}");
 }
 
 #[tokio::test]
@@ -9144,21 +9213,11 @@ async fn antigravity_chat_stream_rewrites_gemini_chunks_and_terminates() {
 
     let (status, _, body) = raw_response(
         app,
-        axum::http::Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("authorization", "Bearer sk-test")
-            .header("content-type", "application/json")
-            .header("content-length", "1")
-            .body(Body::from(
-                json!({
-                    "model": "gemini-4-neon-xhigh",
-                    "stream": true,
-                    "messages": [{"role": "user", "content": "reply exactly: pong"}]
-                })
-                .to_string(),
-            ))
-            .unwrap(),
+        post(
+            "/v1/chat/completions",
+            &json!({"model": "gemini-4-neon-xhigh", "stream": true,
+                    "messages": [{"role": "user", "content": "reply exactly: pong"}]}),
+        ),
     )
     .await;
 
@@ -9170,6 +9229,98 @@ async fn antigravity_chat_stream_rewrites_gemini_chunks_and_terminates() {
     assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
 }
 
+/// L7: a Chat client is told usage once, on the final chunk, as `OpenAI` does;
+/// Gemini repeats its cumulative count on every chunk.
+#[tokio::test]
+async fn antigravity_chat_stream_reports_usage_once() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_antigravity_account(tmp.path());
+    let upstream = Arc::new(AntigravityUpstream::new());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    let (_, _, body) = raw_response(
+        app,
+        post(
+            "/v1/chat/completions",
+            &json!({"model": "gemini-4-neon-low", "stream": true,
+                    "messages": [{"role": "user", "content": "x"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(body.matches("\"usage\"").count(), 1, "{body}");
+    let last = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .rfind(|data| *data != "[DONE]")
+        .expect("a chunk");
+    assert!(last.contains("\"usage\""), "{last}");
+}
+
+/// F8: a stream the upstream cut before any finishReason is not dressed up as
+/// complete.
+#[tokio::test]
+async fn a_cut_antigravity_chat_stream_gets_no_done() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_antigravity_account(tmp.path());
+    let upstream = Arc::new(AntigravityUpstream::new().stream(&[gemini(
+        json!([{"text": "half"}]),
+        None,
+        None,
+    )]));
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, _, body) = raw_response(
+        app,
+        post(
+            "/v1/chat/completions",
+            &json!({"model": "gemini-4-neon-low", "stream": true,
+                    "messages": [{"role": "user", "content": "x"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(body.contains("\"content\":\"half\""), "{body}");
+    assert!(!body.contains("[DONE]"), "{body}");
+}
+
+/// F8: an in-band error frame reaches the client instead of vanishing.
+#[tokio::test]
+async fn an_in_band_antigravity_error_reaches_the_client() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_antigravity_account(tmp.path());
+    let error = json!({"error": {"code": 503, "message": "backend overloaded",
+                                  "status": "UNAVAILABLE"}});
+    let upstream = Arc::new(
+        AntigravityUpstream::new()
+            .stream(&[gemini(json!([{"text": "par"}]), None, None), error.clone()])
+            .stream(&[gemini(json!([{"text": "par"}]), None, None), error]),
+    );
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (_, _, chat) = raw_response(
+        app.clone(),
+        post(
+            "/v1/chat/completions",
+            &json!({"model": "gemini-4-neon-low", "stream": true,
+                    "messages": [{"role": "user", "content": "x"}]}),
+        ),
+    )
+    .await;
+    assert!(chat.contains("backend overloaded"), "{chat}");
+    assert!(!chat.contains("[DONE]"), "{chat}");
+
+    let (_, _, messages) = raw_response(
+        app,
+        post(
+            "/v1/messages",
+            &json!({"model": "gemini-4-neon-low", "stream": true, "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "x"}]}),
+        ),
+    )
+    .await;
+    assert!(messages.contains("event: error"), "{messages}");
+    assert!(messages.contains("backend overloaded"), "{messages}");
+}
+
 #[tokio::test]
 async fn antigravity_messages_stream_closes_the_message() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -9179,22 +9330,11 @@ async fn antigravity_messages_stream_closes_the_message() {
 
     let (status, _, body) = raw_response(
         app,
-        axum::http::Request::builder()
-            .method("POST")
-            .uri("/v1/messages")
-            .header("authorization", "Bearer sk-test")
-            .header("content-type", "application/json")
-            .header("content-length", "1")
-            .body(Body::from(
-                json!({
-                    "model": "gemini-4-neon",
-                    "max_tokens": 64,
-                    "stream": true,
-                    "messages": [{"role": "user", "content": "reply exactly: pong"}]
-                })
-                .to_string(),
-            ))
-            .unwrap(),
+        post(
+            "/v1/messages",
+            &json!({"model": "gemini-4-neon-medium", "max_tokens": 64, "stream": true,
+                    "messages": [{"role": "user", "content": "reply exactly: pong"}]}),
+        ),
     )
     .await;
 
@@ -9203,4 +9343,253 @@ async fn antigravity_messages_stream_closes_the_message() {
     assert!(body.contains("\"thinking_delta\""), "{body}");
     assert!(body.contains("\"text_delta\""), "{body}");
     assert!(body.contains("event: message_stop"), "{body}");
+}
+
+/// F4: Gemini sends the call and the finish in separate chunks; the client
+/// still learns the turn ended on a tool call.
+#[tokio::test]
+async fn a_streamed_antigravity_tool_call_finishes_as_tool_calls() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_antigravity_account(tmp.path());
+    let upstream = Arc::new(AntigravityUpstream::new().stream(&[
+        gemini(
+            json!([{"functionCall": {"name": "get_weather", "args": {"city": "Paris"},
+                                     "id": "call_1"}}]),
+            None,
+            None,
+        ),
+        gemini(json!([]), Some("STOP"), None),
+    ]));
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (_, _, body) = raw_response(
+        app,
+        post(
+            "/v1/chat/completions",
+            &json!({"model": "gemini-4-neon-low", "stream": true, "tools": [weather_tool()],
+                    "messages": [{"role": "user", "content": "weather?"}]}),
+        ),
+    )
+    .await;
+    assert!(body.contains("\"finish_reason\":\"tool_calls\""), "{body}");
+    assert!(!body.contains("\"finish_reason\":\"stop\""), "{body}");
+}
+
+/// F1: a two-turn tool loop on Chat. The second request carries the call and
+/// its result with the vendor's id and the call's thought signature.
+#[tokio::test]
+async fn an_antigravity_chat_tool_loop_survives_its_second_turn() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_antigravity_account(tmp.path());
+    let upstream = Arc::new(AntigravityUpstream::new().reply(200, tool_call_reply()));
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    let first_turn = json!([{"role": "user", "content": "weather in Paris?"}]);
+
+    let (status, one) = json_response(
+        app.clone(),
+        post(
+            "/v1/chat/completions",
+            &json!({"model": "gemini-4-neon-medium", "tools": [weather_tool()],
+                    "messages": first_turn}),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{one}");
+    assert_eq!(one["choices"][0]["finish_reason"], "tool_calls");
+    let call = one["choices"][0]["message"]["tool_calls"][0].clone();
+    let id = call["id"].as_str().expect("id").to_string();
+
+    let (status, two) = json_response(
+        app,
+        post(
+            "/v1/chat/completions",
+            &json!({"model": "gemini-4-neon-medium", "tools": [weather_tool()],
+            "messages": [
+                {"role": "user", "content": "weather in Paris?"},
+                {"role": "assistant", "content": null, "tool_calls": [call]},
+                {"role": "tool", "tool_call_id": id, "content": "22C, sunny"}
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{two}");
+    assert_eq!(two["choices"][0]["message"]["content"], "pong");
+
+    let second = &upstream.envelopes()[1]["request"]["contents"];
+    let replayed = &second[1]["parts"][0];
+    assert_eq!(replayed["functionCall"]["id"], "call_7168");
+    assert_eq!(replayed["thoughtSignature"], "c2lnbmF0dXJl+/=");
+    assert_eq!(second[2]["parts"][0]["functionResponse"]["id"], "call_7168");
+    assert_eq!(
+        second[2]["parts"][0]["functionResponse"]["name"],
+        "get_weather"
+    );
+}
+
+/// F1: the same loop through a streamed Messages client, which hands the id
+/// back on `tool_use` and `tool_result`.
+#[tokio::test]
+async fn an_antigravity_messages_stream_tool_loop_survives_its_second_turn() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_antigravity_account(tmp.path());
+    let upstream = Arc::new(AntigravityUpstream::new().stream(&[
+        gemini(
+            json!([{"thoughtSignature": "c2lnbmF0dXJl+/=",
+                    "functionCall": {"name": "get_weather", "args": {"city": "Paris"},
+                                     "id": "call_7168"}}]),
+            None,
+            None,
+        ),
+        gemini(json!([]), Some("STOP"), None),
+    ]));
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    let tools = json!([{"name": "get_weather", "description": "weather",
+                        "input_schema": {"type": "object",
+                                         "properties": {"city": {"type": "string"}}}}]);
+
+    let (_, _, one) = raw_response(
+        app.clone(),
+        post(
+            "/v1/messages",
+            &json!({"model": "gemini-4-neon-medium", "max_tokens": 256, "stream": true,
+                    "tools": tools,
+                    "messages": [{"role": "user", "content": "weather in Paris?"}]}),
+        ),
+    )
+    .await;
+    assert!(one.contains("\"stop_reason\":\"tool_use\""), "{one}");
+    let id = one
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .find_map(|event| {
+            event["content_block"]["id"]
+                .as_str()
+                .filter(|_| event["content_block"]["type"] == "tool_use")
+                .map(ToString::to_string)
+        })
+        .expect("a tool_use block");
+
+    let (_, _, two) = raw_response(
+        app,
+        post(
+            "/v1/messages",
+            &json!({"model": "gemini-4-neon-medium", "max_tokens": 256, "stream": true,
+            "tools": tools,
+            "messages": [
+                {"role": "user", "content": "weather in Paris?"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": id,
+                    "name": "get_weather", "input": {"city": "Paris"}}]},
+                {"role": "user", "content": [{"type": "tool_result",
+                    "tool_use_id": id, "content": "22C, sunny"}]}
+            ]}),
+        ),
+    )
+    .await;
+    assert!(two.contains("event: message_stop"), "{two}");
+
+    let second = &upstream.envelopes()[1]["request"]["contents"];
+    assert_eq!(second[1]["parts"][0]["functionCall"]["id"], "call_7168");
+    assert_eq!(second[1]["parts"][0]["thoughtSignature"], "c2lnbmF0dXJl+/=");
+    assert_eq!(second[2]["parts"][0]["functionResponse"]["id"], "call_7168");
+}
+
+/// AC-8 / F13: a 429 whose wait lives in `retryDelay` cools the account for
+/// that long, and the request fails over to the sibling.
+#[tokio::test]
+async fn an_antigravity_429_retry_delay_sets_the_cooldown() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_token(tmp.path(), &antigravity_token("a@example.com", "token-a")).expect("save a");
+    save_token(tmp.path(), &antigravity_token("b@example.com", "token-b")).expect("save b");
+    let upstream = Arc::new(AntigravityUpstream::new().reply(
+        429,
+        json!({"error": {"code": 429, "status": "RESOURCE_EXHAUSTED",
+            "message": "You have exhausted your capacity on this model.",
+            "details": [{"@type": "type.googleapis.com/google.rpc.RetryInfo",
+                         "retryDelay": "3600s"}]}}),
+    ));
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    let (status, body) = json_response(
+        app.clone(),
+        post(
+            "/v1/chat/completions",
+            &json!({"model": "gemini-4-neon-low",
+                    "messages": [{"role": "user", "content": "x"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    let (_, accounts) = json_response(
+        app,
+        axum::http::Request::builder()
+            .uri("/admin/accounts")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let first = upstream.calls.lock().expect("calls")[0]
+        .account
+        .token
+        .email
+        .clone();
+    let record = accounts["providers"]["antigravity"]["accounts"]
+        .as_array()
+        .expect("accounts")
+        .iter()
+        .find(|record| record["email"] == first.as_str())
+        .cloned()
+        .expect("the refused account");
+    let until = record["cooldownUntil"].as_f64().expect("cooldown");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs_f64();
+    assert!(until - now > 3000.0, "cooldown {} s", until - now);
+}
+
+/// F3: a fresh antigravity login is picked up without a restart.
+#[tokio::test]
+async fn admin_reload_picks_up_a_relogged_antigravity_token_without_a_restart() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_antigravity_account(tmp.path());
+    let upstream = Arc::new(AntigravityUpstream::new());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+
+    save_token(
+        tmp.path(),
+        &antigravity_token("operator@example.com", "google-relogged-token"),
+    )
+    .expect("save relogged token");
+
+    let (status, reloaded) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/admin/reload")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        reloaded["reloaded"]["antigravity"]["updated"],
+        json!(["operator@example.com"])
+    );
+
+    let (status, _) = json_response(
+        app,
+        post(
+            "/v1/chat/completions",
+            &json!({"model": "gemini-4-neon-low",
+                    "messages": [{"role": "user", "content": "x"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let calls = upstream.calls.lock().expect("calls");
+    assert_eq!(calls[0].account.token.access_token, "google-relogged-token");
 }

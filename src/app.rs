@@ -55,9 +55,10 @@ use crate::upstream::{
     ANTIGRAVITY_STREAM_PATH, CODEX_BASE_URL, CODEX_DEFAULT_CLI_VERSION, CODEX_MODELS_PATH,
     CODEX_RESPONSES_PATH, GROK_CHAT_BASE_URL, Threading, anthropic_headers,
     anthropic_messages_wire, anthropic_usage_headers, antigravity_envelope, antigravity_headers,
-    antigravity_retry_delay, antigravity_unwrap, codex_headers, generic_base_url,
-    generic_chat_headers, generic_headers, grok_chat_headers, learn_antigravity_version,
-    learn_grok_client_version, normalize_codex_responses_body, resolve_beta,
+    antigravity_retry_delay, antigravity_unwrap, antigravity_version, codex_headers,
+    generic_base_url, generic_chat_headers, generic_headers, grok_chat_headers,
+    learn_antigravity_version, learn_grok_client_version, normalize_codex_responses_body,
+    resolve_beta,
 };
 use crate::utils::now_iso;
 use crate::utils::sha256_hex;
@@ -72,6 +73,7 @@ pub type UpstreamSseFuture =
     Pin<Box<dyn Future<Output = anyhow::Result<UpstreamSseResponse>> + Send>>;
 pub type ModelsFuture = Pin<Box<dyn Future<Output = anyhow::Result<FetchedModels>> + Send>>;
 pub type CliVersionsFuture = Pin<Box<dyn Future<Output = anyhow::Result<CliVersions>> + Send>>;
+pub type VersionFuture = Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>>;
 
 #[derive(Debug, Clone)]
 pub struct UpstreamRequest {
@@ -139,10 +141,10 @@ pub trait UpstreamClient: Send + Sync {
     }
 
     /// Antigravity's Cloud Code Assist generate call, over a pooled Google
-    /// subscription. The body crossing this boundary is a Chat Completions
-    /// request: the implementation wraps it in the Antigravity envelope and
-    /// unwraps the Gemini reply, so routing, translation and accounting stay
-    /// shared with every other chat-shaped upstream.
+    /// subscription. The body crossing this boundary is the Antigravity
+    /// envelope and the reply is the upstream's own (`{"response": <Gemini>}`
+    /// or an error): the route wraps and translates, so the wire shapes are
+    /// tested with the route and the client only sends bytes.
     fn antigravity_generate(&self, request: UpstreamRequest) -> UpstreamFuture {
         let _ = request;
         Box::pin(async { anyhow::bail!("no antigravity upstream") })
@@ -151,6 +153,12 @@ pub trait UpstreamClient: Send + Sync {
     fn antigravity_generate_stream(&self, request: UpstreamRequest) -> UpstreamSseFuture {
         let _ = request;
         Box::pin(async { anyhow::bail!("no antigravity upstream") })
+    }
+
+    /// The Antigravity Hub release its updater manifest names. Default: no
+    /// source, so a client that never serves antigravity makes no call.
+    fn fetch_antigravity_version(&self) -> VersionFuture {
+        Box::pin(async { anyhow::bail!("no antigravity version source") })
     }
     fn fetch_models(
         &self,
@@ -539,17 +547,17 @@ impl UpstreamClient for HttpUpstreamClient {
     fn antigravity_generate(&self, request: UpstreamRequest) -> UpstreamFuture {
         let client = self.client.clone();
         Box::pin(async move {
-            let stream = request
-                .body
-                .get("stream")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let timeout_ms = if stream {
-                request.config.timeouts.stream_messages_ms
-            } else {
-                request.config.timeouts.messages_ms
-            };
-            send_antigravity_json(client, &request.account, request.body, timeout_ms).await
+            // The whole-reply path is only taken for a client that did not
+            // stream, so its deadline is the whole-request one.
+            let timeout_ms = request.config.timeouts.messages_ms;
+            send_antigravity_json(
+                client,
+                ANTIGRAVITY_BASE_URL,
+                &request.account,
+                request.body,
+                timeout_ms,
+            )
+            .await
         })
     }
 
@@ -558,12 +566,18 @@ impl UpstreamClient for HttpUpstreamClient {
         Box::pin(async move {
             send_antigravity_stream(
                 client,
+                ANTIGRAVITY_BASE_URL,
                 &request.account,
                 request.body,
                 request.config.timeouts.stream_messages_ms,
             )
             .await
         })
+    }
+
+    fn fetch_antigravity_version(&self) -> VersionFuture {
+        let client = self.client.clone();
+        Box::pin(async move { crate::upstream::fetch_antigravity_manifest_version(&client).await })
     }
 
     fn fetch_models(
@@ -627,33 +641,41 @@ impl UpstreamClient for HttpUpstreamClient {
                 // (no project yet, a 401 mid-refresh) falls back to the static
                 // floor rather than leaving the pool with nothing to advertise.
                 ProviderKind::Antigravity => {
-                    let Some(project) = account.token.project_id.clone() else {
-                        return Ok(antigravity_static_models());
-                    };
-                    let url = format!("{ANTIGRAVITY_BASE_URL}{ANTIGRAVITY_MODELS_PATH}");
-                    let fetched = send_json(
-                        client,
-                        url,
-                        antigravity_headers(&account),
-                        json!({"project": project}),
-                        timeout,
-                    )
-                    .await;
-                    match fetched {
-                        Ok(response) if response.status.is_success() => {
-                            let parsed = parse_antigravity(&response.body, &account.provider);
-                            Ok(if parsed.ids.is_empty() {
-                                antigravity_static_models()
-                            } else {
-                                parsed
-                            })
-                        }
-                        Ok(_) | Err(_) => Ok(antigravity_static_models()),
-                    }
+                    fetch_antigravity_models(client, ANTIGRAVITY_BASE_URL, &account, timeout).await
                 }
             }
         })
     }
+}
+
+/// The antigravity catalog from `fetchAvailableModels` at `base`. The static
+/// floor stands in only for an account with no project, which cannot ask; a
+/// failed fetch is an error, so the refresh keeps the last list it had.
+async fn fetch_antigravity_models(
+    client: reqwest::Client,
+    base: &str,
+    account: &AvailableAccount,
+    timeout_ms: u64,
+) -> anyhow::Result<FetchedModels> {
+    let Some(project) = account.token.project_id.clone() else {
+        return Ok(antigravity_static_models());
+    };
+    let response = send_json(
+        client,
+        format!("{base}{ANTIGRAVITY_MODELS_PATH}"),
+        antigravity_headers(account),
+        json!({"project": project}),
+        timeout_ms,
+    )
+    .await?;
+    if !response.status.is_success() {
+        anyhow::bail!("fetchAvailableModels returned {}", response.status);
+    }
+    let parsed = parse_antigravity(&response.body, &account.provider);
+    if parsed.ids.is_empty() {
+        anyhow::bail!("fetchAvailableModels listed no chat model");
+    }
+    Ok(parsed)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -706,11 +728,6 @@ pub fn create_app_with_upstream(config: Config, upstream: Arc<dyn UpstreamClient
     if tokio::runtime::Handle::try_current().is_ok() {
         tokio::spawn(model_catalog_refresh_loop(state.clone()));
         tokio::spawn(cli_versions_refresh_loop(state.clone()));
-        // The Antigravity `User-Agent` carries the Hub release, which drifts.
-        // One fetch per process; a failure keeps the pinned floor.
-        tokio::spawn(async move {
-            crate::upstream::refresh_antigravity_version(&reqwest::Client::new()).await;
-        });
         if state.config.quota.poll {
             tokio::spawn(quota_poll_loop(state.clone()));
         }
@@ -1200,13 +1217,26 @@ async fn refresh_model_catalog(state: &AppState) {
         // Grok's list is static, but it enters the catalog through the same
         // fetch so /v1/models and routing see it like any provider's.
         ProviderKind::Grok,
-        // Antigravity's list is fetched from Cloud Code Assist when the
-        // account has a project, with a static floor when it does not.
+        // Antigravity's list is fetched from Cloud Code Assist; an account
+        // with no project yet advertises the static floor.
         ProviderKind::Antigravity,
     ] {
         let Some(account) = catalog_account(state, kind).await else {
             continue;
         };
+        // The Hub release the antigravity `User-Agent` names drifts. It is read
+        // here, beside the catalog, so it is asked for only while the pool has
+        // an account and again on every refresh after a boot without network.
+        if kind == ProviderKind::Antigravity {
+            match state.upstream.fetch_antigravity_version().await {
+                Ok(version) => {
+                    crate::upstream::adopt_antigravity_version(&version);
+                }
+                Err(error) => {
+                    tracing::debug!(?error, "antigravity hub version fetch failed");
+                }
+            }
+        }
         match state
             .upstream
             .fetch_models(kind, account, cloaked_config(state))
@@ -1716,32 +1746,18 @@ async fn admin_reload(State(state): State<AppState>, headers: HeaderMap) -> Resp
             .set_allow(reread.allow);
     }
 
-    // Every pool is reloaded here, built-ins included. A hand-written list of
-    // providers is what let grok's fresh login be silently ignored: the token
-    // file was replaced, reload reported nothing, and the relay kept serving
-    // the stale credential until a restart.
-    let anthropic = state.account_managers.anthropic.lock().await.reload();
-    let codex = state.account_managers.codex.lock().await.reload();
-    let grok = state.account_managers.grok.lock().await.reload();
+    // Every pool is reloaded here, built-ins included, from the one list of
+    // pools. A hand-written list is what let first grok's and then
+    // antigravity's fresh login be silently ignored: the token file was
+    // replaced, reload reported nothing, and the relay kept serving the stale
+    // credential until a restart.
     let mut reloaded = serde_json::Map::new();
-    for (provider, result) in [
-        (ProviderId::anthropic(), anthropic),
-        (ProviderId::codex(), codex),
-        (ProviderId::grok(), grok),
-    ] {
-        match result {
+    for (provider, manager) in state.account_managers.pools() {
+        match manager.lock().await.reload() {
             Ok(value) => {
                 reloaded.insert(provider.to_string(), value);
             }
             Err(error) => return accounts_reload_failed(&provider, &error),
-        }
-    }
-    for (id, manager) in &state.account_managers.generic {
-        match manager.lock().await.reload() {
-            Ok(result) => {
-                reloaded.insert(id.clone(), result);
-            }
-            Err(error) => return accounts_reload_failed(id, &error),
         }
     }
 
@@ -2422,17 +2438,8 @@ async fn route_antigravity_request(
     account: &AvailableAccount,
 ) -> Response {
     let model = request.model.as_str();
-    // The envelope carries the project the account is bound to; an account that
-    // has none never reached rotation (login refuses without one), but a
-    // hand-written credential might, and the upstream's own 400 explains it
-    // better than a silent rewrite would.
-    let mut upstream_body = upstream_request_body(ProviderKind::Antigravity, route, body, model);
-    if let Some(object) = upstream_body.as_object_mut() {
-        object.insert(
-            "stream".to_string(),
-            Value::Bool(request.client_wants_stream),
-        );
-    }
+    let chat = upstream_request_body(ProviderKind::Antigravity, route, body, model);
+    let upstream_body = antigravity_envelope(&chat, model, account.token.project_id.as_deref());
     if request.client_wants_stream {
         return match state
             .upstream
@@ -2484,6 +2491,7 @@ async fn route_antigravity_request(
         .await
     {
         Ok(response) => {
+            let response = antigravity_json(response, model);
             record_json_result(state, account.provider.clone(), account, &response, model).await;
             json_upstream_response(response, &account.provider, route, model, &BTreeMap::new())
         }
@@ -3893,6 +3901,9 @@ struct SseStreamStates {
     antigravity: AntigravityChunkState,
     usage: crate::types::UsageData,
     completed: bool,
+    /// The message of an in-band error frame the upstream sent, which ends the
+    /// stream as a failure.
+    stream_error: Option<String>,
     refusal_next_index: u64,
     refusal_open_index: Option<u64>,
 }
@@ -3906,6 +3917,7 @@ impl SseStreamStates {
             antigravity: AntigravityChunkState::new(model),
             usage: crate::types::UsageData::default(),
             completed: false,
+            stream_error: None,
             refusal_next_index: 0,
             refusal_open_index: None,
         }
@@ -3932,6 +3944,11 @@ fn translated_sse_event(
         &mut states.usage,
         &mut states.completed,
     );
+    if provider.kind == ProviderKind::Antigravity
+        && let Some(message) = antigravity_stream_error_message(raw)
+    {
+        states.stream_error = Some(message);
+    }
     forward_refusal_event(
         provider,
         route,
@@ -4025,21 +4042,33 @@ fn transformed_sse_stream(
         // here and nowhere else: a stream that stopped before any
         // finish_reason still owes the client the tool calls it announced
         // and a message_stop, and usage often arrives after finish_reason.
-        if Translation::between(provider.kind, route).closes_its_own_stream() {
+        // An error event ends a Messages stream; nothing follows it.
+        if Translation::between(provider.kind, route).closes_its_own_stream()
+            && states.stream_error.is_none()
+        {
             for chunk in finish_chat_stream(&mut states.anthropic) {
                 yield Bytes::from(chunk);
             }
         }
         // Gemini streams end at `finishReason` with no `[DONE]`; a Chat client
-        // waits for the terminator, so it is written here once the content is
-        // complete.
-        if provider.kind == ProviderKind::Antigravity && route == RequestRoute::Chat {
+        // waits for the terminator, so it is written here, and only when the
+        // upstream finished the reply: a cut stream must not read as complete.
+        if provider.kind == ProviderKind::Antigravity
+            && route == RequestRoute::Chat
+            && states.completed
+            && states.stream_error.is_none()
+        {
             yield Bytes::from("data: [DONE]\n\n");
         }
-        if states.completed {
-            record_stream_success(accounting.as_ref(), &states.usage).await;
-        } else {
-            record_stream_failure(accounting.as_ref(), "stream terminated before completion").await;
+        match &states.stream_error {
+            Some(message) => record_stream_failure(accounting.as_ref(), message).await,
+            None if states.completed => {
+                record_stream_success(accounting.as_ref(), &states.usage).await;
+            }
+            None => {
+                record_stream_failure(accounting.as_ref(), "stream terminated before completion")
+                    .await;
+            }
         }
     })
 }
@@ -4364,11 +4393,24 @@ fn transform_sse_event(
         (ProviderKind::Antigravity, _) => parsed.map_or_else(
             |_| Vec::new(),
             |data| {
+                if let Some(error) = data.get("error").filter(|error| !error.is_null()) {
+                    return antigravity_error_event(error, route);
+                }
                 let gemini = data.get("response").cloned().unwrap_or(data);
                 antigravity_state
                     .chunk(&gemini)
-                    .map_or_else(Vec::new, |chunk| match route {
-                        RequestRoute::Chat => vec![sse(&chunk, None)],
+                    .map_or_else(Vec::new, |mut chunk| match route {
+                        RequestRoute::Chat => {
+                            // Gemini repeats its cumulative usage on every chunk;
+                            // a Chat client is told once, on the final one. The
+                            // relay's own count reads the raw frames.
+                            if chunk["choices"][0]["finish_reason"].is_null()
+                                && let Some(object) = chunk.as_object_mut()
+                            {
+                                object.remove("usage");
+                            }
+                            vec![sse(&chunk, None)]
+                        }
                         RequestRoute::Messages => chat_sse_to_anthropic(&chunk, anthropic_state),
                         RequestRoute::Responses => {
                             chat_sse_to_responses(&chunk, responses_state, model)
@@ -4380,6 +4422,42 @@ fn transform_sse_event(
             |_| Vec::new(),
             |data| vec![sse(&data, passthrough_event(event))],
         ),
+    }
+}
+
+/// The message of an in-band error frame, `data: {"error": {...}}`.
+fn antigravity_stream_error_message(raw: &str) -> Option<String> {
+    let data = serde_json::from_str::<Value>(raw).ok()?;
+    let error = data.get("error").filter(|error| !error.is_null())?;
+    Some(
+        error
+            .get("message")
+            .and_then(Value::as_str)
+            .map_or_else(|| error.to_string(), ToString::to_string),
+    )
+}
+
+/// An in-band upstream error in the client's dialect: a data frame carrying
+/// `error` for Chat, and the `error` event Messages and Responses define.
+fn antigravity_error_event(error: &Value, route: RequestRoute) -> Vec<String> {
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .map_or_else(|| error.to_string(), ToString::to_string);
+    let code = error.get("status").cloned().unwrap_or(Value::Null);
+    match route {
+        RequestRoute::Chat => vec![sse(
+            &json!({"error": {"message": message, "type": "upstream_error", "code": code}}),
+            None,
+        )],
+        RequestRoute::Messages => vec![sse(
+            &json!({"type": "error", "error": {"type": "api_error", "message": message}}),
+            Some("error"),
+        )],
+        RequestRoute::Responses => vec![sse(
+            &json!({"type": "error", "code": code, "message": message, "param": Value::Null}),
+            Some("error"),
+        )],
     }
 }
 
@@ -4763,23 +4841,18 @@ async fn send_grok_stream(
     })
 }
 
-/// Send one antigravity generate call, unwrapping the Gemini envelope into the
-/// Chat Completions reply the relay's translation matrix reads. A 426 teaches
-/// the process the minimum Antigravity version and retries once, the same way
-/// grok's version gate does.
+/// Send one antigravity generate call to `base` and return the upstream's own
+/// reply. A 426 naming a minimum Hub version is retried once with it; the
+/// route translates whatever comes back.
 async fn send_antigravity_json(
     client: reqwest::Client,
+    base: &str,
     account: &AvailableAccount,
-    chat_body: Value,
+    envelope: Value,
     timeout_ms: u64,
 ) -> anyhow::Result<UpstreamJsonResponse> {
-    let model = chat_body
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let envelope = antigravity_envelope(&chat_body, &model, account.token.project_id.as_deref());
-    let url = format!("{ANTIGRAVITY_BASE_URL}{ANTIGRAVITY_GENERATE_PATH}");
+    let url = format!("{base}{ANTIGRAVITY_GENERATE_PATH}");
+    let sent = antigravity_version();
     let first = send_json(
         client.clone(),
         url.clone(),
@@ -4788,24 +4861,24 @@ async fn send_antigravity_json(
         timeout_ms,
     )
     .await?;
-    if first.status.as_u16() == 426 && learn_antigravity_version(&first.body.to_string()).is_some()
+    if first.status.as_u16() == 426
+        && learn_antigravity_version(&first.body.to_string(), &sent).is_some()
     {
-        let retried = send_json(
+        return send_json(
             client,
             url,
             antigravity_headers(account),
             envelope,
             timeout_ms,
         )
-        .await?;
-        return Ok(antigravity_json(retried, &model));
+        .await;
     }
-    Ok(antigravity_json(first, &model))
+    Ok(first)
 }
 
 /// An antigravity reply in the shape the rest of the relay reads: the envelope
 /// unwrapped into Chat on success, and the provider's own `retryDelay` taken as
-/// the retry hint when the body carried one.
+/// the retry hint when no header named one.
 fn antigravity_json(mut response: UpstreamJsonResponse, model: &str) -> UpstreamJsonResponse {
     if response.status.is_success() {
         let gemini = antigravity_unwrap(response.body);
@@ -4822,17 +4895,13 @@ fn antigravity_json(mut response: UpstreamJsonResponse, model: &str) -> Upstream
 /// then to the client's dialect, so the frame splitting stays in one place.
 async fn send_antigravity_stream(
     client: reqwest::Client,
+    base: &str,
     account: &AvailableAccount,
-    chat_body: Value,
+    envelope: Value,
     silence_ms: u64,
 ) -> anyhow::Result<UpstreamSseResponse> {
-    let model = chat_body
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let envelope = antigravity_envelope(&chat_body, &model, account.token.project_id.as_deref());
-    let url = format!("{ANTIGRAVITY_BASE_URL}{ANTIGRAVITY_STREAM_PATH}");
+    let url = format!("{base}{ANTIGRAVITY_STREAM_PATH}");
+    let sent = antigravity_version();
     let first = send_stream(
         client.clone(),
         url.clone(),
@@ -4844,33 +4913,47 @@ async fn send_antigravity_stream(
     if first.status.is_success() {
         return Ok(first);
     }
-    // An error body is a short JSON document, not an event stream: read it
-    // whole so the version gate and the retry delay can be read from it.
-    let bytes = first.body.try_collect::<Vec<Bytes>>().await?.concat();
-    let text = String::from_utf8_lossy(&bytes).to_string();
-    if first.status.as_u16() == 426 && learn_antigravity_version(&text).is_some() {
-        return send_stream(
+    let (first, text) = antigravity_stream_error(first).await?;
+    if first.status.as_u16() == 426 && learn_antigravity_version(&text, &sent).is_some() {
+        let retried = send_stream(
             client,
             url,
             antigravity_headers(account),
             envelope,
             silence_ms,
         )
-        .await;
+        .await?;
+        if retried.status.is_success() {
+            return Ok(retried);
+        }
+        return Ok(antigravity_stream_error(retried).await?.0);
     }
-    let retry_hint = first.retry_hint.or_else(|| {
+    Ok(first)
+}
+
+/// A failed stream's body read whole: it is a short JSON document, not an
+/// event stream, and it carries the 426 floor and the `retryDelay` hint.
+async fn antigravity_stream_error(
+    response: UpstreamSseResponse,
+) -> anyhow::Result<(UpstreamSseResponse, String)> {
+    let bytes = response.body.try_collect::<Vec<Bytes>>().await?.concat();
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    let retry_hint = response.retry_hint.or_else(|| {
         serde_json::from_str::<Value>(&text)
             .ok()
             .and_then(|body| antigravity_retry_delay(&body))
     });
-    Ok(UpstreamSseResponse {
-        status: first.status,
-        retry_hint,
-        quota: first.quota,
-        body: Box::pin(futures_util::stream::once(async move {
-            Ok::<Bytes, anyhow::Error>(Bytes::from(bytes))
-        })),
-    })
+    Ok((
+        UpstreamSseResponse {
+            status: response.status,
+            retry_hint,
+            quota: response.quota,
+            body: Box::pin(futures_util::stream::once(async move {
+                Ok::<Bytes, anyhow::Error>(Bytes::from(bytes))
+            })),
+        },
+        text,
+    ))
 }
 
 fn decode_upstream_body(headers: &HeaderMap, bytes: &[u8], model: &str) -> Value {
@@ -7327,6 +7410,278 @@ mod tests {
         assert_eq!(
             conversation_key(&HeaderMap::new(), &long, RequestRoute::Messages),
             conversation_key(&HeaderMap::new(), &grown, RequestRoute::Messages)
+        );
+    }
+
+    // ---- antigravity: the client boundary ------------------------------------
+
+    fn antigravity_account(project: Option<&str>) -> AvailableAccount {
+        AvailableAccount {
+            token: TokenData {
+                access_token: "google-access".to_string(),
+                refresh_token: "google-refresh".to_string(),
+                email: "operator@example.com".to_string(),
+                expires_at: "2030-01-01T00:00:00Z".to_string(),
+                account_uuid: String::new(),
+                provider: ProviderId::antigravity(),
+                id_token: None,
+                last_refresh_at: None,
+                plan_type: None,
+                project_id: project.map(ToString::to_string),
+            },
+            device_id: "device".to_string(),
+            account_uuid: String::new(),
+            provider: ProviderId::antigravity(),
+            chatgpt_account_id: None,
+        }
+    }
+
+    /// A local Cloud Code: each request gets the next scripted
+    /// `(status, body)`; the last one repeats. Returns the address and the
+    /// `User-Agent` of every request it saw.
+    async fn serve_cloud_code(
+        script: Vec<(u16, &'static str)>,
+    ) -> (std::net::SocketAddr, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("bound address");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let script = Arc::new(script);
+        tokio::spawn(async move {
+            let app = axum::Router::new().fallback(move |headers: HeaderMap| {
+                let log = Arc::clone(&log);
+                let script = Arc::clone(&script);
+                async move {
+                    let agent = headers
+                        .get("user-agent")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    let index = {
+                        let mut log = log.lock().expect("log");
+                        log.push(agent);
+                        log.len() - 1
+                    };
+                    let (status, body) = script[index.min(script.len() - 1)];
+                    (
+                        StatusCode::from_u16(status).expect("status"),
+                        [("content-type", "application/json")],
+                        body,
+                    )
+                }
+            });
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, seen)
+    }
+
+    const GEMINI_OK: &str = r#"{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"pong"}]},"finishReason":"STOP"}]}}"#;
+    const UPGRADE_426: &str =
+        r#"{"error":{"code":426,"message":"Please update to version 99.0.0 or later."}}"#;
+    const EXHAUSTED_429: &str = r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"42s"}]}}"#;
+
+    /// AC-6 / F13: a 426 naming a newer Hub version is retried once, with it.
+    #[tokio::test]
+    async fn an_antigravity_426_is_retried_once_with_the_named_version() {
+        let (addr, seen) = serve_cloud_code(vec![(426, UPGRADE_426), (200, GEMINI_OK)]).await;
+        let response = super::send_antigravity_json(
+            reqwest::Client::new(),
+            &format!("http://{addr}"),
+            &antigravity_account(Some("p")),
+            json!({"model": "gemini-4-neon-low"}),
+            5_000,
+        )
+        .await
+        .expect("the local upstream answers");
+        assert_eq!(response.status, StatusCode::OK);
+        let seen = seen.lock().expect("seen");
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(seen[1].starts_with("antigravity/hub/99.0.0"), "{seen:?}");
+    }
+
+    /// L4 / F13: a stream whose 426 retry is refused still hands back the
+    /// `retryDelay` its body names.
+    #[tokio::test]
+    async fn a_refused_antigravity_stream_retry_keeps_its_retry_delay() {
+        let (addr, seen) = serve_cloud_code(vec![(426, UPGRADE_426), (429, EXHAUSTED_429)]).await;
+        let response = super::send_antigravity_stream(
+            reqwest::Client::new(),
+            &format!("http://{addr}"),
+            &antigravity_account(Some("p")),
+            json!({"model": "gemini-4-neon-low"}),
+            5_000,
+        )
+        .await
+        .expect("the local upstream answers");
+        assert_eq!(response.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.retry_hint,
+            Some(std::time::Duration::from_secs(42))
+        );
+        assert_eq!(seen.lock().expect("seen").len(), 2);
+    }
+
+    /// F13: a failed stream with no 426 reads its `retryDelay` too.
+    #[tokio::test]
+    async fn a_refused_antigravity_stream_reads_its_retry_delay() {
+        let (addr, _) = serve_cloud_code(vec![(429, EXHAUSTED_429)]).await;
+        let response = super::send_antigravity_stream(
+            reqwest::Client::new(),
+            &format!("http://{addr}"),
+            &antigravity_account(Some("p")),
+            json!({"model": "gemini-4-neon-low"}),
+            5_000,
+        )
+        .await
+        .expect("the local upstream answers");
+        assert_eq!(
+            response.retry_hint,
+            Some(std::time::Duration::from_secs(42))
+        );
+    }
+
+    /// F13: the reply the route reads is unwrapped and translated; a 429's
+    /// body names the hint unless a header already did.
+    #[test]
+    fn antigravity_json_unwraps_and_reads_the_retry_delay() {
+        let ok = super::antigravity_json(
+            UpstreamJsonResponse {
+                status: StatusCode::OK,
+                body: serde_json::from_str(GEMINI_OK).expect("json"),
+                retry_hint: None,
+                quota: None,
+            },
+            "gemini-4-neon-low",
+        );
+        assert_eq!(ok.body["object"], "chat.completion");
+        assert_eq!(ok.body["choices"][0]["message"]["content"], "pong");
+
+        let exhausted = |retry_hint| UpstreamJsonResponse {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            body: serde_json::from_str(EXHAUSTED_429).expect("json"),
+            retry_hint,
+            quota: None,
+        };
+        assert_eq!(
+            super::antigravity_json(exhausted(None), "m").retry_hint,
+            Some(std::time::Duration::from_secs(42))
+        );
+        // A header the vendor sent wins over the body.
+        assert_eq!(
+            super::antigravity_json(exhausted(Some(std::time::Duration::from_secs(7))), "m")
+                .retry_hint,
+            Some(std::time::Duration::from_secs(7))
+        );
+    }
+
+    /// F7: a failed catalog fetch is an error, so the last list stays; only an
+    /// account without a project falls back to the floor.
+    #[tokio::test]
+    async fn a_failed_antigravity_catalog_fetch_is_an_error() {
+        let (addr, _) = serve_cloud_code(vec![(503, r#"{"error":{"code":503}}"#)]).await;
+        let base = format!("http://{addr}");
+        let failed = super::fetch_antigravity_models(
+            reqwest::Client::new(),
+            &base,
+            &antigravity_account(Some("p")),
+            5_000,
+        )
+        .await;
+        assert!(failed.is_err(), "{failed:?}");
+
+        let floor = super::fetch_antigravity_models(
+            reqwest::Client::new(),
+            &base,
+            &antigravity_account(None),
+            5_000,
+        )
+        .await
+        .expect("the floor");
+        assert!(floor.ids.contains(&"gemini-4-neon-medium".to_string()));
+
+        let (addr, _) =
+            serve_cloud_code(vec![(200, r#"{"models":{"gemini-4-neon-medium":{}}}"#)]).await;
+        let live = super::fetch_antigravity_models(
+            reqwest::Client::new(),
+            &format!("http://{addr}"),
+            &antigravity_account(Some("p")),
+            5_000,
+        )
+        .await
+        .expect("the live list");
+        assert_eq!(live.ids, vec!["gemini-4-neon-medium".to_string()]);
+    }
+
+    /// An upstream double that counts Hub version fetches.
+    #[derive(Default)]
+    struct VersionCountingUpstream {
+        version_fetches: std::sync::atomic::AtomicUsize,
+    }
+
+    impl UpstreamClient for VersionCountingUpstream {
+        fn generic_chat(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn generic_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!()
+        }
+        fn anthropic_messages(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn anthropic_messages_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!()
+        }
+        fn anthropic_count_tokens(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn codex_responses(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn codex_responses_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!()
+        }
+        fn fetch_models(
+            &self,
+            _kind: ProviderKind,
+            _account: AvailableAccount,
+            _config: Arc<Config>,
+        ) -> super::ModelsFuture {
+            Box::pin(async { Ok(FetchedModels::new(vec![])) })
+        }
+        fn fetch_antigravity_version(&self) -> super::VersionFuture {
+            self.version_fetches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { bail!("offline") })
+        }
+    }
+
+    /// F10: the Hub manifest is asked for only while the antigravity pool has
+    /// an account, and on every refresh, not once per process.
+    #[tokio::test]
+    async fn the_hub_version_is_fetched_only_for_an_antigravity_pool() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let upstream = Arc::new(VersionCountingUpstream::default());
+        let state = test_state(tmp.path(), upstream.clone());
+        super::refresh_model_catalog(&state).await;
+        assert_eq!(
+            upstream
+                .version_fetches
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an install with no antigravity account made a call"
+        );
+
+        save_token(tmp.path(), &antigravity_account(Some("p")).token).expect("save");
+        let state = test_state(tmp.path(), upstream.clone());
+        super::refresh_model_catalog(&state).await;
+        super::refresh_model_catalog(&state).await;
+        assert_eq!(
+            upstream
+                .version_fetches
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
         );
     }
 }

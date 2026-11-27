@@ -249,6 +249,18 @@ impl CliRuntime for RealRuntime {
         provider: ProviderId,
         _key: Option<&str>,
     ) -> Result<String> {
+        if provider.kind == ProviderKind::Antigravity {
+            // Login's control-plane calls present the Hub version too; read
+            // the current one first instead of the pinned floor.
+            self.runtime.block_on(async {
+                if let Ok(version) =
+                    crate::upstream::fetch_antigravity_manifest_version(&reqwest::Client::new())
+                        .await
+                {
+                    crate::upstream::adopt_antigravity_version(&version);
+                }
+            });
+        }
         let state = random_urlsafe(32);
         let pkce = generate_pkce_codes();
         let nonce = random_urlsafe(32);
@@ -260,17 +272,22 @@ impl CliRuntime for RealRuntime {
             provider.kind,
             ProviderKind::Grok | ProviderKind::Antigravity
         ) {
-            // The vendor hands the code to the user by hand when the redirect
-            // cannot reach this host (headless box, browser on another
-            // machine). Take either path, whichever arrives first. The
-            // paste prompt is only honest when stdin can actually deliver
-            // one — a non-tty stdin is the headless case, where the
-            // browser-side link has to do the work.
+            // When the redirect cannot reach this host (headless box, browser
+            // on another machine) the operator carries it by hand. auth.x.ai
+            // shows a code; Google shows nothing, and the browser's address
+            // bar holds the failed redirect URL. Take the loopback callback or
+            // the paste, whichever arrives first. The paste prompt is only
+            // honest when stdin can deliver one — a non-tty stdin is the
+            // headless case, where the browser-side link has to do the work.
             if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-                println!(
-                    "If the browser cannot reach this host, the consent page shows a code instead.\n\
+                let hint = if provider.kind == ProviderKind::Antigravity {
+                    "If the browser cannot reach this host, it ends on a page that does not load.\n\
+                     Copy that page's full URL from the address bar, paste it here and press Enter.\n"
+                } else {
+                    "If the browser cannot reach this host, auth.x.ai shows a code instead.\n\
                      Paste that code — or the full callback URL — here and press Enter.\n"
-                );
+                };
+                println!("{hint}");
             }
             wait_for_callback_or_paste(port, path, Duration::from_mins(5))?
         } else {
@@ -293,7 +310,11 @@ impl CliRuntime for RealRuntime {
                 }
                 ProviderKind::Antigravity => {
                     if callback.pasted {
-                        exchange_antigravity_pasted_code(&callback.code, &pkce).await
+                        // A pasted URL carries its state; a bare code does not.
+                        let returned =
+                            Some(callback.state.as_str()).filter(|state| !state.is_empty());
+                        exchange_antigravity_pasted_code(&callback.code, returned, &state, &pkce)
+                            .await
                     } else {
                         exchange_antigravity_code(&callback.code, &callback.state, &state, &pkce)
                             .await
