@@ -3,7 +3,7 @@
 ## What this is
 
 pengepul is a local relay. It pools subscription **Accounts** per **Provider** —
-anthropic, codex, grok, and OpenAI-compatible endpoints configured in `config.yaml` —
+anthropic, codex, grok, antigravity, and OpenAI-compatible endpoints configured in `config.yaml` —
 behind one REST surface, so a harness runs on a subscription instead of a
 per-token key. It authenticates each caller by a **Local API key**, **Cloaks**
 anthropic- and codex-bound requests so the vendor **Classifier** reads them as
@@ -44,8 +44,8 @@ in files.
   registration, `config.yaml.lock` sit there too. The only other
   long-lived file under the auth dir, `cloaking-versions.json`, is the
   Upstream module's own cache — `cloaking_versions.rs`.)
-- **OAuth** (`oauth.rs`) — mints and Refreshes the anthropic, codex and grok
-  credential, each through an authorization-code flow with PKCE (S256), and is the
+- **OAuth** (`oauth.rs`) — mints and Refreshes the anthropic, codex, grok and
+  antigravity credential, each through an authorization-code flow with PKCE (S256), and is the
   only place a rejected refresh token becomes **Reauth**. A grok code is exchanged
   from whichever arrives first, which the runtime waits on: the loopback callback
   on `127.0.0.1:14550`, or the code auth.x.ai shows when that callback cannot be
@@ -72,7 +72,12 @@ in files.
   two headers the grok Upstream
   (grok build's chat proxy) requires (`grok_chat_headers`), and no Cloaking; a
   426 naming a newer client version is retried once with it, and that version is
-  kept for the process lifetime (`learn_grok_client_version`). A chat call to a
+  kept for the process lifetime (`learn_grok_client_version`). An antigravity
+  call carries the Google access token as bearer and the Antigravity Hub
+  `User-Agent` (`antigravity_headers`), wraps the Chat body in the Antigravity
+  envelope (`antigravity_envelope`), unwraps the Gemini reply
+  (`antigravity_unwrap`), and takes the version from the Hub manifest, falling
+  back to a pinned floor (`refresh_antigravity_version`). It is never Cloaked. A chat call to a
   configured endpoint carries the bearer key; one to an `opencode.ai` host also names
   its conversation in `x-opencode-session`, a hash of Rotation's key
   (`generic_chat_headers`), because OpenCode Go refuses a chat without one. That host
@@ -86,7 +91,10 @@ in files.
   under the upstream's `/models` body, under what the operator states in a
   configured provider's `models:` in `config.yaml` (ADR-0029). grok publishes no
   list to fetch: its two models, `grok-4.6` and `grok-4.5`, are a static one
-  (`grok_static_models`). It also holds the operator's `allow:` lists: a Provider
+  (`grok_static_models`). antigravity fetches its catalog from Cloud Code Assist
+  (`parse_antigravity`), with the brief's floor — `gemini-4-neon` and its four
+  effort tiers (`antigravity_static_models`) — standing in when the fetch has no
+  project or fails. It also holds the operator's `allow:` lists: a Provider
   with one advertises only the listed ids its Upstream lists, matched exactly on the
   id `upstream_model` produces, while its fetched list stays whole so a bare id still
   resolves to it and is refused by name.
@@ -102,7 +110,8 @@ in files.
   stated there as well as in `Translation`.
 - **Config** (`config.rs`) — parses `config.yaml`, including the `providers:`
   section, which is the only Provider registry: there is no database table.
-  An entry named for a built-in (`anthropic`, `claude`, `codex`, `grok`)
+  An entry named for a built-in (`anthropic`, `claude`, `codex`, `grok`,
+  `antigravity`)
   stops the relay at load, since the built-in Pool's prefix would shadow it,
   unless it names a built-in canonically and carries only `allow:`, which
   narrows that built-in's models and registers nothing. `/admin/reload` reads
@@ -191,7 +200,7 @@ in files.
   one, because the Classifier reads the body, not the client's dialect
   (ADR-0028, amending ADR-0002, ADR-0004 and ADR-0007). The vendor-identity
   inject (`apply_cloaking`) runs inside the Upstream client. codex is
-  header-only; grok and a configured OpenAI-compatible endpoint are never
+  header-only; grok, antigravity and a configured OpenAI-compatible endpoint are never
   Cloaked; `count_tokens` gets identifying headers but no body Cloaking.
 - **Tool-name rewrites are bijective within a request and restored before the
   reply reaches the client**, on the upstream's Messages-shaped reply, before

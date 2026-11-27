@@ -27,6 +27,7 @@ From source: `cargo install --git https://github.com/pwguler/pengepul.git --lock
 pengepul login --provider anthropic # authorize an Anthropic account
 pengepul login --provider codex # authorize a ChatGPT/Codex account
 pengepul login --provider grok # authorize a grok.com account
+pengepul login --provider antigravity # authorize a Google AI Pro/Ultra account
 pengepul serve # binds 127.0.0.1:8317
 pengepul serve --host 0.0.0.0 --port 8317 # reachable across your network
 ```
@@ -39,7 +40,11 @@ while that account can serve. A pool set to round-robin (`rotation: { anthropic:
 in `config.yaml`) reads no `priority:` and hands each new conversation to the next account in
 turn instead. A grok
 account serves `grok-4.6` and `grok-4.5`, each with a 500k context window, named bare or
-as `grok/grok-4.6`. Credentials live in `~/.pengepul` (`0600`); a running relay picks up a
+as `grok/grok-4.6`. An antigravity account serves the Google Antigravity catalog —
+`gemini-4-neon` and its `-low`, `-medium`, `-high` and `-xhigh` effort tiers among them,
+plus whatever else the upstream lists — named bare or as `antigravity/gemini-4-neon`.
+Model ids reach the vendor as written, so a tier is part of the name it names.
+Credentials live in `~/.pengepul` (`0600`); a running relay picks up a
 fresh login on restart or `pengepul accounts --reload`. Read the key clients use with
 `pengepul config api-key`. That key alone guards your subscriptions, so keep it secret and
 prefer a trusted network or an SSH tunnel.
@@ -57,7 +62,7 @@ systemctl --user restart pengepul   # or: pengepul service restart
 
 A provider id becomes a directory under the auth dir: letters, digits, `.`, `-`, `_`;
 never `.` or `..`, which a filesystem reads as somewhere else, and never a built-in's
-name (`anthropic`, `claude`, `codex`, `grok`). Providers load at startup, so a new one
+name (`anthropic`, `claude`, `codex`, `grok`, `antigravity`). Providers load at startup, so a new one
 needs a restart. Registration only adds: an id already present with a different
 `base-url` errors, naming the URL it kept, so a mistyped flag cannot move live traffic.
 Repeating is safe; changing or removing one means editing the file.
@@ -152,11 +157,12 @@ port first:
 ssh -L 54545:localhost:54545 user@host # anthropic
 ssh -L 1455:localhost:1455 user@host # codex
 ssh -L 14550:127.0.0.1:14550 user@host # grok
+ssh -L 51121:localhost:51121 user@host # antigravity
 ```
 
-For grok the tunnel is optional: when the browser cannot reach its callback, auth.x.ai
-shows a code instead, and pasting that code, or the full callback URL, at the login prompt
-finishes the same login.
+For grok and antigravity the tunnel is optional: when the browser cannot reach its
+callback, the consent page shows a code instead, and pasting that code, or the full
+callback URL, at the login prompt finishes the same login.
 
 ## Clients
 
@@ -234,7 +240,7 @@ curl -sS http://127.0.0.1:8317/v1/chat/completions \
 
 ```sh
 pengepul serve # start the relay (the default with no subcommand)
-pengepul login --provider anthropic # authorize an account in a browser (--provider codex or grok for the others)
+pengepul login --provider anthropic # authorize an account in a browser (--provider codex, grok or antigravity for the others)
 pengepul login --provider groq --key $KEY # save a static key for a configured provider
 pengepul login --provider groq --base-url $URL --key $KEY # register a new OpenAI-compatible provider and save its key
 pengepul status # health of the running relay: build, uptime, what each pool can serve
