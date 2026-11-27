@@ -1185,13 +1185,25 @@ pub fn parse_minimum_version(response_body: &str) -> Option<String> {
 /// the Antigravity Hub identity in the `User-Agent`.
 #[must_use]
 pub fn antigravity_headers(account: &AvailableAccount) -> BTreeMap<String, String> {
+    antigravity_headers_for(account, &antigravity_version())
+}
+
+/// [`antigravity_headers`] presenting a given Hub `version`.
+#[must_use]
+pub fn antigravity_headers_for(
+    account: &AvailableAccount,
+    version: &str,
+) -> BTreeMap<String, String> {
     BTreeMap::from([
         ("Content-Type".to_string(), "application/json".to_string()),
         (
             "Authorization".to_string(),
             format!("Bearer {}", account.token.access_token),
         ),
-        ("User-Agent".to_string(), antigravity_user_agent()),
+        (
+            "User-Agent".to_string(),
+            antigravity_user_agent_for(version),
+        ),
     ])
 }
 
@@ -1201,10 +1213,11 @@ pub fn antigravity_headers(account: &AvailableAccount) -> BTreeMap<String, Strin
 /// manifest.
 #[must_use]
 pub fn antigravity_user_agent() -> String {
-    format!(
-        "antigravity/hub/{} (aidev_client; os_type=darwin; arch=arm64)",
-        antigravity_version()
-    )
+    antigravity_user_agent_for(&antigravity_version())
+}
+
+fn antigravity_user_agent_for(version: &str) -> String {
+    format!("antigravity/hub/{version} (aidev_client; os_type=darwin; arch=arm64)")
 }
 
 /// The Hub version to present: the highest this process has been taught, by a
@@ -1214,7 +1227,8 @@ pub fn antigravity_version() -> String {
     ANTIGRAVITY_VERSION.current()
 }
 
-static ANTIGRAVITY_VERSION: VersionFloor = VersionFloor::new(ANTIGRAVITY_CLIENT_VERSION);
+/// The process-wide floor every antigravity request presents.
+pub static ANTIGRAVITY_VERSION: VersionFloor = VersionFloor::new(ANTIGRAVITY_CLIENT_VERSION);
 
 /// A client version that only moves up. A 426 names the floor the upstream
 /// enforces and the manifest names the newest release; neither may lower what
@@ -1274,13 +1288,6 @@ fn version_rank(version: &str) -> Vec<u64> {
         .split('.')
         .map(|part| part.parse().unwrap_or(0))
         .collect()
-}
-
-/// The version to retry a 426 with, on the process-wide floor; see
-/// [`VersionFloor::after_426`].
-#[must_use]
-pub fn learn_antigravity_version(response_body: &str, sent: &str) -> Option<String> {
-    ANTIGRAVITY_VERSION.after_426(response_body, sent)
 }
 
 /// Raise the process-wide floor to a version the manifest names.

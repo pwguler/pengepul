@@ -52,13 +52,12 @@ use crate::translate::{
 use crate::types::{AvailableAccount, ProviderId, ProviderKind, UsageData};
 use crate::upstream::{
     ANTHROPIC_BASE_URL, ANTIGRAVITY_BASE_URL, ANTIGRAVITY_GENERATE_PATH, ANTIGRAVITY_MODELS_PATH,
-    ANTIGRAVITY_STREAM_PATH, CODEX_BASE_URL, CODEX_DEFAULT_CLI_VERSION, CODEX_MODELS_PATH,
-    CODEX_RESPONSES_PATH, GROK_CHAT_BASE_URL, Threading, anthropic_headers,
-    anthropic_messages_wire, anthropic_usage_headers, antigravity_envelope, antigravity_headers,
-    antigravity_retry_delay, antigravity_unwrap, antigravity_version, codex_headers,
-    generic_base_url, generic_chat_headers, generic_headers, grok_chat_headers,
-    learn_antigravity_version, learn_grok_client_version, normalize_codex_responses_body,
-    resolve_beta,
+    ANTIGRAVITY_STREAM_PATH, ANTIGRAVITY_VERSION, CODEX_BASE_URL, CODEX_DEFAULT_CLI_VERSION,
+    CODEX_MODELS_PATH, CODEX_RESPONSES_PATH, GROK_CHAT_BASE_URL, Threading, VersionFloor,
+    anthropic_headers, anthropic_messages_wire, anthropic_usage_headers, antigravity_envelope,
+    antigravity_headers, antigravity_headers_for, antigravity_retry_delay, antigravity_unwrap,
+    codex_headers, generic_base_url, generic_chat_headers, generic_headers, grok_chat_headers,
+    learn_grok_client_version, normalize_codex_responses_body, resolve_beta,
 };
 use crate::utils::now_iso;
 use crate::utils::sha256_hex;
@@ -553,6 +552,7 @@ impl UpstreamClient for HttpUpstreamClient {
             send_antigravity_json(
                 client,
                 ANTIGRAVITY_BASE_URL,
+                &ANTIGRAVITY_VERSION,
                 &request.account,
                 request.body,
                 timeout_ms,
@@ -567,6 +567,7 @@ impl UpstreamClient for HttpUpstreamClient {
             send_antigravity_stream(
                 client,
                 ANTIGRAVITY_BASE_URL,
+                &ANTIGRAVITY_VERSION,
                 &request.account,
                 request.body,
                 request.config.timeouts.stream_messages_ms,
@@ -4842,32 +4843,33 @@ async fn send_grok_stream(
 }
 
 /// Send one antigravity generate call to `base` and return the upstream's own
-/// reply. A 426 naming a minimum Hub version is retried once with it; the
-/// route translates whatever comes back.
+/// reply. A 426 naming a minimum Hub version raises `floor` and is retried once
+/// with it; the route translates whatever comes back.
 async fn send_antigravity_json(
     client: reqwest::Client,
     base: &str,
+    floor: &VersionFloor,
     account: &AvailableAccount,
     envelope: Value,
     timeout_ms: u64,
 ) -> anyhow::Result<UpstreamJsonResponse> {
     let url = format!("{base}{ANTIGRAVITY_GENERATE_PATH}");
-    let sent = antigravity_version();
+    let sent = floor.current();
     let first = send_json(
         client.clone(),
         url.clone(),
-        antigravity_headers(account),
+        antigravity_headers_for(account, &sent),
         envelope.clone(),
         timeout_ms,
     )
     .await?;
     if first.status.as_u16() == 426
-        && learn_antigravity_version(&first.body.to_string(), &sent).is_some()
+        && let Some(version) = floor.after_426(&first.body.to_string(), &sent)
     {
         return send_json(
             client,
             url,
-            antigravity_headers(account),
+            antigravity_headers_for(account, &version),
             envelope,
             timeout_ms,
         )
@@ -4896,16 +4898,17 @@ fn antigravity_json(mut response: UpstreamJsonResponse, model: &str) -> Upstream
 async fn send_antigravity_stream(
     client: reqwest::Client,
     base: &str,
+    floor: &VersionFloor,
     account: &AvailableAccount,
     envelope: Value,
     silence_ms: u64,
 ) -> anyhow::Result<UpstreamSseResponse> {
     let url = format!("{base}{ANTIGRAVITY_STREAM_PATH}");
-    let sent = antigravity_version();
+    let sent = floor.current();
     let first = send_stream(
         client.clone(),
         url.clone(),
-        antigravity_headers(account),
+        antigravity_headers_for(account, &sent),
         envelope.clone(),
         silence_ms,
     )
@@ -4914,11 +4917,13 @@ async fn send_antigravity_stream(
         return Ok(first);
     }
     let (first, text) = antigravity_stream_error(first).await?;
-    if first.status.as_u16() == 426 && learn_antigravity_version(&text, &sent).is_some() {
+    if first.status.as_u16() == 426
+        && let Some(version) = floor.after_426(&text, &sent)
+    {
         let retried = send_stream(
             client,
             url,
-            antigravity_headers(account),
+            antigravity_headers_for(account, &version),
             envelope,
             silence_ms,
         )
@@ -7486,9 +7491,11 @@ mod tests {
     #[tokio::test]
     async fn an_antigravity_426_is_retried_once_with_the_named_version() {
         let (addr, seen) = serve_cloud_code(vec![(426, UPGRADE_426), (200, GEMINI_OK)]).await;
+        let floor = crate::upstream::VersionFloor::new("2.35.2");
         let response = super::send_antigravity_json(
             reqwest::Client::new(),
             &format!("http://{addr}"),
+            &floor,
             &antigravity_account(Some("p")),
             json!({"model": "gemini-4-neon-low"}),
             5_000,
@@ -7506,9 +7513,11 @@ mod tests {
     #[tokio::test]
     async fn a_refused_antigravity_stream_retry_keeps_its_retry_delay() {
         let (addr, seen) = serve_cloud_code(vec![(426, UPGRADE_426), (429, EXHAUSTED_429)]).await;
+        let floor = crate::upstream::VersionFloor::new("2.35.2");
         let response = super::send_antigravity_stream(
             reqwest::Client::new(),
             &format!("http://{addr}"),
+            &floor,
             &antigravity_account(Some("p")),
             json!({"model": "gemini-4-neon-low"}),
             5_000,
@@ -7527,9 +7536,11 @@ mod tests {
     #[tokio::test]
     async fn a_refused_antigravity_stream_reads_its_retry_delay() {
         let (addr, _) = serve_cloud_code(vec![(429, EXHAUSTED_429)]).await;
+        let floor = crate::upstream::VersionFloor::new("2.35.2");
         let response = super::send_antigravity_stream(
             reqwest::Client::new(),
             &format!("http://{addr}"),
+            &floor,
             &antigravity_account(Some("p")),
             json!({"model": "gemini-4-neon-low"}),
             5_000,
