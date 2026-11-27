@@ -805,6 +805,7 @@ impl AccountManager {
             id_token: refreshed.id_token.or(old_token.id_token),
             last_refresh_at: Some(refresh_at.clone()),
             plan_type: refreshed.plan_type.or(old_token.plan_type),
+            project_id: refreshed.project_id.or(old_token.project_id),
         };
         save_token(&self.auth_dir, &new_token)?;
         if let Some(state) = self.accounts.get_mut(email) {
@@ -1548,6 +1549,7 @@ mod settle_tests {
             id_token: None,
             last_refresh_at: None,
             plan_type: None,
+            project_id: None,
         })
     }
 

@@ -11,9 +11,11 @@ use crate::app::create_app;
 use crate::cli::{AccountToggle, CliRuntime, LaunchPlan, ModelChoice, ServiceInstallRequest};
 use crate::config::{Config, DebugMode};
 use crate::oauth::{
-    ANTHROPIC_REDIRECT_URI, CODEX_CALLBACK_PATH, CODEX_CALLBACK_PORT, GROK_CALLBACK_PATH,
-    GROK_CALLBACK_PORT, exchange_anthropic_code, exchange_codex_code, exchange_grok_code,
-    exchange_grok_pasted_code, generate_anthropic_auth_url, generate_codex_auth_url,
+    ANTHROPIC_REDIRECT_URI, ANTIGRAVITY_CALLBACK_PATH, ANTIGRAVITY_CALLBACK_PORT,
+    CODEX_CALLBACK_PATH, CODEX_CALLBACK_PORT, GROK_CALLBACK_PATH, GROK_CALLBACK_PORT,
+    exchange_anthropic_code, exchange_antigravity_code, exchange_antigravity_pasted_code,
+    exchange_codex_code, exchange_grok_code, exchange_grok_pasted_code,
+    generate_anthropic_auth_url, generate_antigravity_auth_url, generate_codex_auth_url,
     generate_grok_auth_url, parse_grok_paste,
 };
 use crate::render::Style;
@@ -254,8 +256,11 @@ impl CliRuntime for RealRuntime {
         println!("\nOpen this URL to authorize {provider}:\n\n{auth_url}\n");
         open_browser(&auth_url);
         let (port, path) = callback_endpoint(&provider)?;
-        let callback = if provider.kind == ProviderKind::Grok {
-            // auth.x.ai hands the code to the user by hand when the redirect
+        let callback = if matches!(
+            provider.kind,
+            ProviderKind::Grok | ProviderKind::Antigravity
+        ) {
+            // The vendor hands the code to the user by hand when the redirect
             // cannot reach this host (headless box, browser on another
             // machine). Take either path, whichever arrives first. The
             // paste prompt is only honest when stdin can actually deliver
@@ -263,7 +268,7 @@ impl CliRuntime for RealRuntime {
             // browser-side link has to do the work.
             if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
                 println!(
-                    "If the browser cannot reach this host, auth.x.ai shows a code instead.\n\
+                    "If the browser cannot reach this host, the consent page shows a code instead.\n\
                      Paste that code — or the full callback URL — here and press Enter.\n"
                 );
             }
@@ -284,6 +289,14 @@ impl CliRuntime for RealRuntime {
                         exchange_grok_pasted_code(&callback.code, &pkce).await
                     } else {
                         exchange_grok_code(&callback.code, &callback.state, &state, &pkce).await
+                    }
+                }
+                ProviderKind::Antigravity => {
+                    if callback.pasted {
+                        exchange_antigravity_pasted_code(&callback.code, &pkce).await
+                    } else {
+                        exchange_antigravity_code(&callback.code, &callback.state, &state, &pkce)
+                            .await
                     }
                 }
                 ProviderKind::Generic => {
@@ -481,6 +494,7 @@ fn auth_url(provider: &ProviderId, state: &str, pkce: &PkceCodes, nonce: &str) -
         ProviderKind::Anthropic => generate_anthropic_auth_url(state, pkce),
         ProviderKind::Codex => generate_codex_auth_url(state, pkce),
         ProviderKind::Grok => generate_grok_auth_url(state, pkce, nonce),
+        ProviderKind::Antigravity => generate_antigravity_auth_url(state, pkce),
         ProviderKind::Generic => {
             unreachable!("static-key providers never build an OAuth authorize URL")
         }
@@ -496,6 +510,7 @@ fn callback_endpoint(provider: &ProviderId) -> Result<(u16, &'static str)> {
         }
         ProviderKind::Codex => Ok((CODEX_CALLBACK_PORT, CODEX_CALLBACK_PATH)),
         ProviderKind::Grok => Ok((GROK_CALLBACK_PORT, GROK_CALLBACK_PATH)),
+        ProviderKind::Antigravity => Ok((ANTIGRAVITY_CALLBACK_PORT, ANTIGRAVITY_CALLBACK_PATH)),
         ProviderKind::Generic => {
             unreachable!("static-key providers never serve an OAuth callback")
         }

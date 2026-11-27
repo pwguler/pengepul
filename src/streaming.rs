@@ -3,8 +3,97 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use crate::translate::anthropic_stop_reason;
+use crate::translate::{anthropic_stop_reason, gemini_finish_reason, gemini_parts, gemini_usage};
 use crate::types::UsageData;
+
+/// The state one antigravity stream carries between Gemini chunks: the id and
+/// model every `chat.completion.chunk` names, whether the opening role delta
+/// has gone out, and the next tool-call index.
+pub struct AntigravityChunkState {
+    id: String,
+    model: String,
+    started: bool,
+    tool_index: i64,
+}
+
+impl AntigravityChunkState {
+    #[must_use]
+    pub fn new(model: impl Into<String>) -> Self {
+        Self {
+            id: format!("chatcmpl_{}", uuid::Uuid::new_v4().simple()),
+            model: model.into(),
+            started: false,
+            tool_index: 0,
+        }
+    }
+
+    /// The Chat Completions chunk a Gemini chunk becomes, or `None` when the
+    /// chunk carries nothing a client can use. The id is taken from the first
+    /// chunk that names one, so a streamed reply and a whole one agree.
+    pub fn chunk(&mut self, gemini: &Value) -> Option<Value> {
+        if let Some(id) = gemini.get("responseId").and_then(Value::as_str) {
+            self.id = id.to_string();
+        }
+        let (text, reasoning, tool_calls) = gemini_parts(gemini);
+        let finish = gemini
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|candidates| candidates.first())
+            .and_then(|candidate| candidate.get("finishReason"))
+            .and_then(Value::as_str)
+            .filter(|reason| !reason.is_empty());
+        let usage = gemini_usage(gemini.get("usageMetadata"));
+        if text.is_empty()
+            && reasoning.is_empty()
+            && tool_calls.is_empty()
+            && finish.is_none()
+            && usage.is_none()
+        {
+            return None;
+        }
+
+        let mut delta = serde_json::Map::new();
+        if !self.started {
+            self.started = true;
+            delta.insert("role".to_string(), json!("assistant"));
+        }
+        if !reasoning.is_empty() {
+            delta.insert("reasoning_content".to_string(), json!(reasoning));
+        }
+        if !text.is_empty() {
+            delta.insert("content".to_string(), json!(text));
+        }
+        if !tool_calls.is_empty() {
+            let mut calls = Vec::new();
+            for call in &tool_calls {
+                calls.push(json!({
+                    "index": self.tool_index,
+                    "id": call.get("id").cloned().unwrap_or(Value::Null),
+                    "type": "function",
+                    "function": call.get("function").cloned().unwrap_or(Value::Null)
+                }));
+                self.tool_index += 1;
+            }
+            delta.insert("tool_calls".to_string(), Value::Array(calls));
+        }
+
+        let mut chunk = json!({
+            "id": self.id,
+            "object": "chat.completion.chunk",
+            "created": chrono::Utc::now().timestamp(),
+            "model": self.model,
+            "choices": [{
+                "index": 0,
+                "delta": Value::Object(delta),
+                "finish_reason": finish.map(|_| gemini_finish_reason(gemini, !tool_calls.is_empty()))
+            }]
+        });
+        if let Some(usage) = usage {
+            chunk["usage"] = usage;
+        }
+        Some(chunk)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ChatStreamState {
@@ -1893,5 +1982,82 @@ trait MapExt {
 impl MapExt for serde_json::Map<String, Value> {
     fn is_empty(&self) -> bool {
         serde_json::Map::is_empty(self)
+    }
+}
+
+#[cfg(test)]
+mod antigravity_chunk_tests {
+    use super::AntigravityChunkState;
+    use serde_json::json;
+
+    #[test]
+    fn a_gemini_chunk_becomes_a_chat_completion_chunk() {
+        let mut state = AntigravityChunkState::new("gemini-4-neon-high");
+        let chunk = state
+            .chunk(&json!({
+                "responseId": "resp-1",
+                "candidates": [{"content": {"role": "model", "parts": [
+                    {"text": "thinking", "thought": true},
+                    {"text": "hello"}
+                ]}}],
+                "usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 2,
+                                  "thoughtsTokenCount": 3, "totalTokenCount": 12}
+            }))
+            .expect("a chunk");
+
+        assert_eq!(chunk["id"], "resp-1");
+        assert_eq!(chunk["object"], "chat.completion.chunk");
+        assert_eq!(chunk["model"], "gemini-4-neon-high");
+        let delta = &chunk["choices"][0]["delta"];
+        // The role opens the stream once, on the first chunk.
+        assert_eq!(delta["role"], "assistant");
+        assert_eq!(delta["reasoning_content"], "thinking");
+        assert_eq!(delta["content"], "hello");
+        assert_eq!(chunk["usage"]["prompt_tokens"], 7);
+        assert_eq!(
+            chunk["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            3
+        );
+    }
+
+    #[test]
+    fn a_finish_chunk_carries_the_stop_reason_and_no_role_delta() {
+        let mut state = AntigravityChunkState::new("gemini-4-neon");
+        let _ = state.chunk(&json!({"candidates": [{"content": {"parts": [{"text": "x"}]}}]}));
+        let chunk = state
+            .chunk(&json!({"candidates": [{"content": {"parts": []}, "finishReason": "STOP"}]}))
+            .expect("finish chunk");
+        assert_eq!(chunk["choices"][0]["finish_reason"], "stop");
+        assert!(
+            chunk["choices"][0]["delta"].get("role").is_none(),
+            "the role goes out once"
+        );
+    }
+
+    #[test]
+    fn a_function_call_chunk_numbers_its_tool_calls() {
+        let mut state = AntigravityChunkState::new("gemini-4-neon");
+        let chunk = state
+            .chunk(&json!({"candidates": [{"content": {"parts": [
+                {"functionCall": {"name": "a", "args": {}}},
+                {"functionCall": {"name": "b", "args": {}}}
+            ]}}]}))
+            .expect("chunk");
+        assert_eq!(chunk["choices"][0]["delta"]["tool_calls"][0]["index"], 0);
+        assert_eq!(chunk["choices"][0]["delta"]["tool_calls"][1]["index"], 1);
+        assert_eq!(
+            chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+            "a"
+        );
+    }
+
+    #[test]
+    fn a_chunk_with_nothing_to_say_is_dropped() {
+        let mut state = AntigravityChunkState::new("gemini-4-neon");
+        assert!(
+            state
+                .chunk(&json!({"candidates": [{"content": {"parts": []}}]}))
+                .is_none()
+        );
     }
 }

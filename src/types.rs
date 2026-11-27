@@ -10,6 +10,10 @@ pub enum ProviderKind {
     /// OAuth and relayed to the cli-chat-proxy. "xai" stays free as the
     /// configured-endpoint id for the keyed console API.
     Grok,
+    /// A Google AI Pro/Ultra subscription account, authorized through Google
+    /// Antigravity's own OAuth and relayed to Cloud Code Assist as Gemini
+    /// `generateContent`. "google" stays free as a configured-endpoint id.
+    Antigravity,
     /// A configured OpenAI-compatible endpoint. The id names the `providers:`
     /// config entry ("groq", ...); the kind is what makes it generic.
     Generic,
@@ -22,6 +26,7 @@ impl ProviderKind {
             Self::Anthropic => "anthropic",
             Self::Codex => "codex",
             Self::Grok => "grok",
+            Self::Antigravity => "antigravity",
             Self::Generic => "generic",
         }
     }
@@ -41,6 +46,7 @@ impl FromStr for ProviderKind {
             "anthropic" | "claude" => Ok(Self::Anthropic),
             "codex" => Ok(Self::Codex),
             "grok" => Ok(Self::Grok),
+            "antigravity" => Ok(Self::Antigravity),
             other => Err(format!("unknown provider kind: {other}")),
         }
     }
@@ -76,6 +82,11 @@ impl ProviderId {
         Self::new(ProviderKind::Grok, "grok")
     }
 
+    #[must_use]
+    pub fn antigravity() -> Self {
+        Self::new(ProviderKind::Antigravity, "antigravity")
+    }
+
     /// A configured OpenAI-compatible endpoint, named by its `providers:` entry.
     #[must_use]
     pub fn generic(id: impl Into<Arc<str>>) -> Self {
@@ -90,6 +101,7 @@ impl ProviderId {
             ProviderKind::Anthropic => Self::anthropic(),
             ProviderKind::Codex => Self::codex(),
             ProviderKind::Grok => Self::grok(),
+            ProviderKind::Antigravity => Self::antigravity(),
             ProviderKind::Generic => {
                 unreachable!("a generic provider needs its config entry name")
             }
@@ -136,6 +148,10 @@ pub struct TokenData {
     pub id_token: Option<String>,
     pub last_refresh_at: Option<String>,
     pub plan_type: Option<String>,
+    /// The Cloud Code Assist project this account is bound to, discovered once
+    /// at login. Gemini `generateContent` carries it on every request; a
+    /// Refresh keeps it. `None` for every other provider.
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -215,6 +231,7 @@ mod tests {
         assert_eq!(&*ProviderId::anthropic().id, "anthropic");
         assert_eq!(&*ProviderId::codex().id, "codex");
         assert_eq!(&*ProviderId::grok().id, "grok");
+        assert_eq!(&*ProviderId::antigravity().id, "antigravity");
     }
 
     #[test]
@@ -233,6 +250,7 @@ mod tests {
             (ProviderKind::Anthropic, "anthropic", &["claude"][..]),
             (ProviderKind::Codex, "codex", &[][..]),
             (ProviderKind::Grok, "grok", &[][..]),
+            (ProviderKind::Antigravity, "antigravity", &[][..]),
         ] {
             assert_eq!(kind.canonical_id(), canonical);
             assert_eq!(canonical.parse::<ProviderKind>(), Ok(kind));

@@ -52,6 +52,7 @@ async fn since_last_refresh_refreshes_legacy_token_without_last_refresh() {
                     id_token: None,
                     last_refresh_at: None,
                     plan_type: None,
+                    project_id: None,
                 })
             })
         },
@@ -593,6 +594,7 @@ fn static_token(email: &str) -> TokenData {
         id_token: None,
         last_refresh_at: None,
         plan_type: None,
+        project_id: None,
     }
 }
 
@@ -1797,6 +1799,7 @@ async fn a_pinned_account_on_cooldown_falls_through_to_rotation() {
                 id_token: None,
                 last_refresh_at: None,
                 plan_type: None,
+                project_id: None,
             },
         )
         .expect("save token");
@@ -1865,6 +1868,7 @@ async fn a_conversation_that_failed_over_stays_on_the_account_that_rescued_it() 
                 id_token: None,
                 last_refresh_at: None,
                 plan_type: None,
+                project_id: None,
             },
         )
         .expect("save token");
@@ -2267,6 +2271,7 @@ fn refreshing_codex_manager(auth_dir: &Path) -> AccountManager {
                     id_token: None,
                     last_refresh_at: None,
                     plan_type: None,
+                    project_id: None,
                 })
             })
         },

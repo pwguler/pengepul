@@ -1675,6 +1675,472 @@ fn copy_value_field(source: &Value, target: &mut Value, key: &str) {
     }
 }
 
+// -- Antigravity: Chat Completions <-> Gemini ----------------------------
+
+/// The Gemini `GenerateContentRequest` a Chat Completions body becomes — the
+/// inner `request` of the Antigravity envelope. Chat Completions is the
+/// relay's pivot, so a Messages or Responses client reaches this through the
+/// existing translators rather than through a second matrix.
+#[must_use]
+pub fn antigravity_request(chat: &Value) -> Value {
+    let mut system = Vec::new();
+    let mut contents: Vec<Value> = Vec::new();
+    let mut tool_names: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+
+    for message in value_array(chat.get("messages")) {
+        match message.get("role").and_then(Value::as_str) {
+            Some("system" | "developer") => {
+                let text = text_from_content(message.get("content").unwrap_or(&Value::Null));
+                if !text.is_empty() {
+                    system.push(text);
+                }
+            }
+            Some("assistant") => {
+                let mut parts = Vec::new();
+                // Reasoning the client sends back rides in front of the answer,
+                // flagged as a thought so the vendor does not read it as text.
+                let reasoning = message
+                    .get("reasoning_content")
+                    .or_else(|| message.get("reasoning"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !reasoning.is_empty() {
+                    parts.push(json!({"text": reasoning, "thought": true}));
+                }
+                let text = text_from_content(message.get("content").unwrap_or(&Value::Null));
+                if !text.is_empty() {
+                    parts.push(json!({"text": text}));
+                }
+                for call in value_array(message.get("tool_calls")) {
+                    let function = call.get("function").unwrap_or(&Value::Null);
+                    let name = function
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if let Some(id) = call.get("id").and_then(Value::as_str) {
+                        tool_names.insert(id.to_string(), name.to_string());
+                    }
+                    parts.push(json!({
+                        "functionCall": {
+                            "name": name,
+                            "args": gemini_tool_arguments(function.get("arguments")),
+                        }
+                    }));
+                }
+                push_gemini_content(&mut contents, "model", parts);
+            }
+            Some("tool") => {
+                let name = message
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| tool_names.get(id).cloned())
+                    .or_else(|| {
+                        message
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                    })
+                    .unwrap_or_default();
+                let content = text_from_content(message.get("content").unwrap_or(&Value::Null));
+                push_gemini_content(
+                    &mut contents,
+                    "user",
+                    vec![json!({
+                        "functionResponse": {"name": name, "response": {"content": content}}
+                    })],
+                );
+            }
+            _ => {
+                let parts =
+                    gemini_parts_from_content(message.get("content").unwrap_or(&Value::Null));
+                push_gemini_content(&mut contents, "user", parts);
+            }
+        }
+    }
+
+    let mut out = Map::new();
+    out.insert("contents".to_string(), Value::Array(contents));
+    if !system.is_empty() {
+        // Must be an object with parts; a bare string is a 400 upstream.
+        out.insert(
+            "systemInstruction".to_string(),
+            json!({"parts": [{"text": system.join("\n\n")}]}),
+        );
+    }
+    let generation = gemini_generation_config(chat);
+    if !generation.is_empty() {
+        out.insert("generationConfig".to_string(), Value::Object(generation));
+    }
+    let tools = value_array(chat.get("tools"))
+        .into_iter()
+        .filter_map(gemini_function_declaration)
+        .collect::<Vec<_>>();
+    if !tools.is_empty() {
+        out.insert(
+            "tools".to_string(),
+            json!([{"functionDeclarations": tools}]),
+        );
+        if let Some(config) = gemini_tool_config(chat.get("tool_choice"), &tools) {
+            out.insert("toolConfig".to_string(), config);
+        }
+    }
+    Value::Object(out)
+}
+
+/// Append parts to the conversation, merging into the previous turn when the
+/// role repeats: Gemini reads one `contents` entry per turn, and a Messages
+/// client splits a tool result into its own message.
+fn push_gemini_content(contents: &mut Vec<Value>, role: &str, parts: Vec<Value>) {
+    if parts.is_empty() {
+        return;
+    }
+    if let Some(existing) = contents
+        .last_mut()
+        .filter(|last| last.get("role").and_then(Value::as_str) == Some(role))
+        .and_then(|last| last.get_mut("parts"))
+        .and_then(Value::as_array_mut)
+    {
+        existing.extend(parts);
+        return;
+    }
+    contents.push(json!({"role": role, "parts": parts}));
+}
+
+/// Chat message content as Gemini parts: text, and an image URL as either
+/// `inlineData` (a data URL) or `fileData` (a hosted one).
+fn gemini_parts_from_content(content: &Value) -> Vec<Value> {
+    match content {
+        Value::String(text) => {
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![json!({"text": text})]
+            }
+        }
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| match item.get("type").and_then(Value::as_str) {
+                Some("text") => item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(|text| json!({"text": text})),
+                Some("image_url") => {
+                    let url = item
+                        .get("image_url")
+                        .and_then(|image| image.get("url"))
+                        .or_else(|| item.get("image_url"))
+                        .and_then(Value::as_str)?;
+                    Some(gemini_image_part(url))
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn gemini_image_part(url: &str) -> Value {
+    // `data:<mime>;base64,<payload>` is the only form the upstream can read
+    // without fetching; anything else is handed over as a URI.
+    if let Some((meta, data)) = url
+        .strip_prefix("data:")
+        .and_then(|rest| rest.split_once(','))
+    {
+        let mime = meta.strip_suffix(";base64").unwrap_or(meta);
+        return json!({"inlineData": {"mimeType": mime, "data": data}});
+    }
+    json!({"fileData": {"fileUri": url}})
+}
+
+fn gemini_tool_arguments(arguments: Option<&Value>) -> Value {
+    match arguments {
+        Some(Value::String(raw)) => serde_json::from_str(raw).unwrap_or_else(|_| json!({})),
+        Some(value) if value.is_object() => value.clone(),
+        _ => json!({}),
+    }
+}
+
+fn gemini_generation_config(chat: &Value) -> Map<String, Value> {
+    let mut config = Map::new();
+    let mut budget = None;
+    if let Some(effort) = chat.get("reasoning_effort").and_then(Value::as_str) {
+        budget = Some(gemini_thinking_budget(effort));
+    }
+    let max_tokens = chat.get("max_tokens").and_then(Value::as_i64);
+    if let Some(budget) = budget {
+        config.insert(
+            "thinkingConfig".to_string(),
+            json!({"thinkingBudget": budget, "includeThoughts": true}),
+        );
+        // The upstream refuses `maxOutputTokens <= thinkingBudget`.
+        let limit = max_tokens.unwrap_or(0).max(budget + 1024);
+        config.insert("maxOutputTokens".to_string(), json!(limit));
+    } else if let Some(max_tokens) = max_tokens {
+        config.insert("maxOutputTokens".to_string(), json!(max_tokens));
+    }
+    for (from, to) in [
+        ("temperature", "temperature"),
+        ("top_p", "topP"),
+        ("top_k", "topK"),
+    ] {
+        if let Some(value) = chat.get(from).filter(|value| value.is_number()) {
+            config.insert(to.to_string(), value.clone());
+        }
+    }
+    if let Some(stop) = chat.get("stop") {
+        let sequences = match stop {
+            Value::String(one) => vec![Value::String(one.clone())],
+            Value::Array(items) => items.clone(),
+            _ => Vec::new(),
+        };
+        if !sequences.is_empty() {
+            config.insert("stopSequences".to_string(), Value::Array(sequences));
+        }
+    }
+    config
+}
+
+fn gemini_thinking_budget(effort: &str) -> i64 {
+    match effort {
+        "minimal" => 1_024,
+        "low" => 4_096,
+        "high" => 24_576,
+        "xhigh" => 32_768,
+        _ => 8_192,
+    }
+}
+
+fn gemini_function_declaration(tool: &Value) -> Option<Value> {
+    let function = tool.get("function").unwrap_or(tool);
+    let name = function.get("name").and_then(Value::as_str)?;
+    let mut out = Map::new();
+    out.insert("name".to_string(), json!(name));
+    if let Some(description) = function.get("description").and_then(Value::as_str) {
+        out.insert("description".to_string(), json!(description));
+    }
+    if let Some(parameters) = function.get("parameters").filter(|value| value.is_object()) {
+        out.insert("parameters".to_string(), gemini_schema(parameters));
+    }
+    Some(Value::Object(out))
+}
+
+/// A JSON Schema as the upstream accepts it: the keywords it rejects are
+/// dropped (`const` becomes a one-value `enum`, `$ref`/`$defs`/`$schema`/`$id`
+/// and documentation-only `default`/`examples` are removed), recursively.
+fn gemini_schema(schema: &Value) -> Value {
+    match schema {
+        Value::Object(map) => {
+            let mut out = Map::new();
+            for (key, value) in map {
+                match key.as_str() {
+                    "const" => {
+                        out.insert("enum".to_string(), json!([value.clone()]));
+                    }
+                    "$ref" | "$defs" | "definitions" | "$schema" | "$id" | "default"
+                    | "examples" => {}
+                    "properties" => {
+                        let properties = value
+                            .as_object()
+                            .map(|entries| {
+                                entries
+                                    .iter()
+                                    .map(|(name, subschema)| {
+                                        (name.clone(), gemini_schema(subschema))
+                                    })
+                                    .collect::<Map<String, Value>>()
+                            })
+                            .unwrap_or_default();
+                        out.insert(key.clone(), Value::Object(properties));
+                    }
+                    _ => {
+                        out.insert(key.clone(), gemini_schema_value(value));
+                    }
+                }
+            }
+            Value::Object(out)
+        }
+        other => other.clone(),
+    }
+}
+
+fn gemini_schema_value(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(gemini_schema_value).collect()),
+        Value::Object(_) => gemini_schema(value),
+        other => other.clone(),
+    }
+}
+
+fn gemini_tool_config(choice: Option<&Value>, declarations: &[Value]) -> Option<Value> {
+    let mode = match choice {
+        None => return None,
+        Some(Value::String(mode)) => mode.clone(),
+        Some(object) => {
+            let function = object.get("function").unwrap_or(object);
+            let name = function.get("name").and_then(Value::as_str)?;
+            return Some(json!({"functionCallingConfig": {
+                "mode": "ANY",
+                "allowedFunctionNames": [name]
+            }}));
+        }
+    };
+    let mode = match mode.as_str() {
+        "auto" => "AUTO",
+        "none" => "NONE",
+        "required" | "any" => "ANY",
+        _ => return None,
+    };
+    // `ANY` without a name is the upstream's "must call something"; a client
+    // that named nothing is served by the declared names.
+    let names = declarations
+        .iter()
+        .filter_map(|declaration| declaration.get("name").cloned())
+        .collect::<Vec<_>>();
+    let config = if mode == "ANY" && !names.is_empty() {
+        json!({"mode": mode, "allowedFunctionNames": names})
+    } else {
+        json!({"mode": mode})
+    };
+    Some(json!({"functionCallingConfig": config}))
+}
+
+/// A Gemini `GenerateContentResponse` as an `OpenAI` Chat Completions reply.
+#[must_use]
+pub fn antigravity_response(gemini: &Value, model: &str) -> Value {
+    let (text, reasoning, tool_calls) = gemini_parts(gemini);
+    let mut message = Map::new();
+    message.insert("role".to_string(), json!("assistant"));
+    message.insert("content".to_string(), json!(text));
+    if !reasoning.is_empty() {
+        message.insert("reasoning_content".to_string(), json!(reasoning));
+    }
+    let has_tool_calls = !tool_calls.is_empty();
+    if has_tool_calls {
+        message.insert("tool_calls".to_string(), Value::Array(tool_calls));
+    }
+    let mut out = json!({
+        "id": gemini_id(gemini),
+        "object": "chat.completion",
+        "created": chrono::Utc::now().timestamp(),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": Value::Object(message),
+            "finish_reason": gemini_finish_reason(gemini, has_tool_calls)
+        }]
+    });
+    if let Some(usage) = gemini_usage(gemini.get("usageMetadata")) {
+        out["usage"] = usage;
+    }
+    out
+}
+
+/// One candidate's parts split three ways: answer text, thinking text, and
+/// function calls in the Chat shape. Shared by the whole reply and the stream.
+#[must_use]
+pub fn gemini_parts(gemini: &Value) -> (String, String, Vec<Value>) {
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut tool_calls = Vec::new();
+    for part in value_array(
+        gemini
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|candidates| candidates.first())
+            .and_then(|candidate| candidate.get("content"))
+            .and_then(|content| content.get("parts")),
+    ) {
+        if part.get("thought").and_then(Value::as_bool) == Some(true) {
+            if let Some(thought) = part.get("text").and_then(Value::as_str) {
+                reasoning.push_str(thought);
+            }
+            continue;
+        }
+        if let Some(chunk) = part.get("text").and_then(Value::as_str) {
+            text.push_str(chunk);
+        }
+        if let Some(call) = part.get("functionCall") {
+            tool_calls.push(gemini_tool_call(call));
+        }
+    }
+    (text, reasoning, tool_calls)
+}
+
+fn gemini_tool_call(call: &Value) -> Value {
+    let name = call.get("name").and_then(Value::as_str).unwrap_or_default();
+    let args = call.get("args").cloned().unwrap_or_else(|| json!({}));
+    let id = call.get("id").and_then(Value::as_str).map_or_else(
+        || format!("call_{}", uuid::Uuid::new_v4().simple()),
+        ToString::to_string,
+    );
+    json!({
+        "id": id,
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string())
+        }
+    })
+}
+
+/// `usageMetadata` under the Chat names. `completion_tokens` excludes the
+/// thinking tokens, as Gemini reports them apart, and `total_tokens` keeps the
+/// upstream's own sum so the relay's `output_from` folds the thinking in.
+#[must_use]
+pub fn gemini_usage(usage: Option<&Value>) -> Option<Value> {
+    let usage = usage?;
+    if !usage.is_object() {
+        return None;
+    }
+    let prompt = int_field(usage, "promptTokenCount");
+    let completion = int_field(usage, "candidatesTokenCount");
+    let reasoning = int_field(usage, "thoughtsTokenCount");
+    let cached = int_field(usage, "cachedContentTokenCount");
+    let total = usage
+        .get("totalTokenCount")
+        .and_then(Value::as_i64)
+        .unwrap_or(prompt + completion + reasoning);
+    let mut out = json!({
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total
+    });
+    if reasoning > 0 {
+        out["completion_tokens_details"] = json!({"reasoning_tokens": reasoning});
+    }
+    if cached > 0 {
+        out["prompt_tokens_details"] = json!({"cached_tokens": cached});
+    }
+    Some(out)
+}
+
+#[must_use]
+pub fn gemini_finish_reason(gemini: &Value, has_tool_calls: bool) -> &'static str {
+    let reason = gemini
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|candidates| candidates.first())
+        .and_then(|candidate| candidate.get("finishReason"))
+        .and_then(Value::as_str);
+    match reason {
+        Some("MAX_TOKENS" | "MALFORMED_FUNCTION_CALL") => "length",
+        Some("SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT") => "content_filter",
+        _ if has_tool_calls => "tool_calls",
+        _ => "stop",
+    }
+}
+
+fn gemini_id(gemini: &Value) -> String {
+    gemini
+        .get("responseId")
+        .and_then(Value::as_str)
+        .map_or_else(
+            || format!("chatcmpl_{}", uuid::Uuid::new_v4().simple()),
+            ToString::to_string,
+        )
+}
+
 fn value_array(value: Option<&Value>) -> Vec<&Value> {
     value
         .and_then(Value::as_array)
@@ -1802,5 +2268,174 @@ mod grok_responses_tests {
             "grok-4.6",
         );
         assert_eq!(reply["status"], "incomplete");
+    }
+}
+
+#[cfg(test)]
+mod antigravity_translation_tests {
+    use super::{antigravity_request, antigravity_response};
+    use serde_json::json;
+
+    #[test]
+    fn antigravity_request_maps_messages_system_tools_and_thinking() {
+        let request = antigravity_request(&json!({
+            "model": "gemini-4-neon-high",
+            "reasoning_effort": "high",
+            "max_tokens": 1000,
+            "temperature": 0.4,
+            "messages": [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "look"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}
+                ]},
+                {"role": "assistant", "content": "checking", "tool_calls": [
+                    {"id": "call_1", "type": "function",
+                     "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "22C"}
+            ],
+            "tools": [{"type": "function", "function": {
+                "name": "get_weather",
+                "description": "weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
+                               "required": ["city"], "additionalProperties": false}
+            }}],
+            "tool_choice": "auto"
+        }));
+
+        assert_eq!(request["systemInstruction"]["parts"][0]["text"], "be brief");
+        let contents = request["contents"].as_array().expect("contents");
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[0]["parts"][0]["text"], "look");
+        assert_eq!(
+            contents[0]["parts"][1]["inlineData"]["mimeType"],
+            "image/png"
+        );
+        assert_eq!(contents[0]["parts"][1]["inlineData"]["data"], "AAA");
+        assert_eq!(contents[1]["role"], "model");
+        assert_eq!(
+            contents[1]["parts"][1]["functionCall"]["name"],
+            "get_weather"
+        );
+        assert_eq!(
+            contents[1]["parts"][1]["functionCall"]["args"]["city"],
+            "Paris"
+        );
+        // A tool result is a user turn, and the name is resolved from the call id.
+        assert_eq!(contents[2]["role"], "user");
+        assert_eq!(
+            contents[2]["parts"][0]["functionResponse"]["name"],
+            "get_weather"
+        );
+        assert_eq!(
+            contents[2]["parts"][0]["functionResponse"]["response"]["content"],
+            "22C"
+        );
+        assert_eq!(
+            request["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            24_576
+        );
+        assert_eq!(
+            request["generationConfig"]["thinkingConfig"]["includeThoughts"],
+            true
+        );
+        // The upstream refuses maxOutputTokens <= thinkingBudget.
+        assert!(
+            request["generationConfig"]["maxOutputTokens"]
+                .as_i64()
+                .expect("max")
+                > 24_576
+        );
+        assert_eq!(request["generationConfig"]["temperature"], 0.4);
+        assert_eq!(
+            request["tools"][0]["functionDeclarations"][0]["name"],
+            "get_weather"
+        );
+        assert_eq!(
+            request["toolConfig"]["functionCallingConfig"]["mode"],
+            "AUTO"
+        );
+    }
+
+    #[test]
+    fn antigravity_request_drops_the_schema_keywords_the_upstream_rejects() {
+        let request = antigravity_request(&json!({
+            "messages": [{"role": "user", "content": "x"}],
+            "tools": [{"type": "function", "function": {
+                "name": "pick",
+                "parameters": {
+                    "type": "object",
+                    "$schema": "http://json-schema.org/draft-07/schema#",
+                    "properties": {
+                        "kind": {"const": "email"},
+                        "other": {"type": "string", "default": "x", "examples": ["y"]}
+                    }
+                }
+            }}]
+        }));
+        let parameters = &request["tools"][0]["functionDeclarations"][0]["parameters"];
+        assert!(parameters.get("$schema").is_none(), "{parameters}");
+        assert_eq!(parameters["properties"]["kind"]["enum"], json!(["email"]));
+        assert!(parameters["properties"]["other"].get("default").is_none());
+        assert!(parameters["properties"]["other"].get("examples").is_none());
+    }
+
+    #[test]
+    fn antigravity_response_maps_thinking_text_usage_and_tool_calls() {
+        let response = antigravity_response(
+            &json!({
+                "candidates": [{
+                    "content": {"role": "model", "parts": [
+                        {"text": "weighing", "thought": true},
+                        {"text": "the answer"},
+                        {"functionCall": {"name": "stop", "args": {"now": true}, "id": "call_9"}}
+                    ]},
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 100,
+                    "candidatesTokenCount": 20,
+                    "thoughtsTokenCount": 30,
+                    "totalTokenCount": 150,
+                    "cachedContentTokenCount": 40
+                }
+            }),
+            "gemini-4-neon-high",
+        );
+
+        assert_eq!(response["object"], "chat.completion");
+        assert_eq!(response["model"], "gemini-4-neon-high");
+        let message = &response["choices"][0]["message"];
+        assert_eq!(message["role"], "assistant");
+        assert_eq!(message["reasoning_content"], "weighing");
+        assert_eq!(message["content"], "the answer");
+        assert_eq!(message["tool_calls"][0]["id"], "call_9");
+        assert_eq!(message["tool_calls"][0]["function"]["name"], "stop");
+        assert_eq!(
+            message["tool_calls"][0]["function"]["arguments"],
+            "{\"now\":true}"
+        );
+        // A function call is a tool_calls finish whatever the vendor said.
+        assert_eq!(response["choices"][0]["finish_reason"], "tool_calls");
+        let usage = &response["usage"];
+        assert_eq!(usage["prompt_tokens"], 100);
+        // Gemini reports thinking apart from candidates; the total keeps both
+        // so the relay's output counter folds the thinking in.
+        assert_eq!(usage["completion_tokens"], 20);
+        assert_eq!(usage["total_tokens"], 150);
+        assert_eq!(usage["completion_tokens_details"]["reasoning_tokens"], 30);
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 40);
+    }
+
+    #[test]
+    fn antigravity_response_reports_length_when_the_vendor_cut_the_turn() {
+        let response = antigravity_response(
+            &json!({"candidates": [{"content": {"parts": [{"text": "half"}]},
+                                    "finishReason": "MAX_TOKENS"}]}),
+            "gemini-4-neon",
+        );
+        assert_eq!(response["choices"][0]["finish_reason"], "length");
+        assert!(response.get("usage").is_none(), "nothing was published");
     }
 }

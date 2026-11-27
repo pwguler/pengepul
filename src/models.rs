@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::config::{AllowLists, ConfiguredModel, ConfiguredProvider};
 use crate::types::{ProviderId, ProviderKind};
@@ -443,6 +443,10 @@ fn gpt_and_vendor_family_entries(
             "grok-4.5",
             meta(TEXT_IMAGE, Some(500_000), None, 2.0, 6.0, 0.30, None),
         ),
+        // The Antigravity Gemini 4 family: one window and output cap published
+        // by the upstream catalog for every effort tier, and no per-million
+        // rate that a subscription bills at (docs/research/antigravity-provider.md).
+        ("gemini-4-neon", capability(Some(1_048_576), Some(65_536))),
         ("google/gemini-3", capability(None, None)),
         (
             "gpt-5.6",
@@ -667,6 +671,7 @@ impl ModelCatalog {
                 "anthropic" => return Some(ProviderId::anthropic()),
                 "codex" => return Some(ProviderId::codex()),
                 "grok" => return Some(ProviderId::grok()),
+                "antigravity" => return Some(ProviderId::antigravity()),
                 other if providers.contains_key(other) => {
                     return Some(ProviderId::generic(other));
                 }
@@ -740,7 +745,14 @@ fn heuristic_provider(model: &str) -> Option<ProviderKind> {
     if codex {
         return Some(ProviderKind::Codex);
     }
-    lower.starts_with("grok-").then_some(ProviderKind::Grok)
+    if lower.starts_with("grok-") {
+        return Some(ProviderKind::Grok);
+    }
+    // The Antigravity family is `gemini-4-*`; a bare `gemini-3*` may be a
+    // configured endpoint's model, which the fetched lists claim first.
+    lower
+        .starts_with("gemini-4-")
+        .then_some(ProviderKind::Antigravity)
 }
 
 /// The grok catalog is static: grok build serves two models (its
@@ -755,6 +767,56 @@ pub fn grok_static_models() -> FetchedModels {
         .iter()
         .filter_map(|id| curated_metadata(id, &provider).map(|meta| (id.clone(), meta)))
         .collect();
+    FetchedModels::with_metadata(ids, metadata)
+}
+
+/// The antigravity catalog before a live fetch: the floor the provider
+/// advertises the moment an account exists. A successful
+/// `fetchAvailableModels` replaces it with the upstream's own list.
+#[must_use]
+pub fn antigravity_static_models() -> FetchedModels {
+    let ids = [
+        "gemini-4-neon",
+        "gemini-4-neon-low",
+        "gemini-4-neon-medium",
+        "gemini-4-neon-high",
+        "gemini-4-neon-xhigh",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    let provider = ProviderId::antigravity();
+    let metadata = ids
+        .iter()
+        .filter_map(|id| curated_metadata(id, &provider).map(|meta| (id.clone(), meta)))
+        .collect();
+    FetchedModels::with_metadata(ids, metadata)
+}
+
+/// Models from an Antigravity `fetchAvailableModels` body, which keys a map by
+/// model id: `{"models": {"<id>": {"displayName", "maxTokens",
+/// "maxOutputTokens"}}}`. The window and cap are renamed to the field names the
+/// ranking reads, so the upstream's numbers win over the curated table.
+#[must_use]
+pub fn parse_antigravity(body: &Value, provider: &ProviderId) -> FetchedModels {
+    let Some(models) = body.get("models").and_then(Value::as_object) else {
+        return FetchedModels::new(Vec::new());
+    };
+    let mut ids = Vec::new();
+    let mut metadata = BTreeMap::new();
+    for (id, entry) in models {
+        ids.push(id.clone());
+        let published = json!({
+            "context_length": entry.get("maxTokens"),
+            "max_output_tokens": entry.get("maxOutputTokens"),
+        });
+        if let Some(meta) =
+            ranked_metadata(id, provider, ModelMetadata::from_json(&published), None)
+        {
+            metadata.insert(id.clone(), meta);
+        }
+    }
+    ids.sort();
     FetchedModels::with_metadata(ids, metadata)
 }
 
@@ -1803,5 +1865,107 @@ fn grok_static_models_carry_context_metadata_and_advertise_prefixed() {
             ("grok/grok-4.5".to_string(), Some(500_000)),
             ("grok/grok-4.6".to_string(), Some(500_000)),
         ]
+    );
+}
+
+#[test]
+fn antigravity_models_route_bare_prefixed_and_by_shape() {
+    let mut catalog = ModelCatalog::default();
+    catalog.set_direct(ProviderKind::Antigravity, antigravity_static_models());
+    let providers = BTreeMap::new();
+
+    // The brief's floor: the base id and its four effort tiers.
+    for id in [
+        "gemini-4-neon",
+        "gemini-4-neon-low",
+        "gemini-4-neon-medium",
+        "gemini-4-neon-high",
+        "gemini-4-neon-xhigh",
+    ] {
+        assert_eq!(
+            catalog.resolve_id(id, &providers),
+            Some(ProviderId::antigravity()),
+            "{id}"
+        );
+        assert_eq!(
+            catalog.resolve_id(&format!("antigravity/{id}"), &providers),
+            Some(ProviderId::antigravity()),
+            "antigravity/{id}"
+        );
+    }
+    // A Gemini 4 family id the static list does not name still routes by shape.
+    assert_eq!(
+        catalog.resolve_id("gemini-4-hydrogen-high", &providers),
+        Some(ProviderId::for_kind(ProviderKind::Antigravity))
+    );
+    // A Gemini 3 id is left to a configured endpoint that names it.
+    assert_eq!(catalog.resolve_id("gemini-3-flash", &providers), None);
+}
+
+#[test]
+fn antigravity_static_models_floor_advertises_prefixed_with_limits() {
+    let static_models = antigravity_static_models();
+    assert_eq!(
+        static_models.ids,
+        vec![
+            "gemini-4-neon".to_string(),
+            "gemini-4-neon-low".to_string(),
+            "gemini-4-neon-medium".to_string(),
+            "gemini-4-neon-high".to_string(),
+            "gemini-4-neon-xhigh".to_string(),
+        ]
+    );
+    for id in &static_models.ids {
+        let metadata = static_models.metadata.get(id).expect("curated metadata");
+        assert_eq!(metadata.context_window, Some(1_048_576), "{id}");
+        assert_eq!(metadata.max_output_tokens, Some(65_536), "{id}");
+    }
+
+    let mut catalog = ModelCatalog::default();
+    catalog.set_direct(ProviderKind::Antigravity, static_models);
+    let advertised: Vec<String> = catalog
+        .advertised()
+        .into_iter()
+        .filter(|model| model.provider.kind == ProviderKind::Antigravity)
+        .map(|model| model.id)
+        .collect();
+    assert!(advertised.contains(&"antigravity/gemini-4-neon".to_string()));
+    assert!(advertised.contains(&"antigravity/gemini-4-neon-xhigh".to_string()));
+}
+
+#[test]
+fn parse_antigravity_reads_the_keyed_map_and_its_limits() {
+    let fetched = parse_antigravity(
+        &json!({"models": {
+            "gemini-4-neon-high": {"displayName": "Gemini 4 Neon",
+                                  "maxTokens": 1_048_576, "maxOutputTokens": 65_536},
+            "claude-sonnet-4-6": {"displayName": "Claude Sonnet 4.6"}
+        }}),
+        &ProviderId::antigravity(),
+    );
+    assert_eq!(
+        fetched.ids,
+        vec![
+            "claude-sonnet-4-6".to_string(),
+            "gemini-4-neon-high".to_string()
+        ]
+    );
+    let neon = fetched.metadata.get("gemini-4-neon-high").expect("neon");
+    assert_eq!(neon.context_window, Some(1_048_576));
+    assert_eq!(neon.max_output_tokens, Some(65_536));
+    // An entry that publishes nothing keeps only what the curated table knows.
+    let claude = fetched.metadata.get("claude-sonnet-4-6").expect("claude");
+    assert!(
+        claude.context_window.is_some(),
+        "the curated window fills in"
+    );
+}
+
+#[test]
+fn parse_antigravity_without_a_models_map_is_empty() {
+    assert!(
+        parse_antigravity(&json!({"error": {"code": 401}}), &ProviderId::antigravity())
+            .ids
+            .is_empty()
     );
 }
