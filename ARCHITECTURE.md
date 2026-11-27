@@ -78,8 +78,9 @@ in files.
   Chat body in the Antigravity envelope (`antigravity_envelope`) and unwraps
   and translates the Gemini reply (`antigravity_unwrap`, `antigravity_json`).
   The version comes from the Hub manifest on each catalog refresh and at login
-  (`fetch_antigravity_manifest_version`), over a floor that never goes down
-  (`VersionFloor`). It is never Cloaked. A chat call to a
+  (`fetch_antigravity_manifest_version`), read on a task of its own with a 3 s
+  limit (`spawn_version_refresh`) so neither the catalog nor the login URL waits
+  on it, over a floor that never goes down (`VersionFloor`). It is never Cloaked. A chat call to a
   configured endpoint carries the bearer key; one to an `opencode.ai` host also names
   its conversation in `x-opencode-session`, a hash of Rotation's key
   (`generic_chat_headers`), because OpenCode Go refuses a chat without one. That host

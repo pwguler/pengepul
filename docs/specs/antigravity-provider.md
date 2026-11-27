@@ -37,7 +37,7 @@ sources live in `docs/research/antigravity-provider.md`.
   discovered project id and the plan label (`paidTier` when the account has one).
   A headless host accepts the full callback URL (copied from the browser's address
   bar after the redirect fails) or its code pasted on stdin, whichever arrives
-  first; a pasted URL whose `state` does not match is refused. `--key` and
+  first; a pasted URL whose `state` is missing or does not match is refused. `--key` and
   `--base-url` are refused for it, like the other built-ins. `pengepul accounts
   --reload` picks up a fresh login without a restart.
 - AC-2: `GET /v1/models` advertises the ids the upstream's `fetchAvailableModels`
@@ -60,7 +60,9 @@ sources live in `docs/research/antigravity-provider.md`.
   else `max_tokens`, sets `maxOutputTokens`, raised above the thinking budget only
   when the client set a smaller cap. A reply with a function call finishes
   `tool_calls`, streamed or not. A streamed Chat reply ends `[DONE]` only when the
-  upstream finished it; an in-band error frame reaches the client as an error.
+  upstream finished it, and a streamed Messages reply ends `message_stop` only
+  then too, an `error` event otherwise; an in-band error frame reaches the
+  client as an error.
 - AC-4: An Anthropic-Messages or OpenAI-Responses request naming an antigravity
   model is translated onto the Gemini upstream and answered in the inbound
   dialect by the existing translation matrix, exactly as a grok request is:
@@ -82,7 +84,9 @@ sources live in `docs/research/antigravity-provider.md`.
   once with that version, which stays adopted for the process lifetime and is
   never lowered; the client sees the retried result. The `User-Agent` version is
   otherwise refreshed from the public Antigravity Hub manifest while the pool has
-  an account, falling back to the pinned constant when that fetch fails.
+  an account and at login, falling back to the pinned constant when that fetch
+  fails. The read runs in the background with a 3 s limit: neither a catalog
+  refresh nor the login URL waits on it.
 - AC-7: Account lifecycle reuses the existing machinery: an expired access token
   refreshes from its stored refresh token without operator involvement and keeps
   its stored project id, and a rejected refresh token (`invalid_grant`) lands the

@@ -9683,3 +9683,169 @@ async fn admin_reload_picks_up_a_relogged_antigravity_token_without_a_restart() 
     let calls = upstream.calls.lock().expect("calls");
     assert_eq!(calls[0].account.token.access_token, "google-relogged-token");
 }
+
+// ---- N13: a cut Messages stream is not closed as a finished turn ------------
+
+/// One scripted stream, served on whichever chat-shaped upstream the route
+/// calls: a configured endpoint, grok, or antigravity.
+struct CutStreamUpstream {
+    frames: Vec<String>,
+}
+
+impl CutStreamUpstream {
+    fn new(frames: &[&str]) -> Self {
+        Self {
+            frames: frames.iter().map(|frame| (*frame).to_string()).collect(),
+        }
+    }
+
+    fn reply(&self) -> UpstreamSseFuture {
+        let frames = self.frames.clone();
+        Box::pin(async move {
+            Ok(UpstreamSseResponse {
+                quota: None,
+                retry_hint: None,
+                status: axum::http::StatusCode::OK,
+                body: Box::pin(futures_util::stream::iter(
+                    frames.into_iter().map(|frame| Ok(Bytes::from(frame))),
+                )),
+            })
+        })
+    }
+}
+
+impl UpstreamClient for CutStreamUpstream {
+    fn anthropic_messages(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!()
+    }
+    fn anthropic_messages_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!()
+    }
+    fn anthropic_count_tokens(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!()
+    }
+    fn codex_responses(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!()
+    }
+    fn codex_responses_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        unreachable!()
+    }
+    fn generic_chat(&self, _request: UpstreamRequest) -> UpstreamFuture {
+        unreachable!()
+    }
+    fn generic_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        self.reply()
+    }
+    fn grok_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        self.reply()
+    }
+    fn antigravity_generate_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+        self.reply()
+    }
+    fn fetch_models(
+        &self,
+        _kind: ProviderKind,
+        _account: AvailableAccount,
+        _config: Arc<Config>,
+    ) -> ModelsFuture {
+        Box::pin(async { Ok(FetchedModels::new(vec![])) })
+    }
+}
+
+/// A chat-shaped chunk that starts a reply and never finishes it.
+const CHAT_HALF: &str = "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half\"}}]}\n\n";
+const CHAT_DONE: &str = "data: [DONE]\n\n";
+
+/// The three pools a Messages client can stream from through the chat
+/// matrix, each with one account, and the model id that routes to it.
+fn cut_stream_app(path: &str, frames: &[&str]) -> (tempfile::TempDir, axum::Router, &'static str) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut cfg = config(tmp.path().to_path_buf());
+    let model = match path {
+        "generic" => {
+            save_token(
+                tmp.path(),
+                &TokenData {
+                    access_token: "gsk".to_string(),
+                    refresh_token: String::new(),
+                    email: "key-12345678".to_string(),
+                    expires_at: String::new(),
+                    account_uuid: "acct".to_string(),
+                    provider: ProviderId::generic("groq"),
+                    id_token: None,
+                    last_refresh_at: None,
+                    plan_type: None,
+                    project_id: None,
+                },
+            )
+            .expect("save groq key");
+            cfg.providers.insert(
+                "groq".to_string(),
+                pengepul::config::ConfiguredProvider {
+                    base_url: "https://api.groq.com/openai/v1".to_string(),
+                    models: std::collections::BTreeMap::new(),
+                },
+            );
+            "groq/llama-3.3-70b"
+        }
+        "grok" => {
+            save_grok_account(tmp.path());
+            "grok-4.6"
+        }
+        _ => {
+            save_antigravity_account(tmp.path());
+            "gemini-4-neon-low"
+        }
+    };
+    let app = create_app_with_upstream(cfg, Arc::new(CutStreamUpstream::new(frames)));
+    (tmp, app, model)
+}
+
+async fn messages_stream(app: axum::Router, model: &str) -> String {
+    let (status, _, body) = raw_response(
+        app,
+        post(
+            "/v1/messages",
+            &json!({"model": model, "max_tokens": 64, "stream": true,
+                    "messages": [{"role": "user", "content": "x"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    body
+}
+
+/// N13: a stream the upstream cut before it finished the reply ends with an
+/// error event, not a `message_stop` that tells the client the turn is whole —
+/// on a configured endpoint, on grok, and on antigravity.
+#[tokio::test]
+async fn a_cut_messages_stream_ends_in_an_error_not_a_finished_turn() {
+    let gemini_half = format!(
+        "data: {}\n\n",
+        json!({"response": {"candidates": [{"content": {"parts": [{"text": "half"}]}}]}})
+    );
+    for (path, frame) in [
+        ("generic", CHAT_HALF.to_string()),
+        ("grok", CHAT_HALF.to_string()),
+        ("antigravity", gemini_half),
+    ] {
+        let (_tmp, app, model) = cut_stream_app(path, &[frame.as_str()]);
+        let body = messages_stream(app, model).await;
+        assert!(body.contains("\"text\":\"half\""), "{path}: {body}");
+        assert!(!body.contains("message_stop"), "{path}: {body}");
+        assert!(!body.contains("end_turn"), "{path}: {body}");
+        assert!(body.contains("event: error"), "{path}: {body}");
+    }
+}
+
+/// N13: a gateway that ends on `[DONE]` alone, with no `finish_reason`,
+/// finished the reply; its Messages stream still closes.
+#[tokio::test]
+async fn a_messages_stream_ended_by_done_alone_still_closes() {
+    for path in ["generic", "grok"] {
+        let (_tmp, app, model) = cut_stream_app(path, &[CHAT_HALF, CHAT_DONE]);
+        let body = messages_stream(app, model).await;
+        assert!(body.contains("event: message_stop"), "{path}: {body}");
+        assert!(!body.contains("event: error"), "{path}: {body}");
+    }
+}

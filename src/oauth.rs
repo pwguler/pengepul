@@ -435,23 +435,39 @@ pub async fn exchange_antigravity_code(
     .await
 }
 
+/// What the operator pasted to finish a headless login.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AntigravityPaste {
+    /// A bare authorization code: nothing to compare, and the PKCE verifier
+    /// still binds it to this login.
+    Code(String),
+    /// The failed redirect's URL, copied from the browser's address bar. Google
+    /// always puts this login's `state` on it, so one without it is not ours.
+    Url { code: String, state: Option<String> },
+}
+
 /// The same exchange for a code carried by hand from a browser on another
-/// machine. A pasted callback URL carries its `state`, which must match; a
-/// bare code has none to compare, and the PKCE verifier still binds it.
+/// machine.
 ///
 /// # Errors
 ///
-/// As [`exchange_antigravity_code`], and a pasted `state` that does not match
-/// is refused before any request.
+/// As [`exchange_antigravity_code`]. A pasted URL whose `state` is missing or
+/// does not match is refused before any request.
 pub async fn exchange_antigravity_pasted_code(
-    code: &str,
-    returned_state: Option<&str>,
+    paste: &AntigravityPaste,
     expected_state: &str,
     pkce: &PkceCodes,
 ) -> Result<TokenData> {
-    if let Some(returned) = returned_state {
-        ensure_state(returned, expected_state)?;
-    }
+    let code = match paste {
+        AntigravityPaste::Code(code) => code,
+        AntigravityPaste::Url { code, state } => {
+            let state = state
+                .as_deref()
+                .context("the pasted callback URL carries no state; paste the whole URL")?;
+            ensure_state(state, expected_state)?;
+            code
+        }
+    };
     let redirect = antigravity_redirect_uri();
     let client_id = antigravity_client_id();
     let secret = antigravity_client_secret();
@@ -624,10 +640,21 @@ async fn antigravity_discover_project(access_token: &str) -> Result<(String, Opt
 /// free-tier, so the paid tier names the plan; onboarding takes the control
 /// plane's own default tier, as `CLIProxyAPI`'s `defaultAntigravityTierID` does.
 fn antigravity_plan_and_onboarding_tier(load: &Value) -> (Option<String>, String) {
-    let tier = antigravity_tier(load);
-    let plan = antigravity_paid_tier(load).or_else(|| tier.clone());
-    let onboarding = tier.unwrap_or_else(|| ANTIGRAVITY_FALLBACK_TIER.to_string());
+    // The label is the tier the account is on: its paid tier, else its current
+    // one. The default allowed tier is what a new account would be put on, not
+    // what this one has.
+    let plan = antigravity_paid_tier(load).or_else(|| antigravity_current_tier(load));
+    let onboarding =
+        antigravity_tier(load).unwrap_or_else(|| ANTIGRAVITY_FALLBACK_TIER.to_string());
     (plan, onboarding)
+}
+
+fn antigravity_current_tier(load: &Value) -> Option<String> {
+    load.get("currentTier")
+        .and_then(|tier| tier.get("id"))
+        .and_then(Value::as_str)
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
 }
 
 fn antigravity_paid_tier(load: &Value) -> Option<String> {
@@ -843,6 +870,21 @@ pub fn parse_grok_paste(input: &str) -> Result<(String, Option<String>)> {
         return Ok((code, state));
     }
     Ok((trimmed.to_string(), None))
+}
+
+/// What an antigravity paste is: the same parse as grok's, kept apart because
+/// antigravity requires a state on a URL and grok does not.
+///
+/// # Errors
+///
+/// As [`parse_grok_paste`].
+pub fn parse_antigravity_paste(input: &str) -> Result<AntigravityPaste> {
+    let (code, state) = parse_grok_paste(input)?;
+    Ok(if input.trim().contains("://") {
+        AntigravityPaste::Url { code, state }
+    } else {
+        AntigravityPaste::Code(code)
+    })
 }
 
 /// Exchange a pasted code. The paste carries no state to verify, so the
@@ -1300,10 +1342,25 @@ mod antigravity_oauth_tests {
             antigravity_plan_and_onboarding_tier(&load),
             (Some("g1-pro-tier".to_string()), "standard-tier".to_string())
         );
-        // No paid tier: the plan is the tier the account is on.
+        // N11: no paid tier, so the plan is the tier the account is on
+        // (`currentTier`), not the default it would be onboarded onto.
+        assert_eq!(
+            antigravity_plan_and_onboarding_tier(&json!({
+                "currentTier": {"id": "free-tier"},
+                "allowedTiers": [{"id": "standard-tier", "isDefault": true}]
+            })),
+            (Some("free-tier".to_string()), "standard-tier".to_string())
+        );
         assert_eq!(
             antigravity_plan_and_onboarding_tier(&json!({"currentTier": {"id": "free-tier"}})),
             (Some("free-tier".to_string()), "free-tier".to_string())
+        );
+        // A new account is on no tier yet: no plan label until it has one.
+        assert_eq!(
+            antigravity_plan_and_onboarding_tier(&json!({
+                "allowedTiers": [{"id": "standard-tier", "isDefault": true}]
+            })),
+            (None, "standard-tier".to_string())
         );
         // Nothing at all: no plan label, and onboarding asks for the free tier.
         assert_eq!(
@@ -1320,10 +1377,59 @@ mod antigravity_oauth_tests {
             code_verifier: "v".repeat(43),
             code_challenge: "c".to_string(),
         };
-        let error = super::exchange_antigravity_pasted_code("code", Some("other"), "mine", &pkce)
+        let foreign = super::AntigravityPaste::Url {
+            code: "code".to_string(),
+            state: Some("other".to_string()),
+        };
+        let error = super::exchange_antigravity_pasted_code(&foreign, "mine", &pkce)
             .await
             .expect_err("a foreign state");
         assert!(error.to_string().contains("state mismatch"), "{error}");
+    }
+
+    /// N12: a pasted URL is a redirect Google sent, which always carries this
+    /// login's state; one without it is refused like a foreign one, before the
+    /// code is spent. A bare code stays accepted (PKCE binds it).
+    #[tokio::test]
+    async fn a_pasted_callback_url_without_a_state_is_refused() {
+        let pkce = PkceCodes {
+            code_verifier: "v".repeat(43),
+            code_challenge: "c".to_string(),
+        };
+        let stateless = super::AntigravityPaste::Url {
+            code: "code".to_string(),
+            state: None,
+        };
+        let error = super::exchange_antigravity_pasted_code(&stateless, "mine", &pkce)
+            .await
+            .expect_err("a URL with no state");
+        assert!(error.to_string().contains("no state"), "{error}");
+    }
+
+    #[test]
+    fn a_paste_is_told_apart_as_a_url_or_a_bare_code() {
+        assert_eq!(
+            super::parse_antigravity_paste(
+                "http://localhost:51121/oauth-callback?state=s1&code=c1&scope=x"
+            )
+            .expect("url"),
+            super::AntigravityPaste::Url {
+                code: "c1".to_string(),
+                state: Some("s1".to_string())
+            }
+        );
+        assert_eq!(
+            super::parse_antigravity_paste("http://localhost:51121/oauth-callback?code=c1")
+                .expect("url"),
+            super::AntigravityPaste::Url {
+                code: "c1".to_string(),
+                state: None
+            }
+        );
+        assert_eq!(
+            super::parse_antigravity_paste("  4/0Abc  ").expect("code"),
+            super::AntigravityPaste::Code("4/0Abc".to_string())
+        );
     }
 
     #[test]

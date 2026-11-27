@@ -1343,13 +1343,41 @@ pub fn chat_sse_to_anthropic(data: &Value, state: &mut AnthropicStreamState) -> 
     chunks
 }
 
-/// Close the message, whatever the stream did or did not send.
+/// End a Messages stream whose upstream stopped before it finished the reply:
+/// no `finish_reason` and no `[DONE]`. A `message_stop` here would tell the
+/// client the turn is whole, so the stream ends with the `error` event the
+/// dialect defines instead, and calls the upstream had not finished are not
+/// handed over half-built.
+#[must_use]
+pub fn cut_chat_stream(state: &mut AnthropicStreamState) -> Vec<String> {
+    if !state.started || state.from_chat.closed {
+        return Vec::new();
+    }
+    state.from_chat.closed = true;
+    vec![sse(
+        &json!({"type": "error", "error": {
+            "type": "api_error",
+            "message": "the upstream stream ended before the reply finished"
+        }}),
+        Some("error"),
+    )]
+}
+
+impl AnthropicStreamState {
+    /// Whether the chat stream named a `finish_reason`: the content is whole.
+    #[must_use]
+    pub const fn chat_finished(&self) -> bool {
+        self.from_chat.pending_stop_reason.is_some()
+    }
+}
+
+/// Close the message of a reply the upstream finished.
 ///
-/// Called once when the stream ends. A stream that stops before any
-/// `finish_reason` — a truncation, a dropped connection, a gateway that
-/// ends on `[DONE]` alone — still has to hand the client the tool calls it
-/// announced and a `message_stop`, or the turn simply never closes and the
-/// content is lost.
+/// Called once when the stream ends with a `finish_reason` or `[DONE]`. A
+/// gateway that ends on `[DONE]` alone, with no `finish_reason`, still has to
+/// hand the client the tool calls it announced and a `message_stop`, or the
+/// turn never closes and the content is lost. A stream cut before either is
+/// [`cut_chat_stream`]'s.
 #[must_use]
 pub fn finish_chat_stream(state: &mut AnthropicStreamState) -> Vec<String> {
     if !state.started || state.from_chat.closed {

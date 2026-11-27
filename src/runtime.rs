@@ -16,7 +16,7 @@ use crate::oauth::{
     exchange_anthropic_code, exchange_antigravity_code, exchange_antigravity_pasted_code,
     exchange_codex_code, exchange_grok_code, exchange_grok_pasted_code,
     generate_anthropic_auth_url, generate_antigravity_auth_url, generate_codex_auth_url,
-    generate_grok_auth_url, parse_grok_paste,
+    generate_grok_auth_url, parse_antigravity_paste, parse_grok_paste,
 };
 use crate::render::Style;
 use crate::service::{ServiceOptions, run_command};
@@ -249,18 +249,21 @@ impl CliRuntime for RealRuntime {
         provider: ProviderId,
         _key: Option<&str>,
     ) -> Result<String> {
-        if provider.kind == ProviderKind::Antigravity {
-            // Login's control-plane calls present the Hub version too; read
-            // the current one first instead of the pinned floor.
-            self.runtime.block_on(async {
-                if let Ok(version) =
+        // Login's control-plane calls present the Hub version too. The read
+        // starts now, off this thread, so the URL prints at once; it is waited
+        // on, for at most its short limit, only before those calls, which come
+        // after the operator has finished in the browser.
+        let version_refresh = (provider.kind == ProviderKind::Antigravity).then(|| {
+            crate::upstream::spawn_version_refresh(
+                self.runtime.handle(),
+                &crate::upstream::ANTIGRAVITY_VERSION,
+                async {
                     crate::upstream::fetch_antigravity_manifest_version(&reqwest::Client::new())
                         .await
-                {
-                    crate::upstream::adopt_antigravity_version(&version);
-                }
-            });
-        }
+                },
+                crate::upstream::ANTIGRAVITY_MANIFEST_TIMEOUT,
+            )
+        });
         let state = random_urlsafe(32);
         let pkce = generate_pkce_codes();
         let nonce = random_urlsafe(32);
@@ -293,6 +296,10 @@ impl CliRuntime for RealRuntime {
         } else {
             wait_for_callback(port, path, Duration::from_mins(5))?
         };
+        if let Some(refresh) = version_refresh {
+            // Bounded by the refresh's own limit; a failure keeps the floor.
+            let _ = self.runtime.block_on(refresh);
+        }
         let token = self.runtime.block_on(async {
             match provider.kind {
                 ProviderKind::Anthropic => {
@@ -309,12 +316,9 @@ impl CliRuntime for RealRuntime {
                     }
                 }
                 ProviderKind::Antigravity => {
-                    if callback.pasted {
-                        // A pasted URL carries its state; a bare code does not.
-                        let returned =
-                            Some(callback.state.as_str()).filter(|state| !state.is_empty());
-                        exchange_antigravity_pasted_code(&callback.code, returned, &state, &pkce)
-                            .await
+                    if let Some(raw) = &callback.paste {
+                        let paste = parse_antigravity_paste(raw)?;
+                        exchange_antigravity_pasted_code(&paste, &state, &pkce).await
                     } else {
                         exchange_antigravity_code(&callback.code, &callback.state, &state, &pkce)
                             .await
@@ -509,6 +513,9 @@ struct CallbackResult {
     /// checked; a bare pasted code has none, and the PKCE verifier still binds
     /// it.
     pasted: bool,
+    /// What was pasted, as typed, for a provider that tells a pasted URL from
+    /// a bare code (antigravity refuses a URL without its state).
+    paste: Option<String>,
 }
 
 fn auth_url(provider: &ProviderId, state: &str, pkce: &PkceCodes, nonce: &str) -> String {
@@ -606,6 +613,7 @@ fn wait_for_callback_or_paste(
                 code,
                 state: state.unwrap_or_default(),
                 pasted: true,
+                paste: Some(paste),
             });
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -674,6 +682,7 @@ fn handle_callback_stream(
         code,
         state,
         pasted: false,
+        paste: None,
     })
 }
 

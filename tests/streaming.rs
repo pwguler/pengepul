@@ -910,9 +910,10 @@ fn a_chat_stream_tool_call_becomes_one_tool_use_block() {
 
 #[test]
 fn a_stream_that_never_finishes_still_hands_over_its_tool_calls() {
-    // Truncation, a dropped connection, or a gateway that ends on [DONE]
-    // alone. Buffering the calls turned this from partial content into
-    // total silent loss, so the stream end is where the message closes.
+    // A gateway that ends on [DONE] alone, with no finish_reason. Buffering
+    // the calls turned this from partial content into total silent loss, so
+    // the stream end is where the message closes. (A stream cut before
+    // [DONE] ends in an error event instead: `cut_chat_stream`.)
     let mut state = AnthropicStreamState::new("glm-5.3");
 
     let _ = chat_sse_to_anthropic(

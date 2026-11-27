@@ -38,8 +38,9 @@ use crate::quota::{self, QuotaSnapshot};
 use crate::streaming::{
     AnthropicStreamState, AntigravityChunkState, ChatStreamState, ResponsesStreamState,
     anthropic_sse_to_chat, anthropic_sse_to_responses, chat_sse_to_anthropic,
-    chat_sse_to_responses, drain_complete_sse_events, finish_chat_stream, finish_sse_events,
-    responses_sse_to_anthropic, responses_sse_to_chat, responses_sse_to_payload, sse,
+    chat_sse_to_responses, cut_chat_stream, drain_complete_sse_events, finish_chat_stream,
+    finish_sse_events, responses_sse_to_anthropic, responses_sse_to_chat, responses_sse_to_payload,
+    sse,
 };
 use crate::threads::{Stored, StreamingReply, ThreadLedger, Turn};
 use crate::tokens::{Peak, load_peak, save_peak};
@@ -1234,17 +1235,17 @@ async fn refresh_model_catalog(state: &AppState) {
             continue;
         };
         // The Hub release the antigravity `User-Agent` names drifts. It is read
-        // here, beside the catalog, so it is asked for only while the pool has
-        // an account and again on every refresh after a boot without network.
+        // beside the catalog, so it is asked for only while the pool has an
+        // account and again on every refresh after a boot without network, on
+        // a task of its own: the catalog never waits on it.
         if kind == ProviderKind::Antigravity {
-            match state.upstream.fetch_antigravity_version().await {
-                Ok(version) => {
-                    crate::upstream::adopt_antigravity_version(&version);
-                }
-                Err(error) => {
-                    tracing::debug!(?error, "antigravity hub version fetch failed");
-                }
-            }
+            // Dropping the handle detaches the task; nothing waits on it.
+            drop(crate::upstream::spawn_version_refresh(
+                &tokio::runtime::Handle::current(),
+                &ANTIGRAVITY_VERSION,
+                state.upstream.fetch_antigravity_version(),
+                crate::upstream::ANTIGRAVITY_MANIFEST_TIMEOUT,
+            ));
         }
         match state
             .upstream
@@ -4071,7 +4072,15 @@ fn transformed_sse_stream(
         if Translation::between(provider.kind, route).closes_its_own_stream()
             && states.stream_error.is_none()
         {
-            for chunk in finish_chat_stream(&mut states.anthropic) {
+            // A reply the upstream finished — a `finish_reason`, or `[DONE]`
+            // alone — closes as a turn; one it cut ends in an error event, as a
+            // cut Chat stream ends without `[DONE]`.
+            let tail = if states.completed || states.anthropic.chat_finished() {
+                finish_chat_stream(&mut states.anthropic)
+            } else {
+                cut_chat_stream(&mut states.anthropic)
+            };
+            for chunk in tail {
                 yield Bytes::from(chunk);
             }
         }
@@ -4645,12 +4654,24 @@ async fn send_json(
     body: Value,
     timeout_ms: u64,
 ) -> anyhow::Result<UpstreamJsonResponse> {
+    send_json_ref(client, url, headers, &body, timeout_ms).await
+}
+
+/// [`send_json`] for a body the caller keeps, so a retry sends the same one
+/// without a copy.
+async fn send_json_ref(
+    client: reqwest::Client,
+    url: String,
+    headers: BTreeMap<String, String>,
+    body: &Value,
+    timeout_ms: u64,
+) -> anyhow::Result<UpstreamJsonResponse> {
     let model = body
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or("claude-sonnet-4-6")
         .to_string();
-    let response = build_upstream_request(&client, &url, headers, &body)
+    let response = build_upstream_request(&client, &url, headers, body)
         .timeout(Duration::from_millis(timeout_ms))
         .send()
         .await?;
@@ -4707,10 +4728,22 @@ async fn send_stream(
     body: Value,
     silence_ms: u64,
 ) -> anyhow::Result<UpstreamSseResponse> {
+    send_stream_ref(client, url, headers, &body, silence_ms).await
+}
+
+/// [`send_stream`] for a body the caller keeps, so a retry sends the same one
+/// without a copy.
+async fn send_stream_ref(
+    client: reqwest::Client,
+    url: String,
+    headers: BTreeMap<String, String>,
+    body: &Value,
+    silence_ms: u64,
+) -> anyhow::Result<UpstreamSseResponse> {
     let silence = Duration::from_millis(silence_ms);
     let response = tokio::time::timeout(
         silence,
-        build_upstream_request(&client, &url, headers, &body).send(),
+        build_upstream_request(&client, &url, headers, body).send(),
     )
     .await
     .map_err(|_| silence_error(silence))??;
@@ -4873,22 +4906,22 @@ async fn send_antigravity_json(
 ) -> anyhow::Result<UpstreamJsonResponse> {
     let url = format!("{base}{ANTIGRAVITY_GENERATE_PATH}");
     let sent = floor.current();
-    let first = send_json(
+    let first = send_json_ref(
         client.clone(),
         url.clone(),
         antigravity_headers_for(account, &sent),
-        envelope.clone(),
+        &envelope,
         timeout_ms,
     )
     .await?;
     if first.status.as_u16() == 426
         && let Some(version) = floor.after_426(&first.body.to_string(), &sent)
     {
-        return send_json(
+        return send_json_ref(
             client,
             url,
             antigravity_headers_for(account, &version),
-            envelope,
+            &envelope,
             timeout_ms,
         )
         .await;
@@ -4923,11 +4956,11 @@ async fn send_antigravity_stream(
 ) -> anyhow::Result<UpstreamSseResponse> {
     let url = format!("{base}{ANTIGRAVITY_STREAM_PATH}");
     let sent = floor.current();
-    let first = send_stream(
+    let first = send_stream_ref(
         client.clone(),
         url.clone(),
         antigravity_headers_for(account, &sent),
-        envelope.clone(),
+        &envelope,
         silence_ms,
     )
     .await?;
@@ -4938,11 +4971,11 @@ async fn send_antigravity_stream(
     if first.status.as_u16() == 426
         && let Some(version) = floor.after_426(&text, &sent)
     {
-        let retried = send_stream(
+        let retried = send_stream_ref(
             client,
             url,
             antigravity_headers_for(account, &version),
-            envelope,
+            &envelope,
             silence_ms,
         )
         .await?;
@@ -7459,12 +7492,19 @@ mod tests {
         }
     }
 
+    /// One request the local Cloud Code saw.
+    #[derive(Debug, Clone)]
+    struct SeenRequest {
+        agent: String,
+        body: Vec<u8>,
+    }
+
     /// A local Cloud Code: each request gets the next scripted
-    /// `(status, body)`; the last one repeats. Returns the address and the
-    /// `User-Agent` of every request it saw.
+    /// `(status, body)`; the last one repeats. Returns the address and every
+    /// request it saw, `User-Agent` and body.
     async fn serve_cloud_code(
         script: Vec<(u16, &'static str)>,
-    ) -> (std::net::SocketAddr, Arc<Mutex<Vec<String>>>) {
+    ) -> (std::net::SocketAddr, Arc<Mutex<Vec<SeenRequest>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind a loopback port");
@@ -7473,28 +7513,32 @@ mod tests {
         let log = Arc::clone(&seen);
         let script = Arc::new(script);
         tokio::spawn(async move {
-            let app = axum::Router::new().fallback(move |headers: HeaderMap| {
-                let log = Arc::clone(&log);
-                let script = Arc::clone(&script);
-                async move {
-                    let agent = headers
-                        .get("user-agent")
-                        .and_then(|value| value.to_str().ok())
-                        .unwrap_or_default()
-                        .to_string();
-                    let index = {
-                        let mut log = log.lock().expect("log");
-                        log.push(agent);
-                        log.len() - 1
-                    };
-                    let (status, body) = script[index.min(script.len() - 1)];
-                    (
-                        StatusCode::from_u16(status).expect("status"),
-                        [("content-type", "application/json")],
-                        body,
-                    )
-                }
-            });
+            let app =
+                axum::Router::new().fallback(move |headers: HeaderMap, body: axum::body::Bytes| {
+                    let log = Arc::clone(&log);
+                    let script = Arc::clone(&script);
+                    async move {
+                        let agent = headers
+                            .get("user-agent")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        let index = {
+                            let mut log = log.lock().expect("log");
+                            log.push(SeenRequest {
+                                agent,
+                                body: body.to_vec(),
+                            });
+                            log.len() - 1
+                        };
+                        let (status, body) = script[index.min(script.len() - 1)];
+                        (
+                            StatusCode::from_u16(status).expect("status"),
+                            [("content-type", "application/json")],
+                            body,
+                        )
+                    }
+                });
             let _ = axum::serve(listener, app).await;
         });
         (addr, seen)
@@ -7523,7 +7567,13 @@ mod tests {
         assert_eq!(response.status, StatusCode::OK);
         let seen = seen.lock().expect("seen");
         assert_eq!(seen.len(), 2, "{seen:?}");
-        assert!(seen[1].starts_with("antigravity/hub/99.0.0"), "{seen:?}");
+        assert!(
+            seen[1].agent.starts_with("antigravity/hub/99.0.0"),
+            "{seen:?}"
+        );
+        // N14: the retry sends the very envelope the first try did.
+        assert!(!seen[0].body.is_empty());
+        assert_eq!(seen[1].body, seen[0].body);
     }
 
     /// L4 / F13: a stream whose 426 retry is refused still hands back the
@@ -7807,6 +7857,68 @@ mod tests {
             advertised_antigravity(&state),
             vec!["antigravity/gemini-4-argon-medium".to_string()],
             "a failed fetch replaced the live list"
+        );
+    }
+
+    /// A double whose Hub manifest never answers, and whose catalog does.
+    struct SlowManifestUpstream;
+
+    impl UpstreamClient for SlowManifestUpstream {
+        fn generic_chat(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn generic_chat_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!()
+        }
+        fn anthropic_messages(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn anthropic_messages_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!()
+        }
+        fn anthropic_count_tokens(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn codex_responses(&self, _request: UpstreamRequest) -> UpstreamFuture {
+            unreachable!()
+        }
+        fn codex_responses_stream(&self, _request: UpstreamRequest) -> UpstreamSseFuture {
+            unreachable!()
+        }
+        fn fetch_models(
+            &self,
+            _kind: ProviderKind,
+            _account: AvailableAccount,
+            _config: Arc<Config>,
+        ) -> super::ModelsFuture {
+            Box::pin(async {
+                Ok(FetchedModels::new(vec![
+                    "gemini-4-argon-medium".to_string(),
+                ]))
+            })
+        }
+        fn fetch_antigravity_version(&self) -> super::VersionFuture {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// N15: a Hub manifest that never answers does not hold up the catalog: the
+    /// refresh returns and the live list is in place while the fetch is still
+    /// out.
+    #[tokio::test]
+    async fn a_slow_hub_manifest_does_not_delay_the_catalog() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        save_token(tmp.path(), &antigravity_account(Some("p")).token).expect("save");
+        let state = test_state(tmp.path(), Arc::new(SlowManifestUpstream));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            super::refresh_model_catalog(&state),
+        )
+        .await
+        .expect("the catalog refresh waited on the manifest");
+        assert_eq!(
+            advertised_antigravity(&state),
+            vec!["antigravity/gemini-4-argon-medium".to_string()]
         );
     }
 }

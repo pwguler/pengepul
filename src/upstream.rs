@@ -1291,11 +1291,6 @@ fn version_rank(version: &str) -> Vec<u64> {
         .collect()
 }
 
-/// Raise the process-wide floor to a version the manifest names.
-pub fn adopt_antigravity_version(version: &str) -> bool {
-    ANTIGRAVITY_VERSION.adopt(version)
-}
-
 /// The `version:` line of the Antigravity Hub updater manifest. The document is
 /// YAML; this reads the one key it needs rather than adding a parser.
 #[must_use]
@@ -1368,6 +1363,30 @@ fn parse_proto_duration(raw: &str) -> Option<Duration> {
     Duration::try_from_secs_f64(seconds.parse().ok()?).ok()
 }
 
+/// How long a Hub manifest read may take. The version is a nicety: nothing a
+/// user waits on waits on it.
+pub const ANTIGRAVITY_MANIFEST_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Read the Hub version on `runtime`'s own task, giving up after `limit`, and
+/// raise `floor` with what it names. Returns at once: the caller learns the
+/// outcome from the handle only if it chooses to wait.
+pub fn spawn_version_refresh<F>(
+    runtime: &tokio::runtime::Handle,
+    floor: &'static VersionFloor,
+    fetch: F,
+    limit: Duration,
+) -> tokio::task::JoinHandle<bool>
+where
+    F: std::future::Future<Output = anyhow::Result<String>> + Send + 'static,
+{
+    runtime.spawn(async move {
+        match tokio::time::timeout(limit, fetch).await {
+            Ok(Ok(version)) => floor.adopt(&version),
+            Ok(Err(_)) | Err(_) => false,
+        }
+    })
+}
+
 /// The version the Antigravity Hub updater manifest names.
 ///
 /// # Errors
@@ -1379,7 +1398,7 @@ pub async fn fetch_antigravity_manifest_version(
     let response = client
         .get(ANTIGRAVITY_HUB_MANIFEST_URL)
         .header("User-Agent", "electron-builder")
-        .timeout(Duration::from_secs(10))
+        .timeout(ANTIGRAVITY_MANIFEST_TIMEOUT)
         .send()
         .await?;
     let status = response.status();
@@ -1575,6 +1594,52 @@ mod antigravity_tests {
         );
         assert!(antigravity_user_agent().contains("(aidev_client; os_type=darwin; arch=arm64)"));
         assert_eq!(ANTIGRAVITY_CLIENT_VERSION, "2.35.2");
+    }
+
+    /// N15: a manifest that never answers is given up on after the limit; the
+    /// spawn itself returns at once, and the floor stays.
+    #[test]
+    fn a_slow_manifest_is_given_up_on_without_blocking_the_caller() {
+        static FLOOR: VersionFloor = VersionFloor::new("2.35.2");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let started = std::time::Instant::now();
+        let handle = super::spawn_version_refresh(
+            runtime.handle(),
+            &FLOOR,
+            std::future::pending(),
+            Duration::from_millis(50),
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(20),
+            "the spawn blocked"
+        );
+        let adopted = runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(2), handle).await })
+            .expect("the limit was not applied")
+            .expect("join");
+        assert!(!adopted);
+        assert_eq!(FLOOR.current(), "2.35.2");
+    }
+
+    #[test]
+    fn a_manifest_that_answers_raises_the_floor() {
+        static FLOOR: VersionFloor = VersionFloor::new("2.35.2");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let handle = super::spawn_version_refresh(
+            runtime.handle(),
+            &FLOOR,
+            async { Ok("2.40.0".to_string()) },
+            Duration::from_secs(1),
+        );
+        assert!(runtime.block_on(handle).expect("join"));
+        assert_eq!(FLOOR.current(), "2.40.0");
     }
 
     #[test]
