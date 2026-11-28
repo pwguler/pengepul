@@ -29,6 +29,8 @@ struct FakeUpstream {
     calls: Mutex<Vec<UpstreamRequest>>,
     /// What each Provider's model fetch returns; a Provider left out lists nothing.
     listed: Vec<(ProviderKind, Vec<&'static str>)>,
+    /// The metadata every model fetch carries beside its ids.
+    metadata: BTreeMap<String, ModelMetadata>,
 }
 
 impl FakeUpstream {
@@ -289,7 +291,8 @@ impl UpstreamClient for FakeUpstream {
             .filter(|(listed, _)| *listed == kind)
             .flat_map(|(_, ids)| ids.iter().map(|id| (*id).to_string()))
             .collect();
-        Box::pin(async move { Ok(FetchedModels::new(ids)) })
+        let metadata = self.metadata.clone();
+        Box::pin(async move { Ok(FetchedModels::with_metadata(ids, metadata)) })
     }
 }
 
@@ -10433,5 +10436,165 @@ async fn an_upstream_404_cools_no_account_on_any_provider() {
             assert_eq!(account["failureCount"], 0, "{label}: {account}");
             assert!(account["lastError"].is_null(), "{label}: {account}");
         }
+    }
+}
+
+/// An app whose anthropic catalog lists `claude-opus-5-5` with a fetched output ceiling of
+/// 96000 (not the curated table's 128000) and `mythos-preview` with no metadata at all,
+/// returned once the list is in.
+async fn output_ceiling_app() -> (axum::Router, Arc<FakeUpstream>, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_provider_token(tmp.path(), ProviderId::anthropic(), "alice@example.com");
+    let upstream = Arc::new(FakeUpstream {
+        listed: vec![(
+            ProviderKind::Anthropic,
+            vec!["claude-opus-5-5", "mythos-preview"],
+        )],
+        metadata: BTreeMap::from([(
+            "claude-opus-5-5".to_string(),
+            ModelMetadata {
+                max_output_tokens: Some(96_000),
+                ..ModelMetadata::default()
+            },
+        )]),
+        ..FakeUpstream::default()
+    });
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    advertised_once(&app, "anthropic/mythos-preview").await;
+    (app, upstream, tmp)
+}
+
+/// The body the anthropic upstream was handed for one request to `uri`.
+async fn sent_upstream(
+    app: &axum::Router,
+    upstream: &FakeUpstream,
+    uri: &str,
+    body: &Value,
+) -> Value {
+    let body_text = body.to_string();
+    let (status, reply) = json_response(
+        app.clone(),
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("authorization", "Bearer sk-test")
+            .header("content-type", "application/json")
+            .header("content-length", body_text.len())
+            .body(Body::from(body_text))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200, "{uri} {body}: {reply}");
+    upstream
+        .calls()
+        .last()
+        .expect("an upstream call")
+        .body
+        .clone()
+}
+
+#[tokio::test]
+async fn a_chat_request_with_no_limit_is_sent_the_models_output_ceiling() {
+    let (app, upstream, _tmp) = output_ceiling_app().await;
+    for body in [
+        json!({"model": "anthropic/claude-opus-5-5", "messages": [{"role": "user", "content": "hi"}]}),
+        json!({"model": "claude-opus-5-5", "max_tokens": null,
+               "messages": [{"role": "user", "content": "hi"}]}),
+    ] {
+        let sent = sent_upstream(&app, &upstream, "/v1/chat/completions", &body).await;
+        assert_eq!(sent["max_tokens"], 96_000, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn a_responses_request_with_no_limit_is_sent_the_models_output_ceiling() {
+    let (app, upstream, _tmp) = output_ceiling_app().await;
+    let body = json!({"model": "anthropic/claude-opus-5-5", "input": "hi"});
+    let sent = sent_upstream(&app, &upstream, "/v1/responses", &body).await;
+    assert_eq!(sent["max_tokens"], 96_000);
+}
+
+#[tokio::test]
+async fn a_model_the_catalog_has_not_listed_takes_the_curated_output_ceiling() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    save_provider_token(tmp.path(), ProviderId::anthropic(), "alice@example.com");
+    let upstream = Arc::new(FakeUpstream::default());
+    let app = create_app_with_upstream(config(tmp.path().to_path_buf()), upstream.clone());
+    let body = json!({"model": "claude-opus-5-5", "messages": [{"role": "user", "content": "hi"}]});
+    let sent = sent_upstream(&app, &upstream, "/v1/chat/completions", &body).await;
+    assert_eq!(sent["max_tokens"], 128_000);
+}
+
+#[tokio::test]
+async fn a_model_no_metadata_describes_gets_the_fallback_output_ceiling() {
+    let (app, upstream, _tmp) = output_ceiling_app().await;
+    for (uri, body) in [
+        (
+            "/v1/chat/completions",
+            json!({"model": "anthropic/mythos-preview", "messages": [{"role": "user", "content": "hi"}]}),
+        ),
+        (
+            "/v1/responses",
+            json!({"model": "anthropic/mythos-preview", "input": "hi"}),
+        ),
+    ] {
+        let sent = sent_upstream(&app, &upstream, uri, &body).await;
+        assert_eq!(sent["max_tokens"], 64_000, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn a_client_set_limit_reaches_anthropic_instead_of_the_output_ceiling() {
+    let (app, upstream, _tmp) = output_ceiling_app().await;
+    let messages = json!([{"role": "user", "content": "hi"}]);
+    for (uri, body, expected) in [
+        (
+            "/v1/chat/completions",
+            json!({"model": "claude-opus-5-5", "max_tokens": 1234, "messages": messages}),
+            json!(1234),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model": "claude-opus-5-5", "max_completion_tokens": 2345,
+                   "max_tokens": 10, "messages": messages}),
+            json!(2345),
+        ),
+        (
+            "/v1/responses",
+            json!({"model": "claude-opus-5-5", "max_output_tokens": 3456, "input": "hi"}),
+            json!(3456),
+        ),
+        (
+            "/v1/messages",
+            json!({"model": "claude-opus-5-5", "max_tokens": 4567, "messages": messages}),
+            json!(4567),
+        ),
+        // Messages requires the field, so one without it reaches the vendor as written.
+        (
+            "/v1/messages",
+            json!({"model": "claude-opus-5-5", "messages": messages}),
+            Value::Null,
+        ),
+    ] {
+        let sent = sent_upstream(&app, &upstream, uri, &body).await;
+        assert_eq!(sent["max_tokens"], expected, "{uri} {body}");
+    }
+}
+
+#[tokio::test]
+async fn an_output_ceiling_leaves_room_past_the_thinking_budget() {
+    let (app, upstream, _tmp) = output_ceiling_app().await;
+    for model in ["claude-opus-5-5", "anthropic/mythos-preview"] {
+        let body = json!({"model": model, "reasoning_effort": "high",
+                          "messages": [{"role": "user", "content": "hi"}]});
+        let sent = sent_upstream(&app, &upstream, "/v1/chat/completions", &body).await;
+        let budget = sent["thinking"]["budget_tokens"]
+            .as_u64()
+            .expect("a thinking budget");
+        let limit = sent["max_tokens"].as_u64().expect("a max_tokens");
+        assert!(
+            limit > budget,
+            "{model}: max_tokens {limit} <= budget {budget}"
+        );
     }
 }

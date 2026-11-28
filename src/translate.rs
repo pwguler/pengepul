@@ -16,12 +16,14 @@ pub fn openai_to_anthropic(body: &Value) -> Value {
         "model".to_string(),
         Value::String(resolve_model(body.get("model").and_then(Value::as_str))),
     );
-    out.insert(
-        "max_tokens".to_string(),
-        body.get("max_completion_tokens")
-            .or_else(|| body.get("max_tokens"))
-            .cloned()
-            .unwrap_or_else(|| json!(8192)),
+    // No limit is invented here: the route that knows the model fills its ceiling.
+    let limit = |field| body.get(field).filter(|value| !value.is_null());
+    insert_if_some(
+        &mut out,
+        "max_tokens",
+        limit("max_completion_tokens")
+            .or_else(|| limit("max_tokens"))
+            .cloned(),
     );
     copy_if_present(body, &mut out, "stream");
     copy_if_present(body, &mut out, "temperature");

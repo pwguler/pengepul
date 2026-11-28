@@ -623,6 +623,17 @@ impl ModelCatalog {
         }
     }
 
+    /// The most tokens `model`, a bare id, may write in one reply on `kind`: its listed
+    /// entry's `max_output_tokens`, else the curated table's, else `None`.
+    #[must_use]
+    pub fn output_ceiling(&self, kind: ProviderKind, model: &str) -> Option<u64> {
+        self.direct
+            .get(model)
+            .and_then(|entries| entries.iter().find(|entry| entry.kind == kind))
+            .and_then(|entry| entry.metadata.as_ref()?.max_output_tokens)
+            .or_else(|| curated_metadata(model, &ProviderId::for_kind(kind))?.max_output_tokens)
+    }
+
     /// Whether any fetch has put a list for `kind` in the catalog.
     #[must_use]
     pub fn lists(&self, kind: ProviderKind) -> bool {
