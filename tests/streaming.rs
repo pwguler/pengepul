@@ -1133,3 +1133,29 @@ fn a_finished_stream_that_carried_nothing_is_still_a_whole_message() {
     assert!(tail.contains("\"stop_reason\":\"end_turn\""), "{tail}");
     assert!(finish_chat_stream(&mut state).is_empty());
 }
+
+#[test]
+fn a_chat_stream_cut_by_the_context_window_finishes_with_length() {
+    let mut state = ChatStreamState::new("claude-sonnet-4-5");
+    let mut chunks = anthropic_sse_to_chat(
+        "message_start",
+        &json!({"message": {"usage": {"input_tokens": 2}}}),
+        &mut state,
+    );
+    chunks.extend(anthropic_sse_to_chat(
+        "message_delta",
+        &json!({"delta": {"stop_reason": "model_context_window_exceeded"},
+                "usage": {"output_tokens": 3}}),
+        &mut state,
+    ));
+    let finish = chunks
+        .iter()
+        .filter(|chunk| chunk.starts_with("data: {"))
+        .map(|chunk| payload(chunk))
+        .find_map(|chunk| {
+            chunk["choices"][0]["finish_reason"]
+                .as_str()
+                .map(str::to_string)
+        });
+    assert_eq!(finish.as_deref(), Some("length"));
+}

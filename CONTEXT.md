@@ -33,7 +33,7 @@ Rewriting a request from its inbound dialect into the dialect the chosen upstrea
 _Avoid_: conversion, adapter, mapping, shim
 
 **Output ceiling**:
-The most tokens a model may write in one reply: the `max_output_tokens` of its catalog entry, else of the curated table, else 64000. A request translated onto the anthropic **Upstream** that names no limit is sent with it, because Messages requires `max_tokens` and the other two dialects do not; a limit the client set is sent as written (ADR-0035).
+The `max_tokens` the relay sends for a model when the client set none: the most tokens the model may write in one reply, as the vendor's model list publishes it or else the curated table states it, and the relay's fallback of 64000 for a model neither describes. A request translated onto the anthropic **Upstream** that names no limit is sent with it, because Messages requires `max_tokens` and the other two dialects do not; a limit the client set is sent as written (ADR-0035).
 _Avoid_: default max tokens, output cap, max tokens fallback
 
 ### Accounts

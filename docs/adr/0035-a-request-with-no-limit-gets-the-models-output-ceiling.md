@@ -16,14 +16,14 @@ large session never completed.
 ## Decision
 
 When a translated request names no output limit, the relay asks the anthropic upstream for
-the served model's **Output ceiling**: the `max_output_tokens` of the catalog entry the last
-fetch listed, else of the curated table, else 64000. A limit the client set reaches the
+the served model's **Output ceiling**: the `max_tokens` the vendor's `/v1/models` published
+for it at the last fetch, else the curated table's `max_output_tokens`, else 64000. A limit the client set reaches the
 upstream as written. A native Messages request is not touched.
 
 The ceiling is read where the request is routed, from the catalog the relay already holds,
 so the translator no longer invents a value: it copies a limit or leaves the field out.
 
-64000 is the smallest ceiling of any current anthropic family in the curated table (opus 4,
+64000 is the relay's fallback, not a model's limit. It is the smallest ceiling of any current anthropic family in the curated table (opus 4,
 sonnet 4, haiku 4.5), so every current model accepts it, and it is above the largest
 thinking budget the relay derives from `reasoning_effort` (24576), so the Messages rule
 `max_tokens > budget_tokens` holds for an invented limit. A model too old for 64000 answers
@@ -42,7 +42,18 @@ with the vendor's own 400 naming its maximum, which is a clearer failure than a 
 
 ## Consequences
 
-- A request with no limit can run for as long as the model writes. That is what the client
-  asked for by naming none.
-- A new curated or fetched `max_output_tokens` changes what such a request is asked for, with
-  no code change.
+- A streamed request with no limit runs for as long as the model writes, up to its ceiling.
+  That is what the client asked for by naming none.
+- A request the client did not stream still ends at `messages-ms` (120 s by default, about
+  18,000 tokens at the 155 tokens a second measured on opus). The relay books that deadline
+  as an upstream failure and tries the next account, which generates for the same deadline,
+  so a long reply asked for whole can cost one deadline per account and end in a 502. A
+  client that wants a long reply streams it, or the operator raises `messages-ms`.
+- A model the vendor lists with a new `max_tokens` is asked for it at the next catalog
+  fetch, with no code change. A model the list does not carry takes the curated table's
+  number, which changes only with the code.
+- A reply the context window cut (`model_context_window_exceeded`, which Claude 4.5 and
+  newer return instead of refusing a prompt plus `max_tokens` above the window) is reported
+  as cut, `length` in Chat and `incomplete` in Responses, as a reply cut by its limit is. A
+  ceiling makes that stop far likelier than 8192 did, and a client that reads `length` as
+  truncation must see it.

@@ -27,7 +27,7 @@ The reasoning and the rejected alternatives are in ADR-0035.
 
 - AC-1: A Chat Completions request with no limit (or a `null` one) for an anthropic model
   reaches the upstream with `max_tokens` equal to that model's **Output ceiling** from the
-  fetched catalog.
+  fetched catalog, which reads the `max_tokens` the vendor's `/v1/models` publishes.
 - AC-2: The same holds for a Responses request with no `max_output_tokens`.
 - AC-3: A model the catalog does not list yet takes its ceiling from the curated table, so
   `claude-opus-5-5` is asked for 128000 before the first catalog fetch lands.
@@ -36,17 +36,23 @@ The reasoning and the rejected alternatives are in ADR-0035.
   upstream unchanged, and a native Messages request with no `max_tokens` reaches it with none.
 - AC-6: A request whose `reasoning_effort` asks for thinking and that names no limit reaches
   the upstream with `max_tokens` above the thinking `budget_tokens`.
+- AC-7: A reply the vendor stopped with `model_context_window_exceeded` reaches a Chat client
+  with `finish_reason: "length"`, whole or streamed, and a whole Responses client with
+  `status: "incomplete"`.
 
 ## Verification
 
 ```sh
 cargo test --locked --test app output_ceiling
-cargo test --locked --test translate
+cargo test --locked --test translate context_window
+cargo test --locked --test streaming context_window
+cargo test --locked --lib the_anthropic_list_publishes
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo fmt --check
 ```
 
-Manual, against a relay started from this tree on a spare port: send one Chat Completions
-request with no `max_tokens` to `anthropic/claude-opus-5-5` asking for a long answer, and
-read in the debug log that the upstream body carried `max_tokens: 128000` and that the reply
-reported more than 8192 output tokens.
+Manual, against a relay started from this tree on a spare port with `debug: verbose`: send
+one Chat Completions request with no `max_tokens` to `anthropic/claude-opus-5-5` asking for a
+long answer (count from 1 to 4000, one number per line). The debug log's `upstream usage`
+line reads `output=` above 8192, and the reply's `finish_reason` is `stop`. The debug log
+prints no request body, so the value sent is pinned by the tests, not read from the log.

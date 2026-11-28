@@ -10471,19 +10471,7 @@ async fn sent_upstream(
     uri: &str,
     body: &Value,
 ) -> Value {
-    let body_text = body.to_string();
-    let (status, reply) = json_response(
-        app.clone(),
-        axum::http::Request::builder()
-            .method("POST")
-            .uri(uri)
-            .header("authorization", "Bearer sk-test")
-            .header("content-type", "application/json")
-            .header("content-length", body_text.len())
-            .body(Body::from(body_text))
-            .unwrap(),
-    )
-    .await;
+    let (status, reply) = json_response(app.clone(), post(uri, body)).await;
     assert_eq!(status, 200, "{uri} {body}: {reply}");
     upstream
         .calls()

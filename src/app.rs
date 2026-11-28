@@ -2670,7 +2670,7 @@ async fn route_anthropic_request(
     let masked_body = || {
         let mut upstream = upstream_request_body(ProviderKind::Anthropic, route, body, model);
         // Messages requires `max_tokens` and the other dialects do not, so a translated
-        // request that names no limit is asked for all the model can write (ADR-0035).
+        // request that names no limit is sent the model's Output ceiling (ADR-0035).
         if route != RequestRoute::Messages
             && let Some(object) = upstream.as_object_mut()
         {
