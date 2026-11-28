@@ -1887,7 +1887,7 @@ fn chat_done(state: &ChatStreamState, reason: &str) -> String {
 fn anthropic_stop_reason_to_chat(stop_reason: &str) -> &'static str {
     match stop_reason {
         "tool_use" => "tool_calls",
-        "max_tokens" => "length",
+        reason if crate::translate::is_cut(reason) => "length",
         _ => "stop",
     }
 }

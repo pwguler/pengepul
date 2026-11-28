@@ -65,6 +65,9 @@ use crate::utils::sha256_hex;
 
 const RATE_LIMIT_WINDOW: Duration = Duration::from_mins(1);
 const RATE_LIMIT_MAX: u32 = 60;
+/// The Output ceiling of a model no metadata describes: the smallest of any current
+/// anthropic family, and above the largest thinking budget `reasoning_effort` derives.
+const FALLBACK_OUTPUT_CEILING: u64 = 64_000;
 
 pub type UpstreamFuture =
     Pin<Box<dyn Future<Output = anyhow::Result<UpstreamJsonResponse>> + Send>>;
@@ -2665,12 +2668,22 @@ async fn route_anthropic_request(
     // sanitizer (ADR-0028). The reverse map restores tool_use names in the
     // response.
     let masked_body = || {
-        let (mut masked, reverse) = masquerade_request(&upstream_request_body(
-            ProviderKind::Anthropic,
-            route,
-            body,
-            model,
-        ));
+        let mut upstream = upstream_request_body(ProviderKind::Anthropic, route, body, model);
+        // Messages requires `max_tokens` and the other dialects do not, so a translated
+        // request that names no limit is sent the model's Output ceiling (ADR-0035).
+        if route != RequestRoute::Messages
+            && let Some(object) = upstream.as_object_mut()
+        {
+            object.entry("max_tokens").or_insert_with(|| {
+                let ceiling = state
+                    .catalog
+                    .read()
+                    .expect("catalog lock poisoned")
+                    .output_ceiling(ProviderKind::Anthropic, model);
+                json!(ceiling.unwrap_or(FALLBACK_OUTPUT_CEILING))
+            });
+        }
+        let (mut masked, reverse) = masquerade_request(&upstream);
         // A `thread` that names none asks for nothing, and the vendor is not asked to read
         // it. The relay's own thread crosses to the Upstream client as a fact, never in the body.
         if let Some(object) = masked.as_object_mut()

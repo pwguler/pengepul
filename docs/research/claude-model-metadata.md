@@ -2,8 +2,11 @@
 
 Researched 2026-09-02, to settle the curated per-model metadata in
 `src/models.rs` (`curated_metadata`) after the opus-5 entry was disputed.
-The anthropic `/v1/models` endpoint advertises ids only (`id`, `display_name`,
-`created`), so the vendor docs are the primary source.
+The vendor docs are the source for pricing and modalities. The anthropic
+`/v1/models` endpoint (the OAuth call the relay makes, read 2026-11-28) publishes
+`max_tokens` and `max_input_tokens` per model, and `parse_anthropic` takes those
+over the table below; it published only `id`, `display_name` and `created` when
+this note was first written.
 
 ## Sources
 

@@ -329,7 +329,9 @@ providers:
     allow: [claude-opus-5-5]
 body-limit: 200mb # largest request body the relay will read; empty means unlimited
 timeouts:
-  messages-ms: 120000 # deadline for a whole reply the client did not stream
+  messages-ms: 120000 # deadline for a whole reply the client did not stream; one that sets no
+                      # output limit is asked for the model's ceiling and can run past it, and
+                      # a reply cut by this deadline is tried on the next account in turn
   stream-messages-ms: 600000 # longest a streamed reply may send nothing
   count-tokens-ms: 30000
 debug: off # off | errors | verbose

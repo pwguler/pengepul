@@ -127,8 +127,8 @@ fn number_from(value: &Value) -> Option<f64> {
         .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
 }
 
-/// Per-model metadata for one Provider's catalog. The anthropic upstream advertises only ids,
-/// and commandcode publishes only `context_length`, so these numbers come from the vendor's
+/// Per-model metadata for one Provider's catalog. The anthropic upstream publishes only its
+/// limits, and commandcode only `context_length`, so these numbers come from the vendor's
 /// published model docs (see `docs/research/`) or from measurements recorded in
 /// [`PROVIDER_MODALITIES`]; a model no entry claims is advertised without metadata rather than
 /// with guessed ones. Ordered longest-prefix first, so `claude-fable-5-1` wins over the
@@ -623,6 +623,17 @@ impl ModelCatalog {
         }
     }
 
+    /// The most tokens `model`, a bare id, may write in one reply on `kind`: its listed
+    /// entry's `max_output_tokens`, else the curated table's, else `None`.
+    #[must_use]
+    pub fn output_ceiling(&self, kind: ProviderKind, model: &str) -> Option<u64> {
+        self.direct
+            .get(model)
+            .and_then(|entries| entries.iter().find(|entry| entry.kind == kind))
+            .and_then(|entry| entry.metadata.as_ref()?.max_output_tokens)
+            .or_else(|| curated_metadata(model, &ProviderId::for_kind(kind))?.max_output_tokens)
+    }
+
     /// Whether any fetch has put a list for `kind` in the catalog.
     #[must_use]
     pub fn lists(&self, kind: ProviderKind) -> bool {
@@ -1023,18 +1034,24 @@ pub fn parse_antigravity(body: &Value, provider: &ProviderId) -> FetchedModels {
     FetchedModels::with_metadata(ids, metadata)
 }
 
-/// Models from an Anthropic `/v1/models` body (`{"data": [{"id": ...}]}`). The upstream
-/// carries ids only, so metadata comes from the curated table where one claims the id.
+/// Models from an Anthropic `/v1/models` body (`{"data": [{"id", "max_tokens",
+/// "max_input_tokens"}]}`). The window and cap are renamed to the field names the ranking
+/// reads, so the upstream's numbers win over the curated table, which fills the rest.
 #[must_use]
 pub fn parse_anthropic(body: &Value, provider: &ProviderId) -> FetchedModels {
-    let ids = listed_models(body.get("data"), "id")
-        .into_iter()
-        .map(|(id, _)| id)
-        .collect::<Vec<_>>();
-    let metadata = ids
+    let listed = listed_models(body.get("data"), "id");
+    let metadata = listed
         .iter()
-        .filter_map(|id| curated_metadata(id, provider).map(|meta| (id.clone(), meta)))
+        .filter_map(|(id, entry)| {
+            let published = json!({
+                "context_length": entry.get("max_input_tokens"),
+                "max_output_tokens": entry.get("max_tokens"),
+            });
+            ranked_metadata(id, provider, ModelMetadata::from_json(&published), None)
+                .map(|meta| (id.clone(), meta))
+        })
         .collect();
+    let ids = listed.into_iter().map(|(id, _)| id).collect();
     FetchedModels::with_metadata(ids, metadata)
 }
 
@@ -1304,6 +1321,29 @@ mod tests {
                 "{id} must claim nothing on a Provider it was not measured against"
             );
         }
+    }
+
+    #[test]
+    fn the_anthropic_list_publishes_each_models_window_and_output_ceiling() {
+        // The shape the OAuth `/v1/models` returns, read 2026-11-28.
+        let fetched = parse_anthropic(
+            &json!({"data": [
+                {"id": "claude-haiku-5-5", "max_tokens": 128_000, "max_input_tokens": 1_000_000},
+                {"id": "claude-sonnet-4-5-20250929", "max_tokens": 64_000, "max_input_tokens": 200_000},
+            ]}),
+            &ProviderId::anthropic(),
+        );
+        let haiku = &fetched.metadata["claude-haiku-5-5"];
+        assert_eq!(haiku.max_output_tokens, Some(128_000));
+        assert_eq!(haiku.context_window, Some(1_000_000));
+        let sonnet = &fetched.metadata["claude-sonnet-4-5-20250929"];
+        assert_eq!(sonnet.max_output_tokens, Some(64_000));
+        assert_eq!(sonnet.context_window, Some(200_000));
+        // the curated rates still fill what the list leaves out
+        assert_eq!(
+            sonnet.pricing.and_then(|rates| rates.input_per_million),
+            Some(3.0)
+        );
     }
 
     #[test]

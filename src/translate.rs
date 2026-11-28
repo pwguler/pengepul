@@ -16,12 +16,14 @@ pub fn openai_to_anthropic(body: &Value) -> Value {
         "model".to_string(),
         Value::String(resolve_model(body.get("model").and_then(Value::as_str))),
     );
-    out.insert(
-        "max_tokens".to_string(),
-        body.get("max_completion_tokens")
-            .or_else(|| body.get("max_tokens"))
-            .cloned()
-            .unwrap_or_else(|| json!(8192)),
+    // No limit is invented here: the route that knows the model fills its ceiling.
+    let limit = |field| body.get(field).filter(|value| !value.is_null());
+    insert_if_some(
+        &mut out,
+        "max_tokens",
+        limit("max_completion_tokens")
+            .or_else(|| limit("max_tokens"))
+            .cloned(),
     );
     copy_if_present(body, &mut out, "stream");
     copy_if_present(body, &mut out, "temperature");
@@ -226,7 +228,7 @@ pub fn anthropic_to_responses(payload: &Value, model: &str) -> Value {
         "id": payload.get("id").cloned().unwrap_or_else(|| Value::String(format!("resp_{}", uuid::Uuid::new_v4().simple()))),
         "object": "response",
         "created_at": chrono::Utc::now().timestamp(),
-        "status": if payload.get("stop_reason").and_then(Value::as_str) == Some("max_tokens") { "incomplete" } else { "completed" },
+        "status": if payload.get("stop_reason").and_then(Value::as_str).is_some_and(is_cut) { "incomplete" } else { "completed" },
         "model": model,
         "output": output,
         "output_text": output_text_parts.join(""),
@@ -1595,11 +1597,17 @@ fn web_search_query_from_action(action: &Value) -> String {
 fn finish_reason(stop_reason: Option<&str>, has_tool_calls: bool) -> &'static str {
     if has_tool_calls || stop_reason == Some("tool_use") {
         "tool_calls"
-    } else if stop_reason == Some("max_tokens") {
+    } else if stop_reason.is_some_and(is_cut) {
         "length"
     } else {
         "stop"
     }
+}
+
+/// Whether a Messages `stop_reason` says the reply was cut short: by its limit, or by the
+/// context window, which Claude 4.5 and newer stop at instead of refusing the request.
+pub(crate) fn is_cut(stop_reason: &str) -> bool {
+    matches!(stop_reason, "max_tokens" | "model_context_window_exceeded")
 }
 
 fn usage_to_openai(usage: &Value) -> Value {

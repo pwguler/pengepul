@@ -801,3 +801,24 @@ fn an_assistant_turn_of_pure_tool_calls_sends_null_content() {
     );
     assert_eq!(out["messages"][0]["tool_calls"][0]["id"], "call_1");
 }
+
+#[test]
+fn a_reply_cut_by_the_context_window_reads_as_cut_not_finished() {
+    for stop in ["max_tokens", "model_context_window_exceeded"] {
+        let payload = json!({
+            "content": [{"type": "text", "text": "1\n2\n"}],
+            "stop_reason": stop,
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        });
+        assert_eq!(
+            anthropic_to_openai(&payload, "m")["choices"][0]["finish_reason"],
+            "length",
+            "{stop}"
+        );
+        assert_eq!(
+            anthropic_to_responses(&payload, "m")["status"],
+            "incomplete",
+            "{stop}"
+        );
+    }
+}
